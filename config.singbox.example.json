@@ -1,0 +1,71 @@
+{
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7890
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-reality",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+      "flow": "xtls-rprx-vision",
+      "packet_encoding": "xudp",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+          "short_id": "a1b2"
+        }
+      }
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-aead",
+      "server": "127.0.0.1",
+      "server_port": 10086,
+      "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+      "security": "auto",
+      "alter_id": 0
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan",
+      "server": "example.com",
+      "server_port": 443,
+      "password": "secret",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com"
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2",
+      "server": "example.com",
+      "server_port": 443,
+      "password": "secret",
+      "down_mbps": 100,
+      "obfs": {
+        "type": "salamander",
+        "password": "obfs-secret"
+      },
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com",
+        "alpn": ["h3"]
+      }
+    }
+  ]
+}

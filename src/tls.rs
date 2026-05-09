@@ -1,0 +1,261 @@
+use crate::utls::UtlsFingerprint;
+use anyhow::{Context, Result};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, ServerConfig,
+    SignatureScheme,
+};
+use std::fmt;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
+use std::sync::Arc;
+
+pub const MAX_EARLY_DATA_SIZE: u32 = 64 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct InsecureVerifier;
+
+impl ServerCertVerifier for InsecureVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
+
+pub fn init_crypto() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+pub fn client_config(insecure: bool) -> Arc<ClientConfig> {
+    client_config_with_fingerprint(insecure, None)
+}
+
+pub fn client_config_early_data(insecure: bool) -> Arc<ClientConfig> {
+    client_config_with_fingerprint_early_data(insecure, None)
+}
+
+pub fn client_config_with_fingerprint(
+    insecure: bool,
+    fingerprint: Option<UtlsFingerprint>,
+) -> Arc<ClientConfig> {
+    build_client_config(insecure, fingerprint, false)
+}
+
+pub fn client_config_with_fingerprint_early_data(
+    insecure: bool,
+    fingerprint: Option<UtlsFingerprint>,
+) -> Arc<ClientConfig> {
+    build_client_config(insecure, fingerprint, true)
+}
+
+fn build_client_config(
+    insecure: bool,
+    fingerprint: Option<UtlsFingerprint>,
+    early_data: bool,
+) -> Arc<ClientConfig> {
+    let mut config = if insecure {
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
+            .with_no_client_auth()
+    } else {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
+    config.alpn_protocols = fingerprint
+        .map(UtlsFingerprint::rustls_alpn_protocols)
+        .unwrap_or_default();
+    config.enable_early_data = early_data;
+    if let Some(fingerprint) = fingerprint {
+        tracing::debug!(
+            fingerprint = %fingerprint,
+            profile = fingerprint.rustls_profile_note(),
+            "applied uTLS-like rustls client profile"
+        );
+    }
+    Arc::new(config)
+}
+
+pub fn server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConfig>> {
+    let certs = load_certs(cert_path)?;
+    let key = load_key(key_path)?;
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .with_context(|| {
+            format!(
+                "build TLS server config with cert {} and key {}",
+                DisplayPath(cert_path),
+                DisplayPath(key_path)
+            )
+        })?;
+    config.alpn_protocols.clear();
+    Ok(Arc::new(config))
+}
+
+pub fn server_config_early_data(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConfig>> {
+    let mut config = Arc::unwrap_or_clone(server_config(cert_path, key_path)?);
+    config.max_early_data_size = MAX_EARLY_DATA_SIZE;
+    Ok(Arc::new(config))
+}
+
+pub(crate) fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let file =
+        File::open(path).with_context(|| format!("open certificate {}", DisplayPath(path)))?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("read certificate {}", DisplayPath(path)))?;
+    anyhow::ensure!(
+        !certs.is_empty(),
+        "certificate file contains no certificate"
+    );
+    Ok(certs)
+}
+
+pub(crate) fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
+    let file =
+        File::open(path).with_context(|| format!("open private key {}", DisplayPath(path)))?;
+    let mut reader = BufReader::new(file);
+    rustls_pemfile::private_key(&mut reader)
+        .with_context(|| format!("read private key {}", DisplayPath(path)))?
+        .with_context(|| format!("private key file contains no key: {}", DisplayPath(path)))
+}
+
+struct DisplayPath<'a>(&'a Path);
+
+impl fmt::Display for DisplayPath<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.display())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::{Context, Result};
+    use std::io::Read;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    #[tokio::test]
+    async fn accepts_tls13_early_data_after_ticket_resumption() -> Result<()> {
+        init_crypto();
+
+        let temp = tempfile::tempdir()?;
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
+        let cert_path = temp.path().join("early.crt");
+        let key_path = temp.path().join("early.key");
+        std::fs::write(&cert_path, certified.cert.pem())?;
+        std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let acceptor = TlsAcceptor::from(server_config_early_data(&cert_path, &key_path)?);
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await?;
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let mut stream = acceptor.accept(stream).await?;
+                    if let Some(mut early_data) = stream.get_mut().1.early_data() {
+                        let mut buf = Vec::new();
+                        early_data.read_to_end(&mut buf)?;
+                        if !buf.is_empty() {
+                            stream.write_all(b"EARLY:").await?;
+                            stream.write_all(&buf).await?;
+                        }
+                    }
+                    stream.write_all(b"LATE:").await?;
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let read = stream.read(&mut buf).await?;
+                        if read == 0 {
+                            stream.shutdown().await?;
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                        stream.write_all(&buf[..read]).await?;
+                    }
+                });
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let config = client_config_early_data(true);
+        let (accepted, body) = early_data_roundtrip(config.clone(), addr, b"hello").await?;
+        assert!(!accepted);
+        assert_eq!(body, b"LATE:hello");
+
+        let (accepted, body) = early_data_roundtrip(config, addr, b"world").await?;
+        assert!(accepted);
+        assert_eq!(body, b"EARLY:worldLATE:");
+
+        server_task.abort();
+        Ok(())
+    }
+
+    async fn early_data_roundtrip(
+        config: Arc<ClientConfig>,
+        addr: std::net::SocketAddr,
+        payload: &[u8],
+    ) -> Result<(bool, Vec<u8>)> {
+        let tcp = TcpStream::connect(addr).await?;
+        let server_name = ServerName::try_from("localhost").context("build server name")?;
+        let mut stream = TlsConnector::from(config)
+            .early_data(true)
+            .connect(server_name, tcp)
+            .await
+            .context("connect with early data")?;
+        stream.write_all(payload).await?;
+        stream.flush().await?;
+        stream.shutdown().await?;
+        let mut body = Vec::new();
+        stream.read_to_end(&mut body).await?;
+        let accepted = stream.get_ref().1.is_early_data_accepted();
+        Ok((accepted, body))
+    }
+}

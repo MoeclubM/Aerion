@@ -1,0 +1,306 @@
+use crate::protocol::ProxyTarget;
+use anyhow::{Context, Result, bail, ensure};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+pub const MAGIC_ADDRESS: &str = "sp.v2.udp-over-tcp.arpa";
+pub const LEGACY_MAGIC_ADDRESS: &str = "sp.udp-over-tcp.arpa";
+
+const AF_IPV4: u8 = 0x00;
+const AF_IPV6: u8 = 0x01;
+const AF_FQDN: u8 = 0x02;
+
+#[derive(Debug)]
+pub struct UotRequest {
+    pub is_connect: bool,
+    pub destination: ProxyTarget,
+}
+
+pub fn is_magic_target(target: &ProxyTarget) -> bool {
+    match target {
+        ProxyTarget::Domain(host, _) => {
+            host.eq_ignore_ascii_case(MAGIC_ADDRESS)
+                || host.eq_ignore_ascii_case(LEGACY_MAGIC_ADDRESS)
+        }
+        ProxyTarget::Ip(_) => false,
+    }
+}
+
+pub fn is_legacy_magic_target(target: &ProxyTarget) -> bool {
+    matches!(target, ProxyTarget::Domain(host, _) if host.eq_ignore_ascii_case(LEGACY_MAGIC_ADDRESS))
+}
+
+pub fn magic_target() -> ProxyTarget {
+    ProxyTarget::Domain(MAGIC_ADDRESS.to_string(), 0)
+}
+
+pub fn encode_v2_associate_request() -> Result<Vec<u8>> {
+    let mut bytes = vec![0];
+    write_socks_address(
+        &mut bytes,
+        &ProxyTarget::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
+    )?;
+    Ok(bytes)
+}
+
+pub fn decode_v2_request(payload: &[u8]) -> Result<UotRequest> {
+    ensure!(!payload.is_empty(), "UOT request is empty");
+    let is_connect = payload[0] != 0;
+    let (destination, tail) = read_socks_address(&payload[1..])?;
+    ensure!(tail.is_empty(), "UOT request has trailing bytes");
+    Ok(UotRequest {
+        is_connect,
+        destination,
+    })
+}
+
+pub fn decode_request_for_target<'a>(
+    target: &ProxyTarget,
+    payload: &'a [u8],
+) -> Result<(UotRequest, &'a [u8])> {
+    if is_legacy_magic_target(target) {
+        return Ok((
+            UotRequest {
+                is_connect: false,
+                destination: ProxyTarget::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
+            },
+            payload,
+        ));
+    }
+    Ok((decode_v2_request(payload)?, &[]))
+}
+
+pub fn encode_associate_packet(destination: &ProxyTarget, payload: &[u8]) -> Result<Vec<u8>> {
+    ensure!(
+        payload.len() <= u16::MAX as usize,
+        "UDP payload too large: {}",
+        payload.len()
+    );
+    let mut bytes = Vec::new();
+    write_uot_address(&mut bytes, destination)?;
+    bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(payload);
+    Ok(bytes)
+}
+
+pub fn decode_associate_packet(packet: &[u8]) -> Result<(ProxyTarget, &[u8])> {
+    let (destination, tail) = read_uot_address(packet)?;
+    ensure!(tail.len() >= 2, "UOT packet missing payload length");
+    let length = u16::from_be_bytes([tail[0], tail[1]]) as usize;
+    ensure!(
+        tail.len() >= 2 + length,
+        "UOT packet payload is shorter than declared length"
+    );
+    ensure!(
+        tail.len() == 2 + length,
+        "UOT packet has trailing bytes after payload"
+    );
+    Ok((destination, &tail[2..]))
+}
+
+pub fn encode_connect_packet(payload: &[u8]) -> Result<Vec<u8>> {
+    ensure!(
+        payload.len() <= u16::MAX as usize,
+        "UDP payload too large: {}",
+        payload.len()
+    );
+    let mut bytes = Vec::with_capacity(2 + payload.len());
+    bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(payload);
+    Ok(bytes)
+}
+
+pub fn decode_connect_packet(packet: &[u8]) -> Result<&[u8]> {
+    ensure!(
+        packet.len() >= 2,
+        "UOT connected packet missing payload length"
+    );
+    let length = u16::from_be_bytes([packet[0], packet[1]]) as usize;
+    ensure!(
+        packet.len() >= 2 + length,
+        "UOT connected packet payload is shorter than declared length"
+    );
+    ensure!(
+        packet.len() == 2 + length,
+        "UOT connected packet has trailing bytes after payload"
+    );
+    Ok(&packet[2..])
+}
+
+pub fn parse_socks_udp_packet(packet: &[u8]) -> Result<(ProxyTarget, &[u8])> {
+    ensure!(packet.len() >= 4, "SOCKS UDP packet is too short");
+    ensure!(
+        packet[0] == 0 && packet[1] == 0,
+        "invalid SOCKS UDP reserved bytes"
+    );
+    ensure!(
+        packet[2] == 0,
+        "fragmented SOCKS UDP packets are not supported"
+    );
+    read_socks_address(&packet[3..])
+}
+
+pub fn encode_socks_udp_packet(source: &ProxyTarget, payload: &[u8]) -> Result<Vec<u8>> {
+    let mut bytes = vec![0, 0, 0];
+    write_socks_address(&mut bytes, source)?;
+    bytes.extend_from_slice(payload);
+    Ok(bytes)
+}
+
+fn write_socks_address(bytes: &mut Vec<u8>, target: &ProxyTarget) -> Result<()> {
+    match target {
+        ProxyTarget::Ip(addr) => match addr.ip() {
+            IpAddr::V4(ip) => {
+                bytes.push(0x01);
+                bytes.extend_from_slice(&ip.octets());
+                bytes.extend_from_slice(&addr.port().to_be_bytes());
+            }
+            IpAddr::V6(ip) => {
+                bytes.push(0x04);
+                bytes.extend_from_slice(&ip.octets());
+                bytes.extend_from_slice(&addr.port().to_be_bytes());
+            }
+        },
+        ProxyTarget::Domain(host, port) => {
+            ensure!(host.len() <= u8::MAX as usize, "domain too long");
+            bytes.push(0x03);
+            bytes.push(host.len() as u8);
+            bytes.extend_from_slice(host.as_bytes());
+            bytes.extend_from_slice(&port.to_be_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn read_socks_address(packet: &[u8]) -> Result<(ProxyTarget, &[u8])> {
+    ensure!(!packet.is_empty(), "SOCKS address is empty");
+    match packet[0] {
+        0x01 => {
+            ensure!(packet.len() >= 7, "SOCKS IPv4 address is too short");
+            let ip = Ipv4Addr::new(packet[1], packet[2], packet[3], packet[4]);
+            let port = u16::from_be_bytes([packet[5], packet[6]]);
+            Ok((
+                ProxyTarget::Ip(SocketAddr::new(IpAddr::V4(ip), port)),
+                &packet[7..],
+            ))
+        }
+        0x03 => {
+            ensure!(packet.len() >= 2, "SOCKS domain address is too short");
+            let length = packet[1] as usize;
+            let port_offset = 2 + length;
+            ensure!(
+                packet.len() >= port_offset + 2,
+                "SOCKS domain address missing port"
+            );
+            let host = String::from_utf8(packet[2..port_offset].to_vec())
+                .context("decode SOCKS domain address")?;
+            let port = u16::from_be_bytes([packet[port_offset], packet[port_offset + 1]]);
+            Ok((ProxyTarget::Domain(host, port), &packet[port_offset + 2..]))
+        }
+        0x04 => {
+            ensure!(packet.len() >= 19, "SOCKS IPv6 address is too short");
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&packet[1..17]);
+            let port = u16::from_be_bytes([packet[17], packet[18]]);
+            Ok((
+                ProxyTarget::Ip(SocketAddr::new(IpAddr::from(octets), port)),
+                &packet[19..],
+            ))
+        }
+        other => bail!("unsupported SOCKS address type: {other}"),
+    }
+}
+
+fn write_uot_address(bytes: &mut Vec<u8>, target: &ProxyTarget) -> Result<()> {
+    match target {
+        ProxyTarget::Ip(addr) => match addr.ip() {
+            IpAddr::V4(ip) => {
+                bytes.push(AF_IPV4);
+                bytes.extend_from_slice(&ip.octets());
+                bytes.extend_from_slice(&addr.port().to_be_bytes());
+            }
+            IpAddr::V6(ip) => {
+                bytes.push(AF_IPV6);
+                bytes.extend_from_slice(&ip.octets());
+                bytes.extend_from_slice(&addr.port().to_be_bytes());
+            }
+        },
+        ProxyTarget::Domain(host, port) => {
+            ensure!(host.len() <= u8::MAX as usize, "UOT domain too long");
+            bytes.push(AF_FQDN);
+            bytes.push(host.len() as u8);
+            bytes.extend_from_slice(host.as_bytes());
+            bytes.extend_from_slice(&port.to_be_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn read_uot_address(packet: &[u8]) -> Result<(ProxyTarget, &[u8])> {
+    ensure!(!packet.is_empty(), "UOT address is empty");
+    match packet[0] {
+        AF_IPV4 => {
+            ensure!(packet.len() >= 7, "UOT IPv4 address is too short");
+            let ip = Ipv4Addr::new(packet[1], packet[2], packet[3], packet[4]);
+            let port = u16::from_be_bytes([packet[5], packet[6]]);
+            Ok((
+                ProxyTarget::Ip(SocketAddr::new(IpAddr::V4(ip), port)),
+                &packet[7..],
+            ))
+        }
+        AF_IPV6 => {
+            ensure!(packet.len() >= 19, "UOT IPv6 address is too short");
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&packet[1..17]);
+            let port = u16::from_be_bytes([packet[17], packet[18]]);
+            Ok((
+                ProxyTarget::Ip(SocketAddr::new(IpAddr::from(octets), port)),
+                &packet[19..],
+            ))
+        }
+        AF_FQDN => {
+            ensure!(packet.len() >= 2, "UOT domain address is too short");
+            let length = packet[1] as usize;
+            let port_offset = 2 + length;
+            ensure!(
+                packet.len() >= port_offset + 2,
+                "UOT domain address missing port"
+            );
+            let host = String::from_utf8(packet[2..port_offset].to_vec())
+                .context("decode UOT domain address")?;
+            let port = u16::from_be_bytes([packet[port_offset], packet[port_offset + 1]]);
+            Ok((ProxyTarget::Domain(host, port), &packet[port_offset + 2..]))
+        }
+        other => bail!("unsupported UOT address family: {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrips_associate_packet() {
+        let target = ProxyTarget::Domain("example.com".to_string(), 53);
+        let packet = encode_associate_packet(&target, b"abc").unwrap();
+        let (decoded, payload) = decode_associate_packet(&packet).unwrap();
+        assert_eq!(decoded, target);
+        assert_eq!(payload, b"abc");
+    }
+
+    #[test]
+    fn parses_socks_udp_packet() {
+        let target = ProxyTarget::Ip("1.2.3.4:53".parse().unwrap());
+        let packet = encode_socks_udp_packet(&target, b"abc").unwrap();
+        let (decoded, payload) = parse_socks_udp_packet(&packet).unwrap();
+        assert_eq!(decoded, target);
+        assert_eq!(payload, b"abc");
+    }
+
+    #[test]
+    fn legacy_request_preserves_initial_packet() {
+        let target = ProxyTarget::Domain(LEGACY_MAGIC_ADDRESS.to_string(), 0);
+        let (request, packet) = decode_request_for_target(&target, b"abc").unwrap();
+        assert!(!request.is_connect);
+        assert_eq!(packet, b"abc");
+    }
+}

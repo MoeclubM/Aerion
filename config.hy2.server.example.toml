@@ -1,0 +1,15 @@
+mode = "server"
+
+[server]
+protocol = "hysteria2"
+listen = "0.0.0.0:8443"
+password = "change-me"
+# Optional extra accepted Hysteria2 auth credentials.
+# users = ["uuid-or-password-1", "uuid-or-password-2"]
+cert = "server.crt"
+key = "server.key"
+udp = true
+cc_rx = "0"
+congestion_control = "bbr"
+# obfs = "salamander"
+# obfs_password = "change-me-obfs"

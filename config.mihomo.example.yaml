@@ -1,0 +1,50 @@
+mixed-port: 7890
+allow-lan: false
+
+proxies:
+  - name: vless-reality
+    type: vless
+    server: example.com
+    port: 443
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    udp: true
+    tls: true
+    network: tcp
+    flow: xtls-rprx-vision
+    servername: www.example.com
+    client-fingerprint: chrome
+    packet-encoding: xudp
+    reality-opts:
+      public-key: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
+      short-id: a1b2
+
+  - name: vmess-aead
+    type: vmess
+    server: 127.0.0.1
+    port: 10086
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    alterId: 0
+    cipher: auto
+    network: tcp
+    tls: false
+
+  - name: trojan
+    type: trojan
+    server: example.com
+    port: 443
+    password: secret
+    sni: example.com
+    network: tcp
+    tls: true
+    skip-cert-verify: false
+
+  - name: hysteria2
+    type: hysteria2
+    server: example.com
+    port: 443
+    password: secret
+    sni: example.com
+    obfs: salamander
+    obfs-password: obfs-secret
+    down: 100
+    udp: true
