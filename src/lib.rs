@@ -36,8 +36,8 @@ pub use hysteria2::{
     run_hysteria2_client_listener, run_hysteria2_server, run_hysteria2_server_with_core,
 };
 pub use mieru::{
-    MieruClientConfig, MieruServerConfig, MieruUser, parse_mieru_user, run_mieru_client,
-    run_mieru_client_listener, run_mieru_server, run_mieru_server_with_core,
+    MieruClientConfig, MieruServerConfig, MieruTransport, MieruUser, parse_mieru_user,
+    run_mieru_client, run_mieru_client_listener, run_mieru_server, run_mieru_server_with_core,
 };
 pub use mihomo::{MihomoClientConfig, MihomoConfig, MihomoProxy};
 pub use reality::{

@@ -1,6 +1,6 @@
 use aerion::config::{FileConfig, default_heartbeat_interval_secs, load_config};
 use aerion::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
-use aerion::mieru::{MieruClientConfig, MieruServerConfig, parse_mieru_user};
+use aerion::mieru::{MieruClientConfig, MieruServerConfig, MieruTransport, parse_mieru_user};
 use aerion::padding::PaddingScheme;
 use aerion::{
     ClientConfig, ServerConfig, run_client, run_hysteria2_client, run_hysteria2_server,
@@ -113,6 +113,8 @@ enum Command {
         password: String,
         #[arg(long, default_value_t = 1500)]
         mtu: usize,
+        #[arg(long, default_value = "tcp")]
+        transport: String,
     },
     MieruServer {
         #[arg(long, default_value = "0.0.0.0:8964")]
@@ -127,6 +129,8 @@ enum Command {
         mtu: usize,
         #[arg(long = "user-hint-mandatory")]
         user_hint_mandatory: bool,
+        #[arg(long, default_value = "tcp")]
+        transport: String,
     },
 }
 
@@ -167,6 +171,7 @@ async fn main() -> Result<()> {
                         password: client.password,
                         hashed_password: None,
                         mtu: client.mtu,
+                        transport: MieruTransport::parse(&client.transport)?,
                     })
                     .await;
                 }
@@ -214,6 +219,7 @@ async fn main() -> Result<()> {
                         users,
                         mtu: server.mtu,
                         user_hint_mandatory: server.user_hint_mandatory,
+                        transport: MieruTransport::parse(&server.transport)?,
                     })
                     .await;
                 }
@@ -360,6 +366,7 @@ async fn main() -> Result<()> {
             username,
             password,
             mtu,
+            transport,
         } => {
             let (server_host, server_port) = parse_host_port(&server)?;
             run_mieru_client(MieruClientConfig {
@@ -370,6 +377,7 @@ async fn main() -> Result<()> {
                 password,
                 hashed_password: None,
                 mtu,
+                transport: MieruTransport::parse(&transport)?,
             })
             .await
         }
@@ -380,6 +388,7 @@ async fn main() -> Result<()> {
             users,
             mtu,
             user_hint_mandatory,
+            transport,
         } => {
             let users = users
                 .iter()
@@ -392,6 +401,7 @@ async fn main() -> Result<()> {
                 users,
                 mtu,
                 user_hint_mandatory,
+                transport: MieruTransport::parse(&transport)?,
             })
             .await
         }

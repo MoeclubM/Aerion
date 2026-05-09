@@ -52,6 +52,8 @@ pub struct ClientFileConfig {
     pub heartbeat_interval_secs: u64,
     #[serde(default)]
     pub mtu: usize,
+    #[serde(default = "default_mieru_transport")]
+    pub transport: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +88,8 @@ pub struct ServerFileConfig {
     pub mtu: usize,
     #[serde(default, alias = "user-hint-mandatory", alias = "userHintMandatory")]
     pub user_hint_mandatory: bool,
+    #[serde(default = "default_mieru_transport")]
+    pub transport: String,
 }
 
 pub fn load_config(path: &Path) -> Result<FileConfig> {
@@ -156,6 +160,10 @@ pub fn default_hy2_congestion_control() -> String {
 
 pub fn default_mieru_username() -> String {
     "default".to_string()
+}
+
+pub fn default_mieru_transport() -> String {
+    "tcp".to_string()
 }
 
 impl From<TomlFileConfig> for FileConfig {

@@ -22,12 +22,14 @@ Aerion now provides these server/client protocol stacks:
   - single password plus optional multi-user credential list
 - Mieru:
   - TCP stream underlay with Mieru v3 metadata framing
+  - native UDP packet underlay with stateless packet metadata/payload encryption,
+    ordered delivery, ACK frames, and retransmission
   - XChaCha20-Poly1305 stateful stream encryption
   - Mieru password hashing, PBKDF2-HMAC-SHA256 time-window keys, nonce user hints
   - SOCKS5 CONNECT over Mieru sessions
   - SOCKS5 UDP ASSOCIATE through Mieru packet-over-stream framing
   - multi-user server authentication and traffic accounting through `ProxyCore`
-  - native Mieru UDP packet underlay / traffic-pattern padding is not enabled yet and fails explicitly instead of silently degrading
+  - traffic-pattern padding / nonce-pattern shaping is not enabled yet and fails explicitly instead of silently degrading
 - Trojan:
   - TLS client/server core
   - TCP CONNECT
@@ -145,7 +147,9 @@ cargo run -- run --config config.singbox.example.json
 ```
 
 Use `protocol = "hysteria2"` in `[client]` or `[server]` to select Hysteria2,
-or `protocol = "mieru"` to select Mieru TCP stream mode.
+or `protocol = "mieru"` to select Mieru. Mieru defaults to
+`transport = "tcp"`; set `transport = "udp"` to use the native packet
+underlay.
 The mihomo / Xray / sing-box loaders are exposed for core integration and
 profile conversion; the CLI only parses them and then asks the upper layer to
 select a proxy profile.
