@@ -11,6 +11,7 @@ pub mod reality;
 pub mod reality_tls_client;
 pub mod server;
 pub mod singbox;
+pub mod socket_protect;
 pub mod socks;
 pub mod tls;
 pub mod trojan;

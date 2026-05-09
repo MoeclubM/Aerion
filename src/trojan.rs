@@ -1,5 +1,6 @@
 use crate::core::{CoreSession, ProxyCore};
 use crate::protocol::{ProxyTarget, target_name};
+use crate::socket_protect;
 use crate::{socks, tls, uot, utls};
 use anyhow::{Context, Result, bail, ensure};
 use rustls::pki_types::ServerName;
@@ -217,14 +218,15 @@ async fn handle_trojan_udp_associate(
 async fn connect_trojan_server(
     config: &TrojanClientConfig,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    let tcp = TcpStream::connect((config.server_host.as_str(), config.server_port))
-        .await
-        .with_context(|| {
-            format!(
-                "connect Trojan server {}:{}",
-                config.server_host, config.server_port
-            )
-        })?;
+    let tcp =
+        socket_protect::connect_tcp_host_port(config.server_host.as_str(), config.server_port)
+            .await
+            .with_context(|| {
+                format!(
+                    "connect Trojan server {}:{}",
+                    config.server_host, config.server_port
+                )
+            })?;
     let connector = TlsConnector::from(tls::client_config_with_fingerprint(
         config.insecure,
         config.client_fingerprint,

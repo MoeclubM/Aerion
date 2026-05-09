@@ -4,6 +4,7 @@ use crate::protocol::{
     CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, Frame,
     PaddedFrameWriter, ProxyTarget, encode_target, read_frame, target_name,
 };
+use crate::socket_protect;
 use crate::socks::{self, SocksRequest};
 use crate::tls;
 use crate::uot;
@@ -77,14 +78,15 @@ struct ClientStream {
 
 impl ClientSession {
     async fn connect(config: &ClientConfig, tls_config: Arc<rustls::ClientConfig>) -> Result<Self> {
-        let tcp = TcpStream::connect((config.server_host.as_str(), config.server_port))
-            .await
-            .with_context(|| {
-                format!(
-                    "connect Aerion server {}:{}",
-                    config.server_host, config.server_port
-                )
-            })?;
+        let tcp =
+            socket_protect::connect_tcp_host_port(config.server_host.as_str(), config.server_port)
+                .await
+                .with_context(|| {
+                    format!(
+                        "connect Aerion server {}:{}",
+                        config.server_host, config.server_port
+                    )
+                })?;
         let _ = tcp.set_nodelay(true);
         let connector = TlsConnector::from(tls_config).early_data(true);
         let server_name = ServerName::try_from(config.sni.clone())

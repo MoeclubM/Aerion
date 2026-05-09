@@ -1,8 +1,8 @@
 use crate::core::{CoreSession, ProxyCore};
 use crate::protocol::{ProxyTarget, target_name};
 use crate::{
-    reality, reality_tls_client, socks, tls, uot, utls, vless_h2, vless_http, vless_mux,
-    vless_transport, vless_vision, vless_websocket, vless_xhttp, vless_xudp,
+    reality, reality_tls_client, socket_protect, socks, tls, uot, utls, vless_h2, vless_http,
+    vless_mux, vless_transport, vless_vision, vless_websocket, vless_xhttp, vless_xudp,
 };
 use anyhow::{Context, Result, bail, ensure};
 use rustls::pki_types::ServerName;
@@ -326,14 +326,15 @@ async fn handle_vless_xudp_associate(
 }
 
 async fn connect_vless_server(config: &VlessClientConfig) -> Result<BoxedVlessStream> {
-    let tcp = TcpStream::connect((config.server_host.as_str(), config.server_port))
-        .await
-        .with_context(|| {
-            format!(
-                "connect VLESS server {}:{}",
-                config.server_host, config.server_port
-            )
-        })?;
+    let tcp =
+        socket_protect::connect_tcp_host_port(config.server_host.as_str(), config.server_port)
+            .await
+            .with_context(|| {
+                format!(
+                    "connect VLESS server {}:{}",
+                    config.server_host, config.server_port
+                )
+            })?;
     if let Some(reality) = config.reality.as_ref() {
         let fingerprint = config
             .client_fingerprint

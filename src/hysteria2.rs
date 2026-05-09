@@ -1,6 +1,6 @@
 use crate::core::{CoreSession, ProxyCore};
 use crate::protocol::{ProxyTarget, target_name};
-use crate::{socks, tls, uot};
+use crate::{socket_protect, socks, tls, uot};
 use anyhow::{Context, Result, bail, ensure};
 use blake2::Blake2bVar;
 use blake2::digest::{Update, VariableOutput};
@@ -1206,18 +1206,16 @@ fn auth_passwords(password: &str, users: &[String]) -> Vec<String> {
 }
 
 fn bind_client_udp_socket(bind_ipv6: bool) -> Result<std::net::UdpSocket> {
-    let socket = if bind_ipv6 {
-        std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)).or_else(
-            |_| std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)),
-        )
+    if bind_ipv6 {
+        socket_protect::bind_udp_std(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
+            .or_else(|_| {
+                socket_protect::bind_udp_std(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0))
+            })
+            .context("bind Hysteria2 UDP socket")
     } else {
-        std::net::UdpSocket::bind("0.0.0.0:0")
+        socket_protect::bind_udp_std(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+            .context("bind Hysteria2 UDP socket")
     }
-    .context("bind Hysteria2 UDP socket")?;
-    socket
-        .set_nonblocking(true)
-        .context("set Hysteria2 UDP socket nonblocking")?;
-    Ok(socket)
 }
 
 fn bind_server_udp_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {

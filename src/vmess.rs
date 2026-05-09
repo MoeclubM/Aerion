@@ -1,7 +1,7 @@
 use crate::core::{CoreSession, ProxyCore};
 use crate::protocol::{ProxyTarget, target_name};
 use crate::vmess_body::{BodyConfig, BodyReader, BodyWriter, RequestOptions, SecurityType};
-use crate::{socks, tls, uot, utls};
+use crate::{socket_protect, socks, tls, uot, utls};
 use aes::Aes128;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, generic_array::GenericArray};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -204,14 +204,15 @@ async fn handle_vmess_socks(mut local: TcpStream, config: VmessClientConfig) -> 
 }
 
 async fn connect_vmess_transport(config: &VmessClientConfig) -> Result<VmessTransport> {
-    let tcp = TcpStream::connect((config.server_host.as_str(), config.server_port))
-        .await
-        .with_context(|| {
-            format!(
-                "connect VMess server {}:{}",
-                config.server_host, config.server_port
-            )
-        })?;
+    let tcp =
+        socket_protect::connect_tcp_host_port(config.server_host.as_str(), config.server_port)
+            .await
+            .with_context(|| {
+                format!(
+                    "connect VMess server {}:{}",
+                    config.server_host, config.server_port
+                )
+            })?;
     if !config.tls {
         return Ok(Box::new(tcp));
     }

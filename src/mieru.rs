@@ -1,5 +1,6 @@
 use crate::core::{CoreSession, CoreUser, ProxyCore};
 use crate::protocol::{ProxyTarget, target_name};
+use crate::socket_protect;
 use crate::uot;
 use anyhow::{Context, Result, bail, ensure};
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -900,14 +901,15 @@ async fn connect_mieru_underlay(config: &MieruClientConfig) -> Result<ClientUnde
     if config.transport == MieruTransport::Udp {
         return connect_mieru_packet_underlay(config).await;
     }
-    let stream = TcpStream::connect((config.server_host.as_str(), config.server_port))
-        .await
-        .with_context(|| {
-            format!(
-                "connect Mieru server {}:{}",
-                config.server_host, config.server_port
-            )
-        })?;
+    let stream =
+        socket_protect::connect_tcp_host_port(config.server_host.as_str(), config.server_port)
+            .await
+            .with_context(|| {
+                format!(
+                    "connect Mieru server {}:{}",
+                    config.server_host, config.server_port
+                )
+            })?;
     let (reader, writer) = stream.into_split();
     let key = current_mieru_key(&config.hashed_password())?;
     let send = MieruCipher::new(key, true, config.username.clone());
@@ -951,11 +953,7 @@ async fn connect_mieru_packet_underlay(config: &MieruClientConfig) -> Result<Cli
     } else {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
     };
-    let socket = Arc::new(
-        UdpSocket::bind(bind)
-            .await
-            .with_context(|| format!("bind Mieru UDP underlay on {bind}"))?,
-    );
+    let socket = Arc::new(socket_protect::bind_udp(bind).await?);
     let key = current_mieru_key(&config.hashed_password())?;
     let send = MieruCipher::new(key, false, config.username.clone());
     let recv = MieruCipher::new(key, false, config.username.clone());
