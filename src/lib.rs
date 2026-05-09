@@ -3,6 +3,7 @@ pub mod client_hello;
 pub mod config;
 pub mod core;
 pub mod hysteria2;
+pub mod mieru;
 pub mod mihomo;
 pub mod padding;
 pub mod protocol;
@@ -33,6 +34,10 @@ pub use client_hello::{BuiltClientHello, ClientHelloParams, build_client_hello};
 pub use hysteria2::{
     Hysteria2ClientConfig, Hysteria2ServerConfig, run_hysteria2_client,
     run_hysteria2_client_listener, run_hysteria2_server, run_hysteria2_server_with_core,
+};
+pub use mieru::{
+    MieruClientConfig, MieruServerConfig, MieruUser, parse_mieru_user, run_mieru_client,
+    run_mieru_client_listener, run_mieru_server, run_mieru_server_with_core,
 };
 pub use mihomo::{MihomoClientConfig, MihomoConfig, MihomoProxy};
 pub use reality::{

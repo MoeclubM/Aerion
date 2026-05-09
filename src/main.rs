@@ -1,9 +1,10 @@
 use aerion::config::{FileConfig, default_heartbeat_interval_secs, load_config};
 use aerion::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
+use aerion::mieru::{MieruClientConfig, MieruServerConfig, parse_mieru_user};
 use aerion::padding::PaddingScheme;
 use aerion::{
-    ClientConfig, ServerConfig, run_client, run_hysteria2_client, run_hysteria2_server, run_server,
-    tls,
+    ClientConfig, ServerConfig, run_client, run_hysteria2_client, run_hysteria2_server,
+    run_mieru_client, run_mieru_server, run_server, tls,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -101,6 +102,32 @@ enum Command {
         #[arg(long = "congestion-control", default_value = "bbr")]
         congestion_control: String,
     },
+    MieruClient {
+        #[arg(long, default_value = "127.0.0.1:1080")]
+        listen: SocketAddr,
+        #[arg(long)]
+        server: String,
+        #[arg(long, default_value = "default")]
+        username: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long, default_value_t = 1500)]
+        mtu: usize,
+    },
+    MieruServer {
+        #[arg(long, default_value = "0.0.0.0:8964")]
+        listen: SocketAddr,
+        #[arg(long, default_value = "default")]
+        username: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long = "user")]
+        users: Vec<String>,
+        #[arg(long, default_value_t = 1500)]
+        mtu: usize,
+        #[arg(long = "user-hint-mandatory")]
+        user_hint_mandatory: bool,
+    },
 }
 
 #[tokio::main]
@@ -131,6 +158,18 @@ async fn main() -> Result<()> {
                     })
                     .await;
                 }
+                if is_mieru(&client.protocol) {
+                    return run_mieru_client(MieruClientConfig {
+                        listen: client.listen,
+                        server_host,
+                        server_port,
+                        username: client.username,
+                        password: client.password,
+                        hashed_password: None,
+                        mtu: client.mtu,
+                    })
+                    .await;
+                }
                 ensure_supported_protocol(&client.protocol)?;
                 run_client(ClientConfig {
                     listen: client.listen,
@@ -150,8 +189,10 @@ async fn main() -> Result<()> {
                         listen: server.listen,
                         password: server.password,
                         users: server.users,
-                        cert_path: server.cert,
-                        key_path: server.key,
+                        cert_path: server
+                            .cert
+                            .context("server cert is required for Hysteria2")?,
+                        key_path: server.key.context("server key is required for Hysteria2")?,
                         obfs: server.obfs,
                         obfs_password: server.obfs_password,
                         udp: server.udp,
@@ -160,13 +201,29 @@ async fn main() -> Result<()> {
                     })
                     .await;
                 }
+                if is_mieru(&server.protocol) {
+                    let users = server
+                        .users
+                        .iter()
+                        .map(|user| parse_mieru_user(user))
+                        .collect::<Result<Vec<_>>>()?;
+                    return run_mieru_server(MieruServerConfig {
+                        listen: server.listen,
+                        username: server.username,
+                        password: server.password,
+                        users,
+                        mtu: server.mtu,
+                        user_hint_mandatory: server.user_hint_mandatory,
+                    })
+                    .await;
+                }
                 ensure_supported_protocol(&server.protocol)?;
                 run_server(ServerConfig {
                     listen: server.listen,
                     password: server.password,
                     users: server.users,
-                    cert_path: server.cert,
-                    key_path: server.key,
+                    cert_path: server.cert.context("server cert is required for AnyTLS")?,
+                    key_path: server.key.context("server key is required for AnyTLS")?,
                     padding_scheme: server.padding_scheme,
                     heartbeat_interval_secs: server.heartbeat_interval_secs,
                 })
@@ -297,6 +354,47 @@ async fn main() -> Result<()> {
             })
             .await
         }
+        Command::MieruClient {
+            listen,
+            server,
+            username,
+            password,
+            mtu,
+        } => {
+            let (server_host, server_port) = parse_host_port(&server)?;
+            run_mieru_client(MieruClientConfig {
+                listen,
+                server_host,
+                server_port,
+                username,
+                password,
+                hashed_password: None,
+                mtu,
+            })
+            .await
+        }
+        Command::MieruServer {
+            listen,
+            username,
+            password,
+            users,
+            mtu,
+            user_hint_mandatory,
+        } => {
+            let users = users
+                .iter()
+                .map(|user| parse_mieru_user(user))
+                .collect::<Result<Vec<_>>>()?;
+            run_mieru_server(MieruServerConfig {
+                listen,
+                username,
+                password,
+                users,
+                mtu,
+                user_hint_mandatory,
+            })
+            .await
+        }
     }
 }
 
@@ -327,6 +425,10 @@ fn parse_host_port(value: &str) -> Result<(String, u16)> {
 
 fn is_hysteria2(protocol: &str) -> bool {
     protocol.eq_ignore_ascii_case("hysteria2") || protocol.eq_ignore_ascii_case("hy2")
+}
+
+fn is_mieru(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case("mieru") || protocol.eq_ignore_ascii_case("mierus")
 }
 
 fn ensure_supported_protocol(protocol: &str) -> Result<()> {

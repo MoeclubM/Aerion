@@ -30,6 +30,8 @@ pub struct ClientFileConfig {
     pub protocol: String,
     pub listen: SocketAddr,
     pub server: String,
+    #[serde(default = "default_mieru_username")]
+    pub username: String,
     pub password: String,
     pub sni: Option<String>,
     #[serde(default)]
@@ -48,6 +50,8 @@ pub struct ClientFileConfig {
     pub padding_scheme: Vec<String>,
     #[serde(default = "default_heartbeat_interval_secs")]
     pub heartbeat_interval_secs: u64,
+    #[serde(default)]
+    pub mtu: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,11 +59,15 @@ pub struct ServerFileConfig {
     #[serde(default = "default_protocol")]
     pub protocol: String,
     pub listen: SocketAddr,
+    #[serde(default = "default_mieru_username")]
+    pub username: String,
     pub password: String,
     #[serde(default)]
     pub users: Vec<String>,
-    pub cert: PathBuf,
-    pub key: PathBuf,
+    #[serde(default)]
+    pub cert: Option<PathBuf>,
+    #[serde(default)]
+    pub key: Option<PathBuf>,
     #[serde(default)]
     pub obfs: Option<String>,
     #[serde(default, alias = "obfs-password", alias = "obfsPassword")]
@@ -74,6 +82,10 @@ pub struct ServerFileConfig {
     pub padding_scheme: Vec<String>,
     #[serde(default = "default_heartbeat_interval_secs")]
     pub heartbeat_interval_secs: u64,
+    #[serde(default)]
+    pub mtu: usize,
+    #[serde(default, alias = "user-hint-mandatory", alias = "userHintMandatory")]
+    pub user_hint_mandatory: bool,
 }
 
 pub fn load_config(path: &Path) -> Result<FileConfig> {
@@ -140,6 +152,10 @@ pub fn default_cc_rx() -> String {
 
 pub fn default_hy2_congestion_control() -> String {
     "bbr".to_string()
+}
+
+pub fn default_mieru_username() -> String {
+    "default".to_string()
 }
 
 impl From<TomlFileConfig> for FileConfig {
@@ -286,6 +302,17 @@ mod tests {
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
             load_config(&path).expect("hysteria2 config");
+        }
+    }
+
+    #[test]
+    fn parses_mieru_examples() {
+        for name in [
+            "config.mieru.client.example.toml",
+            "config.mieru.server.example.toml",
+        ] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+            load_config(&path).expect("mieru config");
         }
     }
 

@@ -20,6 +20,14 @@ Aerion now provides these server/client protocol stacks:
   - Salamander obfs for client and server
   - BBR / NewReno congestion control selection
   - single password plus optional multi-user credential list
+- Mieru:
+  - TCP stream underlay with Mieru v3 metadata framing
+  - XChaCha20-Poly1305 stateful stream encryption
+  - Mieru password hashing, PBKDF2-HMAC-SHA256 time-window keys, nonce user hints
+  - SOCKS5 CONNECT over Mieru sessions
+  - SOCKS5 UDP ASSOCIATE through Mieru packet-over-stream framing
+  - multi-user server authentication and traffic accounting through `ProxyCore`
+  - native Mieru UDP packet underlay / traffic-pattern padding is not enabled yet and fails explicitly instead of silently degrading
 - Trojan:
   - TLS client/server core
   - TCP CONNECT
@@ -86,9 +94,10 @@ Aerion now provides these server/client protocol stacks:
 - per-user total traffic quota
 
 `run_server_listener_with_core`, `run_hysteria2_server_with_core`,
-`run_trojan_server_with_core`, `run_vless_server_with_core`, and
-`run_vmess_server_with_core` accept a `ProxyCore` so upper layers can own user
-state, statistics, limits, and quota policy without adding panel/UI code here.
+`run_mieru_server_with_core`, `run_trojan_server_with_core`,
+`run_vless_server_with_core`, and `run_vmess_server_with_core` accept a
+`ProxyCore` so upper layers can own user state, statistics, limits, and quota
+policy without adding panel/UI code here.
 
 ## Build
 
@@ -128,12 +137,15 @@ cargo run -- run --config config.server.example.toml
 cargo run -- run --config config.client.example.toml
 cargo run -- run --config config.hy2.server.example.toml
 cargo run -- run --config config.hy2.client.example.toml
+cargo run -- run --config config.mieru.server.example.toml
+cargo run -- run --config config.mieru.client.example.toml
 cargo run -- run --config config.mihomo.example.yaml
 cargo run -- run --config config.xray.example.json
 cargo run -- run --config config.singbox.example.json
 ```
 
-Use `protocol = "hysteria2"` in `[client]` or `[server]` to select Hysteria2.
+Use `protocol = "hysteria2"` in `[client]` or `[server]` to select Hysteria2,
+or `protocol = "mieru"` to select Mieru TCP stream mode.
 The mihomo / Xray / sing-box loaders are exposed for core integration and
 profile conversion; the CLI only parses them and then asks the upper layer to
 select a proxy profile.
@@ -159,8 +171,6 @@ cargo run -- hysteria2-client `
 
 ## Validation
 
-```powershell
-cargo fmt --check
-cargo check
-cargo test
-```
+Validation is workflow-only for this repository. Use `.github/workflows/ci.yml`
+and monitor the GitHub Actions run to completion; do not treat local build or
+test cache results as acceptance.

@@ -1,0 +1,11 @@
+mode = "server"
+
+[server]
+protocol = "mieru"
+listen = "0.0.0.0:8964"
+username = "default"
+password = "change-me"
+# Extra users use "username:password" entries.
+users = ["alice:alice-password"]
+mtu = 1500
+user-hint-mandatory = false
