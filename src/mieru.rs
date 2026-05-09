@@ -824,7 +824,7 @@ async fn run_mieru_client_read_loop(
     writer: Arc<Mutex<MieruStreamWriter>>,
     sessions: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>>,
 ) {
-    let result = async {
+    let result: Result<()> = async {
         let mut first_read = true;
         loop {
             let segment = read_mieru_segment(&mut reader, &mut recv, first_read).await?;
@@ -983,7 +983,7 @@ async fn run_mieru_session_output(
     writer: Arc<Mutex<MieruStreamWriter>>,
     mut outbound: mpsc::UnboundedReceiver<SessionCommand>,
 ) {
-    let result = async {
+    let result: Result<()> = async {
         let mut next_seq = 0u32;
         let mut opened = !is_client;
         while let Some(command) = outbound.recv().await {
