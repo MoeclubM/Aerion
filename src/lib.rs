@@ -5,6 +5,7 @@ pub mod core;
 pub mod hysteria2;
 pub mod mieru;
 pub mod mihomo;
+pub mod naive;
 pub mod padding;
 pub mod protocol;
 pub mod reality;
@@ -41,6 +42,7 @@ pub use mieru::{
     run_mieru_client, run_mieru_client_listener, run_mieru_server, run_mieru_server_with_core,
 };
 pub use mihomo::{MihomoClientConfig, MihomoConfig, MihomoProxy};
+pub use naive::{NaiveClientConfig, run_naive_client_listener};
 pub use reality::{
     BuiltRealityClientHello, RealityClientConfig, RealityServerConfig, build_reality_client_hello,
     build_reality_client_hello_with_alpn,
