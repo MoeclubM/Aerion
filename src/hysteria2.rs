@@ -793,7 +793,9 @@ async fn authenticate_server(
             send_h3_status(&mut stream, 401).await?;
             bail!("Hysteria2 authentication failed");
         }
-        let session = core.authenticate(auth).await?;
+        let session = core
+            .authenticate_from(auth, connection.remote_address())
+            .await?;
         let response = http::Response::builder()
             .status(http::StatusCode::from_u16(233).context("build Hysteria2 auth status")?)
             .header("Hysteria-UDP", if udp_enabled { "true" } else { "false" })

@@ -761,7 +761,8 @@ pub async fn run_mieru_server_with_core(config: MieruServerConfig, core: ProxyCo
         let user_hint_mandatory = config.user_hint_mandatory;
         tokio::spawn(async move {
             if let Err(error) =
-                handle_mieru_underlay_server(stream, users, core, mtu, user_hint_mandatory).await
+                handle_mieru_underlay_server(stream, users, core, mtu, user_hint_mandatory, peer)
+                    .await
             {
                 tracing::warn!("Mieru underlay {peer} failed: {error:?}");
             }
@@ -1015,6 +1016,7 @@ async fn handle_mieru_underlay_server(
     core: ProxyCore,
     mtu: usize,
     user_hint_mandatory: bool,
+    peer: SocketAddr,
 ) -> Result<()> {
     let (reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(MieruAnyWriter::Stream(MieruStreamWriter::new(
@@ -1029,6 +1031,7 @@ async fn handle_mieru_underlay_server(
         core,
         mtu,
         user_hint_mandatory,
+        peer,
     )
     .await
 }
@@ -1087,6 +1090,7 @@ async fn run_mieru_server_read_loop(
     core: ProxyCore,
     mtu: usize,
     user_hint_mandatory: bool,
+    peer: SocketAddr,
 ) -> Result<()> {
     let mut recv = None::<MieruCipher>;
     let mut user = None::<MieruUserSecret>;
@@ -1108,6 +1112,7 @@ async fn run_mieru_server_read_loop(
                 user.clone().expect("Mieru user is set"),
                 mtu,
                 false,
+                peer,
             )
             .await?;
             continue;
@@ -1126,6 +1131,7 @@ async fn run_mieru_server_read_loop(
             user.clone().expect("Mieru user is set"),
             mtu,
             false,
+            peer,
         )
         .await?;
     }
@@ -1232,6 +1238,7 @@ async fn run_mieru_packet_server(
             user,
             mtu,
             true,
+            peer,
         )
         .await?;
     }
@@ -1245,6 +1252,7 @@ async fn handle_server_segment(
     user: MieruUserSecret,
     mtu: usize,
     reliable: bool,
+    peer: SocketAddr,
 ) -> Result<()> {
     match segment.metadata.protocol() {
         OPEN_SESSION_REQUEST => {
@@ -1255,7 +1263,9 @@ async fn handle_server_segment(
                     .await?;
                 return Ok(());
             }
-            let core_session = core.authenticate(&user.core_credential()).await?;
+            let core_session = core
+                .authenticate_from(&user.core_credential(), peer)
+                .await?;
             let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
             let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
             sessions.lock().await.insert(

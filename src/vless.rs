@@ -140,8 +140,10 @@ pub async fn run_vless_server_with_core(config: VlessServerConfig, core: ProxyCo
         let flow = flow.clone();
         let transport = transport.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                handle_vless_client(stream, acceptor, reality, users, core, flow, transport).await
+            if let Err(error) = handle_vless_client(
+                stream, acceptor, reality, users, core, flow, transport, peer,
+            )
+            .await
             {
                 tracing::warn!("VLESS client {peer} failed: {error:?}");
             }
@@ -425,6 +427,7 @@ async fn handle_vless_client(
     core: ProxyCore,
     allowed_flow: String,
     transport: VlessTransportConfig,
+    peer: SocketAddr,
 ) -> Result<()> {
     let stream = if let Some(reality) = reality {
         let Some(stream) = accept_reality_tls(stream, &reality).await? else {
@@ -445,7 +448,7 @@ async fn handle_vless_client(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("VLESS authentication failed"))?;
     validate_flow(&request, &allowed_flow)?;
-    let session = core.authenticate(&credential).await?;
+    let session = core.authenticate_from(&credential, peer).await?;
     match request.command {
         CMD_TCP => {
             let mut remote = connect_target(&request.target).await?;

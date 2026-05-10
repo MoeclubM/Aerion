@@ -124,6 +124,7 @@ pub async fn run_server_listener_with_core(
                 padding,
                 core,
                 heartbeat_interval_secs,
+                peer,
             )
             .await
             {
@@ -140,6 +141,7 @@ async fn handle_client(
     padding: PaddingScheme,
     core: ProxyCore,
     heartbeat_interval_secs: u64,
+    peer: SocketAddr,
 ) -> Result<()> {
     let mut tls_stream = acceptor.accept(stream).await.context("accept TLS client")?;
     let mut early_data = Vec::new();
@@ -150,7 +152,7 @@ async fn handle_client(
     let mut tls_stream = EarlyDataTlsStream::new(tls_stream, early_data);
     let password_refs = passwords.iter().map(String::as_str).collect::<Vec<_>>();
     let credential = read_auth_preface_user(&mut tls_stream, &password_refs).await?;
-    let session = core.authenticate(&credential).await?;
+    let session = core.authenticate_from(&credential, peer).await?;
     let (mut reader, writer) = split(tls_stream);
     let writer = Arc::new(Mutex::new(writer));
     let mut received_settings = false;

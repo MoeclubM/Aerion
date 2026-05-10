@@ -92,8 +92,12 @@ Aerion now provides these server/client protocol stacks:
 - multi-user credential tables
 - per-user upload/download traffic snapshots
 - per-user online session count
+- per-user online session limits
+- per-user unique source-IP session limits for server runtimes
 - per-user upload/download byte-per-second limits
 - per-user total traffic quota
+- explicit session cancellation for removed or credential-rotated users
+- hot user replacement that preserves existing traffic counters for unchanged user IDs
 
 `run_server_listener_with_core`, `run_hysteria2_server_with_core`,
 `run_mieru_server_with_core`, `run_trojan_server_with_core`,

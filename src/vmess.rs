@@ -166,7 +166,7 @@ pub async fn run_vmess_server_with_core(config: VmessServerConfig, core: ProxyCo
         tokio::spawn(async move {
             let result = async {
                 let stream = accept_vmess_transport(stream, acceptor).await?;
-                handle_vmess_client(stream, users, core).await
+                handle_vmess_client(stream, users, core, peer).await
             }
             .await;
             if let Err(error) = result {
@@ -250,9 +250,10 @@ async fn handle_vmess_client(
     mut stream: VmessTransport,
     users: HashMap<[u8; 16], String>,
     core: ProxyCore,
+    peer: SocketAddr,
 ) -> Result<()> {
     let (request, credential) = read_vmess_request(&mut stream, &users).await?;
-    let session = core.authenticate(&credential).await?;
+    let session = core.authenticate_from(&credential, peer).await?;
     match request.command {
         CMD_TCP => {
             let remote = connect_target(&request.target).await?;

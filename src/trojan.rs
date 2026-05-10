@@ -99,7 +99,7 @@ pub async fn run_trojan_server_with_core(
         let auth = auth.clone();
         let core = core.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_trojan_client(stream, acceptor, auth, core).await {
+            if let Err(error) = handle_trojan_client(stream, acceptor, auth, core, peer).await {
                 tracing::warn!("Trojan client {peer} failed: {error:?}");
             }
         });
@@ -244,10 +244,11 @@ async fn handle_trojan_client(
     acceptor: TlsAcceptor,
     auth: HashMap<[u8; TROJAN_AUTH_LEN], String>,
     core: ProxyCore,
+    peer: SocketAddr,
 ) -> Result<()> {
     let mut stream = acceptor.accept(stream).await.context("accept Trojan TLS")?;
     let credential = read_trojan_auth(&mut stream, &auth).await?;
-    let session = core.authenticate(&credential).await?;
+    let session = core.authenticate_from(&credential, peer).await?;
     match read_trojan_request(&mut stream).await? {
         TrojanRequest::Connect(target) => {
             let mut remote = connect_target(&target).await?;
