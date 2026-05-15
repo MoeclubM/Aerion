@@ -927,7 +927,7 @@ async fn authenticate_tuic_connection(
         constant_time_eq(token, &expected),
         "TUIC authentication failed"
     );
-    let session = core.open_session_from(&user.uuid, peer).await?;
+    let session = core.authenticate_from(&user.uuid, peer).await?;
     auth.set_session(session).await;
     Ok(())
 }

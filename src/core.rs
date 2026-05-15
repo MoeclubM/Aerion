@@ -152,18 +152,12 @@ impl ProxyCore {
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) -> Result<()> {
-        let mut ids = HashSet::new();
         let mut credentials = HashSet::new();
         for user in &users {
             ensure!(!user.id.trim().is_empty(), "core user id is empty");
             ensure!(
                 !user.credential.trim().is_empty(),
                 "core user credential is empty"
-            );
-            ensure!(
-                ids.insert(user.id.clone()),
-                "duplicate core user id {}",
-                user.id
             );
             ensure!(
                 credentials.insert(user.credential.clone()),
@@ -725,6 +719,17 @@ mod tests {
         assert_eq!(new_session.user_id(), "u1");
         let stats = core.snapshot().await;
         assert_eq!(stats[0].upload_bytes, 10);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supports_multiple_credentials_for_one_user() -> Result<()> {
+        let core = ProxyCore::new(vec![
+            CoreUser::password("u1", "secret-a"),
+            CoreUser::password("u1", "secret-b"),
+        ])?;
+        assert_eq!(core.authenticate("secret-a").await?.user_id(), "u1");
+        assert_eq!(core.authenticate("secret-b").await?.user_id(), "u1");
         Ok(())
     }
 }
