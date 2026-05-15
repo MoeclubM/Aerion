@@ -1,6 +1,8 @@
 use aerion::config::{FileConfig, default_heartbeat_interval_secs, load_config};
 use aerion::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
-use aerion::mieru::{MieruClientConfig, MieruServerConfig, MieruTransport, parse_mieru_user};
+use aerion::mieru::{
+    MieruClientConfig, MieruServerConfig, MieruTrafficPattern, MieruTransport, parse_mieru_user,
+};
 use aerion::naive::NaiveClientConfig;
 use aerion::padding::PaddingScheme;
 use aerion::tuic::{TuicClientConfig, TuicServerConfig, parse_tuic_user};
@@ -212,7 +214,6 @@ async fn main() -> Result<()> {
                     .await;
                 }
                 if is_mieru(&client.protocol) {
-                    ensure_mieru_shaping_disabled(&client.traffic_pattern, &client.nonce_pattern)?;
                     return run_mieru_client(MieruClientConfig {
                         listen: client.listen,
                         server_host,
@@ -222,6 +223,10 @@ async fn main() -> Result<()> {
                         hashed_password: None,
                         mtu: client.mtu,
                         transport: MieruTransport::parse(&client.transport)?,
+                        traffic_pattern: MieruTrafficPattern::parse_pair(
+                            client.traffic_pattern.as_deref(),
+                            client.nonce_pattern.as_deref(),
+                        )?,
                     })
                     .await;
                 }
@@ -290,7 +295,6 @@ async fn main() -> Result<()> {
                     .await;
                 }
                 if is_mieru(&server.protocol) {
-                    ensure_mieru_shaping_disabled(&server.traffic_pattern, &server.nonce_pattern)?;
                     let users = server
                         .users
                         .iter()
@@ -304,6 +308,10 @@ async fn main() -> Result<()> {
                         mtu: server.mtu,
                         user_hint_mandatory: server.user_hint_mandatory,
                         transport: MieruTransport::parse(&server.transport)?,
+                        traffic_pattern: MieruTrafficPattern::parse_pair(
+                            server.traffic_pattern.as_deref(),
+                            server.nonce_pattern.as_deref(),
+                        )?,
                     })
                     .await;
                 }
@@ -485,6 +493,7 @@ async fn main() -> Result<()> {
                 hashed_password: None,
                 mtu,
                 transport: MieruTransport::parse(&transport)?,
+                traffic_pattern: None,
             })
             .await
         }
@@ -509,6 +518,7 @@ async fn main() -> Result<()> {
                 mtu,
                 user_hint_mandatory,
                 transport: MieruTransport::parse(&transport)?,
+                traffic_pattern: None,
             })
             .await
         }
@@ -619,26 +629,6 @@ fn is_naive(protocol: &str) -> bool {
     protocol.eq_ignore_ascii_case("naive")
         || protocol.eq_ignore_ascii_case("naive+https")
         || protocol.eq_ignore_ascii_case("naive+quic")
-}
-
-fn ensure_mieru_shaping_disabled(
-    traffic_pattern: &Option<String>,
-    nonce_pattern: &Option<String>,
-) -> Result<()> {
-    if traffic_pattern
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or_default()
-        .is_empty()
-        && nonce_pattern
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or_default()
-            .is_empty()
-    {
-        return Ok(());
-    }
-    bail!("Mieru traffic-pattern padding / nonce-pattern shaping is not implemented by Aerion");
 }
 
 fn ensure_supported_protocol(protocol: &str) -> Result<()> {

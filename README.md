@@ -29,7 +29,7 @@ Aerion now provides these server/client protocol stacks:
   - SOCKS5 CONNECT over Mieru sessions
   - SOCKS5 UDP ASSOCIATE through Mieru packet-over-stream framing
   - multi-user server authentication and traffic accounting through `ProxyCore`
-  - traffic-pattern padding / nonce-pattern shaping is not enabled yet and fails explicitly instead of silently degrading
+  - base64 protobuf traffic-pattern TCP fragmentation and nonce-pattern shaping
 - Naive:
   - local SOCKS5 CONNECT client over HTTPS proxy CONNECT
   - HTTP/1.1, HTTP/2, and HTTP/3 client tunnels

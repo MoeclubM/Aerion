@@ -1,6 +1,6 @@
 use crate::client::ClientConfig;
 use crate::hysteria2::Hysteria2ClientConfig;
-use crate::mieru::{MieruClientConfig, MieruTransport};
+use crate::mieru::{MieruClientConfig, MieruTrafficPattern, MieruTransport};
 use crate::naive::NaiveClientConfig;
 use crate::padding::PaddingScheme;
 use crate::reality::RealityClientConfig;
@@ -620,21 +620,6 @@ impl MihomoAnyTlsProxy {
 
 impl MihomoMieruProxy {
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<MieruClientConfig> {
-        ensure!(
-            self.traffic_pattern
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or_default()
-                .is_empty()
-                && self
-                    .nonce_pattern
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or_default()
-                    .is_empty(),
-            "mihomo Mieru proxy {} sets traffic-pattern/nonce-pattern shaping; Aerion does not implement it yet",
-            self.name
-        );
         Ok(MieruClientConfig {
             listen,
             server_host: self.server.clone(),
@@ -647,6 +632,11 @@ impl MihomoMieruProxy {
             hashed_password: None,
             mtu: 1500,
             transport: MieruTransport::parse(&self.transport)?,
+            traffic_pattern: MieruTrafficPattern::parse_pair(
+                self.traffic_pattern.as_deref(),
+                self.nonce_pattern.as_deref(),
+            )
+            .with_context(|| format!("parse mihomo Mieru proxy {} traffic pattern", self.name))?,
         })
     }
 }
@@ -1087,7 +1077,7 @@ proxies:
     }
 
     #[test]
-    fn rejects_mieru_traffic_pattern_without_silent_degrade() -> Result<()> {
+    fn rejects_invalid_mieru_traffic_pattern_without_silent_degrade() -> Result<()> {
         let yaml = r#"
 proxies:
   - name: mieru-shaped
@@ -1102,7 +1092,7 @@ proxies:
         let error = config.proxies[0]
             .to_client_config("127.0.0.1:1080".parse()?)
             .expect_err("Mieru shaping must not be silently ignored");
-        assert!(error.to_string().contains("traffic-pattern"));
+        assert!(error.to_string().contains("traffic pattern"));
         Ok(())
     }
 }
