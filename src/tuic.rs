@@ -114,6 +114,7 @@ struct TuicFragmentBuffer {
     fragments: Vec<Option<Vec<u8>>>,
 }
 
+#[derive(Clone, Debug)]
 struct TuicPacketCommand {
     assoc_id: u16,
     packet_id: u16,
@@ -1686,5 +1687,58 @@ async fn run_tuic_heartbeat(connection: quinn::Connection, heartbeat_interval: D
             tracing::debug!("TUIC heartbeat stopped: {error:?}");
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_fragments_roundtrip() -> Result<()> {
+        let target = ProxyTarget::Domain("example.com".to_string(), 53);
+        let payload = (0u8..90).collect::<Vec<_>>();
+        let frames = encode_packet_fragments(7, 42, &target, &payload, 48)?;
+        assert!(frames.len() > 1);
+
+        let mut fragments = HashMap::new();
+        let mut complete = None;
+        for frame in frames {
+            let packet = parse_packet_command(&frame)?;
+            if packet.frag_id > 0 {
+                assert!(packet.target.is_none());
+            }
+            complete = push_fragment(&mut fragments, packet)?;
+        }
+
+        let packet = complete.context("fragmented packet did not complete")?;
+        assert_eq!(packet.assoc_id, 7);
+        assert_eq!(packet.target, target);
+        assert_eq!(packet.payload, payload);
+        assert!(fragments.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn packet_parser_rejects_non_first_fragment_address() -> Result<()> {
+        let target = ProxyTarget::Domain("example.com".to_string(), 53);
+        let frame = encode_packet_command(7, 42, 2, 1, Some(&target), b"payload")?;
+        let error =
+            parse_packet_command(&frame).expect_err("non-first fragment must use none addr");
+        assert!(error.to_string().contains("non-first packet fragment"));
+        Ok(())
+    }
+
+    #[test]
+    fn fragment_buffer_rejects_duplicate_fragment() -> Result<()> {
+        let target = ProxyTarget::Domain("example.com".to_string(), 53);
+        let frame = encode_packet_command(7, 42, 2, 0, Some(&target), b"payload")?;
+        let packet = parse_packet_command(&frame)?;
+        let mut fragments = HashMap::new();
+        assert!(push_fragment(&mut fragments, packet.clone())?.is_none());
+        let error =
+            push_fragment(&mut fragments, packet).expect_err("duplicate fragment must fail");
+        assert!(error.to_string().contains("duplicate packet fragment"));
+        Ok(())
     }
 }

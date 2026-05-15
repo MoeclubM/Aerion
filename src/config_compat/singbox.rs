@@ -1115,4 +1115,69 @@ mod tests {
         assert_eq!(vless.transport.mode, "stream-one");
         Ok(())
     }
+
+    #[test]
+    fn parses_naive_and_tuic_outbounds() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "type": "naive",
+      "tag": "naive-h3",
+      "server": "naive.example.com",
+      "server_port": 443,
+      "username": "user",
+      "password": "pass",
+      "quic": true,
+      "udp_over_tcp": { "enabled": true },
+      "tls": {
+        "enabled": true,
+        "server_name": "front.example.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "tuic",
+      "tag": "tuic-v5",
+      "server": "tuic.example.com",
+      "server_port": 443,
+      "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+      "password": "secret",
+      "udp_relay_mode": "quic",
+      "congestion_control": "bbr",
+      "heartbeat": "15s",
+      "tls": {
+        "enabled": true,
+        "server_name": "front.example.com",
+        "alpn": ["h3"]
+      }
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxClientConfig::Naive(naive) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Naive")
+        };
+        assert_eq!(naive.server_host, "naive.example.com");
+        assert_eq!(naive.sni, "front.example.com");
+        assert!(naive.insecure);
+        assert!(naive.quic);
+        assert!(naive.udp_over_tcp);
+
+        let SingBoxClientConfig::Tuic(tuic) =
+            config.outbounds[1].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected TUIC")
+        };
+        assert_eq!(tuic.server_host, "tuic.example.com");
+        assert_eq!(tuic.sni, "front.example.com");
+        assert_eq!(tuic.udp_relay_mode, "quic");
+        assert_eq!(tuic.congestion_control, "bbr");
+        assert_eq!(tuic.alpn_protocols, vec!["h3".to_string()]);
+        assert_eq!(tuic.heartbeat_interval_secs, 15);
+        Ok(())
+    }
 }

@@ -1028,4 +1028,81 @@ proxies:
         assert_eq!(vless.transport.mode, "stream-one");
         Ok(())
     }
+
+    #[test]
+    fn parses_naive_and_tuic_profiles() -> Result<()> {
+        let yaml = r#"
+proxies:
+  - name: naive-h3
+    type: naive
+    server: naive.example.com
+    port: 443
+    username: user
+    password: pass
+    quic: true
+    udp-over-tcp:
+      enabled: true
+    servername: front.example.com
+    skip-cert-verify: true
+    extra-headers:
+      X-Test: value
+  - name: tuic-v5
+    type: tuic
+    server: tuic.example.com
+    port: 443
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    password: secret
+    udp: true
+    udp-relay-mode: quic
+    congestion-controller: bbr
+    alpn:
+      - h3
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let MihomoClientConfig::Naive(naive) =
+            config.proxies[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Naive")
+        };
+        assert_eq!(naive.server_host, "naive.example.com");
+        assert_eq!(naive.sni, "front.example.com");
+        assert!(naive.insecure);
+        assert!(naive.quic);
+        assert!(naive.udp_over_tcp);
+        assert_eq!(
+            naive.extra_headers,
+            vec![("X-Test".to_string(), "value".to_string())]
+        );
+
+        let MihomoClientConfig::Tuic(tuic) =
+            config.proxies[1].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected TUIC")
+        };
+        assert_eq!(tuic.server_host, "tuic.example.com");
+        assert_eq!(tuic.udp_relay_mode, "quic");
+        assert_eq!(tuic.congestion_control, "bbr");
+        assert_eq!(tuic.alpn_protocols, vec!["h3".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mieru_traffic_pattern_without_silent_degrade() -> Result<()> {
+        let yaml = r#"
+proxies:
+  - name: mieru-shaped
+    type: mieru
+    server: mieru.example.com
+    port: 2999
+    username: user
+    password: pass
+    traffic-pattern: abc
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let error = config.proxies[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("Mieru shaping must not be silently ignored");
+        assert!(error.to_string().contains("traffic-pattern"));
+        Ok(())
+    }
 }
