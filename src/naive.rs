@@ -18,7 +18,7 @@ const NAIVE_H3_ALPN: &[u8] = b"h3";
 const NAIVE_HTTP11_ALPN: &[u8] = b"http/1.1";
 const NAIVE_QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NaiveClientConfig {
     pub listen: SocketAddr,
     pub server_host: String,
@@ -124,7 +124,7 @@ async fn open_naive_tunnel(
         socket_protect::connect_tcp_host_port(&config.server_host, config.server_port).await?;
     let server_name = rustls::pki_types::ServerName::try_from(config.sni.clone())
         .with_context(|| format!("invalid Naive TLS server name: {}", config.sni))?;
-    let mut tls = tokio_rustls::TlsConnector::from(naive_tls_config(
+    let tls = tokio_rustls::TlsConnector::from(naive_tls_config(
         config,
         vec![NAIVE_H2_ALPN.to_vec(), NAIVE_HTTP11_ALPN.to_vec()],
     ))

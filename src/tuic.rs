@@ -1,7 +1,7 @@
 use crate::core::{CoreSession, CoreUser, ProxyCore};
 use crate::protocol::{ProxyTarget, target_name};
 use crate::{socket_protect, socks, tls};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use bytes::Bytes;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{Endpoint, IdleTimeout, VarInt};
@@ -614,7 +614,8 @@ async fn handle_client_packet_bytes(inner: &TuicClientInner, bytes: &[u8]) -> Re
     match bytes[1] {
         CMD_PACKET => {
             let packet = parse_packet_command(bytes)?;
-            let packet = push_fragment(&mut inner.udp_fragments.lock().await, packet)?;
+            let mut fragments = inner.udp_fragments.lock().await;
+            let packet = push_fragment(&mut fragments, packet)?;
             if let Some(packet) = packet {
                 let sender = inner
                     .udp_sessions
@@ -877,7 +878,8 @@ async fn handle_server_packet_bytes(
 ) -> Result<()> {
     ensure!(udp_enabled, "TUIC UDP is disabled by server config");
     let packet = parse_packet_command(bytes)?;
-    let packet = push_fragment(&mut udp_fragments.lock().await, packet)?;
+    let mut fragments = udp_fragments.lock().await;
+    let packet = push_fragment(&mut fragments, packet)?;
     let Some(packet) = packet else {
         return Ok(());
     };
@@ -1448,7 +1450,7 @@ fn tuic_token(connection: &quinn::Connection, uuid: &[u8; 16], password: &str) -
     let mut token = [0u8; 32];
     connection
         .export_keying_material(&mut token, uuid, password.as_bytes())
-        .context("export TUIC token keying material")?;
+        .map_err(|_| anyhow!("export TUIC token keying material"))?;
     Ok(token)
 }
 

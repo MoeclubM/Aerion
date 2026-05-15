@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
-use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+use tokio::net::{TcpStream, UdpSocket};
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use tokio::net::TcpSocket;
 
 type SocketProtector = Arc<dyn Fn(i32) -> Result<()> + Send + Sync + 'static>;
 
