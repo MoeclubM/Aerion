@@ -237,19 +237,19 @@ async fn main() -> Result<()> {
             }
             FileConfig::Mihomo(config) => {
                 bail!(
-                    "mihomo YAML parsed {} proxies, but aerion run needs an explicit Aerion client/server TOML config; use aerion::mihomo helpers to select one proxy for the core",
+                    "mihomo YAML parsed {} proxies, but aerion run needs an explicit Aerion client/server TOML config; use aerion::config_compat::mihomo helpers to select one proxy for the core",
                     config.proxies.len()
                 )
             }
             FileConfig::Xray(config) => {
                 bail!(
-                    "xray JSON parsed {} outbounds, but aerion run needs an explicit Aerion client/server TOML config; use aerion::xray helpers to select one outbound for the core",
+                    "xray JSON parsed {} outbounds, but aerion run needs an explicit Aerion client/server TOML config; use aerion::config_compat::xray helpers to select one outbound for the core",
                     config.outbounds.len()
                 )
             }
             FileConfig::SingBox(config) => {
                 bail!(
-                    "sing-box JSON parsed {} outbounds, but aerion run needs an explicit Aerion client/server TOML config; use aerion::singbox helpers to select one outbound for the core",
+                    "sing-box JSON parsed {} outbounds, but aerion run needs an explicit Aerion client/server TOML config; use aerion::config_compat::singbox helpers to select one outbound for the core",
                     config.outbounds.len()
                 )
             }

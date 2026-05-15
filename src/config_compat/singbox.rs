@@ -1,5 +1,5 @@
+use crate::config_compat::mihomo::OneOrManyStrings;
 use crate::hysteria2::Hysteria2ClientConfig;
-use crate::mihomo::OneOrManyStrings;
 use crate::reality::RealityClientConfig;
 use crate::shadowsocks::ShadowsocksClientConfig;
 use crate::trojan::TrojanClientConfig;

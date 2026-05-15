@@ -1,7 +1,7 @@
-use crate::mihomo::MihomoConfig;
+use crate::config_compat::mihomo::MihomoConfig;
+use crate::config_compat::singbox::SingBoxConfig;
+use crate::config_compat::xray::XrayConfig;
 use crate::padding::PaddingScheme;
-use crate::singbox::SingBoxConfig;
-use crate::xray::XrayConfig;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;

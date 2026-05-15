@@ -62,7 +62,7 @@ Aerion now provides these server/client protocol stacks:
     profile-specific extension/cipher ordering tests
   - client-side REALITY transport with custom TLS 1.3 state machine and
     transport-specific ALPN override
-- uTLS / external config helpers:
+- uTLS / config compatibility helpers:
   - `UtlsFingerprint` maps mihomo names such as `chrome`, `firefox`,
     `safari`, `ios`, `android`, `edge`, `360`, `qq`, and randomized profiles
     to the corresponding Go `uTLS` ClientHello IDs
@@ -74,12 +74,15 @@ Aerion now provides these server/client protocol stacks:
     (`h2`, `http/1.1`) or no-ALPN profiles; exact Go uTLS extension ordering /
     GREASE / JA3 parity applies to raw generated ClientHello only, not rustls'
     built-in handshake transcript
+  - config compatibility is stored separately under `src/config_compat/`
   - `MihomoConfig` parses Clash.Meta / mihomo-style `proxies:` YAML for
     Shadowsocks, VLESS, VMess, Trojan, and Hysteria2 core profiles
   - `XrayConfig` parses Xray JSON / JSONC `inbounds` and `outbounds`
     profiles with Shadowsocks, VLESS, VMess, Trojan, and Hysteria2 selection helpers
   - `SingBoxConfig` parses sing-box JSON / JSONC `inbounds` and `outbounds`
     profiles with Shadowsocks, VLESS, VMess, Trojan, and Hysteria2 selection helpers
+  - protocol modules expose the bottom-level connection capability; profile
+    selection and service/app policy stay in the integrating client or server
   - unsupported transport mismatches such as mihomo `smux` or
     REALITY client outbound fail with explicit errors instead of falling back silently
 - VMess:
