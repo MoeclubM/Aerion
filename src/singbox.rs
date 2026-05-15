@@ -1,6 +1,7 @@
 use crate::hysteria2::Hysteria2ClientConfig;
 use crate::mihomo::OneOrManyStrings;
 use crate::reality::RealityClientConfig;
+use crate::shadowsocks::ShadowsocksClientConfig;
 use crate::trojan::TrojanClientConfig;
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::VlessClientConfig;
@@ -102,6 +103,25 @@ pub struct SingBoxTrojanOutbound {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxShadowsocksOutbound {
+    pub server: String,
+    #[serde(rename = "server_port")]
+    pub server_port: u16,
+    pub method: String,
+    pub password: String,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub plugin: Option<Value>,
+    #[serde(default, rename = "plugin_opts")]
+    pub plugin_opts: Option<Value>,
+    #[serde(default)]
+    pub multiplex: Option<SingBoxMultiplexOptions>,
+    #[serde(default, rename = "udp_over_tcp")]
+    pub udp_over_tcp: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct SingBoxHysteria2Outbound {
     pub server: String,
     #[serde(rename = "server_port")]
@@ -190,6 +210,7 @@ pub struct SingBoxHysteria2Obfs {
 
 #[derive(Clone, Debug)]
 pub enum SingBoxClientConfig {
+    Shadowsocks(ShadowsocksClientConfig),
     Vless(VlessClientConfig),
     Vmess(VmessClientConfig),
     Trojan(TrojanClientConfig),
@@ -233,6 +254,10 @@ impl SingBoxOutbound {
 
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<SingBoxClientConfig> {
         match self.kind.trim().to_ascii_lowercase().as_str() {
+            "shadowsocks" | "ss" => Ok(SingBoxClientConfig::Shadowsocks(
+                self.decode::<SingBoxShadowsocksOutbound>()?
+                    .to_client_config(self.name(), listen)?,
+            )),
             "vless" => Ok(SingBoxClientConfig::Vless(
                 self.decode::<SingBoxVlessOutbound>()?
                     .to_client_config(self.name(), listen)?,
@@ -259,6 +284,32 @@ impl SingBoxOutbound {
     {
         serde_json::from_value(Value::Object(self.fields.clone()))
             .with_context(|| format!("parse sing-box outbound {}", self.name()))
+    }
+}
+
+impl SingBoxShadowsocksOutbound {
+    pub fn to_client_config(
+        &self,
+        name: &str,
+        listen: SocketAddr,
+    ) -> Result<ShadowsocksClientConfig> {
+        ensure_multiplex_disabled("sing-box", name, self.multiplex.as_ref())?;
+        ensure!(
+            self.plugin.is_none() && self.plugin_opts.is_none(),
+            "sing-box Shadowsocks outbound {name} sets SIP003 plugin; Aerion Shadowsocks does not implement plugins"
+        );
+        ensure!(
+            self.udp_over_tcp.is_none(),
+            "sing-box Shadowsocks outbound {name} sets udp_over_tcp; Aerion Shadowsocks does not implement UDP-over-TCP"
+        );
+        Ok(ShadowsocksClientConfig {
+            listen,
+            server_host: self.server.clone(),
+            server_port: self.server_port,
+            method: self.method.clone(),
+            password: self.password.clone(),
+            udp: network_allows_udp(self.network.as_deref()),
+        })
     }
 }
 

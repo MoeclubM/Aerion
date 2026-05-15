@@ -1,5 +1,6 @@
 use crate::hysteria2::Hysteria2ClientConfig;
 use crate::reality::RealityClientConfig;
+use crate::shadowsocks::ShadowsocksClientConfig;
 use crate::trojan::TrojanClientConfig;
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::VlessClientConfig;
@@ -29,11 +30,30 @@ pub struct MihomoConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum MihomoProxy {
+    #[serde(rename = "ss", alias = "shadowsocks")]
+    Shadowsocks(MihomoShadowsocksProxy),
     Vless(MihomoVlessProxy),
     Vmess(MihomoVmessProxy),
     Trojan(MihomoTrojanProxy),
     #[serde(rename = "hysteria2", alias = "hy2")]
     Hysteria2(MihomoHysteria2Proxy),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct MihomoShadowsocksProxy {
+    pub name: String,
+    pub server: String,
+    pub port: u16,
+    pub cipher: String,
+    pub password: String,
+    #[serde(default = "default_true")]
+    pub udp: bool,
+    #[serde(default)]
+    pub plugin: Option<String>,
+    #[serde(default, rename = "plugin-opts", alias = "plugin_opts")]
+    pub plugin_opts: Option<BTreeMap<String, String>>,
+    #[serde(default, rename = "udp-over-tcp", alias = "udp_over_tcp")]
+    pub udp_over_tcp: Option<MihomoUdpOverTcpOptions>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -229,6 +249,12 @@ pub struct MihomoXhttpOptions {
     pub headers: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct MihomoUdpOverTcpOptions {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum OneOrManyStrings {
@@ -238,6 +264,7 @@ pub enum OneOrManyStrings {
 
 #[derive(Clone, Debug)]
 pub enum MihomoClientConfig {
+    Shadowsocks(ShadowsocksClientConfig),
     Vless(VlessClientConfig),
     Vmess(VmessClientConfig),
     Trojan(TrojanClientConfig),
@@ -268,6 +295,7 @@ impl MihomoConfig {
 impl MihomoProxy {
     pub fn name(&self) -> &str {
         match self {
+            Self::Shadowsocks(proxy) => &proxy.name,
             Self::Vless(proxy) => &proxy.name,
             Self::Vmess(proxy) => &proxy.name,
             Self::Trojan(proxy) => &proxy.name,
@@ -277,12 +305,47 @@ impl MihomoProxy {
 
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<MihomoClientConfig> {
         Ok(match self {
+            Self::Shadowsocks(proxy) => {
+                MihomoClientConfig::Shadowsocks(proxy.to_client_config(listen)?)
+            }
             Self::Vless(proxy) => MihomoClientConfig::Vless(proxy.to_client_config(listen)?),
             Self::Vmess(proxy) => MihomoClientConfig::Vmess(proxy.to_client_config(listen)?),
             Self::Trojan(proxy) => MihomoClientConfig::Trojan(proxy.to_client_config(listen)?),
             Self::Hysteria2(proxy) => {
                 MihomoClientConfig::Hysteria2(proxy.to_client_config(listen)?)
             }
+        })
+    }
+}
+
+impl MihomoShadowsocksProxy {
+    pub fn to_client_config(&self, listen: SocketAddr) -> Result<ShadowsocksClientConfig> {
+        ensure!(
+            self.plugin
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+                && self.plugin_opts.as_ref().is_none_or(BTreeMap::is_empty),
+            "mihomo Shadowsocks proxy {} uses SIP003 plugin; Aerion Shadowsocks does not implement plugins",
+            self.name
+        );
+        ensure!(
+            !self
+                .udp_over_tcp
+                .as_ref()
+                .map(|opts| opts.enabled)
+                .unwrap_or(false),
+            "mihomo Shadowsocks proxy {} enables UDP-over-TCP; Aerion Shadowsocks does not implement UDP-over-TCP",
+            self.name
+        );
+        Ok(ShadowsocksClientConfig {
+            listen,
+            server_host: self.server.clone(),
+            server_port: self.port,
+            method: self.cipher.clone(),
+            password: self.password.clone(),
+            udp: self.udp,
         })
     }
 }

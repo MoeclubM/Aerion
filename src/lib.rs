@@ -11,6 +11,7 @@ pub mod protocol;
 pub mod reality;
 pub mod reality_tls_client;
 pub mod server;
+pub mod shadowsocks;
 pub mod singbox;
 pub mod socket_protect;
 pub mod socks;
@@ -48,6 +49,9 @@ pub use reality::{
     build_reality_client_hello_with_alpn,
 };
 pub use server::{ServerConfig, run_server, run_server_listener, run_server_listener_with_core};
+pub use shadowsocks::{
+    ShadowsocksClientConfig, run_shadowsocks_client, run_shadowsocks_client_listener,
+};
 pub use singbox::{SingBoxClientConfig, SingBoxConfig, SingBoxOutbound};
 pub use trojan::{
     TrojanClientConfig, TrojanServerConfig, run_trojan_client, run_trojan_client_listener,

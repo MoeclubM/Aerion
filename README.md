@@ -30,6 +30,13 @@ Aerion now provides these server/client protocol stacks:
   - SOCKS5 UDP ASSOCIATE through Mieru packet-over-stream framing
   - multi-user server authentication and traffic accounting through `ProxyCore`
   - traffic-pattern padding / nonce-pattern shaping is not enabled yet and fails explicitly instead of silently degrading
+- Shadowsocks:
+  - local SOCKS5 CONNECT and UDP ASSOCIATE client
+  - TCP relay through the configured Shadowsocks server
+  - UDP relay with the Shadowsocks UDP packet format
+  - AEAD, AEAD-2022, AEAD-2022 extra, AEAD extra, and stream ciphers enabled by the bundled `shadowsocks-rust` features
+  - protected outbound sockets through Aerion's Android socket protector hook
+  - SIP003 plugins and UDP-over-TCP are not implemented and fail explicitly
 - Trojan:
   - TLS client/server core
   - TCP CONNECT
@@ -68,11 +75,11 @@ Aerion now provides these server/client protocol stacks:
     GREASE / JA3 parity applies to raw generated ClientHello only, not rustls'
     built-in handshake transcript
   - `MihomoConfig` parses Clash.Meta / mihomo-style `proxies:` YAML for
-    VLESS, VMess, Trojan, and Hysteria2 core profiles
+    Shadowsocks, VLESS, VMess, Trojan, and Hysteria2 core profiles
   - `XrayConfig` parses Xray JSON / JSONC `inbounds` and `outbounds`
-    profiles with VLESS, VMess, Trojan, and Hysteria2 selection helpers
+    profiles with Shadowsocks, VLESS, VMess, Trojan, and Hysteria2 selection helpers
   - `SingBoxConfig` parses sing-box JSON / JSONC `inbounds` and `outbounds`
-    profiles with VLESS, VMess, Trojan, and Hysteria2 selection helpers
+    profiles with Shadowsocks, VLESS, VMess, Trojan, and Hysteria2 selection helpers
   - unsupported transport mismatches such as mihomo `smux` or
     REALITY client outbound fail with explicit errors instead of falling back silently
 - VMess:

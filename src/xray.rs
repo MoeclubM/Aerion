@@ -1,6 +1,7 @@
 use crate::hysteria2::Hysteria2ClientConfig;
 use crate::mihomo::OneOrManyStrings;
 use crate::reality::RealityClientConfig;
+use crate::shadowsocks::ShadowsocksClientConfig;
 use crate::trojan::TrojanClientConfig;
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::VlessClientConfig;
@@ -60,6 +61,8 @@ pub struct XrayOutboundSettings {
     pub packet_encoding: Option<String>,
     #[serde(default)]
     pub security: Option<String>,
+    #[serde(default)]
+    pub method: Option<String>,
     #[serde(default, rename = "alterId", alias = "alter_id")]
     pub alter_id: Option<u16>,
     #[serde(default)]
@@ -100,6 +103,8 @@ pub struct XrayServer {
     pub port: u16,
     #[serde(default)]
     pub password: Option<String>,
+    #[serde(default)]
+    pub method: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -259,6 +264,7 @@ pub struct XrayMuxOptions {
 
 #[derive(Clone, Debug)]
 pub enum XrayClientConfig {
+    Shadowsocks(ShadowsocksClientConfig),
     Vless(VlessClientConfig),
     Vmess(VmessClientConfig),
     Trojan(TrojanClientConfig),
@@ -299,6 +305,9 @@ impl XrayOutbound {
 
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<XrayClientConfig> {
         match self.protocol.trim().to_ascii_lowercase().as_str() {
+            "shadowsocks" | "ss" => Ok(XrayClientConfig::Shadowsocks(
+                self.to_shadowsocks_client_config(listen)?,
+            )),
             "vless" => Ok(XrayClientConfig::Vless(
                 self.to_vless_client_config(listen)?,
             )),
@@ -370,6 +379,40 @@ impl XrayOutbound {
                 .or_else(|| tls.and_then(|settings| settings.fingerprint)),
             reality,
             transport,
+        })
+    }
+
+    fn to_shadowsocks_client_config(&self, listen: SocketAddr) -> Result<ShadowsocksClientConfig> {
+        let server = self.first_trojan_server()?;
+        ensure_tcp_network("xray", self.name(), &self.stream_settings.network)?;
+        let stream_security = self.stream_settings.security.trim();
+        ensure!(
+            stream_security.is_empty() || stream_security.eq_ignore_ascii_case("none"),
+            "xray Shadowsocks outbound {} uses stream security {}; Aerion Shadowsocks expects raw Shadowsocks transport",
+            self.name(),
+            stream_security
+        );
+        Ok(ShadowsocksClientConfig {
+            listen,
+            server_host: server.address.clone(),
+            server_port: server.port,
+            method: server
+                .method
+                .or(self.settings.method.clone())
+                .or(self.settings.security.clone())
+                .with_context(|| {
+                    format!(
+                        "xray Shadowsocks outbound {} is missing method",
+                        self.name()
+                    )
+                })?,
+            password: server.password.with_context(|| {
+                format!(
+                    "xray Shadowsocks outbound {} is missing password",
+                    self.name()
+                )
+            })?,
+            udp: true,
         })
     }
 
@@ -524,6 +567,7 @@ impl XrayOutbound {
                 .port
                 .with_context(|| format!("xray outbound {} is missing port", self.name()))?,
             password: self.settings.password.clone(),
+            method: self.settings.method.clone(),
         })
     }
 
