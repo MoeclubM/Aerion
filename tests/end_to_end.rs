@@ -428,6 +428,7 @@ async fn socks_client_reaches_tcp_target_through_mieru_server() -> Result<()> {
         users: Vec::new(),
         mtu: 1500,
         user_hint_mandatory: false,
+        traffic_pattern: None,
         transport: MieruTransport::Tcp,
     }));
 
@@ -443,6 +444,7 @@ async fn socks_client_reaches_tcp_target_through_mieru_server() -> Result<()> {
             password: "test-password".to_string(),
             hashed_password: None,
             mtu: 1500,
+            traffic_pattern: None,
             transport: MieruTransport::Tcp,
         },
     ));
@@ -485,6 +487,7 @@ async fn socks_client_reaches_tcp_target_through_mieru_udp_packet_underlay() -> 
         users: Vec::new(),
         mtu: 1500,
         user_hint_mandatory: false,
+        traffic_pattern: None,
         transport: MieruTransport::Udp,
     }));
 
@@ -500,6 +503,7 @@ async fn socks_client_reaches_tcp_target_through_mieru_udp_packet_underlay() -> 
             password: "test-password".to_string(),
             hashed_password: None,
             mtu: 1500,
+            traffic_pattern: None,
             transport: MieruTransport::Udp,
         },
     ));
@@ -541,6 +545,7 @@ async fn socks_udp_associate_reaches_udp_target_through_mieru_stream() -> Result
         users: Vec::new(),
         mtu: 1500,
         user_hint_mandatory: false,
+        traffic_pattern: None,
         transport: MieruTransport::Tcp,
     }));
 
@@ -556,6 +561,7 @@ async fn socks_udp_associate_reaches_udp_target_through_mieru_stream() -> Result
             password: "test-password".to_string(),
             hashed_password: None,
             mtu: 1500,
+            traffic_pattern: None,
             transport: MieruTransport::Tcp,
         },
     ));
@@ -615,6 +621,7 @@ async fn socks_udp_associate_reaches_udp_target_through_mieru_packet_underlay() 
         users: Vec::new(),
         mtu: 1500,
         user_hint_mandatory: false,
+        traffic_pattern: None,
         transport: MieruTransport::Udp,
     }));
 
@@ -630,6 +637,7 @@ async fn socks_udp_associate_reaches_udp_target_through_mieru_packet_underlay() 
             password: "test-password".to_string(),
             hashed_password: None,
             mtu: 1500,
+            traffic_pattern: None,
             transport: MieruTransport::Udp,
         },
     ));
