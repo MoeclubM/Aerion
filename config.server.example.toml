@@ -1,6 +1,9 @@
-mode = "server"
+# Aerion native server profiles live in one file.
+# Select one with: aerion run --config config.server.example.toml --profile anytls
 
-[server]
+[[servers]]
+name = "anytls"
+protocol = "anytls"
 listen = "0.0.0.0:8443"
 password = "change-me"
 # Optional extra accepted AnyTLS credentials.
@@ -8,17 +11,50 @@ password = "change-me"
 cert = "server.crt"
 key = "server.key"
 heartbeat_interval_secs = 30
-
 # Optional AnyTLS-compatible padding scheme.
-# Omit this field to use the default scheme.
-# padding_scheme = [
-#   "stop=8",
-#   "0=30-30",
-#   "1=100-400",
-#   "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
-#   "3=9-9,500-1000",
-#   "4=500-1000",
-#   "5=500-1000",
-#   "6=500-1000",
-#   "7=500-1000",
-# ]
+# padding_scheme = ["stop=8", "0=30-30", "1=100-400"]
+
+[[servers]]
+name = "hysteria2"
+protocol = "hysteria2"
+listen = "0.0.0.0:8444"
+password = "change-me"
+# Optional extra accepted Hysteria2 auth credentials.
+# users = ["uuid-or-password-1", "uuid-or-password-2"]
+cert = "server.crt"
+key = "server.key"
+udp = true
+cc_rx = "0"
+congestion_control = "bbr"
+# obfs = "salamander"
+# obfs_password = "change-me-obfs"
+
+[[servers]]
+name = "mieru-tcp"
+protocol = "mieru"
+listen = "0.0.0.0:8964"
+username = "default"
+password = "change-me"
+# Extra users use "username:password" entries.
+users = ["alice:alice-password"]
+mtu = 1500
+transport = "tcp" # tcp/stream or udp/packet
+# Optional base64 protobuf trafficPattern / noncePattern strings from Mieru.
+# traffic_pattern = "..."
+# nonce_pattern = "..."
+user-hint-mandatory = false
+
+[[servers]]
+name = "tuic"
+protocol = "tuic"
+listen = "0.0.0.0:443"
+username = "00000000-0000-0000-0000-000000000000"
+password = "change-me"
+# Optional extra accepted TUIC v5 users in "uuid:password" form.
+# users = ["11111111-1111-1111-1111-111111111111:change-me-too"]
+cert = "server.crt"
+key = "server.key"
+udp = true
+congestion_control = "cubic"
+alpn = ["h3"]
+heartbeat_interval_secs = 10

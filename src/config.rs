@@ -2,7 +2,7 @@ use crate::config_compat::mihomo::MihomoConfig;
 use crate::config_compat::singbox::SingBoxConfig;
 use crate::config_compat::xray::XrayConfig;
 use crate::padding::PaddingScheme;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::Value;
 use std::net::SocketAddr;
@@ -12,20 +12,36 @@ use std::path::{Path, PathBuf};
 pub enum FileConfig {
     Client { client: ClientFileConfig },
     Server { server: ServerFileConfig },
+    Aerion(AerionFileConfig),
     Mihomo(MihomoConfig),
     Xray(XrayConfig),
     SingBox(SingBoxConfig),
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "mode", rename_all = "lowercase")]
-enum TomlFileConfig {
-    Client { client: ClientFileConfig },
-    Server { server: ServerFileConfig },
+struct TomlFileConfig {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    client: Option<ClientFileConfig>,
+    #[serde(default)]
+    server: Option<ServerFileConfig>,
+    #[serde(default)]
+    clients: Vec<ClientFileConfig>,
+    #[serde(default)]
+    servers: Vec<ServerFileConfig>,
+}
+
+#[derive(Debug)]
+pub struct AerionFileConfig {
+    pub clients: Vec<ClientFileConfig>,
+    pub servers: Vec<ServerFileConfig>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ClientFileConfig {
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default = "default_protocol")]
     pub protocol: String,
     pub listen: SocketAddr,
@@ -70,6 +86,8 @@ pub struct ClientFileConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct ServerFileConfig {
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default = "default_protocol")]
     pub protocol: String,
     pub listen: SocketAddr,
@@ -137,8 +155,9 @@ pub fn load_config(path: &Path) -> Result<FileConfig> {
         };
     }
     toml::from_str::<TomlFileConfig>(&text)
-        .map(Into::into)
-        .with_context(|| format!("parse config file {}", path.display()))
+        .with_context(|| format!("parse config file {}", path.display()))?
+        .into_file_config()
+        .with_context(|| format!("load Aerion TOML config file {}", path.display()))
 }
 
 pub fn load_mihomo_config(path: &Path) -> Result<MihomoConfig> {
@@ -194,11 +213,44 @@ pub fn default_mieru_transport() -> String {
     "tcp".to_string()
 }
 
-impl From<TomlFileConfig> for FileConfig {
-    fn from(config: TomlFileConfig) -> Self {
-        match config {
-            TomlFileConfig::Client { client } => Self::Client { client },
-            TomlFileConfig::Server { server } => Self::Server { server },
+impl TomlFileConfig {
+    fn into_file_config(self) -> Result<FileConfig> {
+        let mode = self.mode.as_deref().map(str::trim).map(str::to_string);
+        match mode.as_deref() {
+            Some(mode) if mode.eq_ignore_ascii_case("client") => {
+                ensure!(
+                    self.server.is_none() && self.clients.is_empty() && self.servers.is_empty(),
+                    "mode = \"client\" must use a single [client] profile"
+                );
+                Ok(FileConfig::Client {
+                    client: self.client.context("mode = \"client\" requires [client]")?,
+                })
+            }
+            Some(mode) if mode.eq_ignore_ascii_case("server") => {
+                ensure!(
+                    self.client.is_none() && self.clients.is_empty() && self.servers.is_empty(),
+                    "mode = \"server\" must use a single [server] profile"
+                );
+                Ok(FileConfig::Server {
+                    server: self.server.context("mode = \"server\" requires [server]")?,
+                })
+            }
+            Some(mode) => bail!("unsupported Aerion config mode: {mode}"),
+            None => {
+                let mut clients = self.clients;
+                if let Some(client) = self.client {
+                    clients.insert(0, client);
+                }
+                let mut servers = self.servers;
+                if let Some(server) = self.server {
+                    servers.insert(0, server);
+                }
+                ensure!(
+                    !clients.is_empty() || !servers.is_empty(),
+                    "Aerion TOML config has no [client], [server], [[clients]], or [[servers]] profiles"
+                );
+                Ok(FileConfig::Aerion(AerionFileConfig { clients, servers }))
+            }
         }
     }
 }
@@ -317,7 +369,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.client.example.toml");
         assert!(matches!(
             load_config(&path).expect("client config"),
-            FileConfig::Client { .. }
+            FileConfig::Aerion(config) if config.clients.len() == 5 && config.servers.is_empty()
         ));
     }
 
@@ -326,30 +378,8 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.server.example.toml");
         assert!(matches!(
             load_config(&path).expect("server config"),
-            FileConfig::Server { .. }
+            FileConfig::Aerion(config) if config.clients.is_empty() && config.servers.len() == 4
         ));
-    }
-
-    #[test]
-    fn parses_hysteria2_examples() {
-        for name in [
-            "config.hy2.client.example.toml",
-            "config.hy2.server.example.toml",
-        ] {
-            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
-            load_config(&path).expect("hysteria2 config");
-        }
-    }
-
-    #[test]
-    fn parses_mieru_examples() {
-        for name in [
-            "config.mieru.client.example.toml",
-            "config.mieru.server.example.toml",
-        ] {
-            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
-            load_config(&path).expect("mieru config");
-        }
     }
 
     #[test]

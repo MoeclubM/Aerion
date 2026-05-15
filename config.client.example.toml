@@ -1,23 +1,71 @@
-mode = "client"
+# Aerion native client profiles live in one file.
+# Select one with: aerion run --config config.client.example.toml --profile anytls
 
-[client]
+[[clients]]
+name = "anytls"
+protocol = "anytls"
 listen = "127.0.0.1:1080"
 server = "example.com:8443"
 password = "change-me"
 sni = "example.com"
 insecure = false
 heartbeat_interval_secs = 30
-
 # Optional AnyTLS-compatible padding scheme.
-# Omit this field to use the default scheme.
-# padding_scheme = [
-#   "stop=8",
-#   "0=30-30",
-#   "1=100-400",
-#   "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
-#   "3=9-9,500-1000",
-#   "4=500-1000",
-#   "5=500-1000",
-#   "6=500-1000",
-#   "7=500-1000",
-# ]
+# padding_scheme = ["stop=8", "0=30-30", "1=100-400"]
+
+[[clients]]
+name = "hysteria2"
+protocol = "hysteria2"
+listen = "127.0.0.1:1081"
+server = "example.com:8443"
+password = "change-me"
+sni = "example.com"
+insecure = false
+udp = true
+congestion_control = "bbr"
+# download_bandwidth is Mbps and is sent as Hysteria-CC-RX.
+# download_bandwidth = 100
+# obfs = "salamander"
+# obfs_password = "change-me-obfs"
+
+[[clients]]
+name = "mieru-tcp"
+protocol = "mieru"
+listen = "127.0.0.1:1082"
+server = "127.0.0.1:8964"
+username = "default"
+password = "change-me"
+mtu = 1500
+transport = "tcp" # tcp/stream or udp/packet
+# Optional base64 protobuf trafficPattern / noncePattern strings from Mieru.
+# traffic_pattern = "..."
+# nonce_pattern = "..."
+
+[[clients]]
+name = "naive-h2"
+protocol = "naive"
+listen = "127.0.0.1:1083"
+server = "example.com:443"
+username = "user"
+password = "change-me"
+sni = "example.com"
+insecure = false
+# Enable SOCKS5 UDP ASSOCIATE over UOT-style UDP-over-TCP.
+udp = false
+# Set transport = "quic" or protocol = "naive+quic" for HTTP/3.
+transport = "tcp"
+
+[[clients]]
+name = "tuic"
+protocol = "tuic"
+listen = "127.0.0.1:1084"
+server = "example.com:443"
+username = "00000000-0000-0000-0000-000000000000"
+password = "change-me"
+sni = "example.com"
+insecure = false
+udp = true
+udp_relay_mode = "native"
+congestion_control = "cubic"
+alpn = ["h3"]
+heartbeat_interval_secs = 10

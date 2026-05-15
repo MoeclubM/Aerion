@@ -166,31 +166,38 @@ For a self-signed server certificate, add `--insecure` on the client.
 ## Config file
 
 ```powershell
-cargo run -- run --config config.server.example.toml
-cargo run -- run --config config.client.example.toml
-cargo run -- run --config config.hy2.server.example.toml
-cargo run -- run --config config.hy2.client.example.toml
-cargo run -- run --config config.mieru.server.example.toml
-cargo run -- run --config config.mieru.client.example.toml
-cargo run -- run --config config.naive.client.example.toml
-cargo run -- run --config config.tuic.server.example.toml
-cargo run -- run --config config.tuic.client.example.toml
-cargo run -- run --config config.mihomo.example.yaml
-cargo run -- run --config config.xray.example.json
-cargo run -- run --config config.singbox.example.json
+cargo run -- run --config config.client.example.toml --profile anytls
+cargo run -- run --config config.client.example.toml --profile hysteria2
+cargo run -- run --config config.client.example.toml --profile mieru-tcp
+cargo run -- run --config config.client.example.toml --profile naive-h2
+cargo run -- run --config config.client.example.toml --profile tuic
+cargo run -- run --config config.server.example.toml --profile anytls
+cargo run -- run --config config.server.example.toml --profile hysteria2
+cargo run -- run --config config.server.example.toml --profile mieru-tcp
+cargo run -- run --config config.server.example.toml --profile tuic
+cargo run -- run --config config.mihomo.example.yaml --profile anytls
+cargo run -- run --config config.xray.example.json --profile vless-reality
+cargo run -- run --config config.singbox.example.json --profile anytls
 ```
 
-Use `protocol = "hysteria2"` in `[client]` or `[server]` to select Hysteria2,
-or `protocol = "mieru"` to select Mieru. Mieru defaults to
-`transport = "tcp"`; set `transport = "udp"` to use the native packet
-underlay.
-Use `protocol = "tuic"` with `username` as the TUIC UUID and `password` as the
-TUIC password; extra server users use `uuid:password` entries.
-Use `protocol = "naive"` for an HTTPS Naive client; set `transport = "quic"`
-or `protocol = "naive+quic"` for HTTP/3.
-The mihomo / Xray / sing-box loaders are exposed for core integration and
-profile conversion; the CLI only parses them and then asks the upper layer to
-select a proxy profile.
+Aerion-native TOML can keep multiple `[[clients]]` or `[[servers]]` profiles in
+one file. `mode = "client"` with `[client]` and `mode = "server"` with
+`[server]` remain supported for single-profile files. When a file has more than
+one runnable profile, pass `--profile <name>`; `--listen <addr:port>` can
+override a client/server listen address or supply the local SOCKS listen for
+mihomo / Xray / sing-box configs that omit an inbound listener.
+
+Use `protocol = "hysteria2"` to select Hysteria2, or `protocol = "mieru"` to
+select Mieru. Mieru defaults to `transport = "tcp"`; set `transport = "udp"` to
+use the native packet underlay. Use `protocol = "tuic"` with `username` as the
+TUIC UUID and `password` as the TUIC password; extra server users use
+`uuid:password` entries. Use `protocol = "naive"` for an HTTPS Naive client;
+set `transport = "quic"` or `protocol = "naive+quic"` for HTTP/3.
+
+The CLI can run mihomo YAML, Xray JSON/JSONC, and sing-box JSON/JSONC client
+profiles directly. If those files contain multiple proxies/outbounds, select one
+with `--profile`; unsupported transports still fail explicitly instead of being
+silently downgraded.
 
 ## Run Hysteria2
 

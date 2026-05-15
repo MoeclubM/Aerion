@@ -1,4 +1,7 @@
-use aerion::config::{FileConfig, default_heartbeat_interval_secs, load_config};
+use aerion::config::{
+    AerionFileConfig, ClientFileConfig, FileConfig, ServerFileConfig,
+    default_heartbeat_interval_secs, load_config,
+};
 use aerion::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
 use aerion::mieru::{
     MieruClientConfig, MieruServerConfig, MieruTrafficPattern, MieruTransport, parse_mieru_user,
@@ -7,9 +10,11 @@ use aerion::naive::NaiveClientConfig;
 use aerion::padding::PaddingScheme;
 use aerion::tuic::{TuicClientConfig, TuicServerConfig, parse_tuic_user};
 use aerion::{
-    ClientConfig, ServerConfig, run_client, run_hysteria2_client, run_hysteria2_server,
-    run_mieru_client, run_mieru_server, run_naive_client, run_server, run_tuic_client,
-    run_tuic_server, tls,
+    ClientConfig, MihomoClientConfig, MihomoProxy, ServerConfig, ShadowsocksClientConfig,
+    SingBoxClientConfig, SingBoxOutbound, TrojanClientConfig, VlessClientConfig, VmessClientConfig,
+    XrayClientConfig, XrayOutbound, run_client, run_hysteria2_client, run_hysteria2_server,
+    run_mieru_client, run_mieru_server, run_naive_client, run_server, run_shadowsocks_client,
+    run_trojan_client, run_tuic_client, run_tuic_server, run_vless_client, run_vmess_client, tls,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -30,6 +35,10 @@ enum Command {
     Run {
         #[arg(long)]
         config: PathBuf,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        listen: Option<SocketAddr>,
     },
     Client {
         #[arg(long, default_value = "127.0.0.1:1080")]
@@ -193,182 +202,11 @@ async fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command {
-        Command::Run { config } => match load_config(&config)? {
-            FileConfig::Client { client } => {
-                let (server_host, server_port) = parse_host_port(&client.server)?;
-                let sni = client.sni.unwrap_or_else(|| server_host.clone());
-                if is_hysteria2(&client.protocol) {
-                    return run_hysteria2_client(Hysteria2ClientConfig {
-                        listen: client.listen,
-                        server_host,
-                        server_port,
-                        password: client.password,
-                        sni,
-                        insecure: client.insecure,
-                        obfs: client.obfs,
-                        obfs_password: client.obfs_password,
-                        download_bandwidth: client.download_bandwidth,
-                        udp: client.udp,
-                        congestion_control: client.congestion_control,
-                    })
-                    .await;
-                }
-                if is_mieru(&client.protocol) {
-                    return run_mieru_client(MieruClientConfig {
-                        listen: client.listen,
-                        server_host,
-                        server_port,
-                        username: client.username,
-                        password: client.password,
-                        hashed_password: None,
-                        mtu: client.mtu,
-                        transport: MieruTransport::parse(&client.transport)?,
-                        traffic_pattern: MieruTrafficPattern::parse_pair(
-                            client.traffic_pattern.as_deref(),
-                            client.nonce_pattern.as_deref(),
-                        )?,
-                    })
-                    .await;
-                }
-                if is_tuic(&client.protocol) {
-                    return run_tuic_client(TuicClientConfig {
-                        listen: client.listen,
-                        server_host,
-                        server_port,
-                        uuid: client.username,
-                        password: client.password,
-                        sni,
-                        insecure: client.insecure,
-                        udp: client.udp,
-                        udp_relay_mode: client.udp_relay_mode,
-                        congestion_control: client.congestion_control,
-                        alpn_protocols: client.alpn_protocols,
-                        heartbeat_interval_secs: client.heartbeat_interval_secs,
-                    })
-                    .await;
-                }
-                if is_naive(&client.protocol) {
-                    return run_naive_client(NaiveClientConfig {
-                        listen: client.listen,
-                        server_host,
-                        server_port,
-                        username: client.username,
-                        password: client.password,
-                        sni,
-                        insecure: client.insecure,
-                        extra_headers: Vec::new(),
-                        udp_over_tcp: client.udp,
-                        quic: client.transport.eq_ignore_ascii_case("quic")
-                            || client.protocol.eq_ignore_ascii_case("naive+quic"),
-                    })
-                    .await;
-                }
-                ensure_supported_protocol(&client.protocol)?;
-                run_client(ClientConfig {
-                    listen: client.listen,
-                    server_host,
-                    server_port,
-                    password: client.password,
-                    sni,
-                    insecure: client.insecure,
-                    padding_scheme: client.padding_scheme,
-                    heartbeat_interval_secs: client.heartbeat_interval_secs,
-                })
-                .await
-            }
-            FileConfig::Server { server } => {
-                if is_hysteria2(&server.protocol) {
-                    return run_hysteria2_server(Hysteria2ServerConfig {
-                        listen: server.listen,
-                        password: server.password,
-                        users: server.users,
-                        cert_path: server
-                            .cert
-                            .context("server cert is required for Hysteria2")?,
-                        key_path: server.key.context("server key is required for Hysteria2")?,
-                        obfs: server.obfs,
-                        obfs_password: server.obfs_password,
-                        udp: server.udp,
-                        cc_rx: server.cc_rx,
-                        congestion_control: server.congestion_control,
-                    })
-                    .await;
-                }
-                if is_mieru(&server.protocol) {
-                    let users = server
-                        .users
-                        .iter()
-                        .map(|user| parse_mieru_user(user))
-                        .collect::<Result<Vec<_>>>()?;
-                    return run_mieru_server(MieruServerConfig {
-                        listen: server.listen,
-                        username: server.username,
-                        password: server.password,
-                        users,
-                        mtu: server.mtu,
-                        user_hint_mandatory: server.user_hint_mandatory,
-                        transport: MieruTransport::parse(&server.transport)?,
-                        traffic_pattern: MieruTrafficPattern::parse_pair(
-                            server.traffic_pattern.as_deref(),
-                            server.nonce_pattern.as_deref(),
-                        )?,
-                    })
-                    .await;
-                }
-                if is_tuic(&server.protocol) {
-                    let users = server
-                        .users
-                        .iter()
-                        .map(|user| {
-                            parse_tuic_user(user)
-                                .map(|user| format!("{}:{}", user.uuid, user.password))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    return run_tuic_server(TuicServerConfig {
-                        listen: server.listen,
-                        uuid: server.username,
-                        password: server.password,
-                        users,
-                        cert_path: server.cert.context("server cert is required for TUIC")?,
-                        key_path: server.key.context("server key is required for TUIC")?,
-                        udp: server.udp,
-                        congestion_control: server.congestion_control,
-                        alpn_protocols: server.alpn_protocols,
-                        heartbeat_interval_secs: server.heartbeat_interval_secs,
-                    })
-                    .await;
-                }
-                ensure_supported_protocol(&server.protocol)?;
-                run_server(ServerConfig {
-                    listen: server.listen,
-                    password: server.password,
-                    users: server.users,
-                    cert_path: server.cert.context("server cert is required for AnyTLS")?,
-                    key_path: server.key.context("server key is required for AnyTLS")?,
-                    padding_scheme: server.padding_scheme,
-                    heartbeat_interval_secs: server.heartbeat_interval_secs,
-                })
-                .await
-            }
-            FileConfig::Mihomo(config) => {
-                bail!(
-                    "mihomo YAML parsed {} proxies, but aerion run needs an explicit Aerion client/server TOML config; use aerion::config_compat::mihomo helpers to select one proxy for the core",
-                    config.proxies.len()
-                )
-            }
-            FileConfig::Xray(config) => {
-                bail!(
-                    "xray JSON parsed {} outbounds, but aerion run needs an explicit Aerion client/server TOML config; use aerion::config_compat::xray helpers to select one outbound for the core",
-                    config.outbounds.len()
-                )
-            }
-            FileConfig::SingBox(config) => {
-                bail!(
-                    "sing-box JSON parsed {} outbounds, but aerion run needs an explicit Aerion client/server TOML config; use aerion::config_compat::singbox helpers to select one outbound for the core",
-                    config.outbounds.len()
-                )
-            }
-        },
+        Command::Run {
+            config,
+            profile,
+            listen,
+        } => run_file_config(load_config(&config)?, profile.as_deref(), listen).await,
         Command::Client {
             listen,
             server,
@@ -586,6 +424,394 @@ async fn main() -> Result<()> {
             .await
         }
     }
+}
+
+enum RunnableClientConfig {
+    AnyTls(ClientConfig),
+    Hysteria2(Hysteria2ClientConfig),
+    Mieru(MieruClientConfig),
+    Naive(NaiveClientConfig),
+    Shadowsocks(ShadowsocksClientConfig),
+    Trojan(TrojanClientConfig),
+    Tuic(TuicClientConfig),
+    Vless(VlessClientConfig),
+    Vmess(VmessClientConfig),
+}
+
+impl From<MihomoClientConfig> for RunnableClientConfig {
+    fn from(config: MihomoClientConfig) -> Self {
+        match config {
+            MihomoClientConfig::AnyTls(config) => Self::AnyTls(config),
+            MihomoClientConfig::Hysteria2(config) => Self::Hysteria2(config),
+            MihomoClientConfig::Mieru(config) => Self::Mieru(config),
+            MihomoClientConfig::Naive(config) => Self::Naive(config),
+            MihomoClientConfig::Shadowsocks(config) => Self::Shadowsocks(config),
+            MihomoClientConfig::Trojan(config) => Self::Trojan(config),
+            MihomoClientConfig::Tuic(config) => Self::Tuic(config),
+            MihomoClientConfig::Vless(config) => Self::Vless(config),
+            MihomoClientConfig::Vmess(config) => Self::Vmess(config),
+        }
+    }
+}
+
+impl From<SingBoxClientConfig> for RunnableClientConfig {
+    fn from(config: SingBoxClientConfig) -> Self {
+        match config {
+            SingBoxClientConfig::AnyTls(config) => Self::AnyTls(config),
+            SingBoxClientConfig::Hysteria2(config) => Self::Hysteria2(config),
+            SingBoxClientConfig::Naive(config) => Self::Naive(config),
+            SingBoxClientConfig::Shadowsocks(config) => Self::Shadowsocks(config),
+            SingBoxClientConfig::Trojan(config) => Self::Trojan(config),
+            SingBoxClientConfig::Tuic(config) => Self::Tuic(config),
+            SingBoxClientConfig::Vless(config) => Self::Vless(config),
+            SingBoxClientConfig::Vmess(config) => Self::Vmess(config),
+        }
+    }
+}
+
+impl From<XrayClientConfig> for RunnableClientConfig {
+    fn from(config: XrayClientConfig) -> Self {
+        match config {
+            XrayClientConfig::Hysteria2(config) => Self::Hysteria2(config),
+            XrayClientConfig::Shadowsocks(config) => Self::Shadowsocks(config),
+            XrayClientConfig::Trojan(config) => Self::Trojan(config),
+            XrayClientConfig::Vless(config) => Self::Vless(config),
+            XrayClientConfig::Vmess(config) => Self::Vmess(config),
+        }
+    }
+}
+
+async fn run_file_config(
+    config: FileConfig,
+    profile: Option<&str>,
+    listen: Option<SocketAddr>,
+) -> Result<()> {
+    match config {
+        FileConfig::Client { client } => run_native_client(client, listen).await,
+        FileConfig::Server { server } => run_native_server(server, listen).await,
+        FileConfig::Aerion(config) => run_aerion_config(config, profile, listen).await,
+        FileConfig::Mihomo(config) => {
+            let listen = listen
+                .or(config.local_socks_listen()?)
+                .context("mihomo config has no mixed-port/socks-port/port; pass --listen")?;
+            let proxy = select_mihomo_proxy(&config.proxies, profile)?;
+            run_client_config(proxy.to_client_config(listen)?.into()).await
+        }
+        FileConfig::Xray(config) => {
+            let listen = listen
+                .or(config.local_socks_listen()?)
+                .context("xray config has no socks inbound; pass --listen")?;
+            let outbound = select_xray_outbound(&config.outbounds, profile)?;
+            run_client_config(outbound.to_client_config(listen)?.into()).await
+        }
+        FileConfig::SingBox(config) => {
+            let listen = listen
+                .or(config.local_socks_listen()?)
+                .context("sing-box config has no mixed/socks inbound; pass --listen")?;
+            let outbound = select_singbox_outbound(&config.outbounds, profile)?;
+            run_client_config(outbound.to_client_config(listen)?.into()).await
+        }
+    }
+}
+
+async fn run_aerion_config(
+    config: AerionFileConfig,
+    profile: Option<&str>,
+    listen: Option<SocketAddr>,
+) -> Result<()> {
+    if let Some(profile) = profile {
+        if let Some(client) = config
+            .clients
+            .into_iter()
+            .find(|client| native_client_name(client) == profile)
+        {
+            return run_native_client(client, listen).await;
+        }
+        if let Some(server) = config
+            .servers
+            .into_iter()
+            .find(|server| native_server_name(server) == profile)
+        {
+            return run_native_server(server, listen).await;
+        }
+        bail!("Aerion TOML profile {profile} was not found");
+    }
+
+    match (config.clients.len(), config.servers.len()) {
+        (1, 0) => run_native_client(config.clients.into_iter().next().unwrap(), listen).await,
+        (0, 1) => run_native_server(config.servers.into_iter().next().unwrap(), listen).await,
+        _ => bail!(
+            "Aerion TOML config has multiple profiles [{}]; pass --profile",
+            native_profile_names(&config)
+        ),
+    }
+}
+
+async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAddr>) -> Result<()> {
+    if let Some(listen) = listen {
+        client.listen = listen;
+    }
+    let (server_host, server_port) = parse_host_port(&client.server)?;
+    let sni = client.sni.unwrap_or_else(|| server_host.clone());
+    if is_hysteria2(&client.protocol) {
+        return run_hysteria2_client(Hysteria2ClientConfig {
+            listen: client.listen,
+            server_host,
+            server_port,
+            password: client.password,
+            sni,
+            insecure: client.insecure,
+            obfs: client.obfs,
+            obfs_password: client.obfs_password,
+            download_bandwidth: client.download_bandwidth,
+            udp: client.udp,
+            congestion_control: client.congestion_control,
+        })
+        .await;
+    }
+    if is_mieru(&client.protocol) {
+        return run_mieru_client(MieruClientConfig {
+            listen: client.listen,
+            server_host,
+            server_port,
+            username: client.username,
+            password: client.password,
+            hashed_password: None,
+            mtu: client.mtu,
+            transport: MieruTransport::parse(&client.transport)?,
+            traffic_pattern: MieruTrafficPattern::parse_pair(
+                client.traffic_pattern.as_deref(),
+                client.nonce_pattern.as_deref(),
+            )?,
+        })
+        .await;
+    }
+    if is_tuic(&client.protocol) {
+        return run_tuic_client(TuicClientConfig {
+            listen: client.listen,
+            server_host,
+            server_port,
+            uuid: client.username,
+            password: client.password,
+            sni,
+            insecure: client.insecure,
+            udp: client.udp,
+            udp_relay_mode: client.udp_relay_mode,
+            congestion_control: client.congestion_control,
+            alpn_protocols: client.alpn_protocols,
+            heartbeat_interval_secs: client.heartbeat_interval_secs,
+        })
+        .await;
+    }
+    if is_naive(&client.protocol) {
+        return run_naive_client(NaiveClientConfig {
+            listen: client.listen,
+            server_host,
+            server_port,
+            username: client.username,
+            password: client.password,
+            sni,
+            insecure: client.insecure,
+            extra_headers: Vec::new(),
+            udp_over_tcp: client.udp,
+            quic: client.transport.eq_ignore_ascii_case("quic")
+                || client.protocol.eq_ignore_ascii_case("naive+quic"),
+        })
+        .await;
+    }
+    ensure_supported_protocol(&client.protocol)?;
+    run_client(ClientConfig {
+        listen: client.listen,
+        server_host,
+        server_port,
+        password: client.password,
+        sni,
+        insecure: client.insecure,
+        padding_scheme: client.padding_scheme,
+        heartbeat_interval_secs: client.heartbeat_interval_secs,
+    })
+    .await
+}
+
+async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAddr>) -> Result<()> {
+    if let Some(listen) = listen {
+        server.listen = listen;
+    }
+    if is_hysteria2(&server.protocol) {
+        return run_hysteria2_server(Hysteria2ServerConfig {
+            listen: server.listen,
+            password: server.password,
+            users: server.users,
+            cert_path: server
+                .cert
+                .context("server cert is required for Hysteria2")?,
+            key_path: server.key.context("server key is required for Hysteria2")?,
+            obfs: server.obfs,
+            obfs_password: server.obfs_password,
+            udp: server.udp,
+            cc_rx: server.cc_rx,
+            congestion_control: server.congestion_control,
+        })
+        .await;
+    }
+    if is_mieru(&server.protocol) {
+        let users = server
+            .users
+            .iter()
+            .map(|user| parse_mieru_user(user))
+            .collect::<Result<Vec<_>>>()?;
+        return run_mieru_server(MieruServerConfig {
+            listen: server.listen,
+            username: server.username,
+            password: server.password,
+            users,
+            mtu: server.mtu,
+            user_hint_mandatory: server.user_hint_mandatory,
+            transport: MieruTransport::parse(&server.transport)?,
+            traffic_pattern: MieruTrafficPattern::parse_pair(
+                server.traffic_pattern.as_deref(),
+                server.nonce_pattern.as_deref(),
+            )?,
+        })
+        .await;
+    }
+    if is_tuic(&server.protocol) {
+        let users = server
+            .users
+            .iter()
+            .map(|user| {
+                parse_tuic_user(user).map(|user| format!("{}:{}", user.uuid, user.password))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return run_tuic_server(TuicServerConfig {
+            listen: server.listen,
+            uuid: server.username,
+            password: server.password,
+            users,
+            cert_path: server.cert.context("server cert is required for TUIC")?,
+            key_path: server.key.context("server key is required for TUIC")?,
+            udp: server.udp,
+            congestion_control: server.congestion_control,
+            alpn_protocols: server.alpn_protocols,
+            heartbeat_interval_secs: server.heartbeat_interval_secs,
+        })
+        .await;
+    }
+    ensure_supported_protocol(&server.protocol)?;
+    run_server(ServerConfig {
+        listen: server.listen,
+        password: server.password,
+        users: server.users,
+        cert_path: server.cert.context("server cert is required for AnyTLS")?,
+        key_path: server.key.context("server key is required for AnyTLS")?,
+        padding_scheme: server.padding_scheme,
+        heartbeat_interval_secs: server.heartbeat_interval_secs,
+    })
+    .await
+}
+
+async fn run_client_config(config: RunnableClientConfig) -> Result<()> {
+    match config {
+        RunnableClientConfig::AnyTls(config) => run_client(config).await,
+        RunnableClientConfig::Hysteria2(config) => run_hysteria2_client(config).await,
+        RunnableClientConfig::Mieru(config) => run_mieru_client(config).await,
+        RunnableClientConfig::Naive(config) => run_naive_client(config).await,
+        RunnableClientConfig::Shadowsocks(config) => run_shadowsocks_client(config).await,
+        RunnableClientConfig::Trojan(config) => run_trojan_client(config).await,
+        RunnableClientConfig::Tuic(config) => run_tuic_client(config).await,
+        RunnableClientConfig::Vless(config) => run_vless_client(config).await,
+        RunnableClientConfig::Vmess(config) => run_vmess_client(config).await,
+    }
+}
+
+fn select_mihomo_proxy<'a>(
+    proxies: &'a [MihomoProxy],
+    profile: Option<&str>,
+) -> Result<&'a MihomoProxy> {
+    if let Some(profile) = profile {
+        return proxies
+            .iter()
+            .find(|proxy| proxy.name() == profile)
+            .with_context(|| format!("mihomo proxy {profile} was not found"));
+    }
+    match proxies {
+        [proxy] => Ok(proxy),
+        [] => bail!("mihomo config has no proxies"),
+        _ => bail!(
+            "mihomo config has multiple proxies [{}]; pass --profile",
+            proxies
+                .iter()
+                .map(MihomoProxy::name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn select_xray_outbound<'a>(
+    outbounds: &'a [XrayOutbound],
+    profile: Option<&str>,
+) -> Result<&'a XrayOutbound> {
+    if let Some(profile) = profile {
+        return outbounds
+            .iter()
+            .find(|outbound| outbound.name() == profile)
+            .with_context(|| format!("xray outbound {profile} was not found"));
+    }
+    match outbounds {
+        [outbound] => Ok(outbound),
+        [] => bail!("xray config has no outbounds"),
+        _ => bail!(
+            "xray config has multiple outbounds [{}]; pass --profile",
+            outbounds
+                .iter()
+                .map(XrayOutbound::name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn select_singbox_outbound<'a>(
+    outbounds: &'a [SingBoxOutbound],
+    profile: Option<&str>,
+) -> Result<&'a SingBoxOutbound> {
+    if let Some(profile) = profile {
+        return outbounds
+            .iter()
+            .find(|outbound| outbound.name() == profile)
+            .with_context(|| format!("sing-box outbound {profile} was not found"));
+    }
+    match outbounds {
+        [outbound] => Ok(outbound),
+        [] => bail!("sing-box config has no outbounds"),
+        _ => bail!(
+            "sing-box config has multiple outbounds [{}]; pass --profile",
+            outbounds
+                .iter()
+                .map(SingBoxOutbound::name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn native_client_name(client: &ClientFileConfig) -> &str {
+    client.name.as_deref().unwrap_or(&client.protocol)
+}
+
+fn native_server_name(server: &ServerFileConfig) -> &str {
+    server.name.as_deref().unwrap_or(&server.protocol)
+}
+
+fn native_profile_names(config: &AerionFileConfig) -> String {
+    config
+        .clients
+        .iter()
+        .map(native_client_name)
+        .chain(config.servers.iter().map(native_server_name))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn parse_host_port(value: &str) -> Result<(String, u16)> {
