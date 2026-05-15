@@ -46,6 +46,14 @@ pub struct ClientFileConfig {
     pub udp: bool,
     #[serde(default = "default_hy2_congestion_control")]
     pub congestion_control: String,
+    #[serde(
+        default = "default_tuic_udp_relay_mode",
+        alias = "udp-relay-mode",
+        alias = "udpRelayMode"
+    )]
+    pub udp_relay_mode: String,
+    #[serde(default, alias = "alpn")]
+    pub alpn_protocols: Vec<String>,
     #[serde(default = "PaddingScheme::default_lines")]
     pub padding_scheme: Vec<String>,
     #[serde(default = "default_heartbeat_interval_secs")]
@@ -54,6 +62,10 @@ pub struct ClientFileConfig {
     pub mtu: usize,
     #[serde(default = "default_mieru_transport")]
     pub transport: String,
+    #[serde(default, alias = "traffic-pattern", alias = "trafficPattern")]
+    pub traffic_pattern: Option<String>,
+    #[serde(default, alias = "nonce-pattern", alias = "noncePattern")]
+    pub nonce_pattern: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +92,14 @@ pub struct ServerFileConfig {
     pub cc_rx: String,
     #[serde(default = "default_hy2_congestion_control")]
     pub congestion_control: String,
+    #[serde(
+        default = "default_tuic_udp_relay_mode",
+        alias = "udp-relay-mode",
+        alias = "udpRelayMode"
+    )]
+    pub udp_relay_mode: String,
+    #[serde(default, alias = "alpn")]
+    pub alpn_protocols: Vec<String>,
     #[serde(default = "PaddingScheme::default_lines")]
     pub padding_scheme: Vec<String>,
     #[serde(default = "default_heartbeat_interval_secs")]
@@ -90,6 +110,10 @@ pub struct ServerFileConfig {
     pub user_hint_mandatory: bool,
     #[serde(default = "default_mieru_transport")]
     pub transport: String,
+    #[serde(default, alias = "traffic-pattern", alias = "trafficPattern")]
+    pub traffic_pattern: Option<String>,
+    #[serde(default, alias = "nonce-pattern", alias = "noncePattern")]
+    pub nonce_pattern: Option<String>,
 }
 
 pub fn load_config(path: &Path) -> Result<FileConfig> {
@@ -156,6 +180,10 @@ pub fn default_cc_rx() -> String {
 
 pub fn default_hy2_congestion_control() -> String {
     "bbr".to_string()
+}
+
+pub fn default_tuic_udp_relay_mode() -> String {
+    "native".to_string()
 }
 
 pub fn default_mieru_username() -> String {
@@ -329,7 +357,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.mihomo.example.yaml");
         assert!(matches!(
             load_config(&path).expect("mihomo config"),
-            FileConfig::Mihomo(config) if config.proxies.len() == 4
+            FileConfig::Mihomo(config) if config.proxies.len() == 6
         ));
     }
 
@@ -347,7 +375,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.singbox.example.json");
         assert!(matches!(
             load_config(&path).expect("sing-box config"),
-            FileConfig::SingBox(config) if config.outbounds.len() == 4
+            FileConfig::SingBox(config) if config.outbounds.len() == 6
         ));
     }
 

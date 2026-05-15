@@ -1,8 +1,12 @@
+use crate::client::ClientConfig;
 use crate::config_compat::mihomo::OneOrManyStrings;
 use crate::hysteria2::Hysteria2ClientConfig;
+use crate::naive::NaiveClientConfig;
+use crate::padding::PaddingScheme;
 use crate::reality::RealityClientConfig;
 use crate::shadowsocks::ShadowsocksClientConfig;
 use crate::trojan::TrojanClientConfig;
+use crate::tuic::TuicClientConfig;
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::VlessClientConfig;
 use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
@@ -139,6 +143,54 @@ pub struct SingBoxHysteria2Outbound {
     pub down: Option<u64>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxAnyTlsOutbound {
+    pub server: String,
+    #[serde(rename = "server_port")]
+    pub server_port: u16,
+    pub password: String,
+    #[serde(default)]
+    pub tls: Option<SingBoxTlsOptions>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxNaiveOutbound {
+    pub server: String,
+    #[serde(rename = "server_port")]
+    pub server_port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub tls: Option<SingBoxTlsOptions>,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default, rename = "extra_headers")]
+    pub extra_headers: BTreeMap<String, String>,
+    #[serde(default, rename = "udp_over_tcp")]
+    pub udp_over_tcp: Option<Value>,
+    #[serde(default)]
+    pub quic: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxTuicOutbound {
+    pub server: String,
+    #[serde(rename = "server_port")]
+    pub server_port: u16,
+    pub uuid: String,
+    pub password: String,
+    #[serde(default)]
+    pub tls: Option<SingBoxTlsOptions>,
+    #[serde(default, rename = "congestion_control")]
+    pub congestion_control: Option<String>,
+    #[serde(default, rename = "udp_relay_mode")]
+    pub udp_relay_mode: Option<String>,
+    #[serde(default)]
+    pub heartbeat: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct SingBoxTlsOptions {
     #[serde(default)]
@@ -215,6 +267,9 @@ pub enum SingBoxClientConfig {
     Vmess(VmessClientConfig),
     Trojan(TrojanClientConfig),
     Hysteria2(Hysteria2ClientConfig),
+    AnyTls(ClientConfig),
+    Naive(NaiveClientConfig),
+    Tuic(TuicClientConfig),
 }
 
 impl SingBoxConfig {
@@ -272,6 +327,18 @@ impl SingBoxOutbound {
             )),
             "hysteria2" | "hy2" => Ok(SingBoxClientConfig::Hysteria2(
                 self.decode::<SingBoxHysteria2Outbound>()?
+                    .to_client_config(self.name(), listen)?,
+            )),
+            "anytls" => Ok(SingBoxClientConfig::AnyTls(
+                self.decode::<SingBoxAnyTlsOutbound>()?
+                    .to_client_config(self.name(), listen)?,
+            )),
+            "naive" => Ok(SingBoxClientConfig::Naive(
+                self.decode::<SingBoxNaiveOutbound>()?
+                    .to_client_config(self.name(), listen)?,
+            )),
+            "tuic" => Ok(SingBoxClientConfig::Tuic(
+                self.decode::<SingBoxTuicOutbound>()?
                     .to_client_config(self.name(), listen)?,
             )),
             other => bail!("unsupported sing-box outbound type {other}"),
@@ -469,6 +536,103 @@ impl SingBoxHysteria2Outbound {
     }
 }
 
+impl SingBoxAnyTlsOutbound {
+    pub fn to_client_config(&self, name: &str, listen: SocketAddr) -> Result<ClientConfig> {
+        let tls = self
+            .tls
+            .as_ref()
+            .with_context(|| format!("sing-box AnyTLS outbound {name} is missing tls"))?;
+        ensure!(
+            tls.enabled,
+            "sing-box AnyTLS outbound {name} disables TLS; AnyTLS requires TLS"
+        );
+        Ok(ClientConfig {
+            listen,
+            server_host: self.server.clone(),
+            server_port: self.server_port,
+            password: self.password.clone(),
+            sni: sni_or_server(tls.server_name.as_deref(), &self.server),
+            insecure: tls.insecure,
+            padding_scheme: PaddingScheme::default_lines(),
+            heartbeat_interval_secs: 30,
+        })
+    }
+}
+
+impl SingBoxNaiveOutbound {
+    pub fn to_client_config(&self, name: &str, listen: SocketAddr) -> Result<NaiveClientConfig> {
+        let tls = self
+            .tls
+            .as_ref()
+            .with_context(|| format!("sing-box Naive outbound {name} is missing tls"))?;
+        ensure!(
+            tls.enabled,
+            "sing-box Naive outbound {name} disables TLS; Naive requires HTTPS/TLS"
+        );
+        Ok(NaiveClientConfig {
+            listen,
+            server_host: self.server.clone(),
+            server_port: self.server_port,
+            username: self.username.clone().unwrap_or_default(),
+            password: self.password.clone().unwrap_or_default(),
+            sni: sni_or_server(tls.server_name.as_deref(), &self.server),
+            insecure: tls.insecure,
+            extra_headers: self.extra_headers.clone().into_iter().collect(),
+            udp_over_tcp: value_bool_or_object(self.udp_over_tcp.as_ref()),
+            quic: self.quic
+                || self
+                    .network
+                    .as_deref()
+                    .map(|network| {
+                        matches!(
+                            network.to_ascii_lowercase().as_str(),
+                            "quic" | "h3" | "http3"
+                        )
+                    })
+                    .unwrap_or(false),
+        })
+    }
+}
+
+impl SingBoxTuicOutbound {
+    pub fn to_client_config(&self, name: &str, listen: SocketAddr) -> Result<TuicClientConfig> {
+        let tls = self
+            .tls
+            .as_ref()
+            .with_context(|| format!("sing-box TUIC outbound {name} is missing tls"))?;
+        ensure!(
+            tls.enabled,
+            "sing-box TUIC outbound {name} disables TLS; TUIC requires QUIC TLS"
+        );
+        ensure_tuic_alpn("sing-box", name, tls.alpn.as_ref())?;
+        Ok(TuicClientConfig {
+            listen,
+            server_host: self.server.clone(),
+            server_port: self.server_port,
+            uuid: self.uuid.clone(),
+            password: self.password.clone(),
+            sni: sni_or_server(tls.server_name.as_deref(), &self.server),
+            insecure: tls.insecure,
+            udp: true,
+            udp_relay_mode: self
+                .udp_relay_mode
+                .clone()
+                .unwrap_or_else(|| "native".to_string()),
+            congestion_control: self
+                .congestion_control
+                .clone()
+                .unwrap_or_else(|| "cubic".to_string()),
+            alpn_protocols: alpn_values(tls.alpn.as_ref()),
+            heartbeat_interval_secs: self
+                .heartbeat
+                .as_deref()
+                .map(parse_duration_secs)
+                .transpose()?
+                .unwrap_or(10),
+        })
+    }
+}
+
 impl SingBoxTlsOptions {
     fn utls_fingerprint(&self, name: &str) -> Result<Option<UtlsFingerprint>> {
         let Some(utls) = &self.utls else {
@@ -660,6 +824,16 @@ fn ensure_hy2_alpn(format: &str, name: &str, alpn: Option<&OneOrManyStrings>) ->
     Ok(())
 }
 
+fn ensure_tuic_alpn(format: &str, name: &str, alpn: Option<&OneOrManyStrings>) -> Result<()> {
+    let values = alpn_values(alpn);
+    ensure!(
+        values.is_empty() || values.iter().any(|value| value.eq_ignore_ascii_case("h3")),
+        "{format} TUIC outbound {name} sets ALPN {:?}; TUIC over QUIC requires h3-compatible ALPN",
+        values
+    );
+    Ok(())
+}
+
 fn alpn_values(alpn: Option<&OneOrManyStrings>) -> Vec<String> {
     alpn.map(OneOrManyStrings::to_vec)
         .unwrap_or_default()
@@ -667,6 +841,22 @@ fn alpn_values(alpn: Option<&OneOrManyStrings>) -> Vec<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .collect()
+}
+
+fn value_bool_or_object(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Object(_)) => true,
+        _ => false,
+    }
+}
+
+fn parse_duration_secs(value: &str) -> Result<u64> {
+    let value = value.trim();
+    let seconds = value.strip_suffix('s').unwrap_or(value).trim();
+    seconds
+        .parse::<u64>()
+        .with_context(|| format!("parse duration seconds {value}"))
 }
 
 fn sni_or_server(value: Option<&str>, server: &str) -> String {

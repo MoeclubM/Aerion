@@ -1,0 +1,14 @@
+mode = "client"
+
+[client]
+protocol = "naive"
+listen = "127.0.0.1:1080"
+server = "example.com:443"
+username = "user"
+password = "change-me"
+sni = "example.com"
+insecure = false
+# Enable SOCKS5 UDP ASSOCIATE over UOT-style UDP-over-TCP.
+udp = false
+# Set transport = "quic" or protocol = "naive+quic" for HTTP/3.
+transport = "tcp"

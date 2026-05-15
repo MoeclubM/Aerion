@@ -63,6 +63,13 @@ enum NaiveTunnel {
     },
 }
 
+pub async fn run_naive_client(config: NaiveClientConfig) -> Result<()> {
+    let listener = TcpListener::bind(config.listen)
+        .await
+        .with_context(|| format!("bind Naive SOCKS listener on {}", config.listen))?;
+    run_naive_client_listener(listener, config).await
+}
+
 pub async fn run_naive_client_listener(
     listener: TcpListener,
     config: NaiveClientConfig,

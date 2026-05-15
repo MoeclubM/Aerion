@@ -1,7 +1,12 @@
+use crate::client::ClientConfig;
 use crate::hysteria2::Hysteria2ClientConfig;
+use crate::mieru::{MieruClientConfig, MieruTransport};
+use crate::naive::NaiveClientConfig;
+use crate::padding::PaddingScheme;
 use crate::reality::RealityClientConfig;
 use crate::shadowsocks::ShadowsocksClientConfig;
 use crate::trojan::TrojanClientConfig;
+use crate::tuic::TuicClientConfig;
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::VlessClientConfig;
 use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
@@ -37,6 +42,12 @@ pub enum MihomoProxy {
     Trojan(MihomoTrojanProxy),
     #[serde(rename = "hysteria2", alias = "hy2")]
     Hysteria2(MihomoHysteria2Proxy),
+    #[serde(rename = "anytls", alias = "any-tls")]
+    AnyTls(MihomoAnyTlsProxy),
+    Mieru(MihomoMieruProxy),
+    #[serde(rename = "naive", alias = "naive+https", alias = "naive+quic")]
+    Naive(MihomoNaiveProxy),
+    Tuic(MihomoTuicProxy),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -202,6 +213,92 @@ pub struct MihomoHysteria2Proxy {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct MihomoMieruProxy {
+    pub name: String,
+    pub server: String,
+    pub port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    pub password: String,
+    #[serde(default = "default_tcp")]
+    pub transport: String,
+    #[serde(default, rename = "traffic-pattern", alias = "traffic_pattern")]
+    pub traffic_pattern: Option<String>,
+    #[serde(default, rename = "nonce-pattern", alias = "nonce_pattern")]
+    pub nonce_pattern: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct MihomoAnyTlsProxy {
+    pub name: String,
+    pub server: String,
+    pub port: u16,
+    pub password: String,
+    #[serde(default, alias = "servername", alias = "server-name", alias = "sni")]
+    pub servername: Option<String>,
+    #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
+    pub skip_cert_verify: bool,
+    #[serde(default, rename = "padding-scheme", alias = "padding_scheme")]
+    pub padding_scheme: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct MihomoNaiveProxy {
+    pub name: String,
+    pub server: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default, alias = "servername", alias = "server-name", alias = "sni")]
+    pub servername: Option<String>,
+    #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
+    pub skip_cert_verify: bool,
+    #[serde(default)]
+    pub quic: bool,
+    #[serde(default, rename = "udp-over-tcp", alias = "udp_over_tcp")]
+    pub udp_over_tcp: Option<MihomoUdpOverTcpOptions>,
+    #[serde(default, rename = "extra-headers", alias = "extra_headers")]
+    pub extra_headers: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct MihomoTuicProxy {
+    pub name: String,
+    pub server: String,
+    pub port: u16,
+    #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default = "default_true")]
+    pub udp: bool,
+    #[serde(default, alias = "servername", alias = "server-name", alias = "sni")]
+    pub servername: Option<String>,
+    #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
+    pub skip_cert_verify: bool,
+    #[serde(default)]
+    pub alpn: Option<OneOrManyStrings>,
+    #[serde(
+        default = "default_tuic_congestion_control",
+        rename = "congestion-controller",
+        alias = "congestion_control",
+        alias = "congestion-control"
+    )]
+    pub congestion_control: String,
+    #[serde(
+        default = "default_tuic_udp_relay_mode",
+        rename = "udp-relay-mode",
+        alias = "udp_relay_mode"
+    )]
+    pub udp_relay_mode: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct MihomoRealityOpts {
     #[serde(rename = "public-key", alias = "public_key")]
     pub public_key: String,
@@ -269,6 +366,10 @@ pub enum MihomoClientConfig {
     Vmess(VmessClientConfig),
     Trojan(TrojanClientConfig),
     Hysteria2(Hysteria2ClientConfig),
+    AnyTls(ClientConfig),
+    Mieru(MieruClientConfig),
+    Naive(NaiveClientConfig),
+    Tuic(TuicClientConfig),
 }
 
 impl MihomoConfig {
@@ -300,6 +401,10 @@ impl MihomoProxy {
             Self::Vmess(proxy) => &proxy.name,
             Self::Trojan(proxy) => &proxy.name,
             Self::Hysteria2(proxy) => &proxy.name,
+            Self::AnyTls(proxy) => &proxy.name,
+            Self::Mieru(proxy) => &proxy.name,
+            Self::Naive(proxy) => &proxy.name,
+            Self::Tuic(proxy) => &proxy.name,
         }
     }
 
@@ -314,6 +419,10 @@ impl MihomoProxy {
             Self::Hysteria2(proxy) => {
                 MihomoClientConfig::Hysteria2(proxy.to_client_config(listen)?)
             }
+            Self::AnyTls(proxy) => MihomoClientConfig::AnyTls(proxy.to_client_config(listen)?),
+            Self::Mieru(proxy) => MihomoClientConfig::Mieru(proxy.to_client_config(listen)?),
+            Self::Naive(proxy) => MihomoClientConfig::Naive(proxy.to_client_config(listen)?),
+            Self::Tuic(proxy) => MihomoClientConfig::Tuic(proxy.to_client_config(listen)?),
         })
     }
 }
@@ -490,6 +599,110 @@ impl MihomoHysteria2Proxy {
     }
 }
 
+impl MihomoAnyTlsProxy {
+    pub fn to_client_config(&self, listen: SocketAddr) -> Result<ClientConfig> {
+        Ok(ClientConfig {
+            listen,
+            server_host: self.server.clone(),
+            server_port: self.port,
+            password: self.password.clone(),
+            sni: sni_or_server(self.servername.as_deref(), &self.server),
+            insecure: self.skip_cert_verify,
+            padding_scheme: if self.padding_scheme.is_empty() {
+                PaddingScheme::default_lines()
+            } else {
+                self.padding_scheme.clone()
+            },
+            heartbeat_interval_secs: 30,
+        })
+    }
+}
+
+impl MihomoMieruProxy {
+    pub fn to_client_config(&self, listen: SocketAddr) -> Result<MieruClientConfig> {
+        ensure!(
+            self.traffic_pattern
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+                && self
+                    .nonce_pattern
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty(),
+            "mihomo Mieru proxy {} sets traffic-pattern/nonce-pattern shaping; Aerion does not implement it yet",
+            self.name
+        );
+        Ok(MieruClientConfig {
+            listen,
+            server_host: self.server.clone(),
+            server_port: self.port,
+            username: self
+                .username
+                .clone()
+                .unwrap_or_else(|| self.password.clone()),
+            password: self.password.clone(),
+            hashed_password: None,
+            mtu: 1500,
+            transport: MieruTransport::parse(&self.transport)?,
+        })
+    }
+}
+
+impl MihomoNaiveProxy {
+    pub fn to_client_config(&self, listen: SocketAddr) -> Result<NaiveClientConfig> {
+        Ok(NaiveClientConfig {
+            listen,
+            server_host: self.server.clone(),
+            server_port: self.port.unwrap_or(443),
+            username: self.username.clone().unwrap_or_default(),
+            password: self.password.clone().unwrap_or_default(),
+            sni: sni_or_server(self.servername.as_deref(), &self.server),
+            insecure: self.skip_cert_verify,
+            extra_headers: self.extra_headers.clone().into_iter().collect(),
+            udp_over_tcp: self
+                .udp_over_tcp
+                .as_ref()
+                .map(|options| options.enabled)
+                .unwrap_or(false),
+            quic: self.quic,
+        })
+    }
+}
+
+impl MihomoTuicProxy {
+    pub fn to_client_config(&self, listen: SocketAddr) -> Result<TuicClientConfig> {
+        ensure!(
+            self.token.as_deref().unwrap_or_default().trim().is_empty(),
+            "mihomo TUIC proxy {} uses TUIC v4 token; Aerion implements TUIC v5 UUID/password auth",
+            self.name
+        );
+        ensure_tuic_alpn(&self.name, self.alpn.as_ref())?;
+        Ok(TuicClientConfig {
+            listen,
+            server_host: self.server.clone(),
+            server_port: self.port,
+            uuid: self
+                .uuid
+                .clone()
+                .with_context(|| format!("mihomo TUIC proxy {} is missing uuid", self.name))?,
+            password: self
+                .password
+                .clone()
+                .with_context(|| format!("mihomo TUIC proxy {} is missing password", self.name))?,
+            sni: sni_or_server(self.servername.as_deref(), &self.server),
+            insecure: self.skip_cert_verify,
+            udp: self.udp,
+            udp_relay_mode: self.udp_relay_mode.clone(),
+            congestion_control: self.congestion_control.clone(),
+            alpn_protocols: alpn_values(self.alpn.as_ref()),
+            heartbeat_interval_secs: 10,
+        })
+    }
+}
+
 impl MihomoRealityOpts {
     pub fn to_client_config(&self) -> Result<RealityClientConfig> {
         RealityClientConfig::from_strings(&self.public_key, &self.short_id)
@@ -577,6 +790,16 @@ fn ensure_hy2_alpn(name: &str, alpn: Option<&OneOrManyStrings>) -> Result<()> {
     Ok(())
 }
 
+fn ensure_tuic_alpn(name: &str, alpn: Option<&OneOrManyStrings>) -> Result<()> {
+    let values = alpn_values(alpn);
+    ensure!(
+        values.is_empty() || values.iter().any(|value| value.eq_ignore_ascii_case("h3")),
+        "mihomo TUIC proxy {name} sets ALPN {:?}; TUIC over QUIC requires h3-compatible ALPN",
+        values
+    );
+    Ok(())
+}
+
 fn alpn_values(alpn: Option<&OneOrManyStrings>) -> Vec<String> {
     alpn.map(OneOrManyStrings::to_vec)
         .unwrap_or_default()
@@ -608,6 +831,14 @@ fn default_vmess_cipher() -> String {
 
 fn default_hy2_congestion_control() -> String {
     "bbr".to_string()
+}
+
+fn default_tuic_congestion_control() -> String {
+    "cubic".to_string()
+}
+
+fn default_tuic_udp_relay_mode() -> String {
+    "native".to_string()
 }
 
 fn deserialize_optional_bandwidth_mbps<'de, D>(

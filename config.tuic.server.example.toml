@@ -1,0 +1,15 @@
+mode = "server"
+
+[server]
+protocol = "tuic"
+listen = "0.0.0.0:443"
+username = "00000000-0000-0000-0000-000000000000"
+password = "change-me"
+# Optional extra accepted TUIC v5 users in "uuid:password" form.
+# users = ["11111111-1111-1111-1111-111111111111:change-me-too"]
+cert = "server.crt"
+key = "server.key"
+udp = true
+congestion_control = "cubic"
+alpn = ["h3"]
+heartbeat_interval_secs = 10

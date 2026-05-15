@@ -16,6 +16,7 @@ pub mod socket_protect;
 pub mod socks;
 pub mod tls;
 pub mod trojan;
+pub mod tuic;
 pub mod uot;
 pub mod utls;
 pub mod vless;
@@ -43,7 +44,7 @@ pub use mieru::{
     MieruClientConfig, MieruServerConfig, MieruTransport, MieruUser, parse_mieru_user,
     run_mieru_client, run_mieru_client_listener, run_mieru_server, run_mieru_server_with_core,
 };
-pub use naive::{NaiveClientConfig, run_naive_client_listener};
+pub use naive::{NaiveClientConfig, run_naive_client, run_naive_client_listener};
 pub use reality::{
     BuiltRealityClientHello, RealityClientConfig, RealityServerConfig, build_reality_client_hello,
     build_reality_client_hello_with_alpn,
@@ -55,6 +56,10 @@ pub use shadowsocks::{
 pub use trojan::{
     TrojanClientConfig, TrojanServerConfig, run_trojan_client, run_trojan_client_listener,
     run_trojan_server, run_trojan_server_with_core,
+};
+pub use tuic::{
+    TuicClientConfig, TuicServerConfig, TuicUdpRelayMode, TuicUser, parse_tuic_user,
+    run_tuic_client, run_tuic_client_listener, run_tuic_server, run_tuic_server_with_core,
 };
 pub use utls::UtlsFingerprint;
 pub use vless::{

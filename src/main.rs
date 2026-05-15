@@ -1,10 +1,13 @@
 use aerion::config::{FileConfig, default_heartbeat_interval_secs, load_config};
 use aerion::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
 use aerion::mieru::{MieruClientConfig, MieruServerConfig, MieruTransport, parse_mieru_user};
+use aerion::naive::NaiveClientConfig;
 use aerion::padding::PaddingScheme;
+use aerion::tuic::{TuicClientConfig, TuicServerConfig, parse_tuic_user};
 use aerion::{
     ClientConfig, ServerConfig, run_client, run_hysteria2_client, run_hysteria2_server,
-    run_mieru_client, run_mieru_server, run_server, tls,
+    run_mieru_client, run_mieru_server, run_naive_client, run_server, run_tuic_client,
+    run_tuic_server, tls,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -132,6 +135,52 @@ enum Command {
         #[arg(long, default_value = "tcp")]
         transport: String,
     },
+    TuicClient {
+        #[arg(long, default_value = "127.0.0.1:1080")]
+        listen: SocketAddr,
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        uuid: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        sni: Option<String>,
+        #[arg(long)]
+        insecure: bool,
+        #[arg(long, default_value_t = true)]
+        udp: bool,
+        #[arg(long = "udp-relay-mode", default_value = "native")]
+        udp_relay_mode: String,
+        #[arg(long = "congestion-control", default_value = "cubic")]
+        congestion_control: String,
+        #[arg(long = "alpn")]
+        alpn_protocols: Vec<String>,
+        #[arg(long, default_value_t = default_heartbeat_interval_secs())]
+        heartbeat_interval_secs: u64,
+    },
+    TuicServer {
+        #[arg(long, default_value = "0.0.0.0:443")]
+        listen: SocketAddr,
+        #[arg(long)]
+        uuid: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long = "user")]
+        users: Vec<String>,
+        #[arg(long)]
+        cert: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long, default_value_t = true)]
+        udp: bool,
+        #[arg(long = "congestion-control", default_value = "cubic")]
+        congestion_control: String,
+        #[arg(long = "alpn")]
+        alpn_protocols: Vec<String>,
+        #[arg(long, default_value_t = default_heartbeat_interval_secs())]
+        heartbeat_interval_secs: u64,
+    },
 }
 
 #[tokio::main]
@@ -163,6 +212,7 @@ async fn main() -> Result<()> {
                     .await;
                 }
                 if is_mieru(&client.protocol) {
+                    ensure_mieru_shaping_disabled(&client.traffic_pattern, &client.nonce_pattern)?;
                     return run_mieru_client(MieruClientConfig {
                         listen: client.listen,
                         server_host,
@@ -172,6 +222,39 @@ async fn main() -> Result<()> {
                         hashed_password: None,
                         mtu: client.mtu,
                         transport: MieruTransport::parse(&client.transport)?,
+                    })
+                    .await;
+                }
+                if is_tuic(&client.protocol) {
+                    return run_tuic_client(TuicClientConfig {
+                        listen: client.listen,
+                        server_host,
+                        server_port,
+                        uuid: client.username,
+                        password: client.password,
+                        sni,
+                        insecure: client.insecure,
+                        udp: client.udp,
+                        udp_relay_mode: client.udp_relay_mode,
+                        congestion_control: client.congestion_control,
+                        alpn_protocols: client.alpn_protocols,
+                        heartbeat_interval_secs: client.heartbeat_interval_secs,
+                    })
+                    .await;
+                }
+                if is_naive(&client.protocol) {
+                    return run_naive_client(NaiveClientConfig {
+                        listen: client.listen,
+                        server_host,
+                        server_port,
+                        username: client.username,
+                        password: client.password,
+                        sni,
+                        insecure: client.insecure,
+                        extra_headers: Vec::new(),
+                        udp_over_tcp: client.udp,
+                        quic: client.transport.eq_ignore_ascii_case("quic")
+                            || client.protocol.eq_ignore_ascii_case("naive+quic"),
                     })
                     .await;
                 }
@@ -207,6 +290,7 @@ async fn main() -> Result<()> {
                     .await;
                 }
                 if is_mieru(&server.protocol) {
+                    ensure_mieru_shaping_disabled(&server.traffic_pattern, &server.nonce_pattern)?;
                     let users = server
                         .users
                         .iter()
@@ -220,6 +304,29 @@ async fn main() -> Result<()> {
                         mtu: server.mtu,
                         user_hint_mandatory: server.user_hint_mandatory,
                         transport: MieruTransport::parse(&server.transport)?,
+                    })
+                    .await;
+                }
+                if is_tuic(&server.protocol) {
+                    let users = server
+                        .users
+                        .iter()
+                        .map(|user| {
+                            parse_tuic_user(user)
+                                .map(|user| format!("{}:{}", user.uuid, user.password))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    return run_tuic_server(TuicServerConfig {
+                        listen: server.listen,
+                        uuid: server.username,
+                        password: server.password,
+                        users,
+                        cert_path: server.cert.context("server cert is required for TUIC")?,
+                        key_path: server.key.context("server key is required for TUIC")?,
+                        udp: server.udp,
+                        congestion_control: server.congestion_control,
+                        alpn_protocols: server.alpn_protocols,
+                        heartbeat_interval_secs: server.heartbeat_interval_secs,
                     })
                     .await;
                 }
@@ -405,6 +512,69 @@ async fn main() -> Result<()> {
             })
             .await
         }
+        Command::TuicClient {
+            listen,
+            server,
+            uuid,
+            password,
+            sni,
+            insecure,
+            udp,
+            udp_relay_mode,
+            congestion_control,
+            alpn_protocols,
+            heartbeat_interval_secs,
+        } => {
+            let (server_host, server_port) = parse_host_port(&server)?;
+            let sni = sni.unwrap_or_else(|| server_host.clone());
+            run_tuic_client(TuicClientConfig {
+                listen,
+                server_host,
+                server_port,
+                uuid,
+                password,
+                sni,
+                insecure,
+                udp,
+                udp_relay_mode,
+                congestion_control,
+                alpn_protocols,
+                heartbeat_interval_secs,
+            })
+            .await
+        }
+        Command::TuicServer {
+            listen,
+            uuid,
+            password,
+            users,
+            cert,
+            key,
+            udp,
+            congestion_control,
+            alpn_protocols,
+            heartbeat_interval_secs,
+        } => {
+            let users = users
+                .iter()
+                .map(|user| {
+                    parse_tuic_user(user).map(|user| format!("{}:{}", user.uuid, user.password))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            run_tuic_server(TuicServerConfig {
+                listen,
+                uuid,
+                password,
+                users,
+                cert_path: cert,
+                key_path: key,
+                udp,
+                congestion_control,
+                alpn_protocols,
+                heartbeat_interval_secs,
+            })
+            .await
+        }
     }
 }
 
@@ -439,6 +609,36 @@ fn is_hysteria2(protocol: &str) -> bool {
 
 fn is_mieru(protocol: &str) -> bool {
     protocol.eq_ignore_ascii_case("mieru") || protocol.eq_ignore_ascii_case("mierus")
+}
+
+fn is_tuic(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case("tuic")
+}
+
+fn is_naive(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case("naive")
+        || protocol.eq_ignore_ascii_case("naive+https")
+        || protocol.eq_ignore_ascii_case("naive+quic")
+}
+
+fn ensure_mieru_shaping_disabled(
+    traffic_pattern: &Option<String>,
+    nonce_pattern: &Option<String>,
+) -> Result<()> {
+    if traffic_pattern
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+        && nonce_pattern
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+    {
+        return Ok(());
+    }
+    bail!("Mieru traffic-pattern padding / nonce-pattern shaping is not implemented by Aerion");
 }
 
 fn ensure_supported_protocol(protocol: &str) -> Result<()> {

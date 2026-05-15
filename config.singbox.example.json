@@ -66,6 +66,33 @@
         "server_name": "example.com",
         "alpn": ["h3"]
       }
+    },
+    {
+      "type": "anytls",
+      "tag": "anytls",
+      "server": "example.com",
+      "server_port": 443,
+      "password": "secret",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com"
+      }
+    },
+    {
+      "type": "tuic",
+      "tag": "tuic-v5",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+      "password": "secret",
+      "congestion_control": "cubic",
+      "udp_relay_mode": "native",
+      "heartbeat": "10s",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com",
+        "alpn": ["h3"]
+      }
     }
   ]
 }

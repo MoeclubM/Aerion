@@ -1,0 +1,15 @@
+mode = "client"
+
+[client]
+protocol = "tuic"
+listen = "127.0.0.1:1080"
+server = "example.com:443"
+username = "00000000-0000-0000-0000-000000000000"
+password = "change-me"
+sni = "example.com"
+insecure = false
+udp = true
+udp_relay_mode = "native"
+congestion_control = "cubic"
+alpn = ["h3"]
+heartbeat_interval_secs = 10

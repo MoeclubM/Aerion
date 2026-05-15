@@ -30,6 +30,12 @@ Aerion now provides these server/client protocol stacks:
   - SOCKS5 UDP ASSOCIATE through Mieru packet-over-stream framing
   - multi-user server authentication and traffic accounting through `ProxyCore`
   - traffic-pattern padding / nonce-pattern shaping is not enabled yet and fails explicitly instead of silently degrading
+- Naive:
+  - local SOCKS5 CONNECT client over HTTPS proxy CONNECT
+  - HTTP/1.1, HTTP/2, and HTTP/3 client tunnels
+  - Basic authentication, TLS SNI verification, optional extra headers
+  - UOT-style SOCKS5 UDP ASSOCIATE when UDP-over-TCP is enabled
+  - Naive-compatible randomized padding chunks for tunnel payloads
 - Shadowsocks:
   - local SOCKS5 CONNECT and UDP ASSOCIATE client
   - TCP relay through the configured Shadowsocks server
@@ -42,6 +48,14 @@ Aerion now provides these server/client protocol stacks:
   - TCP CONNECT
   - UDP ASSOCIATE packets over the Trojan TCP stream
   - multi-user password credentials
+- TUIC:
+  - TUIC v5 over QUIC/TLS with `h3` ALPN
+  - exported-keying-material token authentication from UUID and password
+  - TCP CONNECT over QUIC bidirectional streams
+  - UDP relay through native QUIC datagrams or QUIC unidirectional streams
+  - packet fragmentation/reassembly, dissociate, and heartbeat commands
+  - Cubic / BBR / NewReno congestion control selection
+  - multi-user UUID/password credentials and `ProxyCore` accounting
 - VLESS:
   - TLS client/server core
   - TCP / WebSocket / HTTPUpgrade / HTTP/2 / gRPC transports
@@ -76,11 +90,13 @@ Aerion now provides these server/client protocol stacks:
     built-in handshake transcript
   - config compatibility is stored separately under `src/config_compat/`
   - `MihomoConfig` parses Clash.Meta / mihomo-style `proxies:` YAML for
-    Shadowsocks, VLESS, VMess, Trojan, and Hysteria2 core profiles
+    Shadowsocks, VLESS, VMess, Trojan, Hysteria2, AnyTLS, Mieru, Naive, and
+    TUIC core profiles
   - `XrayConfig` parses Xray JSON / JSONC `inbounds` and `outbounds`
     profiles with Shadowsocks, VLESS, VMess, Trojan, and Hysteria2 selection helpers
   - `SingBoxConfig` parses sing-box JSON / JSONC `inbounds` and `outbounds`
-    profiles with Shadowsocks, VLESS, VMess, Trojan, and Hysteria2 selection helpers
+    profiles with Shadowsocks, VLESS, VMess, Trojan, Hysteria2, AnyTLS, Naive,
+    and TUIC selection helpers
   - protocol modules expose the bottom-level connection capability; profile
     selection and service/app policy stay in the integrating client or server
   - unsupported transport mismatches such as mihomo `smux` or
@@ -111,7 +127,8 @@ Aerion now provides these server/client protocol stacks:
 
 `run_server_listener_with_core`, `run_hysteria2_server_with_core`,
 `run_mieru_server_with_core`, `run_trojan_server_with_core`,
-`run_vless_server_with_core`, and `run_vmess_server_with_core` accept a
+`run_tuic_server_with_core`, `run_vless_server_with_core`, and
+`run_vmess_server_with_core` accept a
 `ProxyCore` so upper layers can own user state, statistics, limits, and quota
 policy without adding panel/UI code here.
 
@@ -155,6 +172,9 @@ cargo run -- run --config config.hy2.server.example.toml
 cargo run -- run --config config.hy2.client.example.toml
 cargo run -- run --config config.mieru.server.example.toml
 cargo run -- run --config config.mieru.client.example.toml
+cargo run -- run --config config.naive.client.example.toml
+cargo run -- run --config config.tuic.server.example.toml
+cargo run -- run --config config.tuic.client.example.toml
 cargo run -- run --config config.mihomo.example.yaml
 cargo run -- run --config config.xray.example.json
 cargo run -- run --config config.singbox.example.json
@@ -164,6 +184,10 @@ Use `protocol = "hysteria2"` in `[client]` or `[server]` to select Hysteria2,
 or `protocol = "mieru"` to select Mieru. Mieru defaults to
 `transport = "tcp"`; set `transport = "udp"` to use the native packet
 underlay.
+Use `protocol = "tuic"` with `username` as the TUIC UUID and `password` as the
+TUIC password; extra server users use `uuid:password` entries.
+Use `protocol = "naive"` for an HTTPS Naive client; set `transport = "quic"`
+or `protocol = "naive+quic"` for HTTP/3.
 The mihomo / Xray / sing-box loaders are exposed for core integration and
 profile conversion; the CLI only parses them and then asks the upper layer to
 select a proxy profile.
@@ -185,6 +209,28 @@ cargo run -- hysteria2-client `
   --password "change-me" `
   --sni example.com `
   --congestion-control bbr
+```
+
+## Run TUIC
+
+```powershell
+cargo run -- tuic-server `
+  --listen 0.0.0.0:443 `
+  --uuid 00000000-0000-0000-0000-000000000000 `
+  --password "change-me" `
+  --congestion-control cubic `
+  --cert server.crt `
+  --key server.key
+
+cargo run -- tuic-client `
+  --listen 127.0.0.1:1080 `
+  --server example.com:443 `
+  --uuid 00000000-0000-0000-0000-000000000000 `
+  --password "change-me" `
+  --sni example.com `
+  --udp-relay-mode native `
+  --congestion-control cubic `
+  --alpn h3
 ```
 
 ## Validation

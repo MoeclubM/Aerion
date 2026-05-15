@@ -48,3 +48,24 @@ proxies:
     obfs-password: obfs-secret
     down: 100
     udp: true
+
+  - name: anytls
+    type: anytls
+    server: example.com
+    port: 443
+    password: secret
+    sni: example.com
+    skip-cert-verify: false
+
+  - name: tuic-v5
+    type: tuic
+    server: example.com
+    port: 443
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    password: secret
+    sni: example.com
+    alpn:
+      - h3
+    congestion-controller: cubic
+    udp-relay-mode: native
+    udp: true

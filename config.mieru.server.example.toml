@@ -9,4 +9,6 @@ password = "change-me"
 users = ["alice:alice-password"]
 mtu = 1500
 transport = "tcp" # tcp/stream or udp/packet
+# traffic_pattern / nonce_pattern shaping is not implemented yet; setting either
+# field fails explicitly instead of being ignored.
 user-hint-mandatory = false
