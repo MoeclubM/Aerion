@@ -33,6 +33,7 @@ pub struct TrafficSnapshot {
     pub download_bytes: u64,
     pub online_sessions: u64,
     pub online_ips: u64,
+    pub online_ip_list: Vec<String>,
     pub quota_bytes: Option<u64>,
     pub quota_remaining_bytes: Option<u64>,
     pub max_online_sessions: Option<u64>,
@@ -522,12 +523,14 @@ impl UserState {
         let upload = self.upload.load(Ordering::Relaxed);
         let download = self.download.load(Ordering::Relaxed);
         let limits = *self.limits.read().expect("core limits lock poisoned");
+        let online_ip_list = self.online_ip_list();
         TrafficSnapshot {
             user_id: self.id.clone(),
             upload_bytes: upload,
             download_bytes: download,
             online_sessions: self.online.load(Ordering::Relaxed),
             online_ips: self.online_ips.load(Ordering::Relaxed),
+            online_ip_list,
             quota_bytes: limits.quota_bytes,
             quota_remaining_bytes: limits
                 .quota_bytes
@@ -535,6 +538,18 @@ impl UserState {
             max_online_sessions: limits.max_online_sessions,
             max_online_ips: limits.max_online_ips,
         }
+    }
+
+    fn online_ip_list(&self) -> Vec<String> {
+        let sessions = self.sessions.lock().expect("core sessions lock poisoned");
+        let mut ips = sessions
+            .values()
+            .filter_map(|slot| slot.source_ip.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        ips.sort();
+        ips
     }
 }
 
