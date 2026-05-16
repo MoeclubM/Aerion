@@ -197,6 +197,8 @@ pub struct SingBoxTuicOutbound {
     pub uuid: String,
     pub password: String,
     #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
     pub tls: Option<SingBoxTlsOptions>,
     #[serde(default, rename = "congestion_control")]
     pub congestion_control: Option<String>,
@@ -204,6 +206,10 @@ pub struct SingBoxTuicOutbound {
     pub udp_relay_mode: Option<String>,
     #[serde(default)]
     pub heartbeat: Option<String>,
+    #[serde(default, rename = "zero_rtt_handshake")]
+    pub zero_rtt_handshake: bool,
+    #[serde(default, rename = "udp_over_stream")]
+    pub udp_over_stream: Option<Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -684,6 +690,15 @@ impl SingBoxNaiveOutbound {
 
 impl SingBoxTuicOutbound {
     pub fn to_client_config(&self, name: &str, listen: SocketAddr) -> Result<TuicClientConfig> {
+        ensure_supported_network("sing-box", name, self.network.as_deref())?;
+        ensure!(
+            !self.zero_rtt_handshake,
+            "sing-box TUIC outbound {name} enables zero_rtt_handshake; Aerion TUIC client does not expose 0-RTT handshakes"
+        );
+        ensure!(
+            !value_bool_or_object(self.udp_over_stream.as_ref()),
+            "sing-box TUIC outbound {name} enables udp_over_stream; Aerion TUIC client does not implement UDP-over-stream"
+        );
         let tls = self
             .tls
             .as_ref()
@@ -701,7 +716,7 @@ impl SingBoxTuicOutbound {
             password: self.password.clone(),
             sni: sni_or_server(tls.server_name.as_deref(), &self.server),
             insecure: tls.insecure,
-            udp: true,
+            udp: network_allows_udp(self.network.as_deref()),
             udp_relay_mode: self
                 .udp_relay_mode
                 .clone()
@@ -1481,6 +1496,7 @@ mod tests {
       "server_port": 443,
       "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
       "password": "secret",
+      "network": "tcp",
       "udp_relay_mode": "quic",
       "congestion_control": "bbr",
       "heartbeat": "15s",
@@ -1512,10 +1528,55 @@ mod tests {
         };
         assert_eq!(tuic.server_host, "tuic.example.com");
         assert_eq!(tuic.sni, "front.example.com");
+        assert!(!tuic.udp);
         assert_eq!(tuic.udp_relay_mode, "quic");
         assert_eq!(tuic.congestion_control, "bbr");
         assert_eq!(tuic.alpn_protocols, vec!["h3".to_string()]);
         assert_eq!(tuic.heartbeat_interval_secs, 15);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unmapped_tuic_options() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "type": "tuic",
+      "tag": "tuic-0rtt",
+      "server": "tuic.example.com",
+      "server_port": 443,
+      "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+      "password": "secret",
+      "zero_rtt_handshake": true,
+      "tls": { "enabled": true }
+    },
+    {
+      "type": "tuic",
+      "tag": "tuic-uos",
+      "server": "tuic.example.com",
+      "server_port": 443,
+      "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+      "password": "secret",
+      "udp_over_stream": true,
+      "tls": { "enabled": true }
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let zero_rtt_error = config.outbounds[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("0-RTT must be explicit");
+        assert!(zero_rtt_error.to_string().contains("zero_rtt"));
+        let udp_over_stream_error = config.outbounds[1]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("udp_over_stream must be explicit");
+        assert!(
+            udp_over_stream_error
+                .to_string()
+                .contains("udp_over_stream")
+        );
         Ok(())
     }
 }
