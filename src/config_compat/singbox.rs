@@ -498,9 +498,13 @@ impl SingBoxVmessOutbound {
 
 impl SingBoxTrojanOutbound {
     pub fn to_client_config(&self, name: &str, listen: SocketAddr) -> Result<TrojanClientConfig> {
-        ensure_transport_is_raw("sing-box", name, self.transport.as_ref())?;
         ensure_multiplex_disabled("sing-box", name, self.multiplex.as_ref())?;
-        ensure_tcp_network("sing-box", name, self.network.as_deref())?;
+        let transport = vless_transport_config(
+            "sing-box",
+            name,
+            self.network.as_deref(),
+            self.transport.as_ref(),
+        )?;
         let tls = self
             .tls
             .as_ref()
@@ -509,7 +513,7 @@ impl SingBoxTrojanOutbound {
             tls.enabled,
             "sing-box Trojan outbound {name} disables TLS; Trojan requires TLS in Aerion"
         );
-        ensure_no_alpn("sing-box", name, tls.alpn.as_ref())?;
+        ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
         Ok(TrojanClientConfig {
             listen,
             server_host: self.server.clone(),
@@ -519,6 +523,7 @@ impl SingBoxTrojanOutbound {
             insecure: tls.insecure,
             udp: network_allows_udp(self.network.as_deref()),
             client_fingerprint: tls.utls_fingerprint(name)?,
+            transport,
         })
     }
 }
@@ -732,20 +737,6 @@ fn network_allows_udp(network: Option<&str>) -> bool {
         .unwrap_or_default()
         .trim()
         .eq_ignore_ascii_case("tcp")
-}
-
-fn ensure_transport_is_raw(format: &str, name: &str, transport: Option<&Value>) -> Result<()> {
-    if let Some(Value::Object(map)) = transport {
-        ensure!(
-            map.is_empty(),
-            "{format} outbound {name} sets transport; Aerion currently wires raw TCP transport only"
-        );
-    }
-    ensure!(
-        transport.is_none() || matches!(transport, Some(Value::Object(map)) if map.is_empty()),
-        "{format} outbound {name} sets transport; Aerion currently wires raw TCP transport only"
-    );
-    Ok(())
 }
 
 fn vless_transport_config(
@@ -1100,6 +1091,40 @@ mod tests {
         assert_eq!(vless.transport.path, "/vless");
         assert_eq!(
             vless.transport.request_host("example.com"),
+            "edge.example.com"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_trojan_websocket_transport() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [{
+    "type": "trojan",
+    "tag": "trojan-ws",
+    "server": "example.com",
+    "server_port": 443,
+    "password": "secret",
+    "tls": { "enabled": true },
+    "transport": {
+      "type": "ws",
+      "path": "/trojan",
+      "headers": { "Host": "edge.example.com" }
+    }
+  }]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxClientConfig::Trojan(trojan) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Trojan")
+        };
+        assert_eq!(trojan.transport.kind, VlessTransportKind::WebSocket);
+        assert_eq!(trojan.transport.path, "/trojan");
+        assert_eq!(
+            trojan.transport.request_host("example.com"),
             "edge.example.com"
         );
         Ok(())

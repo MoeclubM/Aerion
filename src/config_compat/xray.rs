@@ -513,14 +513,14 @@ impl XrayOutbound {
 
     fn to_trojan_client_config(&self, listen: SocketAddr) -> Result<TrojanClientConfig> {
         let server = self.first_trojan_server()?;
-        ensure_tcp_network("xray", self.name(), &self.stream_settings.network)?;
+        let transport = self.vless_transport_config()?;
         ensure_tls_or_reality("xray Trojan", self.name(), &self.stream_settings.security)?;
         ensure!(
             !self.is_reality(),
             "xray Trojan outbound {} uses REALITY; Aerion only wires REALITY on VLESS",
             self.name()
         );
-        ensure_no_alpn("xray", self.name(), self.stream_alpn())?;
+        ensure_vless_alpn("xray", self.name(), &transport, self.stream_alpn())?;
         let tls = self.stream_settings.tls_settings.as_ref();
         let server_host = server.address.clone();
         Ok(TrojanClientConfig {
@@ -538,6 +538,7 @@ impl XrayOutbound {
             insecure: tls.map(|settings| settings.allow_insecure).unwrap_or(false),
             udp: true,
             client_fingerprint: tls.and_then(|settings| settings.fingerprint),
+            transport,
         })
     }
 
@@ -1042,6 +1043,42 @@ mod tests {
         assert_eq!(vmess.packet_encoding, "packetaddr");
         assert_eq!(
             vmess.transport.request_host("example.com"),
+            "edge.example.com"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_trojan_websocket_transport() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [{
+    "tag": "trojan-ws",
+    "protocol": "trojan",
+    "settings": {
+      "servers": [{ "address": "example.com", "port": 443, "password": "secret" }]
+    },
+    "streamSettings": {
+      "network": "ws",
+      "security": "tls",
+      "wsSettings": {
+        "path": "/trojan",
+        "headers": { "Host": "edge.example.com" }
+      }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let XrayClientConfig::Trojan(trojan) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Trojan")
+        };
+        assert_eq!(trojan.transport.kind, VlessTransportKind::WebSocket);
+        assert_eq!(trojan.transport.path, "/trojan");
+        assert_eq!(
+            trojan.transport.request_host("example.com"),
             "edge.example.com"
         );
         Ok(())

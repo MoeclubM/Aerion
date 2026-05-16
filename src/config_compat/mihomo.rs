@@ -601,8 +601,27 @@ impl MihomoTrojanProxy {
             "mihomo Trojan proxy {} disables TLS; Trojan requires TLS in Aerion",
             self.name
         );
-        ensure_tcp_network(&self.name, &self.network)?;
-        ensure_no_alpn(&self.name, self.alpn.as_ref())?;
+        let network = self.network.trim();
+        let transport = if network.eq_ignore_ascii_case("grpc") {
+            VlessTransportConfig::from_network(
+                network,
+                self.grpc_opts
+                    .as_ref()
+                    .and_then(|opts| opts.grpc_service_name.clone()),
+                None,
+                Vec::new(),
+            )?
+        } else {
+            VlessTransportConfig::from_headers(
+                network,
+                self.ws_opts.as_ref().and_then(|opts| opts.path.clone()),
+                self.ws_opts
+                    .as_ref()
+                    .map(|opts| opts.headers.clone())
+                    .unwrap_or_default(),
+            )?
+        };
+        ensure_vless_alpn(&self.name, &transport, self.alpn.as_ref())?;
         Ok(TrojanClientConfig {
             listen,
             server_host: self.server.clone(),
@@ -612,6 +631,7 @@ impl MihomoTrojanProxy {
             insecure: self.skip_cert_verify,
             udp: self.udp,
             client_fingerprint: self.client_fingerprint,
+            transport,
         })
     }
 }
@@ -756,16 +776,6 @@ impl OneOrManyStrings {
             Self::Many(values) => values.clone(),
         }
     }
-}
-
-fn ensure_tcp_network(name: &str, network: &str) -> Result<()> {
-    let network = network.trim();
-    if network.is_empty() || network.eq_ignore_ascii_case("tcp") {
-        return Ok(());
-    }
-    bail!(
-        "mihomo proxy {name} uses network {network}; Aerion currently wires raw TCP transport only"
-    )
 }
 
 fn ensure_no_smux(name: &str, smux: Option<&MihomoSmuxOptions>) -> Result<()> {
@@ -1049,6 +1059,36 @@ proxies:
         assert_eq!(vless.transport.path, "/vless");
         assert_eq!(
             vless.transport.request_host("example.com"),
+            "edge.example.com"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_trojan_websocket_transport() -> Result<()> {
+        let yaml = r#"
+proxies:
+  - name: trojan-ws
+    type: trojan
+    server: example.com
+    port: 443
+    password: secret
+    network: ws
+    ws-opts:
+      path: /trojan
+      headers:
+        Host: edge.example.com
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let MihomoClientConfig::Trojan(trojan) =
+            config.proxies[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Trojan")
+        };
+        assert_eq!(trojan.transport.kind, VlessTransportKind::WebSocket);
+        assert_eq!(trojan.transport.path, "/trojan");
+        assert_eq!(
+            trojan.transport.request_host("example.com"),
             "edge.example.com"
         );
         Ok(())

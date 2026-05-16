@@ -48,6 +48,7 @@ Aerion now provides these server/client protocol stacks:
   - SIP003 plugins are not implemented and fail explicitly
 - Trojan:
   - TLS client/server core
+  - raw TCP, WebSocket, HTTPUpgrade, HTTP/2, gRPC, and XHTTP/SplitHTTP stream-one transports
   - TCP CONNECT
   - UDP ASSOCIATE packets over the Trojan TCP stream
   - multi-user password credentials

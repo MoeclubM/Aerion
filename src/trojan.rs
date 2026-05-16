@@ -1,7 +1,8 @@
 use crate::core::{CoreSession, ProxyCore};
 use crate::protocol::{ProxyTarget, target_name};
 use crate::socket_protect;
-use crate::{socks, tls, uot, utls};
+use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
+use crate::{socks, tls, uot, utls, vless_h2, vless_http, vless_websocket, vless_xhttp};
 use anyhow::{Context, Result, bail, ensure};
 use rustls::pki_types::ServerName;
 use sha2::{Digest, Sha224};
@@ -31,6 +32,7 @@ pub struct TrojanClientConfig {
     pub insecure: bool,
     pub udp: bool,
     pub client_fingerprint: Option<utls::UtlsFingerprint>,
+    pub transport: VlessTransportConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -40,7 +42,14 @@ pub struct TrojanServerConfig {
     pub users: Vec<String>,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+    pub transport: VlessTransportConfig,
 }
+
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+type TrojanTransport = Box<dyn AsyncReadWrite>;
 
 enum TrojanRequest {
     Connect(ProxyTarget),
@@ -90,16 +99,25 @@ pub async fn run_trojan_server_with_core(
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind Trojan server on {}", config.listen))?;
-    let acceptor = TlsAcceptor::from(tls::server_config(&config.cert_path, &config.key_path)?);
+    let mut server_config = tls::server_config(&config.cert_path, &config.key_path)?;
+    let alpn = config.transport.alpn_protocols();
+    if !alpn.is_empty() {
+        server_config.alpn_protocols = alpn;
+    }
+    let acceptor = TlsAcceptor::from(server_config);
     let auth = trojan_auth_map(&config.password, &config.users);
+    let transport = config.transport.clone();
     tracing::info!("Trojan server listening on {}", listener.local_addr()?);
     loop {
         let (stream, peer) = listener.accept().await.context("accept Trojan client")?;
         let acceptor = acceptor.clone();
         let auth = auth.clone();
         let core = core.clone();
+        let transport = transport.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_trojan_client(stream, acceptor, auth, core, peer).await {
+            if let Err(error) =
+                handle_trojan_client(stream, acceptor, auth, core, peer, transport).await
+            {
                 tracing::warn!("Trojan client {peer} failed: {error:?}");
             }
         });
@@ -215,9 +233,7 @@ async fn handle_trojan_udp_associate(
     }
 }
 
-async fn connect_trojan_server(
-    config: &TrojanClientConfig,
-) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+async fn connect_trojan_server(config: &TrojanClientConfig) -> Result<TrojanTransport> {
     let tcp =
         socket_protect::connect_tcp_host_port(config.server_host.as_str(), config.server_port)
             .await
@@ -227,16 +243,72 @@ async fn connect_trojan_server(
                     config.server_host, config.server_port
                 )
             })?;
-    let connector = TlsConnector::from(tls::client_config_with_fingerprint(
+    let mut client_config = Arc::unwrap_or_clone(tls::client_config_with_fingerprint(
         config.insecure,
         config.client_fingerprint,
     ));
+    let alpn = config.transport.alpn_protocols();
+    if !alpn.is_empty() {
+        client_config.alpn_protocols = alpn;
+    }
+    let connector = TlsConnector::from(Arc::new(client_config));
     let server_name = ServerName::try_from(config.sni.clone())
         .with_context(|| format!("invalid Trojan SNI: {}", config.sni))?;
-    connector
+    let stream = connector
         .connect(server_name, tcp)
         .await
-        .context("TLS connect to Trojan server")
+        .context("TLS connect to Trojan server")?;
+    apply_trojan_client_transport(stream, config).await
+}
+
+async fn apply_trojan_client_transport<S>(
+    mut stream: S,
+    config: &TrojanClientConfig,
+) -> Result<TrojanTransport>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match config.transport.kind {
+        VlessTransportKind::Tcp => Ok(Box::new(stream)),
+        VlessTransportKind::HttpUpgrade => {
+            vless_http::client_upgrade(&mut stream, &config.transport, &config.server_host).await?;
+            Ok(Box::new(stream))
+        }
+        VlessTransportKind::WebSocket => Ok(Box::new(
+            vless_websocket::client(stream, &config.transport, &config.server_host).await?,
+        )),
+        VlessTransportKind::Http2 => Ok(Box::new(
+            vless_h2::client(stream, &config.transport, &config.server_host).await?,
+        )),
+        VlessTransportKind::Grpc => Ok(Box::new(
+            vless_h2::grpc_client(stream, &config.transport, &config.server_host).await?,
+        )),
+        VlessTransportKind::Xhttp => Ok(Box::new(
+            vless_xhttp::client(stream, &config.transport, &config.server_host).await?,
+        )),
+    }
+}
+
+async fn apply_trojan_server_transport<S>(
+    mut stream: S,
+    transport: &VlessTransportConfig,
+) -> Result<TrojanTransport>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match transport.kind {
+        VlessTransportKind::Tcp => Ok(Box::new(stream)),
+        VlessTransportKind::HttpUpgrade => {
+            vless_http::server_upgrade(&mut stream, transport).await?;
+            Ok(Box::new(stream))
+        }
+        VlessTransportKind::WebSocket => {
+            Ok(Box::new(vless_websocket::server(stream, transport).await?))
+        }
+        VlessTransportKind::Http2 => Ok(Box::new(vless_h2::server(stream, transport).await?)),
+        VlessTransportKind::Grpc => Ok(Box::new(vless_h2::grpc_server(stream, transport).await?)),
+        VlessTransportKind::Xhttp => Ok(Box::new(vless_xhttp::server(stream, transport).await?)),
+    }
 }
 
 async fn handle_trojan_client(
@@ -245,8 +317,10 @@ async fn handle_trojan_client(
     auth: HashMap<[u8; TROJAN_AUTH_LEN], String>,
     core: ProxyCore,
     peer: SocketAddr,
+    transport: VlessTransportConfig,
 ) -> Result<()> {
-    let mut stream = acceptor.accept(stream).await.context("accept Trojan TLS")?;
+    let stream = acceptor.accept(stream).await.context("accept Trojan TLS")?;
+    let mut stream = apply_trojan_server_transport(stream, &transport).await?;
     let credential = read_trojan_auth(&mut stream, &auth).await?;
     let session = core.authenticate_from(&credential, peer).await?;
     match read_trojan_request(&mut stream).await? {
@@ -299,10 +373,7 @@ where
     Ok(())
 }
 
-async fn relay_trojan_udp(
-    stream: tokio_rustls::server::TlsStream<TcpStream>,
-    session: CoreSession,
-) -> Result<()> {
+async fn relay_trojan_udp(stream: TrojanTransport, session: CoreSession) -> Result<()> {
     let udp = Arc::new(
         UdpSocket::bind("0.0.0.0:0")
             .await
