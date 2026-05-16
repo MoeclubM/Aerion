@@ -1171,6 +1171,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_vmess_xudp_packet_encoding() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [{
+    "type": "vmess",
+    "tag": "vmess-xudp",
+    "server": "example.com",
+    "server_port": 80,
+    "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+    "alter_id": 0,
+    "packet_encoding": "xudp"
+  }]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxClientConfig::Vmess(vmess) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected VMess")
+        };
+        assert_eq!(vmess.packet_encoding, "xudp");
+        Ok(())
+    }
+
+    #[test]
     fn parses_vless_http2_transport() -> Result<()> {
         let json = r#"
 {

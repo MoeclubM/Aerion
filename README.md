@@ -110,7 +110,7 @@ Aerion now provides these server/client protocol stacks:
   - raw TCP/TLS plus TCP / WebSocket / HTTPUpgrade / HTTP/2 / gRPC / XHTTP transports for client/server
   - TCP command with raw `none` body plus chunked AES-128-GCM /
     ChaCha20-Poly1305 body security
-  - UDP command over VMess chunk stream, including `packetaddr` packet encoding
+  - UDP command over VMess chunk stream, including `packetaddr` and `xudp` packet encoding
   - client `security` accepts `none`, `aes-128-gcm`, `chacha20-poly1305`,
     `auto`, or `zero`
   - multi-user UUID credentials

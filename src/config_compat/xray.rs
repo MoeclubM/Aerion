@@ -1049,6 +1049,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_vmess_xudp_packet_encoding() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [{
+    "tag": "vmess-xudp",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [{
+        "address": "example.com",
+        "port": 80,
+        "users": [{
+          "id": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+          "alterId": 0,
+          "packetEncoding": "xudp"
+        }]
+      }]
+    },
+    "streamSettings": { "network": "tcp", "security": "none" }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let XrayClientConfig::Vmess(vmess) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected VMess")
+        };
+        assert_eq!(vmess.packet_encoding, "xudp");
+        Ok(())
+    }
+
+    #[test]
     fn parses_trojan_websocket_transport() -> Result<()> {
         let json = r#"
 {

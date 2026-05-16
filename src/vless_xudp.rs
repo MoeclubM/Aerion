@@ -89,6 +89,18 @@ pub async fn write_client_packet<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    let encoded = encode_client_packet(destination, payload, is_new)?;
+    writer
+        .write_all(&encoded)
+        .await
+        .context("write XUDP packet")
+}
+
+pub fn encode_client_packet(
+    destination: &ProxyTarget,
+    payload: &[u8],
+    is_new: bool,
+) -> Result<Vec<u8>> {
     let mut metadata = vec![
         0u8,
         0u8,
@@ -99,14 +111,11 @@ where
         metadata.push(NETWORK_UDP);
         write_destination_xudp(&mut metadata, destination)?;
     }
-    writer
-        .write_all(&(metadata.len() as u16).to_be_bytes())
-        .await?;
-    writer.write_all(&metadata).await?;
-    writer
-        .write_all(&(payload.len() as u16).to_be_bytes())
-        .await?;
-    writer.write_all(payload).await.context("write XUDP packet")
+    encode_packet_parts(&metadata, payload)
+}
+
+pub fn encode_response_packet(source: &ProxyTarget, payload: &[u8]) -> Result<Vec<u8>> {
+    encode_packet(source, payload)
 }
 
 pub async fn read_response_packet<R>(reader: &mut R) -> Result<Option<(ProxyTarget, Vec<u8>)>>
@@ -133,7 +142,6 @@ where
         metadata_len >= 4,
         "short XUDP metadata length {metadata_len}"
     );
-
     let mut metadata = vec![0u8; metadata_len as usize];
     reader
         .read_exact(&mut metadata)
@@ -145,7 +153,42 @@ where
         .read_exact(&mut payload)
         .await
         .context("read XUDP payload")?;
+    decode_packet_parts(&metadata, payload, current_destination)
+}
 
+pub fn decode_packet_chunk(
+    chunk: &[u8],
+    current_destination: &mut Option<ProxyTarget>,
+) -> Result<Option<(ProxyTarget, Vec<u8>)>> {
+    ensure!(chunk.len() >= 4, "short XUDP packet chunk");
+    let metadata_len = u16::from_be_bytes([chunk[0], chunk[1]]) as usize;
+    ensure!(
+        metadata_len >= 4,
+        "short XUDP metadata length {metadata_len}"
+    );
+    let payload_len_offset = 2 + metadata_len;
+    ensure!(
+        chunk.len() >= payload_len_offset + 2,
+        "truncated XUDP packet chunk"
+    );
+    let payload_len =
+        u16::from_be_bytes([chunk[payload_len_offset], chunk[payload_len_offset + 1]]) as usize;
+    let payload_offset = payload_len_offset + 2;
+    ensure!(
+        chunk.len() == payload_offset + payload_len,
+        "XUDP packet chunk has trailing bytes"
+    );
+    let metadata = &chunk[2..payload_len_offset];
+    let payload = chunk[payload_offset..].to_vec();
+    decode_packet_parts(metadata, payload, current_destination)
+        .map(|packet| packet.map(|packet| (packet.destination, packet.payload)))
+}
+
+fn decode_packet_parts(
+    metadata: &[u8],
+    payload: Vec<u8>,
+    current_destination: &mut Option<ProxyTarget>,
+) -> Result<Option<ClientPacket>> {
     let status = metadata[2];
     if status == STATUS_END {
         return Ok(None);
@@ -185,10 +228,18 @@ fn encode_packet(source: &ProxyTarget, payload: &[u8]) -> Result<Vec<u8>> {
     ensure!(payload.len() <= u16::MAX as usize, "XUDP payload too large");
     let mut metadata = vec![0u8, 0u8, STATUS_KEEP, 0x01, NETWORK_UDP];
     write_destination_xudp(&mut metadata, source)?;
+    encode_packet_parts(&metadata, payload)
+}
 
+fn encode_packet_parts(metadata: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
+    ensure!(
+        metadata.len() <= u16::MAX as usize,
+        "XUDP metadata too large"
+    );
+    ensure!(payload.len() <= u16::MAX as usize, "XUDP payload too large");
     let mut encoded = Vec::with_capacity(2 + metadata.len() + 2 + payload.len());
     encoded.extend_from_slice(&(metadata.len() as u16).to_be_bytes());
-    encoded.extend_from_slice(&metadata);
+    encoded.extend_from_slice(metadata);
     encoded.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     encoded.extend_from_slice(payload);
     Ok(encoded)
@@ -323,6 +374,16 @@ mod tests {
             .context("packet")?;
         assert_eq!(packet.destination, target);
         assert_eq!(packet.payload, b"abc");
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_in_memory_xudp_packet_chunk() -> Result<()> {
+        let target = ProxyTarget::Domain("example.com".to_string(), 53);
+        let bytes = encode_client_packet(&target, b"abc", true)?;
+        let (destination, payload) = decode_packet_chunk(&bytes, &mut None)?.context("packet")?;
+        assert_eq!(destination, target);
+        assert_eq!(payload, b"abc");
         Ok(())
     }
 }

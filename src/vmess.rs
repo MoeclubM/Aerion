@@ -4,6 +4,7 @@ use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
 use crate::vmess_body::{BodyConfig, BodyReader, BodyWriter, RequestOptions, SecurityType};
 use crate::{
     socket_protect, socks, tls, uot, utls, vless_h2, vless_http, vless_websocket, vless_xhttp,
+    vless_xudp,
 };
 use aes::Aes128;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, generic_array::GenericArray};
@@ -27,6 +28,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 const VERSION: u8 = 0x01;
 const CMD_TCP: u8 = 0x01;
 const CMD_UDP: u8 = 0x02;
+const CMD_MUX: u8 = 0x03;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x02;
 const ATYP_IPV6: u8 = 0x03;
@@ -98,6 +100,7 @@ struct VmessClientKeys {
 enum VmessPacketEncoding {
     PerTarget,
     PacketAddr,
+    Xudp,
 }
 
 pub fn ensure_vmess_packet_encoding(value: &str) -> Result<()> {
@@ -108,9 +111,7 @@ fn vmess_packet_encoding(value: &str) -> Result<VmessPacketEncoding> {
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "none" => Ok(VmessPacketEncoding::PerTarget),
         "packetaddr" | "packet-addr" => Ok(VmessPacketEncoding::PacketAddr),
-        "xudp" => bail!(
-            "VMess packet_encoding xudp requires VMess Mux/XUDP; Aerion currently supports packetaddr or per-target UDP"
-        ),
+        "xudp" => Ok(VmessPacketEncoding::Xudp),
         other => bail!("unsupported VMess packet_encoding {other}"),
     }
 }
@@ -352,6 +353,14 @@ async fn handle_vmess_client(
             write_vmess_response_header(&mut stream, &request).await?;
             relay_vmess_udp(stream, request, session).await
         }
+        CMD_MUX if vless_xudp::is_mux_target(&request.target) => {
+            write_vmess_response_header(&mut stream, &request).await?;
+            relay_vmess_udp(stream, request, session).await
+        }
+        CMD_MUX => bail!(
+            "unsupported VMess mux target {}",
+            target_name(&request.target)
+        ),
         other => bail!("unsupported VMess command {other:#x}"),
     }
 }
@@ -491,8 +500,14 @@ async fn handle_vmess_udp_associate(
         Arc<Mutex<BodyWriter<WriteHalf<VmessTransport>>>>,
     >::new()));
     let user = parse_uuid(&config.user_id)?;
-    if vmess_packet_encoding(&config.packet_encoding)? == VmessPacketEncoding::PacketAddr {
-        return handle_vmess_packetaddr_associate(control, config, udp, user).await;
+    match vmess_packet_encoding(&config.packet_encoding)? {
+        VmessPacketEncoding::PacketAddr => {
+            return handle_vmess_packetaddr_associate(control, config, udp, user).await;
+        }
+        VmessPacketEncoding::Xudp => {
+            return handle_vmess_xudp_associate(control, config, udp, user).await;
+        }
+        VmessPacketEncoding::PerTarget => {}
     }
 
     let udp_loop = {
@@ -645,6 +660,103 @@ async fn handle_vmess_packetaddr_associate(
     }
 }
 
+async fn handle_vmess_xudp_associate(
+    mut control: TcpStream,
+    config: VmessClientConfig,
+    udp: Arc<UdpSocket>,
+    user: [u8; 16],
+) -> Result<()> {
+    let mut server = connect_vmess_transport(&config).await?;
+    let security = SecurityType::from_name(&config.security)?;
+    let options = vmess_request_options(CMD_MUX, security);
+    let keys = write_vmess_request(
+        &mut server,
+        &user,
+        CMD_MUX,
+        &vless_xudp::mux_target(),
+        security,
+        options,
+    )
+    .await?;
+    read_vmess_response_header(&mut server, &keys).await?;
+    let request_config = BodyConfig::new_request(
+        keys.security,
+        keys.options,
+        keys.request_body_key,
+        keys.request_body_iv,
+    )?;
+    let response_config = BodyConfig::new_response(
+        keys.security,
+        keys.options,
+        keys.request_body_key,
+        keys.request_body_iv,
+    )?;
+    let (reader, writer) = tokio::io::split(server);
+    let mut reader = BodyReader::new(reader, response_config);
+    let mut writer = BodyWriter::new(writer, request_config);
+    let peer = Arc::new(Mutex::new(None::<SocketAddr>));
+
+    let udp_to_vmess = {
+        let udp = udp.clone();
+        let peer = peer.clone();
+        async move {
+            let mut buffer = vec![0u8; u16::MAX as usize + 32];
+            loop {
+                let (read, next_peer) = udp
+                    .recv_from(&mut buffer)
+                    .await
+                    .context("receive SOCKS UDP packet")?;
+                *peer.lock().await = Some(next_peer);
+                let (target, payload) = uot::parse_socks_udp_packet(&buffer[..read])?;
+                let packet = vless_xudp::encode_client_packet(&target, payload, true)?;
+                writer
+                    .write_packet_plain(&packet)
+                    .await
+                    .context("write VMess XUDP packet")?;
+            }
+        }
+    };
+    let vmess_to_udp = {
+        let udp = udp.clone();
+        async move {
+            let mut current_source = None;
+            loop {
+                let Some(packet) = reader.read_packet().await? else {
+                    return Ok::<(), anyhow::Error>(());
+                };
+                let Some((source, payload)) =
+                    vless_xudp::decode_packet_chunk(&packet, &mut current_source)?
+                else {
+                    return Ok::<(), anyhow::Error>(());
+                };
+                let response = uot::encode_socks_udp_packet(&source, &payload)?;
+                let peer = (*peer.lock().await).context("SOCKS UDP peer is not known yet")?;
+                udp.send_to(&response, peer)
+                    .await
+                    .with_context(|| format!("send VMess XUDP response to {peer}"))?;
+            }
+        }
+    };
+    let control_closed = async {
+        let mut buffer = [0u8; 1];
+        loop {
+            if control
+                .read(&mut buffer)
+                .await
+                .context("read SOCKS UDP control connection")?
+                == 0
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    };
+    tokio::select! {
+        result = control_closed => result,
+        result = udp_to_vmess => result,
+        result = vmess_to_udp => result,
+    }
+}
+
 async fn open_vmess_udp_tunnel(
     config: &VmessClientConfig,
     user: [u8; 16],
@@ -713,6 +825,9 @@ async fn relay_vmess_udp(
     let (client_reader, client_writer) = tokio::io::split(stream);
     let mut client_reader = BodyReader::new(client_reader, request_config);
     let mut client_writer = BodyWriter::new(client_writer, response_config);
+    if vless_xudp::is_mux_target(&request.target) {
+        return relay_vmess_xudp_udp(client_reader, client_writer, session).await;
+    }
     if is_vmess_packetaddr_target(&request.target) {
         return relay_vmess_packetaddr_udp(client_reader, client_writer, session).await;
     }
@@ -762,6 +877,67 @@ async fn relay_vmess_udp(
                 .write_packet_plain(&buffer[..read])
                 .await
                 .context("write VMess UDP response packet")?;
+        }
+    };
+    tokio::select! {
+        result = uplink => result,
+        result = downlink => result,
+    }
+}
+
+async fn relay_vmess_xudp_udp<R, W>(
+    mut client_reader: BodyReader<R>,
+    mut client_writer: BodyWriter<W>,
+    session: CoreSession,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let socket = Arc::new(
+        UdpSocket::bind("0.0.0.0:0")
+            .await
+            .context("bind VMess XUDP UDP socket")?,
+    );
+    let uplink_socket = socket.clone();
+    let uplink_session = session.clone();
+    let uplink = async move {
+        let mut current_destination = None;
+        while let Some(packet) = client_reader.read_packet().await? {
+            let Some((target, payload)) =
+                vless_xudp::decode_packet_chunk(&packet, &mut current_destination)?
+            else {
+                return Ok::<(), anyhow::Error>(());
+            };
+            uplink_session.record_upload(payload.len()).await?;
+            let target = target_socket_addr(&target).await?;
+            let sent = uplink_socket
+                .send_to(&payload, target)
+                .await
+                .with_context(|| format!("send VMess XUDP payload to {target}"))?;
+            ensure!(
+                sent == payload.len(),
+                "short VMess XUDP send: expected {}, wrote {}",
+                payload.len(),
+                sent
+            );
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let downlink = async move {
+        let mut buffer = vec![0u8; u16::MAX as usize];
+        loop {
+            let (read, source) = socket
+                .recv_from(&mut buffer)
+                .await
+                .context("receive VMess XUDP UDP response")?;
+            session.record_download(read).await?;
+            let packet =
+                vless_xudp::encode_response_packet(&ProxyTarget::Ip(source), &buffer[..read])?;
+            client_writer
+                .write_packet_plain(&packet)
+                .await
+                .context("write VMess XUDP response packet")?;
         }
     };
     tokio::select! {
@@ -1460,7 +1636,7 @@ fn unix_time() -> i64 {
 
 fn vmess_request_options(command: u8, security: SecurityType) -> RequestOptions {
     let mut options = RequestOptions::new(0);
-    if command == CMD_UDP || security.normalized() != SecurityType::None {
+    if command == CMD_UDP || command == CMD_MUX || security.normalized() != SecurityType::None {
         options.enable_chunk_stream();
     }
     options
