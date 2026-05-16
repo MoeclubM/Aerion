@@ -127,12 +127,17 @@ pub struct SingBoxShadowsocksOutbound {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct SingBoxHysteria2Outbound {
-    pub server: String,
-    #[serde(rename = "server_port")]
-    pub server_port: u16,
+    #[serde(default)]
+    pub server: Option<String>,
+    #[serde(default, rename = "server_port")]
+    pub server_port: Option<u16>,
+    #[serde(default, rename = "server_ports")]
+    pub server_ports: Option<Value>,
     pub password: String,
     #[serde(default)]
     pub network: Option<String>,
+    #[serde(default, rename = "up_mbps")]
+    pub up_mbps: Option<u64>,
     #[serde(default)]
     pub tls: Option<SingBoxTlsOptions>,
     #[serde(default)]
@@ -141,6 +146,16 @@ pub struct SingBoxHysteria2Outbound {
     pub down_mbps: Option<u64>,
     #[serde(default, rename = "down")]
     pub down: Option<u64>,
+    #[serde(default)]
+    pub realm: Option<Value>,
+    #[serde(default, rename = "hop_interval")]
+    pub hop_interval: Option<String>,
+    #[serde(default, rename = "hop_interval_max")]
+    pub hop_interval_max: Option<String>,
+    #[serde(default, rename = "bbr_profile")]
+    pub bbr_profile: Option<String>,
+    #[serde(default, rename = "brutal_debug")]
+    pub brutal_debug: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -534,7 +549,45 @@ impl SingBoxHysteria2Outbound {
         name: &str,
         listen: SocketAddr,
     ) -> Result<Hysteria2ClientConfig> {
-        ensure_tcp_network("sing-box", name, self.network.as_deref())?;
+        ensure_supported_network("sing-box", name, self.network.as_deref())?;
+        ensure!(
+            !self
+                .server_ports
+                .as_ref()
+                .map(value_has_data)
+                .unwrap_or(false)
+                && self.hop_interval.is_none()
+                && self.hop_interval_max.is_none(),
+            "sing-box Hysteria2 outbound {name} enables port hopping; Aerion Hysteria2 client expects one fixed port"
+        );
+        ensure!(
+            self.up_mbps.unwrap_or(0) == 0,
+            "sing-box Hysteria2 outbound {name} sets up_mbps; Aerion Hysteria2 client does not expose upload bandwidth"
+        );
+        ensure!(
+            !self.realm.as_ref().map(value_has_data).unwrap_or(false),
+            "sing-box Hysteria2 outbound {name} sets realm; Aerion Hysteria2 client does not expose realm override"
+        );
+        ensure!(
+            self.bbr_profile
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none_or(|value| value.eq_ignore_ascii_case("standard")),
+            "sing-box Hysteria2 outbound {name} sets bbr_profile {:?}; Aerion Hysteria2 uses the default BBR profile",
+            self.bbr_profile
+        );
+        ensure!(
+            !self.brutal_debug,
+            "sing-box Hysteria2 outbound {name} enables brutal_debug; Aerion Hysteria2 client does not expose brutal debug"
+        );
+        let server_port = self.server_port.with_context(|| {
+            format!("sing-box Hysteria2 outbound {name} is missing server_port")
+        })?;
+        let server = self
+            .server
+            .as_ref()
+            .with_context(|| format!("sing-box Hysteria2 outbound {name} is missing server"))?;
         let tls = self
             .tls
             .as_ref()
@@ -557,10 +610,10 @@ impl SingBoxHysteria2Outbound {
         };
         Ok(Hysteria2ClientConfig {
             listen,
-            server_host: self.server.clone(),
-            server_port: self.server_port,
+            server_host: server.clone(),
+            server_port,
             password: self.password.clone(),
-            sni: sni_or_server(tls.server_name.as_deref(), &self.server),
+            sni: sni_or_server(tls.server_name.as_deref(), server),
             insecure: tls.insecure,
             obfs,
             obfs_password,
@@ -723,13 +776,26 @@ fn ensure_disabled_reality(name: &str, tls: &SingBoxTlsOptions) -> Result<()> {
     Ok(())
 }
 
-fn ensure_tcp_network(format: &str, name: &str, network: Option<&str>) -> Result<()> {
+fn ensure_supported_network(format: &str, name: &str, network: Option<&str>) -> Result<()> {
     let network = network.unwrap_or_default().trim();
     ensure!(
-        network.is_empty() || network.eq_ignore_ascii_case("tcp"),
-        "{format} outbound {name} uses network {network}; this Aerion local client requires TCP-capable relay"
+        network.is_empty()
+            || network.eq_ignore_ascii_case("tcp")
+            || network.eq_ignore_ascii_case("udp"),
+        "{format} outbound {name} uses network {network}; Aerion supports sing-box tcp or udp network selection"
     );
     Ok(())
+}
+
+fn value_has_data(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_u64().unwrap_or(1) != 0,
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
 }
 
 fn network_allows_udp(network: Option<&str>) -> bool {
@@ -1296,6 +1362,95 @@ mod tests {
             "edge.example.com"
         );
         assert_eq!(vless.transport.mode, "stream-one");
+        Ok(())
+    }
+
+    #[test]
+    fn parses_hysteria2_udp_network() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [{
+    "type": "hysteria2",
+    "tag": "hy2-udp",
+    "server": "example.com",
+    "server_port": 443,
+    "password": "secret",
+    "network": "udp",
+    "down_mbps": 80,
+    "tls": {
+      "enabled": true,
+      "server_name": "hy2.example.com",
+      "insecure": true,
+      "alpn": ["h3"]
+    },
+    "obfs": {
+      "type": "salamander",
+      "password": "obfs-pass"
+    }
+  }]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxClientConfig::Hysteria2(hysteria2) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Hysteria2")
+        };
+        assert_eq!(hysteria2.server_host, "example.com");
+        assert_eq!(hysteria2.server_port, 443);
+        assert_eq!(hysteria2.password, "secret");
+        assert_eq!(hysteria2.sni, "hy2.example.com");
+        assert!(hysteria2.insecure);
+        assert!(hysteria2.udp);
+        assert_eq!(hysteria2.obfs.as_deref(), Some("salamander"));
+        assert_eq!(hysteria2.obfs_password.as_deref(), Some("obfs-pass"));
+        assert_eq!(hysteria2.download_bandwidth, Some(80));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_hysteria2_port_hopping() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [{
+    "type": "hysteria2",
+    "tag": "hy2-hop",
+    "server": "example.com",
+    "server_ports": [443, 8443],
+    "hop_interval": "30s",
+    "password": "secret",
+    "tls": { "enabled": true }
+  }]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config.outbounds[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("port hopping must be explicit");
+        assert!(error.to_string().contains("port hopping"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_hysteria2_upload_bandwidth() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [{
+    "type": "hysteria2",
+    "tag": "hy2-up",
+    "server": "example.com",
+    "server_port": 443,
+    "password": "secret",
+    "up_mbps": 10,
+    "tls": { "enabled": true }
+  }]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config.outbounds[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("up_mbps must be explicit");
+        assert!(error.to_string().contains("up_mbps"));
         Ok(())
     }
 
