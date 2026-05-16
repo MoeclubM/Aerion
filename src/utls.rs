@@ -22,7 +22,13 @@ pub enum UtlsFingerprint {
 impl UtlsFingerprint {
     pub fn from_mihomo_name(value: &str) -> Result<Option<Self>> {
         let value = value.trim();
-        if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        let normalized = value.to_ascii_lowercase().replace(['-', '_'], "");
+        if value.is_empty()
+            || normalized == "none"
+            || normalized == "unsafe"
+            || normalized == "golang"
+            || normalized == "hellogolang"
+        {
             return Ok(None);
         }
         Ok(Some(value.parse()?))
@@ -103,13 +109,31 @@ impl FromStr for UtlsFingerprint {
         let normalized = value.trim().to_ascii_lowercase().replace(['-', '_'], "");
         match normalized.as_str() {
             "chrome" | "hellochrome" | "hellochromeauto" => Ok(Self::Chrome),
+            other if other.starts_with("hellochrome") || other.starts_with("chrome") => {
+                Ok(Self::Chrome)
+            }
             "firefox" | "hellofirefox" | "hellofirefoxauto" => Ok(Self::Firefox),
+            other if other.starts_with("hellofirefox") || other.starts_with("firefox") => {
+                Ok(Self::Firefox)
+            }
             "safari" | "hellosafari" | "hellosafariauto" => Ok(Self::Safari),
+            other if other.starts_with("hellosafari") || other.starts_with("safari") => {
+                Ok(Self::Safari)
+            }
             "ios" | "helloios" | "helloiosauto" => Ok(Self::Ios),
+            other if other.starts_with("helloios") => Ok(Self::Ios),
             "android" | "okhttp" | "android11okhttp" | "helloandroid11okhttp" => Ok(Self::Android),
+            other if other.starts_with("helloandroid") || other.starts_with("android") => {
+                Ok(Self::Android)
+            }
             "edge" | "helloedge" | "helloedgeauto" => Ok(Self::Edge),
+            other if other.starts_with("helloedge") || other.starts_with("edge") => Ok(Self::Edge),
             "360" | "qihoo360" | "hello360" | "hello360auto" => Ok(Self::Qihoo360),
+            other if other.starts_with("hello360") || other.starts_with("qihoo360") => {
+                Ok(Self::Qihoo360)
+            }
             "qq" | "helloqq" | "helloqqauto" => Ok(Self::Qq),
+            other if other.starts_with("helloqq") => Ok(Self::Qq),
             "random" => Ok(Self::Random),
             "randomized" | "hellorandomized" => Ok(Self::Randomized),
             "randomizedalpn" | "hellorandomizedalpn" => Ok(Self::RandomizedAlpn),
@@ -164,9 +188,18 @@ mod tests {
             UtlsFingerprint::Firefox
         );
         assert_eq!(
+            "HelloChrome_106_Shuffle".parse::<UtlsFingerprint>()?,
+            UtlsFingerprint::Chrome
+        );
+        assert_eq!(
+            "chrome_psk_shuffle".parse::<UtlsFingerprint>()?,
+            UtlsFingerprint::Chrome
+        );
+        assert_eq!(
             "randomized_no_alpn".parse::<UtlsFingerprint>()?,
             UtlsFingerprint::RandomizedNoAlpn
         );
+        assert_eq!(UtlsFingerprint::from_mihomo_name("unsafe")?, None);
         assert_eq!(
             UtlsFingerprint::Android.as_utls_client_hello_id(),
             "HelloAndroid_11_OkHttp"
