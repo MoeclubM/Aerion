@@ -9,15 +9,19 @@ use aerion::mieru::{
 use aerion::naive::NaiveClientConfig;
 use aerion::padding::PaddingScheme;
 use aerion::tuic::{TuicClientConfig, TuicServerConfig, parse_tuic_user};
+use aerion::vless_transport::VlessTransportConfig;
 use aerion::{
-    ClientConfig, MihomoClientConfig, MihomoProxy, ServerConfig, ShadowsocksClientConfig,
-    SingBoxClientConfig, SingBoxOutbound, TrojanClientConfig, VlessClientConfig, VmessClientConfig,
-    XrayClientConfig, XrayOutbound, run_client, run_hysteria2_client, run_hysteria2_server,
-    run_mieru_client, run_mieru_server, run_naive_client, run_server, run_shadowsocks_client,
-    run_trojan_client, run_tuic_client, run_tuic_server, run_vless_client, run_vmess_client, tls,
+    ClientConfig, MihomoClientConfig, MihomoProxy, RealityClientConfig, RealityServerConfig,
+    ServerConfig, ShadowsocksClientConfig, SingBoxClientConfig, SingBoxOutbound,
+    TrojanClientConfig, VlessClientConfig, VmessClientConfig, XrayClientConfig, XrayOutbound,
+    run_client, run_hysteria2_client, run_hysteria2_server, run_mieru_client, run_mieru_server,
+    run_naive_client, run_server, run_shadowsocks_client, run_trojan_client, run_trojan_server,
+    run_tuic_client, run_tuic_server, run_vless_client, run_vless_server, run_vmess_client,
+    run_vmess_server, tls,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -619,6 +623,85 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
         })
         .await;
     }
+    if is_shadowsocks(&client.protocol) {
+        return run_shadowsocks_client(ShadowsocksClientConfig {
+            listen: client.listen,
+            server_host,
+            server_port,
+            method: client
+                .security
+                .context("Shadowsocks client requires cipher")?,
+            password: client.password,
+            udp: client.udp,
+        })
+        .await;
+    }
+    if is_trojan(&client.protocol) {
+        return run_trojan_client(TrojanClientConfig {
+            listen: client.listen,
+            server_host,
+            server_port,
+            password: client.password,
+            sni,
+            insecure: client.insecure,
+            udp: client.udp,
+            client_fingerprint: client.client_fingerprint,
+        })
+        .await;
+    }
+    if is_vless(&client.protocol) {
+        let user_id = native_user_id(client.user_id, &client.username, "VLESS client")?;
+        let reality = client
+            .reality_public_key
+            .as_deref()
+            .map(|public_key| {
+                RealityClientConfig::from_strings(
+                    public_key,
+                    client.reality_short_id.as_deref().unwrap_or_default(),
+                )
+            })
+            .transpose()?;
+        ensure!(
+            reality.is_some() || client.tls.unwrap_or(true),
+            "VLESS client requires TLS or REALITY"
+        );
+        return run_vless_client(VlessClientConfig {
+            listen: client.listen,
+            server_host,
+            server_port,
+            user_id,
+            sni,
+            insecure: client.insecure,
+            flow: client.flow,
+            packet_encoding: client.packet_encoding,
+            mux: client.mux,
+            udp: client.udp,
+            client_fingerprint: client.client_fingerprint,
+            reality,
+            transport: native_vless_transport(
+                client.network.as_deref(),
+                client.path,
+                client.host,
+                client.headers,
+            )?,
+        })
+        .await;
+    }
+    if is_vmess(&client.protocol) {
+        return run_vmess_client(VmessClientConfig {
+            listen: client.listen,
+            server_host,
+            server_port,
+            user_id: native_user_id(client.user_id, &client.username, "VMess client")?,
+            security: client.security.unwrap_or_else(|| "auto".to_string()),
+            udp: client.udp,
+            tls: client.tls.unwrap_or(false),
+            sni,
+            insecure: client.insecure,
+            client_fingerprint: client.client_fingerprint,
+        })
+        .await;
+    }
     ensure_supported_protocol(&client.protocol)?;
     run_client(ClientConfig {
         listen: client.listen,
@@ -694,6 +777,86 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             congestion_control: server.congestion_control,
             alpn_protocols: server.alpn_protocols,
             heartbeat_interval_secs: server.heartbeat_interval_secs,
+        })
+        .await;
+    }
+    if is_trojan(&server.protocol) {
+        return run_trojan_server(TrojanServerConfig {
+            listen: server.listen,
+            password: server.password,
+            users: server.users,
+            cert_path: server.cert.context("server cert is required for Trojan")?,
+            key_path: server.key.context("server key is required for Trojan")?,
+        })
+        .await;
+    }
+    if is_vless(&server.protocol) {
+        let transport = native_vless_transport(
+            server.network.as_deref(),
+            server.path,
+            server.host,
+            server.headers,
+        )?;
+        let reality = server
+            .reality_private_key
+            .as_deref()
+            .map(|private_key| {
+                RealityServerConfig::from_strings(
+                    server
+                        .reality_server_name
+                        .clone()
+                        .context("VLESS REALITY server requires reality_server_name")?,
+                    server.reality_server_port.unwrap_or(443),
+                    server.reality_server_names.clone(),
+                    private_key,
+                    &server.reality_short_ids,
+                    transport.alpn_protocols(),
+                )
+            })
+            .transpose()?;
+        let (cert_path, key_path) = if reality.is_some() {
+            (PathBuf::new(), PathBuf::new())
+        } else {
+            (
+                server.cert.context("server cert is required for VLESS")?,
+                server.key.context("server key is required for VLESS")?,
+            )
+        };
+        return run_vless_server(VlessServerConfig {
+            listen: server.listen,
+            user_id: native_user_id(server.user_id, &server.username, "VLESS server")?,
+            users: server.users,
+            cert_path,
+            key_path,
+            flow: server.flow,
+            reality,
+            transport,
+        })
+        .await;
+    }
+    if is_vmess(&server.protocol) {
+        let tls = server
+            .tls
+            .unwrap_or_else(|| server.cert.is_some() || server.key.is_some());
+        let (cert_path, key_path) = if tls {
+            (
+                Some(
+                    server
+                        .cert
+                        .context("server cert is required for VMess TLS")?,
+                ),
+                Some(server.key.context("server key is required for VMess TLS")?),
+            )
+        } else {
+            (None, None)
+        };
+        return run_vmess_server(VmessServerConfig {
+            listen: server.listen,
+            user_id: native_user_id(server.user_id, &server.username, "VMess server")?,
+            users: server.users,
+            tls,
+            cert_path,
+            key_path,
         })
         .await;
     }
@@ -855,6 +1018,45 @@ fn is_naive(protocol: &str) -> bool {
     protocol.eq_ignore_ascii_case("naive")
         || protocol.eq_ignore_ascii_case("naive+https")
         || protocol.eq_ignore_ascii_case("naive+quic")
+}
+
+fn is_shadowsocks(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case("shadowsocks") || protocol.eq_ignore_ascii_case("ss")
+}
+
+fn is_trojan(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case("trojan")
+}
+
+fn is_vless(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case("vless")
+}
+
+fn is_vmess(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case("vmess")
+}
+
+fn native_user_id(user_id: Option<String>, username: &str, label: &str) -> Result<String> {
+    user_id
+        .or_else(|| {
+            let username = username.trim();
+            (!username.is_empty() && username != "default").then(|| username.to_string())
+        })
+        .with_context(|| format!("{label} requires uuid/user_id"))
+}
+
+fn native_vless_transport(
+    network: Option<&str>,
+    path: Option<String>,
+    host: Option<String>,
+    headers: BTreeMap<String, String>,
+) -> Result<VlessTransportConfig> {
+    VlessTransportConfig::from_network(
+        network.unwrap_or("tcp"),
+        path,
+        host,
+        headers.into_iter().collect(),
+    )
 }
 
 fn ensure_supported_protocol(protocol: &str) -> Result<()> {

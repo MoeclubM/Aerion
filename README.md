@@ -171,10 +171,17 @@ cargo run -- run --config config.client.example.toml --profile hysteria2
 cargo run -- run --config config.client.example.toml --profile mieru-tcp
 cargo run -- run --config config.client.example.toml --profile naive-h2
 cargo run -- run --config config.client.example.toml --profile tuic
+cargo run -- run --config config.client.example.toml --profile shadowsocks
+cargo run -- run --config config.client.example.toml --profile trojan
+cargo run -- run --config config.client.example.toml --profile vless-reality
+cargo run -- run --config config.client.example.toml --profile vmess-tls
 cargo run -- run --config config.server.example.toml --profile anytls
 cargo run -- run --config config.server.example.toml --profile hysteria2
 cargo run -- run --config config.server.example.toml --profile mieru-tcp
 cargo run -- run --config config.server.example.toml --profile tuic
+cargo run -- run --config config.server.example.toml --profile trojan
+cargo run -- run --config config.server.example.toml --profile vless
+cargo run -- run --config config.server.example.toml --profile vmess
 cargo run -- run --config config.mihomo.example.yaml --profile anytls
 cargo run -- run --config config.xray.example.json --profile vless-reality
 cargo run -- run --config config.singbox.example.json --profile anytls
@@ -193,6 +200,10 @@ use the native packet underlay. Use `protocol = "tuic"` with `username` as the
 TUIC UUID and `password` as the TUIC password; extra server users use
 `uuid:password` entries. Use `protocol = "naive"` for an HTTPS Naive client;
 set `transport = "quic"` or `protocol = "naive+quic"` for HTTP/3.
+Aerion-native TOML also runs Shadowsocks, Trojan, VLESS, and VMess client
+profiles plus Trojan, VLESS, and VMess server profiles. Shadowsocks and Naive
+server profiles are not exposed because Aerion currently provides those stacks
+as local clients only.
 
 The CLI can run mihomo YAML, Xray JSON/JSONC, and sing-box JSON/JSONC client
 profiles directly. If those files contain multiple proxies/outbounds, select one

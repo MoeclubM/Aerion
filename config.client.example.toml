@@ -69,3 +69,61 @@ udp_relay_mode = "native"
 congestion_control = "cubic"
 alpn = ["h3"]
 heartbeat_interval_secs = 10
+
+[[clients]]
+name = "shadowsocks"
+protocol = "shadowsocks"
+listen = "127.0.0.1:1085"
+server = "example.com:8388"
+security = "aes-256-gcm"
+password = "change-me"
+udp = true
+
+[[clients]]
+name = "trojan"
+protocol = "trojan"
+listen = "127.0.0.1:1086"
+server = "example.com:443"
+password = "change-me"
+sni = "example.com"
+insecure = false
+udp = true
+client_fingerprint = "chrome"
+
+[[clients]]
+name = "vless-reality"
+protocol = "vless"
+listen = "127.0.0.1:1087"
+server = "example.com:443"
+user_id = "00000000-0000-0000-0000-000000000000"
+password = ""
+sni = "www.example.com"
+flow = "xtls-rprx-vision"
+packet_encoding = "xudp"
+client_fingerprint = "chrome"
+reality_public_key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+reality_short_id = "a1b2"
+
+[[clients]]
+name = "vless-ws"
+protocol = "vless"
+listen = "127.0.0.1:1088"
+server = "example.com:443"
+user_id = "00000000-0000-0000-0000-000000000000"
+password = ""
+sni = "example.com"
+network = "ws"
+path = "/vless"
+host = "edge.example.com"
+
+[[clients]]
+name = "vmess-tls"
+protocol = "vmess"
+listen = "127.0.0.1:1089"
+server = "example.com:443"
+user_id = "00000000-0000-0000-0000-000000000000"
+password = ""
+security = "auto"
+tls = true
+sni = "example.com"
+udp = true

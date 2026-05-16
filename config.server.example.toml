@@ -58,3 +58,38 @@ udp = true
 congestion_control = "cubic"
 alpn = ["h3"]
 heartbeat_interval_secs = 10
+
+[[servers]]
+name = "trojan"
+protocol = "trojan"
+listen = "0.0.0.0:8445"
+password = "change-me"
+# Optional extra accepted Trojan passwords.
+# users = ["change-me-too"]
+cert = "server.crt"
+key = "server.key"
+
+[[servers]]
+name = "vless"
+protocol = "vless"
+listen = "0.0.0.0:8446"
+user_id = "00000000-0000-0000-0000-000000000000"
+password = ""
+# Optional extra accepted VLESS UUIDs.
+# users = ["11111111-1111-1111-1111-111111111111"]
+cert = "server.crt"
+key = "server.key"
+flow = "xtls-rprx-vision"
+network = "tcp"
+
+[[servers]]
+name = "vmess"
+protocol = "vmess"
+listen = "0.0.0.0:8447"
+user_id = "00000000-0000-0000-0000-000000000000"
+password = ""
+# Optional extra accepted VMess UUIDs.
+# users = ["11111111-1111-1111-1111-111111111111"]
+tls = true
+cert = "server.crt"
+key = "server.key"

@@ -2,9 +2,11 @@ use crate::config_compat::mihomo::MihomoConfig;
 use crate::config_compat::singbox::SingBoxConfig;
 use crate::config_compat::xray::XrayConfig;
 use crate::padding::PaddingScheme;
+use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -48,10 +50,53 @@ pub struct ClientFileConfig {
     pub server: String,
     #[serde(default = "default_mieru_username")]
     pub username: String,
+    #[serde(default, alias = "uuid", alias = "id", alias = "user-id")]
+    pub user_id: Option<String>,
     pub password: String,
     pub sni: Option<String>,
     #[serde(default)]
     pub insecure: bool,
+    #[serde(default)]
+    pub tls: Option<bool>,
+    #[serde(default, alias = "cipher")]
+    pub security: Option<String>,
+    #[serde(default)]
+    pub flow: String,
+    #[serde(default, alias = "packet-encoding", alias = "packetEncoding")]
+    pub packet_encoding: String,
+    #[serde(default)]
+    pub mux: bool,
+    #[serde(
+        default,
+        alias = "client-fingerprint",
+        alias = "clientFingerprint",
+        deserialize_with = "deserialize_optional_fingerprint"
+    )]
+    pub client_fingerprint: Option<UtlsFingerprint>,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(
+        default,
+        alias = "public-key",
+        alias = "publicKey",
+        alias = "reality-public-key",
+        alias = "realityPublicKey"
+    )]
+    pub reality_public_key: Option<String>,
+    #[serde(
+        default,
+        alias = "short-id",
+        alias = "shortId",
+        alias = "reality-short-id",
+        alias = "realityShortId"
+    )]
+    pub reality_short_id: Option<String>,
     #[serde(default)]
     pub obfs: Option<String>,
     #[serde(default, alias = "obfs-password", alias = "obfsPassword")]
@@ -93,6 +138,8 @@ pub struct ServerFileConfig {
     pub listen: SocketAddr,
     #[serde(default = "default_mieru_username")]
     pub username: String,
+    #[serde(default, alias = "uuid", alias = "id", alias = "user-id")]
+    pub user_id: Option<String>,
     pub password: String,
     #[serde(default)]
     pub users: Vec<String>,
@@ -100,6 +147,28 @@ pub struct ServerFileConfig {
     pub cert: Option<PathBuf>,
     #[serde(default)]
     pub key: Option<PathBuf>,
+    #[serde(default)]
+    pub tls: Option<bool>,
+    #[serde(default)]
+    pub flow: String,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default, alias = "reality-private-key", alias = "realityPrivateKey")]
+    pub reality_private_key: Option<String>,
+    #[serde(default, alias = "reality-server-name", alias = "realityServerName")]
+    pub reality_server_name: Option<String>,
+    #[serde(default, alias = "reality-server-port", alias = "realityServerPort")]
+    pub reality_server_port: Option<u16>,
+    #[serde(default, alias = "reality-server-names", alias = "realityServerNames")]
+    pub reality_server_names: Vec<String>,
+    #[serde(default, alias = "short-ids", alias = "shortIds")]
+    pub reality_short_ids: Vec<String>,
     #[serde(default)]
     pub obfs: Option<String>,
     #[serde(default, alias = "obfs-password", alias = "obfsPassword")]
@@ -369,7 +438,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.client.example.toml");
         assert!(matches!(
             load_config(&path).expect("client config"),
-            FileConfig::Aerion(config) if config.clients.len() == 5 && config.servers.is_empty()
+            FileConfig::Aerion(config) if config.clients.len() == 10 && config.servers.is_empty()
         ));
     }
 
@@ -378,7 +447,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.server.example.toml");
         assert!(matches!(
             load_config(&path).expect("server config"),
-            FileConfig::Aerion(config) if config.clients.is_empty() && config.servers.len() == 4
+            FileConfig::Aerion(config) if config.clients.is_empty() && config.servers.len() == 7
         ));
     }
 
