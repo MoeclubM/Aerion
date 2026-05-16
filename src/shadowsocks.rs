@@ -23,7 +23,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::timeout;
 
@@ -175,9 +175,10 @@ pub async fn run_shadowsocks_server(config: ShadowsocksServerConfig) -> Result<(
     }
 }
 
-async fn handle_shadowsocks_tcp_client(
-    mut inbound: ProxyServerStream<shadowsocks::net::TcpStream>,
-) -> Result<()> {
+async fn handle_shadowsocks_tcp_client<S>(mut inbound: ProxyServerStream<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let target = inbound
         .handshake()
         .await
