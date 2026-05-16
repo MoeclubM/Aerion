@@ -8,7 +8,9 @@ use crate::vless::VlessClientConfig;
 use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
 use crate::vmess::{VmessClientConfig, ensure_vmess_packet_encoding};
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::de;
+use serde::{Deserialize, Deserializer};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -47,6 +49,8 @@ pub struct XrayOutbound {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct XrayOutboundSettings {
+    #[serde(default)]
+    pub version: Option<u8>,
     #[serde(default)]
     pub address: Option<String>,
     #[serde(default)]
@@ -113,6 +117,10 @@ pub struct XrayStreamSettings {
     pub network: String,
     #[serde(default)]
     pub security: String,
+    #[serde(default, rename = "hysteriaSettings", alias = "hysteria_settings")]
+    pub hysteria_settings: Option<XrayHysteriaSettings>,
+    #[serde(default)]
+    pub finalmask: Option<XrayFinalMask>,
     #[serde(default, rename = "tlsSettings", alias = "tls_settings")]
     pub tls_settings: Option<XrayTlsSettings>,
     #[serde(default, rename = "realitySettings", alias = "reality_settings")]
@@ -153,6 +161,8 @@ impl Default for XrayStreamSettings {
         Self {
             network: default_tcp_network(),
             security: String::new(),
+            hysteria_settings: None,
+            finalmask: None,
             tls_settings: None,
             reality_settings: None,
             ws_settings: None,
@@ -163,6 +173,55 @@ impl Default for XrayStreamSettings {
             split_http_settings: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct XrayHysteriaSettings {
+    #[serde(default)]
+    pub version: Option<u8>,
+    #[serde(default)]
+    pub auth: Option<String>,
+    #[serde(default)]
+    pub congestion: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_xray_bandwidth")]
+    pub down: Option<u64>,
+    #[serde(default, rename = "udpHop", alias = "udphop", alias = "udp_hop")]
+    pub udp_hop: Option<Value>,
+    #[serde(default)]
+    pub masquerade: Option<Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct XrayFinalMask {
+    #[serde(default)]
+    pub tcp: Vec<XrayMask>,
+    #[serde(default)]
+    pub udp: Vec<XrayMask>,
+    #[serde(default, rename = "quicParams", alias = "quic_params")]
+    pub quic_params: Option<XrayQuicParams>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct XrayMask {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub settings: Option<Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct XrayQuicParams {
+    #[serde(default)]
+    pub congestion: Option<String>,
+    #[serde(
+        default,
+        rename = "brutalDown",
+        alias = "brutal_down",
+        deserialize_with = "deserialize_optional_xray_bandwidth"
+    )]
+    pub brutal_down: Option<u64>,
+    #[serde(default, rename = "udpHop", alias = "udp_hop")]
+    pub udp_hop: Option<Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -317,7 +376,7 @@ impl XrayOutbound {
             "trojan" => Ok(XrayClientConfig::Trojan(
                 self.to_trojan_client_config(listen)?,
             )),
-            "hysteria2" | "hy2" => Ok(XrayClientConfig::Hysteria2(
+            "hysteria" | "hysteria2" | "hy2" => Ok(XrayClientConfig::Hysteria2(
                 self.to_hysteria2_client_config(listen)?,
             )),
             other => bail!("unsupported xray outbound protocol {other}"),
@@ -544,23 +603,153 @@ impl XrayOutbound {
 
     fn to_hysteria2_client_config(&self, listen: SocketAddr) -> Result<Hysteria2ClientConfig> {
         let server = self.first_trojan_server()?;
+        let hysteria = self.stream_settings.hysteria_settings.as_ref();
+        let version = self
+            .settings
+            .version
+            .or_else(|| hysteria.and_then(|settings| settings.version));
+        ensure!(
+            !self.protocol.eq_ignore_ascii_case("hysteria") || version == Some(2),
+            "xray Hysteria outbound {} uses version {:?}; Aerion supports Hysteria2 version 2",
+            self.name(),
+            version
+        );
+        if let Some(version) = version {
+            ensure!(
+                version == 2,
+                "xray Hysteria outbound {} uses version {}; Aerion supports Hysteria2 version 2",
+                self.name(),
+                version
+            );
+        }
+        let network = self.stream_settings.network.trim();
+        if self.protocol.eq_ignore_ascii_case("hysteria") {
+            ensure!(
+                network.eq_ignore_ascii_case("hysteria"),
+                "xray Hysteria outbound {} uses network {}; Xray Hysteria profiles use hysteria transport",
+                self.name(),
+                network
+            );
+        } else {
+            ensure!(
+                network.is_empty()
+                    || network.eq_ignore_ascii_case("tcp")
+                    || network.eq_ignore_ascii_case("hysteria"),
+                "xray Hysteria2 outbound {} uses network {}; Aerion Hysteria2 expects hysteria transport",
+                self.name(),
+                network
+            );
+        }
+        let tls = self.stream_settings.tls_settings.as_ref();
+        ensure_hysteria_alpn(
+            "xray",
+            self.name(),
+            tls.and_then(|settings| settings.alpn.as_ref()),
+        )?;
+        ensure!(
+            !hysteria
+                .and_then(|settings| settings.udp_hop.as_ref())
+                .map(value_has_data)
+                .unwrap_or(false),
+            "xray Hysteria outbound {} enables UDP port hopping; Aerion Hysteria2 client expects one fixed port",
+            self.name()
+        );
+        ensure!(
+            !hysteria
+                .and_then(|settings| settings.masquerade.as_ref())
+                .map(value_has_data)
+                .unwrap_or(false),
+            "xray Hysteria outbound {} sets masquerade; Aerion Hysteria2 client binding does not expose masquerade",
+            self.name()
+        );
+        let finalmask = self.stream_settings.finalmask.as_ref();
+        if let Some(finalmask) = finalmask {
+            ensure!(
+                finalmask.tcp.is_empty(),
+                "xray Hysteria outbound {} sets finalmask TCP masks; Aerion Hysteria2 only maps salamander UDP obfs",
+                self.name()
+            );
+            ensure!(
+                finalmask.udp.len() <= 1,
+                "xray Hysteria outbound {} sets multiple finalmask UDP masks; Aerion Hysteria2 exposes one obfs layer",
+                self.name()
+            );
+            ensure!(
+                !finalmask
+                    .quic_params
+                    .as_ref()
+                    .and_then(|params| params.udp_hop.as_ref())
+                    .map(value_has_data)
+                    .unwrap_or(false),
+                "xray Hysteria outbound {} enables finalmask UDP port hopping; Aerion Hysteria2 client expects one fixed port",
+                self.name()
+            );
+        }
+        let (obfs, obfs_password) = match finalmask.and_then(|finalmask| finalmask.udp.first()) {
+            Some(mask) => {
+                ensure!(
+                    mask.kind.eq_ignore_ascii_case("salamander"),
+                    "xray Hysteria outbound {} uses finalmask UDP mask {}; Aerion supports salamander",
+                    self.name(),
+                    mask.kind
+                );
+                let password = mask
+                    .settings
+                    .as_ref()
+                    .and_then(|settings| settings.get("password"))
+                    .and_then(Value::as_str)
+                    .with_context(|| {
+                        format!(
+                            "xray Hysteria outbound {} salamander mask is missing password",
+                            self.name()
+                        )
+                    })?
+                    .to_string();
+                (Some("salamander".to_string()), Some(password))
+            }
+            None => (None, None),
+        };
+        let congestion_control = finalmask
+            .and_then(|finalmask| finalmask.quic_params.as_ref())
+            .and_then(|params| params.congestion.clone())
+            .or_else(|| hysteria.and_then(|settings| settings.congestion.clone()))
+            .unwrap_or_else(|| "bbr".to_string());
+        ensure!(
+            congestion_control.trim().is_empty()
+                || congestion_control.eq_ignore_ascii_case("bbr")
+                || congestion_control.eq_ignore_ascii_case("reno"),
+            "xray Hysteria outbound {} uses congestion {}; Aerion Hysteria2 supports bbr or reno",
+            self.name(),
+            congestion_control
+        );
+        let download_bandwidth = finalmask
+            .and_then(|finalmask| finalmask.quic_params.as_ref())
+            .and_then(|params| params.brutal_down)
+            .or_else(|| hysteria.and_then(|settings| settings.down));
         Ok(Hysteria2ClientConfig {
             listen,
             server_host: server.address.clone(),
             server_port: server.port,
-            password: server.password.with_context(|| {
-                format!(
-                    "xray Hysteria2 outbound {} is missing password",
-                    self.name()
-                )
-            })?,
-            sni: sni_or_server(None, &server.address, self.name()),
-            insecure: false,
-            obfs: None,
-            obfs_password: None,
-            download_bandwidth: None,
+            password: hysteria
+                .and_then(|settings| settings.auth.clone())
+                .or(server.password)
+                .with_context(|| {
+                    format!(
+                        "xray Hysteria2 outbound {} is missing password",
+                        self.name()
+                    )
+                })?,
+            sni: sni_or_server(
+                tls.and_then(|settings| settings.server_name.as_deref()),
+                &server.address,
+                self.name(),
+            ),
+            insecure: tls.map(|settings| settings.allow_insecure).unwrap_or(false),
+            obfs,
+            obfs_password,
+            download_bandwidth,
             udp: true,
-            congestion_control: "bbr".to_string(),
+            congestion_control,
         })
     }
 
@@ -859,6 +1048,85 @@ fn ensure_vless_alpn(
     ensure_no_alpn(format, name, alpn)
 }
 
+fn ensure_hysteria_alpn(format: &str, name: &str, alpn: Option<&OneOrManyStrings>) -> Result<()> {
+    let values = alpn
+        .map(OneOrManyStrings::to_vec)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>();
+    ensure!(
+        values.is_empty() || (values.len() == 1 && values[0].eq_ignore_ascii_case("h3")),
+        "{format} Hysteria outbound {name} sets ALPN {:?}; Aerion Hysteria2 uses h3",
+        values
+    );
+    Ok(())
+}
+
+fn value_has_data(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_u64().unwrap_or(1) != 0,
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum XrayBandwidthValue {
+    Number(u64),
+    Text(String),
+}
+
+fn deserialize_optional_xray_bandwidth<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<XrayBandwidthValue>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    match value {
+        XrayBandwidthValue::Number(0) => Ok(None),
+        XrayBandwidthValue::Number(value) => Ok(Some(value)),
+        XrayBandwidthValue::Text(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Ok(None);
+            }
+            let mut split = value.len();
+            for (idx, ch) in value.char_indices() {
+                if !ch.is_ascii_digit() && ch != '.' {
+                    split = idx;
+                    break;
+                }
+            }
+            let number = value[..split].parse::<f64>().map_err(de::Error::custom)?;
+            let unit = value[split..].trim().to_ascii_lowercase();
+            let mbps = match unit.as_str() {
+                "" | "m" | "mb" | "mbps" => number,
+                "b" | "bps" => number / 1_000_000.0,
+                "k" | "kb" | "kbps" => number / 1024.0,
+                "g" | "gb" | "gbps" => number * 1024.0,
+                "t" | "tb" | "tbps" => number * 1024.0 * 1024.0,
+                _ => {
+                    return Err(de::Error::custom(format!(
+                        "unsupported xray bandwidth unit: {unit}"
+                    )));
+                }
+            };
+            if mbps <= 0.0 {
+                return Ok(None);
+            }
+            Ok(Some(mbps.ceil() as u64))
+        }
+    }
+}
+
 fn sni_or_server(value: Option<&str>, server: &str, name: &str) -> String {
     value
         .map(str::trim)
@@ -1077,6 +1345,62 @@ mod tests {
             bail!("expected VMess")
         };
         assert_eq!(vmess.packet_encoding, "xudp");
+        Ok(())
+    }
+
+    #[test]
+    fn parses_hysteria2_transport_profile() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [{
+    "tag": "hy2",
+    "protocol": "hysteria",
+    "settings": {
+      "version": 2,
+      "address": "example.com",
+      "port": 443
+    },
+    "streamSettings": {
+      "network": "hysteria",
+      "security": "tls",
+      "tlsSettings": {
+        "serverName": "hy2.example.com",
+        "allowInsecure": true,
+        "alpn": ["h3"]
+      },
+      "hysteriaSettings": {
+        "version": 2,
+        "auth": "secret"
+      },
+      "finalmask": {
+        "udp": [{
+          "type": "salamander",
+          "settings": { "password": "obfs-pass" }
+        }],
+        "quicParams": {
+          "congestion": "reno",
+          "brutalDown": "80mbps"
+        }
+      }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let XrayClientConfig::Hysteria2(hysteria2) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Hysteria2")
+        };
+        assert_eq!(hysteria2.server_host, "example.com");
+        assert_eq!(hysteria2.server_port, 443);
+        assert_eq!(hysteria2.password, "secret");
+        assert_eq!(hysteria2.sni, "hy2.example.com");
+        assert!(hysteria2.insecure);
+        assert_eq!(hysteria2.obfs.as_deref(), Some("salamander"));
+        assert_eq!(hysteria2.obfs_password.as_deref(), Some("obfs-pass"));
+        assert_eq!(hysteria2.download_bandwidth, Some(80));
+        assert_eq!(hysteria2.congestion_control, "reno");
         Ok(())
     }
 
