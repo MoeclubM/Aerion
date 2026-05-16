@@ -618,7 +618,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             sni,
             insecure: client.insecure,
             extra_headers: Vec::new(),
-            udp_over_tcp: client.udp,
+            udp_over_tcp: client.udp_over_tcp,
             quic: client.transport.eq_ignore_ascii_case("quic")
                 || client.protocol.eq_ignore_ascii_case("naive+quic"),
         })
@@ -814,7 +814,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             users: server.users,
             cert_path: server.cert.context("server cert is required for Naive")?,
             key_path: server.key.context("server key is required for Naive")?,
-            udp_over_tcp: server.udp,
+            udp_over_tcp: server.udp_over_tcp,
             quic: server.transport.eq_ignore_ascii_case("quic")
                 || server.protocol.eq_ignore_ascii_case("naive+quic"),
         })

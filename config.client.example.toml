@@ -51,7 +51,7 @@ password = "change-me"
 sni = "example.com"
 insecure = false
 # Enable SOCKS5 UDP ASSOCIATE over UOT-style UDP-over-TCP.
-udp = false
+udp_over_tcp = false
 # Set transport = "quic" or protocol = "naive+quic" for HTTP/3.
 transport = "tcp"
 

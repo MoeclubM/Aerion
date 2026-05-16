@@ -79,7 +79,7 @@ password = "change-me"
 users = ["alice:alice-password"]
 cert = "server.crt"
 key = "server.key"
-udp = true
+udp_over_tcp = true
 # Set transport = "quic" or protocol = "naive+quic" to also bind HTTP/3.
 
 [[servers]]
