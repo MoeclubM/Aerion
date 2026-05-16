@@ -11,9 +11,9 @@ use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::VlessClientConfig;
 use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
 use crate::vmess::{VmessClientConfig, ensure_vmess_packet_encoding};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Deserializer, de};
-use serde_yaml::Value;
+use serde_yaml::{Mapping, Value};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -33,22 +33,80 @@ pub struct MihomoConfig {
     pub proxies: Vec<MihomoProxy>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MihomoProxy {
-    #[serde(rename = "ss", alias = "shadowsocks")]
     Shadowsocks(MihomoShadowsocksProxy),
     Vless(MihomoVlessProxy),
     Vmess(MihomoVmessProxy),
     Trojan(MihomoTrojanProxy),
-    #[serde(rename = "hysteria2", alias = "hy2")]
     Hysteria2(MihomoHysteria2Proxy),
-    #[serde(rename = "anytls", alias = "any-tls")]
     AnyTls(MihomoAnyTlsProxy),
     Mieru(MihomoMieruProxy),
-    #[serde(rename = "naive", alias = "naive+https", alias = "naive+quic")]
     Naive(MihomoNaiveProxy),
     Tuic(MihomoTuicProxy),
+    Unsupported(MihomoUnsupportedProxy),
+}
+
+impl<'de> Deserialize<'de> for MihomoProxy {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let Value::Mapping(mapping) = &value else {
+            return Err(de::Error::custom("mihomo proxy entry must be a mapping"));
+        };
+        let kind = mihomo_mapping_str(mapping, "type")
+            .ok_or_else(|| de::Error::custom("mihomo proxy entry is missing type"))?
+            .to_string();
+        let normalized = kind.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "ss" | "shadowsocks" => serde_yaml::from_value(value)
+                .map(MihomoProxy::Shadowsocks)
+                .map_err(de::Error::custom),
+            "vless" => serde_yaml::from_value(value)
+                .map(MihomoProxy::Vless)
+                .map_err(de::Error::custom),
+            "vmess" => serde_yaml::from_value(value)
+                .map(MihomoProxy::Vmess)
+                .map_err(de::Error::custom),
+            "trojan" => serde_yaml::from_value(value)
+                .map(MihomoProxy::Trojan)
+                .map_err(de::Error::custom),
+            "hysteria2" | "hy2" => serde_yaml::from_value(value)
+                .map(MihomoProxy::Hysteria2)
+                .map_err(de::Error::custom),
+            "anytls" | "any-tls" => serde_yaml::from_value(value)
+                .map(MihomoProxy::AnyTls)
+                .map_err(de::Error::custom),
+            "mieru" => serde_yaml::from_value(value)
+                .map(MihomoProxy::Mieru)
+                .map_err(de::Error::custom),
+            "naive" | "naive+https" | "naive+quic" => serde_yaml::from_value(value)
+                .map(MihomoProxy::Naive)
+                .map_err(de::Error::custom),
+            "tuic" => serde_yaml::from_value(value)
+                .map(MihomoProxy::Tuic)
+                .map_err(de::Error::custom),
+            _ => {
+                let name = mihomo_mapping_str(mapping, "name")
+                    .ok_or_else(|| de::Error::custom("unsupported mihomo proxy is missing name"))?
+                    .to_string();
+                Ok(MihomoProxy::Unsupported(MihomoUnsupportedProxy {
+                    name,
+                    kind,
+                    fields: mihomo_string_fields(mapping),
+                }))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MihomoUnsupportedProxy {
+    pub name: String,
+    pub kind: String,
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -464,6 +522,7 @@ impl MihomoProxy {
             Self::Mieru(proxy) => &proxy.name,
             Self::Naive(proxy) => &proxy.name,
             Self::Tuic(proxy) => &proxy.name,
+            Self::Unsupported(proxy) => &proxy.name,
         }
     }
 
@@ -482,6 +541,11 @@ impl MihomoProxy {
             Self::Mieru(proxy) => MihomoClientConfig::Mieru(proxy.to_client_config(listen)?),
             Self::Naive(proxy) => MihomoClientConfig::Naive(proxy.to_client_config(listen)?),
             Self::Tuic(proxy) => MihomoClientConfig::Tuic(proxy.to_client_config(listen)?),
+            Self::Unsupported(proxy) => bail!(
+                "unsupported mihomo proxy {} type {}; Aerion cannot run this proxy protocol",
+                proxy.name,
+                proxy.kind
+            ),
         })
     }
 }
@@ -974,6 +1038,24 @@ fn value_has_data(value: &Value) -> bool {
     }
 }
 
+fn mihomo_mapping_str<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a str> {
+    mapping
+        .get(&Value::String(key.to_string()))
+        .and_then(Value::as_str)
+}
+
+fn mihomo_string_fields(mapping: &Mapping) -> BTreeMap<String, Value> {
+    mapping
+        .iter()
+        .filter_map(|(key, value)| {
+            let Value::String(key) = key else {
+                return None;
+            };
+            Some((key.clone(), value.clone()))
+        })
+        .collect()
+}
+
 fn ensure_no_smux(name: &str, smux: Option<&MihomoSmuxOptions>) -> Result<()> {
     ensure!(
         !smux.map(MihomoSmuxOptions::is_enabled).unwrap_or(false),
@@ -1122,6 +1204,52 @@ mod tests {
     use anyhow::bail;
 
     use super::*;
+
+    #[test]
+    fn parses_unsupported_proxy_entries_without_breaking_selected_proxy() -> Result<()> {
+        let yaml = r#"
+proxies:
+  - name: direct-out
+    type: direct
+    udp: true
+  - name: wireguard-out
+    type: wireguard
+    ip: 172.16.0.2
+    ipv6: "fd00::2"
+    private-key: ignored-by-aerion
+    peers:
+      - server: wg.example.com
+        port: 51820
+        public-key: ignored
+  - name: naive-h3
+    type: naive+quic
+    server: naive.example.com
+    username: user
+    password: pass
+    quic: true
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        assert_eq!(
+            config.proxy("direct-out").context("direct proxy")?.name(),
+            "direct-out"
+        );
+        let error = config
+            .proxy("wireguard-out")
+            .context("wireguard proxy")?
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("unsupported proxy must fail explicitly when selected");
+        assert!(error.to_string().contains("unsupported mihomo proxy"));
+
+        let MihomoClientConfig::Naive(naive) = config
+            .proxy("naive-h3")
+            .context("naive proxy")?
+            .to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Naive")
+        };
+        assert!(naive.quic);
+        Ok(())
+    }
 
     #[test]
     fn parses_shadowsocks_udp_over_tcp_profile() -> Result<()> {
