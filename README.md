@@ -105,7 +105,7 @@ Aerion now provides these server/client protocol stacks:
     REALITY client outbound fail with explicit errors instead of falling back silently
 - VMess:
   - AEAD request/response header
-  - raw TCP transport and TLS transport for client/server
+  - raw TCP/TLS plus TCP / WebSocket / HTTPUpgrade / HTTP/2 / gRPC / XHTTP transports for client/server
   - TCP command with raw `none` body plus chunked AES-128-GCM /
     ChaCha20-Poly1305 body security
   - UDP command over VMess chunk stream

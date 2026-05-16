@@ -444,9 +444,13 @@ impl SingBoxVlessOutbound {
 
 impl SingBoxVmessOutbound {
     pub fn to_client_config(&self, name: &str, listen: SocketAddr) -> Result<VmessClientConfig> {
-        ensure_transport_is_raw("sing-box", name, self.transport.as_ref())?;
         ensure_multiplex_disabled("sing-box", name, self.multiplex.as_ref())?;
-        ensure_tcp_network("sing-box", name, self.network.as_deref())?;
+        let transport = vless_transport_config(
+            "sing-box",
+            name,
+            self.network.as_deref(),
+            self.transport.as_ref(),
+        )?;
         ensure!(
             self.alter_id == 0,
             "sing-box VMess outbound {name} uses legacy alter_id {}; Aerion implements AEAD VMess only",
@@ -462,9 +466,10 @@ impl SingBoxVmessOutbound {
         );
         if let Some(tls) = &self.tls {
             if tls.enabled {
-                ensure_no_alpn("sing-box", name, tls.alpn.as_ref())?;
+                ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
             } else {
                 ensure_disabled_utls(name, tls)?;
+                ensure_no_alpn("sing-box", name, tls.alpn.as_ref())?;
             }
         }
         let tls_enabled = self.tls.as_ref().map(|tls| tls.enabled).unwrap_or(false);
@@ -478,13 +483,21 @@ impl SingBoxVmessOutbound {
             udp: network_allows_udp(self.network.as_deref()),
             tls: tls_enabled,
             sni: sni_or_server(server_name, &self.server),
-            insecure: self.tls.as_ref().map(|tls| tls.insecure).unwrap_or(false),
-            client_fingerprint: self
-                .tls
-                .as_ref()
-                .map(|tls| tls.utls_fingerprint(name))
-                .transpose()?
-                .flatten(),
+            insecure: if tls_enabled {
+                self.tls.as_ref().map(|tls| tls.insecure).unwrap_or(false)
+            } else {
+                false
+            },
+            client_fingerprint: if tls_enabled {
+                self.tls
+                    .as_ref()
+                    .map(|tls| tls.utls_fingerprint(name))
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            },
+            transport,
         })
     }
 }
@@ -1066,6 +1079,44 @@ mod tests {
         assert_eq!(vless.transport.path, "/vless");
         assert_eq!(
             vless.transport.request_host("example.com"),
+            "edge.example.com"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_vmess_websocket_transport() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [{
+    "type": "vmess",
+    "tag": "vmess-ws",
+    "server": "example.com",
+    "server_port": 80,
+    "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+    "alter_id": 0,
+    "transport": {
+      "type": "ws",
+      "path": "/vmess",
+      "headers": { "Host": "edge.example.com" }
+    }
+  }]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxClientConfig::Vmess(vmess) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected VMess")
+        };
+        assert!(!vmess.tls);
+        assert_eq!(
+            vmess.transport.kind,
+            crate::vless_transport::VlessTransportKind::WebSocket
+        );
+        assert_eq!(vmess.transport.path, "/vmess");
+        assert_eq!(
+            vmess.transport.request_host("example.com"),
             "edge.example.com"
         );
         Ok(())

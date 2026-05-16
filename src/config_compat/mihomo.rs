@@ -543,8 +543,31 @@ impl MihomoVmessProxy {
             "mihomo VMess proxy {} sets client-fingerprint while TLS is disabled",
             self.name
         );
-        ensure_tcp_network(&self.name, &self.network)?;
-        ensure_no_alpn(&self.name, self.alpn.as_ref())?;
+        let network = self.network.trim();
+        let transport = if network.eq_ignore_ascii_case("grpc") {
+            VlessTransportConfig::from_network(
+                network,
+                self.grpc_opts
+                    .as_ref()
+                    .and_then(|opts| opts.grpc_service_name.clone()),
+                None,
+                Vec::new(),
+            )?
+        } else {
+            VlessTransportConfig::from_headers(
+                network,
+                self.ws_opts.as_ref().and_then(|opts| opts.path.clone()),
+                self.ws_opts
+                    .as_ref()
+                    .map(|opts| opts.headers.clone())
+                    .unwrap_or_default(),
+            )?
+        };
+        if self.tls {
+            ensure_vless_alpn(&self.name, &transport, self.alpn.as_ref())?;
+        } else {
+            ensure_no_alpn(&self.name, self.alpn.as_ref())?;
+        }
         Ok(VmessClientConfig {
             listen,
             server_host: self.server.clone(),
@@ -554,8 +577,17 @@ impl MihomoVmessProxy {
             udp: self.udp,
             tls: self.tls,
             sni: sni_or_server(self.servername.as_deref(), &self.server),
-            insecure: self.skip_cert_verify,
-            client_fingerprint: self.client_fingerprint,
+            insecure: if self.tls {
+                self.skip_cert_verify
+            } else {
+                false
+            },
+            client_fingerprint: if self.tls {
+                self.client_fingerprint
+            } else {
+                None
+            },
+            transport,
         })
     }
 }
@@ -990,6 +1022,41 @@ proxies:
         assert_eq!(vless.transport.path, "/vless");
         assert_eq!(
             vless.transport.request_host("example.com"),
+            "edge.example.com"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_vmess_websocket_transport() -> Result<()> {
+        let yaml = r#"
+proxies:
+  - name: vmess-ws
+    type: vmess
+    server: example.com
+    port: 80
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    alterId: 0
+    network: ws
+    ws-opts:
+      path: /vmess
+      headers:
+        Host: edge.example.com
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let MihomoClientConfig::Vmess(vmess) =
+            config.proxies[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected VMess")
+        };
+        assert!(!vmess.tls);
+        assert_eq!(
+            vmess.transport.kind,
+            crate::vless_transport::VlessTransportKind::WebSocket
+        );
+        assert_eq!(vmess.transport.path, "/vmess");
+        assert_eq!(
+            vmess.transport.request_host("example.com"),
             "edge.example.com"
         );
         Ok(())

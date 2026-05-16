@@ -698,6 +698,12 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             sni,
             insecure: client.insecure,
             client_fingerprint: client.client_fingerprint,
+            transport: native_vless_transport(
+                client.network.as_deref(),
+                client.path,
+                client.host,
+                client.headers,
+            )?,
         })
         .await;
     }
@@ -884,6 +890,12 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             tls,
             cert_path,
             key_path,
+            transport: native_vless_transport(
+                server.network.as_deref(),
+                server.path,
+                server.host,
+                server.headers,
+            )?,
         })
         .await;
     }

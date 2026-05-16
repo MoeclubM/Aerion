@@ -1,7 +1,10 @@
 use crate::core::{CoreSession, ProxyCore};
 use crate::protocol::{ProxyTarget, target_name};
+use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
 use crate::vmess_body::{BodyConfig, BodyReader, BodyWriter, RequestOptions, SecurityType};
-use crate::{socket_protect, socks, tls, uot, utls};
+use crate::{
+    socket_protect, socks, tls, uot, utls, vless_h2, vless_http, vless_websocket, vless_xhttp,
+};
 use aes::Aes128;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, generic_array::GenericArray};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -52,6 +55,7 @@ pub struct VmessClientConfig {
     pub sni: String,
     pub insecure: bool,
     pub client_fingerprint: Option<utls::UtlsFingerprint>,
+    pub transport: VlessTransportConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +66,7 @@ pub struct VmessServerConfig {
     pub tls: bool,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
+    pub transport: VlessTransportConfig,
 }
 
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -153,19 +158,24 @@ pub async fn run_vmess_server_with_core(config: VmessServerConfig, core: ProxyCo
             .key_path
             .as_ref()
             .context("VMess TLS server requires key_path")?;
-        Some(TlsAcceptor::from(tls::server_config(cert_path, key_path)?))
+        let mut server_config = Arc::unwrap_or_clone(tls::server_config(cert_path, key_path)?);
+        server_config.alpn_protocols = config.transport.alpn_protocols();
+        Some(TlsAcceptor::from(Arc::new(server_config)))
     } else {
         None
     };
+    let transport = config.transport.clone();
     tracing::info!("VMess server listening on {}", listener.local_addr()?);
     loop {
         let (stream, peer) = listener.accept().await.context("accept VMess client")?;
         let acceptor = acceptor.clone();
         let users = users.clone();
         let core = core.clone();
+        let transport = transport.clone();
         tokio::spawn(async move {
             let result = async {
                 let stream = accept_vmess_transport(stream, acceptor).await?;
+                let stream = apply_vmess_server_transport(stream, &transport).await?;
                 handle_vmess_client(stream, users, core, peer).await
             }
             .await;
@@ -214,12 +224,17 @@ async fn connect_vmess_transport(config: &VmessClientConfig) -> Result<VmessTran
                 )
             })?;
     if !config.tls {
-        return Ok(Box::new(tcp));
+        return apply_vmess_client_transport(tcp, config).await;
     }
-    let connector = TlsConnector::from(tls::client_config_with_fingerprint(
+    let mut client_config = Arc::unwrap_or_clone(tls::client_config_with_fingerprint(
         config.insecure,
         config.client_fingerprint,
     ));
+    let alpn = config.transport.alpn_protocols();
+    if !alpn.is_empty() {
+        client_config.alpn_protocols = alpn;
+    }
+    let connector = TlsConnector::from(Arc::new(client_config));
     let sni = if config.sni.trim().is_empty() {
         config.server_host.clone()
     } else {
@@ -231,7 +246,7 @@ async fn connect_vmess_transport(config: &VmessClientConfig) -> Result<VmessTran
         .connect(server_name, tcp)
         .await
         .context("TLS connect to VMess server")?;
-    Ok(Box::new(stream))
+    apply_vmess_client_transport(stream, config).await
 }
 
 async fn accept_vmess_transport(
@@ -243,6 +258,56 @@ async fn accept_vmess_transport(
             acceptor.accept(stream).await.context("accept VMess TLS")?,
         )),
         None => Ok(Box::new(stream)),
+    }
+}
+
+async fn apply_vmess_client_transport<S>(
+    mut stream: S,
+    config: &VmessClientConfig,
+) -> Result<VmessTransport>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match config.transport.kind {
+        VlessTransportKind::Tcp => Ok(Box::new(stream)),
+        VlessTransportKind::HttpUpgrade => {
+            vless_http::client_upgrade(&mut stream, &config.transport, &config.server_host).await?;
+            Ok(Box::new(stream))
+        }
+        VlessTransportKind::WebSocket => Ok(Box::new(
+            vless_websocket::client(stream, &config.transport, &config.server_host).await?,
+        )),
+        VlessTransportKind::Http2 => Ok(Box::new(
+            vless_h2::client(stream, &config.transport, &config.server_host).await?,
+        )),
+        VlessTransportKind::Grpc => Ok(Box::new(
+            vless_h2::grpc_client(stream, &config.transport, &config.server_host).await?,
+        )),
+        VlessTransportKind::Xhttp => Ok(Box::new(
+            vless_xhttp::client(stream, &config.transport, &config.server_host).await?,
+        )),
+    }
+}
+
+async fn apply_vmess_server_transport<S>(
+    mut stream: S,
+    transport: &VlessTransportConfig,
+) -> Result<VmessTransport>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match transport.kind {
+        VlessTransportKind::Tcp => Ok(Box::new(stream)),
+        VlessTransportKind::HttpUpgrade => {
+            vless_http::server_upgrade(&mut stream, transport).await?;
+            Ok(Box::new(stream))
+        }
+        VlessTransportKind::WebSocket => {
+            Ok(Box::new(vless_websocket::server(stream, transport).await?))
+        }
+        VlessTransportKind::Http2 => Ok(Box::new(vless_h2::server(stream, transport).await?)),
+        VlessTransportKind::Grpc => Ok(Box::new(vless_h2::grpc_server(stream, transport).await?)),
+        VlessTransportKind::Xhttp => Ok(Box::new(vless_xhttp::server(stream, transport).await?)),
     }
 }
 
