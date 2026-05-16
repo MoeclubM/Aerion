@@ -456,7 +456,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.mihomo.example.yaml");
         assert!(matches!(
             load_config(&path).expect("mihomo config"),
-            FileConfig::Mihomo(config) if config.proxies.len() == 6
+            FileConfig::Mihomo(config) if config.proxies.len() == 9
         ));
     }
 
@@ -465,7 +465,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.xray.example.json");
         assert!(matches!(
             load_config(&path).expect("xray config"),
-            FileConfig::Xray(config) if config.outbounds.len() == 3
+            FileConfig::Xray(config) if config.outbounds.len() == 5
         ));
     }
 
@@ -474,8 +474,45 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.singbox.example.json");
         assert!(matches!(
             load_config(&path).expect("sing-box config"),
-            FileConfig::SingBox(config) if config.outbounds.len() == 6
+            FileConfig::SingBox(config) if config.outbounds.len() == 8
         ));
+    }
+
+    #[test]
+    fn compat_examples_convert_all_profiles() -> Result<()> {
+        let listen = "127.0.0.1:1080".parse()?;
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.mihomo.example.yaml");
+        let FileConfig::Mihomo(config) = load_config(&path)? else {
+            bail!("expected mihomo config")
+        };
+        for proxy in &config.proxies {
+            proxy
+                .to_client_config(listen)
+                .with_context(|| format!("convert mihomo proxy {}", proxy.name()))?;
+        }
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.xray.example.json");
+        let FileConfig::Xray(config) = load_config(&path)? else {
+            bail!("expected xray config")
+        };
+        for outbound in &config.outbounds {
+            outbound
+                .to_client_config(listen)
+                .with_context(|| format!("convert xray outbound {}", outbound.name()))?;
+        }
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.singbox.example.json");
+        let FileConfig::SingBox(config) = load_config(&path)? else {
+            bail!("expected sing-box config")
+        };
+        for outbound in &config.outbounds {
+            outbound
+                .to_client_config(listen)
+                .with_context(|| format!("convert sing-box outbound {}", outbound.name()))?;
+        }
+
+        Ok(())
     }
 
     #[test]

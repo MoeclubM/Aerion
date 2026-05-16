@@ -40,6 +40,14 @@
       "alter_id": 0
     },
     {
+      "type": "shadowsocks",
+      "tag": "shadowsocks",
+      "server": "example.com",
+      "server_port": 8388,
+      "method": "aes-128-gcm",
+      "password": "secret"
+    },
+    {
       "type": "trojan",
       "tag": "trojan",
       "server": "example.com",
@@ -76,6 +84,21 @@
       "tls": {
         "enabled": true,
         "server_name": "example.com"
+      }
+    },
+    {
+      "type": "naive",
+      "tag": "naive-h2",
+      "server": "example.com",
+      "server_port": 443,
+      "username": "user",
+      "password": "secret",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com"
+      },
+      "extra_headers": {
+        "X-Aerion": "example"
       }
     },
     {

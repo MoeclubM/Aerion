@@ -28,6 +28,14 @@ proxies:
     network: tcp
     tls: false
 
+  - name: shadowsocks
+    type: ss
+    server: example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: secret
+    udp: true
+
   - name: trojan
     type: trojan
     server: example.com
@@ -49,6 +57,14 @@ proxies:
     down: 100
     udp: true
 
+  - name: mieru-tcp
+    type: mieru
+    server: example.com
+    port: 2999
+    username: user
+    password: secret
+    transport: tcp
+
   - name: anytls
     type: anytls
     server: example.com
@@ -56,6 +72,16 @@ proxies:
     password: secret
     sni: example.com
     skip-cert-verify: false
+
+  - name: naive-h2
+    type: naive
+    server: example.com
+    port: 443
+    username: user
+    password: secret
+    servername: example.com
+    extra-headers:
+      X-Aerion: example
 
   - name: tuic-v5
     type: tuic

@@ -183,8 +183,15 @@ cargo run -- run --config config.server.example.toml --profile trojan
 cargo run -- run --config config.server.example.toml --profile vless
 cargo run -- run --config config.server.example.toml --profile vmess
 cargo run -- run --config config.mihomo.example.yaml --profile anytls
+cargo run -- run --config config.mihomo.example.yaml --profile shadowsocks
+cargo run -- run --config config.mihomo.example.yaml --profile mieru-tcp
+cargo run -- run --config config.mihomo.example.yaml --profile naive-h2
 cargo run -- run --config config.xray.example.json --profile vless-reality
+cargo run -- run --config config.xray.example.json --profile shadowsocks
+cargo run -- run --config config.xray.example.json --profile hysteria2
 cargo run -- run --config config.singbox.example.json --profile anytls
+cargo run -- run --config config.singbox.example.json --profile shadowsocks
+cargo run -- run --config config.singbox.example.json --profile naive-h2
 ```
 
 Aerion-native TOML can keep multiple `[[clients]]` or `[[servers]]` profiles in

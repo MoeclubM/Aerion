@@ -62,8 +62,47 @@
       }
     },
     {
+      "tag": "shadowsocks",
+      "protocol": "shadowsocks",
+      "settings": {
+        "servers": [
+          {
+            "address": "example.com",
+            "port": 8388,
+            "method": "aes-128-gcm",
+            "password": "secret"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      }
+    },
+    {
       "tag": "trojan",
       "protocol": "trojan",
+      "settings": {
+        "servers": [
+          {
+            "address": "example.com",
+            "port": 443,
+            "password": "secret"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "example.com",
+          "allowInsecure": false
+        }
+      }
+    },
+    {
+      "tag": "hysteria2",
+      "protocol": "hysteria2",
       "settings": {
         "servers": [
           {
