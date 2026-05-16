@@ -50,6 +50,7 @@ pub struct VmessClientConfig {
     pub server_port: u16,
     pub user_id: String,
     pub security: String,
+    pub packet_encoding: String,
     pub udp: bool,
     pub tls: bool,
     pub sni: String,
@@ -91,6 +92,27 @@ struct VmessClientKeys {
     request_body_iv: [u8; 16],
     options: RequestOptions,
     security: SecurityType,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VmessPacketEncoding {
+    PerTarget,
+    PacketAddr,
+}
+
+pub fn ensure_vmess_packet_encoding(value: &str) -> Result<()> {
+    vmess_packet_encoding(value).map(|_| ())
+}
+
+fn vmess_packet_encoding(value: &str) -> Result<VmessPacketEncoding> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "none" => Ok(VmessPacketEncoding::PerTarget),
+        "packetaddr" | "packet-addr" => Ok(VmessPacketEncoding::PacketAddr),
+        "xudp" => bail!(
+            "VMess packet_encoding xudp requires VMess Mux/XUDP; Aerion currently supports packetaddr or per-target UDP"
+        ),
+        other => bail!("unsupported VMess packet_encoding {other}"),
+    }
 }
 
 impl VmessRequest {
@@ -469,6 +491,9 @@ async fn handle_vmess_udp_associate(
         Arc<Mutex<BodyWriter<WriteHalf<VmessTransport>>>>,
     >::new()));
     let user = parse_uuid(&config.user_id)?;
+    if vmess_packet_encoding(&config.packet_encoding)? == VmessPacketEncoding::PacketAddr {
+        return handle_vmess_packetaddr_associate(control, config, udp, user).await;
+    }
 
     let udp_loop = {
         let udp = udp.clone();
@@ -523,6 +548,100 @@ async fn handle_vmess_udp_associate(
     tokio::select! {
         result = control_closed => result,
         result = udp_loop => result,
+    }
+}
+
+async fn handle_vmess_packetaddr_associate(
+    mut control: TcpStream,
+    config: VmessClientConfig,
+    udp: Arc<UdpSocket>,
+    user: [u8; 16],
+) -> Result<()> {
+    let mut server = connect_vmess_transport(&config).await?;
+    let security = SecurityType::from_name(&config.security)?;
+    let options = vmess_request_options(CMD_UDP, security);
+    let keys = write_vmess_request(
+        &mut server,
+        &user,
+        CMD_UDP,
+        &vmess_packetaddr_target(),
+        security,
+        options,
+    )
+    .await?;
+    read_vmess_response_header(&mut server, &keys).await?;
+    let request_config = BodyConfig::new_request(
+        keys.security,
+        keys.options,
+        keys.request_body_key,
+        keys.request_body_iv,
+    )?;
+    let response_config = BodyConfig::new_response(
+        keys.security,
+        keys.options,
+        keys.request_body_key,
+        keys.request_body_iv,
+    )?;
+    let (reader, writer) = tokio::io::split(server);
+    let mut reader = BodyReader::new(reader, response_config);
+    let writer = Arc::new(Mutex::new(BodyWriter::new(writer, request_config)));
+    let peer = Arc::new(Mutex::new(None::<SocketAddr>));
+
+    let udp_to_vmess = {
+        let udp = udp.clone();
+        let peer = peer.clone();
+        async move {
+            let mut buffer = vec![0u8; u16::MAX as usize + 32];
+            loop {
+                let (read, next_peer) = udp
+                    .recv_from(&mut buffer)
+                    .await
+                    .context("receive SOCKS UDP packet")?;
+                *peer.lock().await = Some(next_peer);
+                let (target, payload) = uot::parse_socks_udp_packet(&buffer[..read])?;
+                let packet = encode_vmess_packetaddr_packet(&target, payload)?;
+                writer
+                    .lock()
+                    .await
+                    .write_packet_plain(&packet)
+                    .await
+                    .context("write VMess packetaddr packet")?;
+            }
+        }
+    };
+    let vmess_to_udp = {
+        let udp = udp.clone();
+        async move {
+            loop {
+                let Some(packet) = reader.read_packet().await? else {
+                    return Ok::<(), anyhow::Error>(());
+                };
+                let (source, payload) = decode_vmess_packetaddr_packet(&packet)?;
+                let response = uot::encode_socks_udp_packet(&source, payload)?;
+                let peer = (*peer.lock().await).context("SOCKS UDP peer is not known yet")?;
+                udp.send_to(&response, peer)
+                    .await
+                    .with_context(|| format!("send VMess packetaddr response to {peer}"))?;
+            }
+        }
+    };
+    let control_closed = async {
+        let mut buffer = [0u8; 1];
+        loop {
+            if control
+                .read(&mut buffer)
+                .await
+                .context("read SOCKS UDP control connection")?
+                == 0
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    };
+    tokio::select! {
+        result = control_closed => result,
+        result = udp_to_vmess => result,
+        result = vmess_to_udp => result,
     }
 }
 
@@ -589,6 +708,15 @@ async fn relay_vmess_udp(
         request.options.chunk_stream(),
         "VMess UDP command requires chunk stream option"
     );
+    let request_config = request.request_body_config()?;
+    let response_config = request.response_body_config()?;
+    let (client_reader, client_writer) = tokio::io::split(stream);
+    let mut client_reader = BodyReader::new(client_reader, request_config);
+    let mut client_writer = BodyWriter::new(client_writer, response_config);
+    if is_vmess_packetaddr_target(&request.target) {
+        return relay_vmess_packetaddr_udp(client_reader, client_writer, session).await;
+    }
+
     let target = target_socket_addr(&request.target).await?;
     let socket = Arc::new(
         UdpSocket::bind(if target.is_ipv4() {
@@ -603,12 +731,6 @@ async fn relay_vmess_udp(
         .connect(target)
         .await
         .with_context(|| format!("connect VMess UDP target {target}"))?;
-
-    let request_config = request.request_body_config()?;
-    let response_config = request.response_body_config()?;
-    let (client_reader, client_writer) = tokio::io::split(stream);
-    let mut client_reader = BodyReader::new(client_reader, request_config);
-    let mut client_writer = BodyWriter::new(client_writer, response_config);
 
     let uplink_socket = socket.clone();
     let uplink_session = session.clone();
@@ -640,6 +762,61 @@ async fn relay_vmess_udp(
                 .write_packet_plain(&buffer[..read])
                 .await
                 .context("write VMess UDP response packet")?;
+        }
+    };
+    tokio::select! {
+        result = uplink => result,
+        result = downlink => result,
+    }
+}
+
+async fn relay_vmess_packetaddr_udp<R, W>(
+    mut client_reader: BodyReader<R>,
+    mut client_writer: BodyWriter<W>,
+    session: CoreSession,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let socket = Arc::new(
+        UdpSocket::bind("0.0.0.0:0")
+            .await
+            .context("bind VMess packetaddr UDP socket")?,
+    );
+    let uplink_socket = socket.clone();
+    let uplink_session = session.clone();
+    let uplink = async move {
+        while let Some(packet) = client_reader.read_packet().await? {
+            let (target, payload) = decode_vmess_packetaddr_packet(&packet)?;
+            uplink_session.record_upload(payload.len()).await?;
+            let target = target_socket_addr(&target).await?;
+            let sent = uplink_socket
+                .send_to(payload, target)
+                .await
+                .with_context(|| format!("send VMess packetaddr payload to {target}"))?;
+            ensure!(
+                sent == payload.len(),
+                "short VMess packetaddr send: expected {}, wrote {}",
+                payload.len(),
+                sent
+            );
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let downlink = async move {
+        let mut buffer = vec![0u8; u16::MAX as usize];
+        loop {
+            let (read, source) = socket
+                .recv_from(&mut buffer)
+                .await
+                .context("receive VMess packetaddr UDP response")?;
+            session.record_download(read).await?;
+            let packet = encode_vmess_packetaddr_packet(&ProxyTarget::Ip(source), &buffer[..read])?;
+            client_writer
+                .write_packet_plain(&packet)
+                .await
+                .context("write VMess packetaddr response packet")?;
         }
     };
     tokio::select! {
@@ -1014,6 +1191,65 @@ fn read_vmess_address_sync(data: &[u8]) -> Result<(ProxyTarget, usize)> {
             ))
         }
         other => bail!("unsupported VMess address type {other:#x}"),
+    }
+}
+
+fn vmess_packetaddr_target() -> ProxyTarget {
+    ProxyTarget::Domain("sp.packet-addr.v2fly.arpa".to_string(), 0)
+}
+
+fn is_vmess_packetaddr_target(target: &ProxyTarget) -> bool {
+    matches!(target, ProxyTarget::Domain(host, _) if host.eq_ignore_ascii_case("sp.packet-addr.v2fly.arpa"))
+}
+
+fn encode_vmess_packetaddr_packet(target: &ProxyTarget, payload: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(19 + payload.len());
+    match target {
+        ProxyTarget::Ip(addr) => {
+            out.extend_from_slice(&addr.port().to_be_bytes());
+            match addr.ip() {
+                IpAddr::V4(ip) => {
+                    out.push(ATYP_IPV4);
+                    out.extend_from_slice(&ip.octets());
+                }
+                IpAddr::V6(ip) => {
+                    out.push(0x02);
+                    out.extend_from_slice(&ip.octets());
+                }
+            }
+        }
+        ProxyTarget::Domain(host, _) => {
+            bail!("VMess packetaddr does not support FQDN target {host}")
+        }
+    }
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+fn decode_vmess_packetaddr_packet(data: &[u8]) -> Result<(ProxyTarget, &[u8])> {
+    ensure!(data.len() >= 3, "short VMess packetaddr packet");
+    let port = u16::from_be_bytes([data[0], data[1]]);
+    match data[2] {
+        ATYP_IPV4 => {
+            ensure!(data.len() >= 7, "short VMess packetaddr IPv4 packet");
+            Ok((
+                ProxyTarget::Ip(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(data[3], data[4], data[5], data[6])),
+                    port,
+                )),
+                &data[7..],
+            ))
+        }
+        0x02 => {
+            ensure!(data.len() >= 19, "short VMess packetaddr IPv6 packet");
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&data[3..19]);
+            Ok((
+                ProxyTarget::Ip(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port)),
+                &data[19..],
+            ))
+        }
+        other => bail!("unsupported VMess packetaddr address type {other:#x}"),
     }
 }
 

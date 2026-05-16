@@ -10,7 +10,7 @@ use crate::tuic::TuicClientConfig;
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::VlessClientConfig;
 use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
-use crate::vmess::VmessClientConfig;
+use crate::vmess::{VmessClientConfig, ensure_vmess_packet_encoding};
 use anyhow::{Context, Result, bail, ensure};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
@@ -454,14 +454,9 @@ impl SingBoxVmessOutbound {
             "sing-box VMess outbound {name} uses legacy alter_id {}; Aerion implements AEAD VMess only",
             self.alter_id
         );
-        ensure!(
-            self.packet_encoding
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or_default()
-                .is_empty(),
-            "sing-box VMess outbound {name} sets packet_encoding; Aerion VMess UDP uses VMess chunk stream and does not expose this switch"
-        );
+        let packet_encoding = self.packet_encoding.clone().unwrap_or_default();
+        ensure_vmess_packet_encoding(&packet_encoding)
+            .with_context(|| format!("sing-box VMess outbound {name} packet_encoding"))?;
         if let Some(tls) = &self.tls {
             if tls.enabled {
                 ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
@@ -478,6 +473,7 @@ impl SingBoxVmessOutbound {
             server_port: self.server_port,
             user_id: self.uuid.clone(),
             security: self.security.clone(),
+            packet_encoding,
             udp: network_allows_udp(self.network.as_deref()),
             tls: tls_enabled,
             sni: sni_or_server(server_name, &self.server),
@@ -1120,6 +1116,7 @@ mod tests {
     "server_port": 80,
     "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
     "alter_id": 0,
+    "packet_encoding": "packetaddr",
     "transport": {
       "type": "ws",
       "path": "/vmess",
@@ -1140,6 +1137,7 @@ mod tests {
             crate::vless_transport::VlessTransportKind::WebSocket
         );
         assert_eq!(vmess.transport.path, "/vmess");
+        assert_eq!(vmess.packet_encoding, "packetaddr");
         assert_eq!(
             vmess.transport.request_host("example.com"),
             "edge.example.com"

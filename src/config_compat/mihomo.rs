@@ -10,7 +10,7 @@ use crate::tuic::TuicClientConfig;
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::VlessClientConfig;
 use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
-use crate::vmess::VmessClientConfig;
+use crate::vmess::{VmessClientConfig, ensure_vmess_packet_encoding};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Deserializer, de};
 use std::collections::BTreeMap;
@@ -132,6 +132,8 @@ pub struct MihomoVmessProxy {
     pub tls: bool,
     #[serde(default = "default_tcp")]
     pub network: String,
+    #[serde(default, rename = "packet-encoding", alias = "packet_encoding")]
+    pub packet_encoding: String,
     #[serde(default, alias = "server-name", alias = "sni")]
     pub servername: Option<String>,
     #[serde(
@@ -540,6 +542,8 @@ impl MihomoVmessProxy {
             "mihomo VMess proxy {} sets client-fingerprint while TLS is disabled",
             self.name
         );
+        ensure_vmess_packet_encoding(&self.packet_encoding)
+            .with_context(|| format!("mihomo VMess proxy {} packet-encoding", self.name))?;
         let network = self.network.trim();
         let transport = if network.eq_ignore_ascii_case("grpc") {
             VlessTransportConfig::from_network(
@@ -571,6 +575,7 @@ impl MihomoVmessProxy {
             server_port: self.port,
             user_id: self.uuid.clone(),
             security: self.cipher.clone(),
+            packet_encoding: self.packet_encoding.clone(),
             udp: self.udp,
             tls: self.tls,
             sni: sni_or_server(self.servername.as_deref(), &self.server),
@@ -1059,6 +1064,7 @@ proxies:
     port: 80
     uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
     alterId: 0
+    packet-encoding: packetaddr
     network: ws
     ws-opts:
       path: /vmess
@@ -1077,6 +1083,7 @@ proxies:
             crate::vless_transport::VlessTransportKind::WebSocket
         );
         assert_eq!(vmess.transport.path, "/vmess");
+        assert_eq!(vmess.packet_encoding, "packetaddr");
         assert_eq!(
             vmess.transport.request_host("example.com"),
             "edge.example.com"

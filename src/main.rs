@@ -694,6 +694,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             server_port,
             user_id: native_user_id(client.user_id, &client.username, "VMess client")?,
             security: client.security.unwrap_or_else(|| "auto".to_string()),
+            packet_encoding: client.packet_encoding,
             udp: client.udp,
             tls: client.tls.unwrap_or(false),
             sni,

@@ -6,7 +6,7 @@ use crate::trojan::TrojanClientConfig;
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::VlessClientConfig;
 use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
-use crate::vmess::VmessClientConfig;
+use crate::vmess::{VmessClientConfig, ensure_vmess_packet_encoding};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -457,6 +457,14 @@ impl XrayOutbound {
             self.name(),
             alter_id
         );
+        let packet_encoding = peer
+            .user
+            .packet_encoding
+            .clone()
+            .or(self.settings.packet_encoding.clone())
+            .unwrap_or_default();
+        ensure_vmess_packet_encoding(&packet_encoding)
+            .with_context(|| format!("xray VMess outbound {} packetEncoding", self.name()))?;
         let tls = self.stream_settings.tls_settings.as_ref();
         let tls_enabled = self
             .stream_settings
@@ -481,6 +489,7 @@ impl XrayOutbound {
                 .security
                 .or(self.settings.security.clone())
                 .unwrap_or_else(|| "auto".to_string()),
+            packet_encoding,
             udp: true,
             tls: tls_enabled,
             sni: sni_or_server(
@@ -967,7 +976,11 @@ mod tests {
       "vnext": [{
         "address": "example.com",
         "port": 443,
-        "users": [{ "id": "a3482e88-686a-4a58-8126-99c9df64b7bf", "alterId": 0 }]
+        "users": [{
+          "id": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+          "alterId": 0,
+          "packetEncoding": "packetaddr"
+        }]
       }]
     },
     "streamSettings": { "network": "tcp", "security": "tls" }
@@ -996,7 +1009,11 @@ mod tests {
       "vnext": [{
         "address": "example.com",
         "port": 80,
-        "users": [{ "id": "a3482e88-686a-4a58-8126-99c9df64b7bf", "alterId": 0 }]
+        "users": [{
+          "id": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+          "alterId": 0,
+          "packetEncoding": "packetaddr"
+        }]
       }]
     },
     "streamSettings": {
@@ -1022,6 +1039,7 @@ mod tests {
             crate::vless_transport::VlessTransportKind::WebSocket
         );
         assert_eq!(vmess.transport.path, "/vmess");
+        assert_eq!(vmess.packet_encoding, "packetaddr");
         assert_eq!(
             vmess.transport.request_host("example.com"),
             "edge.example.com"
