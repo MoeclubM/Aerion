@@ -438,6 +438,7 @@ impl XrayOutbound {
                 )
             })?,
             udp: true,
+            udp_over_tcp: false,
         })
     }
 

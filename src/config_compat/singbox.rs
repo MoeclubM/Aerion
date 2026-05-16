@@ -365,17 +365,15 @@ impl SingBoxShadowsocksOutbound {
             self.plugin.is_none() && self.plugin_opts.is_none(),
             "sing-box Shadowsocks outbound {name} sets SIP003 plugin; Aerion Shadowsocks does not implement plugins"
         );
-        ensure!(
-            self.udp_over_tcp.is_none(),
-            "sing-box Shadowsocks outbound {name} sets udp_over_tcp; Aerion Shadowsocks does not implement UDP-over-TCP"
-        );
+        let udp_over_tcp = value_bool_or_object(self.udp_over_tcp.as_ref());
         Ok(ShadowsocksClientConfig {
             listen,
             server_host: self.server.clone(),
             server_port: self.server_port,
             method: self.method.clone(),
             password: self.password.clone(),
-            udp: network_allows_udp(self.network.as_deref()),
+            udp: network_allows_udp(self.network.as_deref()) || udp_over_tcp,
+            udp_over_tcp,
         })
     }
 }
@@ -955,6 +953,33 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_shadowsocks_udp_over_tcp_outbound() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [{
+    "type": "shadowsocks",
+    "tag": "ss-uot",
+    "server": "example.com",
+    "server_port": 8388,
+    "method": "aes-128-gcm",
+    "password": "secret",
+    "network": "tcp",
+    "udp_over_tcp": { "enabled": true }
+  }]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxClientConfig::Shadowsocks(shadowsocks) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Shadowsocks")
+        };
+        assert!(shadowsocks.udp);
+        assert!(shadowsocks.udp_over_tcp);
+        Ok(())
+    }
 
     #[test]
     fn parses_vless_reality_outbound() -> Result<()> {

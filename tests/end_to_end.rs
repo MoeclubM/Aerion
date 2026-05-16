@@ -6,11 +6,13 @@ use aerion::vless_transport::VlessTransportConfig;
 use aerion::{
     ClientConfig, Hysteria2ClientConfig, Hysteria2ServerConfig, MieruClientConfig,
     MieruServerConfig, MieruTransport, RealityClientConfig, RealityServerConfig, ServerConfig,
-    TrojanClientConfig, TrojanServerConfig, UtlsFingerprint, VlessClientConfig, VlessServerConfig,
-    VmessClientConfig, VmessServerConfig, run_client_listener, run_hysteria2_client_listener,
-    run_hysteria2_server, run_mieru_client_listener, run_mieru_server, run_server_listener,
-    run_trojan_client_listener, run_trojan_server, run_vless_client_listener, run_vless_server,
-    run_vmess_client_listener, run_vmess_server, tls,
+    ShadowsocksClientConfig, ShadowsocksServerConfig, TrojanClientConfig, TrojanServerConfig,
+    UtlsFingerprint, VlessClientConfig, VlessServerConfig, VmessClientConfig, VmessServerConfig,
+    run_client_listener, run_hysteria2_client_listener, run_hysteria2_server,
+    run_mieru_client_listener, run_mieru_server, run_server_listener,
+    run_shadowsocks_client_listener, run_shadowsocks_server, run_trojan_client_listener,
+    run_trojan_server, run_vless_client_listener, run_vless_server, run_vmess_client_listener,
+    run_vmess_server, tls,
 };
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
@@ -218,6 +220,77 @@ async fn socks_udp_associate_reaches_udp_target_through_uot() -> Result<()> {
     })
     .await
     .context("end-to-end UDP proxy test timed out")
+    .and_then(|inner| inner);
+
+    client_task.abort();
+    server_task.abort();
+    if result.is_ok() {
+        udp_echo_task.await??;
+    } else {
+        udp_echo_task.abort();
+    }
+    result
+}
+
+#[tokio::test]
+async fn socks_udp_associate_reaches_udp_target_through_shadowsocks_uot() -> Result<()> {
+    let udp_echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let udp_echo_addr = udp_echo.local_addr()?;
+    let udp_echo_task = tokio::spawn(async move {
+        let mut buffer = [0u8; 1024];
+        let (read, peer) = udp_echo.recv_from(&mut buffer).await?;
+        udp_echo.send_to(&buffer[..read], peer).await?;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let server_addr = unused_tcp_addr()?;
+    let server_task = tokio::spawn(run_shadowsocks_server(ShadowsocksServerConfig {
+        listen: server_addr,
+        method: "aes-128-gcm".to_string(),
+        password: "test-password".to_string(),
+        users: Vec::new(),
+        udp: false,
+        udp_over_tcp: true,
+    }));
+
+    let client_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let client_addr = client_listener.local_addr()?;
+    let client_task = tokio::spawn(run_shadowsocks_client_listener(
+        client_listener,
+        ShadowsocksClientConfig {
+            listen: client_addr,
+            server_host: "127.0.0.1".to_string(),
+            server_port: server_addr.port(),
+            method: "aes-128-gcm".to_string(),
+            password: "test-password".to_string(),
+            udp: true,
+            udp_over_tcp: true,
+        },
+    ));
+
+    let result = timeout(Duration::from_secs(5), async {
+        let mut control = TcpStream::connect(client_addr).await?;
+        control.write_all(&[0x05, 0x01, 0x00]).await?;
+        let mut greeting = [0u8; 2];
+        control.read_exact(&mut greeting).await?;
+        anyhow::ensure!(greeting == [0x05, 0x00], "unexpected SOCKS greeting reply");
+
+        write_socks_udp_associate(&mut control).await?;
+        let udp_bind = read_socks_reply_addr(&mut control).await?;
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        udp.send_to(&socks_udp_packet(udp_echo_addr, b"hello ss uot")?, udp_bind)
+            .await?;
+        let mut response = [0u8; 256];
+        let (read, _) = udp.recv_from(&mut response).await?;
+        let payload = socks_udp_payload(&response[..read])?;
+        anyhow::ensure!(
+            payload == b"hello ss uot",
+            "Shadowsocks UOT payload mismatch"
+        );
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("Shadowsocks UOT end-to-end test timed out")
     .and_then(|inner| inner);
 
     client_task.abort();

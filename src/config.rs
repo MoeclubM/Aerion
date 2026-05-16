@@ -105,6 +105,8 @@ pub struct ClientFileConfig {
     pub download_bandwidth: Option<u64>,
     #[serde(default = "default_udp")]
     pub udp: bool,
+    #[serde(default, alias = "udp-over-tcp", alias = "udpOverTcp", alias = "uot")]
+    pub udp_over_tcp: bool,
     #[serde(default = "default_hy2_congestion_control")]
     pub congestion_control: String,
     #[serde(
@@ -177,6 +179,8 @@ pub struct ServerFileConfig {
     pub obfs_password: Option<String>,
     #[serde(default = "default_udp")]
     pub udp: bool,
+    #[serde(default, alias = "udp-over-tcp", alias = "udpOverTcp", alias = "uot")]
+    pub udp_over_tcp: bool,
     #[serde(default = "default_cc_rx")]
     pub cc_rx: String,
     #[serde(default = "default_hy2_congestion_control")]

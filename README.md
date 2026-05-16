@@ -42,9 +42,10 @@ Aerion now provides these server/client protocol stacks:
   - TCP and UDP server relay
   - TCP relay through the configured Shadowsocks server
   - UDP relay with the Shadowsocks UDP packet format
+  - SIP003 UDP-over-TCP / UOT relay over the Shadowsocks TCP stream
   - AEAD, AEAD-2022, AEAD-2022 extra, AEAD extra, and stream ciphers enabled by the bundled `shadowsocks-rust` features
   - protected outbound sockets through Aerion's Android socket protector hook
-  - SIP003 plugins and UDP-over-TCP are not implemented and fail explicitly
+  - SIP003 plugins are not implemented and fail explicitly
 - Trojan:
   - TLS client/server core
   - TCP CONNECT

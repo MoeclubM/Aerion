@@ -1,6 +1,6 @@
 use crate::protocol::{ProxyTarget, target_name};
 use crate::{socket_protect, socks, uot};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use shadowsocks::config::{
     ServerAddr as ShadowsocksServerAddr, ServerConfig as ShadowsocksInnerConfig, ServerType,
     ServerUser, ServerUserManager,
@@ -23,8 +23,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 const SHADOWSOCKS_UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -37,6 +38,7 @@ pub struct ShadowsocksClientConfig {
     pub method: String,
     pub password: String,
     pub udp: bool,
+    pub udp_over_tcp: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +48,7 @@ pub struct ShadowsocksServerConfig {
     pub password: String,
     pub users: Vec<String>,
     pub udp: bool,
+    pub udp_over_tcp: bool,
 }
 
 #[derive(Clone)]
@@ -55,6 +58,7 @@ struct ShadowsocksRuntime {
     server: ShadowsocksInnerConfig,
     context: ShadowsocksSharedContext,
     udp: bool,
+    udp_over_tcp: bool,
 }
 
 #[derive(Clone)]
@@ -62,6 +66,7 @@ struct ShadowsocksServerRuntime {
     server: ShadowsocksInnerConfig,
     context: ShadowsocksSharedContext,
     udp: bool,
+    udp_over_tcp: bool,
 }
 
 pub async fn run_shadowsocks_client(config: ShadowsocksClientConfig) -> Result<()> {
@@ -111,6 +116,7 @@ impl ShadowsocksRuntime {
                 .context("build Shadowsocks server config")?,
             context: ShadowsocksContext::new_shared(ServerType::Local),
             udp: config.udp,
+            udp_over_tcp: config.udp_over_tcp,
         })
     }
 }
@@ -144,6 +150,7 @@ impl ShadowsocksServerRuntime {
             server,
             context: ShadowsocksContext::new_shared(ServerType::Server),
             udp: config.udp,
+            udp_over_tcp: config.udp_over_tcp,
         })
     }
 }
@@ -167,15 +174,19 @@ pub async fn run_shadowsocks_server(config: ShadowsocksServerConfig) -> Result<(
             .accept()
             .await
             .context("accept Shadowsocks client")?;
+        let udp_over_tcp = runtime.udp_over_tcp;
         tokio::spawn(async move {
-            if let Err(error) = handle_shadowsocks_tcp_client(stream).await {
+            if let Err(error) = handle_shadowsocks_tcp_client(stream, udp_over_tcp).await {
                 tracing::warn!("Shadowsocks TCP client {peer} failed: {error:?}");
             }
         });
     }
 }
 
-async fn handle_shadowsocks_tcp_client<S>(mut inbound: ProxyServerStream<S>) -> Result<()>
+async fn handle_shadowsocks_tcp_client<S>(
+    mut inbound: ProxyServerStream<S>,
+    udp_over_tcp: bool,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -184,6 +195,13 @@ where
         .await
         .context("read Shadowsocks TCP target")?;
     let target = proxy_target(&target);
+    if uot::is_magic_target(&target) {
+        ensure!(
+            udp_over_tcp,
+            "Shadowsocks UDP-over-TCP is disabled by server config"
+        );
+        return relay_shadowsocks_uot_stream(inbound, target).await;
+    }
     let mut outbound = connect_proxy_target(&target).await?;
     tracing::info!("Shadowsocks serving TCP {}", target_name(&target));
     tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
@@ -295,6 +313,9 @@ async fn handle_shadowsocks_socks(mut local: TcpStream, runtime: ShadowsocksRunt
         }
         socks::SocksRequest::UdpAssociate => {
             ensure!(runtime.udp, "Shadowsocks UDP is disabled by client config");
+            if runtime.udp_over_tcp {
+                return handle_shadowsocks_uot_associate(local, runtime).await;
+            }
             handle_shadowsocks_udp_associate(local, runtime).await
         }
     }
@@ -351,6 +372,232 @@ async fn handle_shadowsocks_udp_associate(
     }
 }
 
+async fn handle_shadowsocks_uot_associate(
+    mut control: TcpStream,
+    runtime: ShadowsocksRuntime,
+) -> Result<()> {
+    let bind_ip = match control.local_addr()?.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ip => ip,
+    };
+    let udp = Arc::new(
+        UdpSocket::bind(SocketAddr::new(bind_ip, 0))
+            .await
+            .with_context(|| format!("bind Shadowsocks UOT SOCKS UDP socket on {bind_ip}:0"))?,
+    );
+    socks::write_reply_with_bind(&mut control, 0x00, udp.local_addr()?).await?;
+
+    let tcp =
+        socket_protect::connect_tcp_host_port(runtime.server_host.as_str(), runtime.server_port)
+            .await
+            .with_context(|| {
+                format!(
+                    "connect Shadowsocks UOT server {}:{}",
+                    runtime.server_host, runtime.server_port
+                )
+            })?;
+    let mut remote = ProxyClientStream::from_stream(
+        runtime.context.clone(),
+        tcp,
+        &runtime.server,
+        shadowsocks_address(&uot::magic_target()),
+    );
+    poll_fn(|cx| Pin::new(&mut remote).poll_write(cx, &[]))
+        .await
+        .context("write Shadowsocks UOT TCP request header")?;
+    remote
+        .write_all(&uot::encode_v2_associate_request()?)
+        .await
+        .context("write Shadowsocks UOT associate request")?;
+    let (mut remote_reader, mut remote_writer) = tokio::io::split(remote);
+    let peer = Arc::new(Mutex::new(None::<SocketAddr>));
+
+    let udp_to_stream = {
+        let udp = udp.clone();
+        let peer = peer.clone();
+        async move {
+            let mut buffer = vec![0u8; u16::MAX as usize + 32];
+            loop {
+                let (read, next_peer) = udp
+                    .recv_from(&mut buffer)
+                    .await
+                    .context("receive Shadowsocks UOT SOCKS UDP packet")?;
+                *peer.lock().await = Some(next_peer);
+                let (target, payload) = uot::parse_socks_udp_packet(&buffer[..read])?;
+                let packet = uot::encode_associate_packet(&target, payload)?;
+                remote_writer
+                    .write_all(&packet)
+                    .await
+                    .context("write Shadowsocks UOT packet")?;
+            }
+        }
+    };
+    let stream_to_udp = {
+        let udp = udp.clone();
+        async move {
+            let request = uot::legacy_associate_request();
+            let mut pending = Vec::new();
+            let mut buffer = vec![0u8; 32 * 1024];
+            loop {
+                while let Some((source, payload, _)) =
+                    uot::take_stream_packet(&request, &mut pending)?
+                {
+                    let peer = (*peer.lock().await).context("SOCKS UDP peer is not known yet")?;
+                    let response = uot::encode_socks_udp_packet(&source, &payload)?;
+                    udp.send_to(&response, peer)
+                        .await
+                        .with_context(|| format!("send Shadowsocks UOT response to {peer}"))?;
+                }
+                let read = remote_reader
+                    .read(&mut buffer)
+                    .await
+                    .context("read Shadowsocks UOT stream")?;
+                if read == 0 {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                pending.extend_from_slice(&buffer[..read]);
+            }
+        }
+    };
+    let control_closed = async {
+        let mut buffer = [0u8; 1];
+        loop {
+            if control
+                .read(&mut buffer)
+                .await
+                .context("read Shadowsocks UOT control connection")?
+                == 0
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    };
+
+    tokio::select! {
+        result = udp_to_stream => result,
+        result = stream_to_udp => result,
+        result = control_closed => result,
+    }
+}
+
+async fn relay_shadowsocks_uot_stream<S>(
+    mut inbound: ProxyServerStream<S>,
+    target: ProxyTarget,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut pending = Vec::new();
+    let request = if uot::is_legacy_magic_target(&target) {
+        uot::legacy_associate_request()
+    } else {
+        let mut buffer = [0u8; 1024];
+        loop {
+            let read = inbound
+                .read(&mut buffer)
+                .await
+                .context("read Shadowsocks UOT request")?;
+            ensure!(read > 0, "Shadowsocks UOT stream closed before request");
+            pending.extend_from_slice(&buffer[..read]);
+            if let Some(request) = uot::take_v2_request(&mut pending)? {
+                break request;
+            }
+        }
+    };
+    let udp = Arc::new(
+        UdpSocket::bind(match &request.destination {
+            ProxyTarget::Ip(addr) if addr.is_ipv6() => "[::]:0",
+            _ => "0.0.0.0:0",
+        })
+        .await
+        .context("bind Shadowsocks UOT UDP socket")?,
+    );
+    if request.is_connect {
+        let target = resolve_proxy_target(&request.destination).await?;
+        udp.connect(target)
+            .await
+            .with_context(|| format!("connect Shadowsocks UOT UDP target {target}"))?;
+    }
+    tracing::info!("Shadowsocks serving UDP-over-TCP");
+    let (mut reader, mut writer) = tokio::io::split(inbound);
+    let downlink_is_connect = request.is_connect;
+
+    let uplink = {
+        let udp = udp.clone();
+        let request = request;
+        async move {
+            let mut buffer = vec![0u8; 32 * 1024];
+            loop {
+                while let Some((destination, payload, connected)) =
+                    uot::take_stream_packet(&request, &mut pending)?
+                {
+                    if connected {
+                        let sent = udp
+                            .send(&payload)
+                            .await
+                            .context("send connected Shadowsocks UOT payload")?;
+                        if sent != payload.len() {
+                            bail!(
+                                "short Shadowsocks UOT send: expected {}, wrote {}",
+                                payload.len(),
+                                sent
+                            );
+                        }
+                    } else {
+                        let target = resolve_proxy_target(&destination).await?;
+                        let sent = udp
+                            .send_to(&payload, target)
+                            .await
+                            .with_context(|| format!("send Shadowsocks UOT payload to {target}"))?;
+                        if sent != payload.len() {
+                            bail!(
+                                "short Shadowsocks UOT send: expected {}, wrote {}",
+                                payload.len(),
+                                sent
+                            );
+                        }
+                    }
+                }
+                let read = reader
+                    .read(&mut buffer)
+                    .await
+                    .context("read Shadowsocks UOT packet stream")?;
+                if read == 0 {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                pending.extend_from_slice(&buffer[..read]);
+            }
+        }
+    };
+    let downlink = async move {
+        let mut buffer = vec![0u8; u16::MAX as usize];
+        loop {
+            let packet = if downlink_is_connect {
+                let read = udp
+                    .recv(&mut buffer)
+                    .await
+                    .context("receive connected Shadowsocks UOT payload")?;
+                uot::encode_connect_packet(&buffer[..read])?
+            } else {
+                let (read, source) = udp
+                    .recv_from(&mut buffer)
+                    .await
+                    .context("receive Shadowsocks UOT payload")?;
+                uot::encode_associate_packet(&ProxyTarget::Ip(source), &buffer[..read])?
+            };
+            writer
+                .write_all(&packet)
+                .await
+                .context("write Shadowsocks UOT response packet")?;
+        }
+    };
+
+    tokio::select! {
+        result = uplink => result,
+        result = downlink => result,
+    }
+}
+
 async fn connect_shadowsocks_udp_server(
     runtime: &ShadowsocksRuntime,
 ) -> Result<ProxySocket<ShadowsocksUdpSocket>> {
@@ -392,6 +639,19 @@ async fn connect_proxy_target(target: &ProxyTarget) -> Result<TcpStream> {
     match target {
         ProxyTarget::Ip(addr) => socket_protect::connect_tcp_addr(*addr).await,
         ProxyTarget::Domain(host, port) => socket_protect::connect_tcp_host_port(host, *port).await,
+    }
+}
+
+async fn resolve_proxy_target(target: &ProxyTarget) -> Result<SocketAddr> {
+    match target {
+        ProxyTarget::Ip(addr) => Ok(*addr),
+        ProxyTarget::Domain(host, port) => tokio::net::lookup_host((host.as_str(), *port))
+            .await
+            .with_context(|| format!("resolve Shadowsocks UOT target {host}:{port}"))?
+            .next()
+            .with_context(|| {
+                format!("Shadowsocks UOT target resolved to no addresses: {host}:{port}")
+            }),
     }
 }
 

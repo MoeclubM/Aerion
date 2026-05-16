@@ -58,15 +58,55 @@ pub fn decode_request_for_target<'a>(
     payload: &'a [u8],
 ) -> Result<(UotRequest, &'a [u8])> {
     if is_legacy_magic_target(target) {
-        return Ok((
-            UotRequest {
-                is_connect: false,
-                destination: ProxyTarget::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
-            },
-            payload,
-        ));
+        return Ok((legacy_associate_request(), payload));
     }
     Ok((decode_v2_request(payload)?, &[]))
+}
+
+pub fn legacy_associate_request() -> UotRequest {
+    UotRequest {
+        is_connect: false,
+        destination: ProxyTarget::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
+    }
+}
+
+pub fn take_v2_request(pending: &mut Vec<u8>) -> Result<Option<UotRequest>> {
+    let Some(length) = v2_request_len(pending)? else {
+        return Ok(None);
+    };
+    if pending.len() < length {
+        return Ok(None);
+    }
+    let request = decode_v2_request(&pending[..length])?;
+    pending.drain(..length);
+    Ok(Some(request))
+}
+
+pub fn take_stream_packet(
+    request: &UotRequest,
+    pending: &mut Vec<u8>,
+) -> Result<Option<(ProxyTarget, Vec<u8>, bool)>> {
+    if request.is_connect {
+        let Some(length) = connect_packet_len(pending)? else {
+            return Ok(None);
+        };
+        if pending.len() < length {
+            return Ok(None);
+        }
+        let payload = decode_connect_packet(&pending[..length])?.to_vec();
+        pending.drain(..length);
+        return Ok(Some((request.destination.clone(), payload, true)));
+    }
+    let Some(length) = associate_packet_len(pending)? else {
+        return Ok(None);
+    };
+    if pending.len() < length {
+        return Ok(None);
+    }
+    let packet = pending[..length].to_vec();
+    pending.drain(..length);
+    let (destination, payload) = decode_associate_packet(&packet)?;
+    Ok(Some((destination, payload.to_vec(), false)))
 }
 
 pub fn encode_associate_packet(destination: &ProxyTarget, payload: &[u8]) -> Result<Vec<u8>> {
@@ -144,6 +184,71 @@ pub fn encode_socks_udp_packet(source: &ProxyTarget, payload: &[u8]) -> Result<V
     write_socks_address(&mut bytes, source)?;
     bytes.extend_from_slice(payload);
     Ok(bytes)
+}
+
+fn v2_request_len(packet: &[u8]) -> Result<Option<usize>> {
+    if packet.len() < 2 {
+        return Ok(None);
+    }
+    let address_offset = 1;
+    match packet[address_offset] {
+        0x01 => Ok(Some(address_offset + 7)),
+        0x04 => Ok(Some(address_offset + 19)),
+        0x03 => {
+            if packet.len() < address_offset + 2 {
+                return Ok(None);
+            }
+            Ok(Some(
+                address_offset + 2 + packet[address_offset + 1] as usize + 2,
+            ))
+        }
+        other => bail!("unsupported UOT request address type: {other}"),
+    }
+}
+
+fn connect_packet_len(packet: &[u8]) -> Result<Option<usize>> {
+    if packet.len() < 2 {
+        return Ok(None);
+    }
+    let payload_len = u16::from_be_bytes([packet[0], packet[1]]) as usize;
+    Ok(Some(2 + payload_len))
+}
+
+fn associate_packet_len(packet: &[u8]) -> Result<Option<usize>> {
+    if packet.is_empty() {
+        return Ok(None);
+    }
+    let payload_len_offset = match packet[0] {
+        AF_IPV4 => {
+            if packet.len() < 7 {
+                return Ok(None);
+            }
+            7
+        }
+        AF_IPV6 => {
+            if packet.len() < 19 {
+                return Ok(None);
+            }
+            19
+        }
+        AF_FQDN => {
+            if packet.len() < 2 {
+                return Ok(None);
+            }
+            let address_len = packet[1] as usize;
+            if packet.len() < 2 + address_len + 2 {
+                return Ok(None);
+            }
+            2 + address_len + 2
+        }
+        other => bail!("unsupported UOT address family: {other}"),
+    };
+    if packet.len() < payload_len_offset + 2 {
+        return Ok(None);
+    }
+    let payload_len =
+        u16::from_be_bytes([packet[payload_len_offset], packet[payload_len_offset + 1]]) as usize;
+    Ok(Some(payload_len_offset + 2 + payload_len))
 }
 
 fn write_socks_address(bytes: &mut Vec<u8>, target: &ProxyTarget) -> Result<()> {

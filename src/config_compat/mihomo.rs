@@ -439,15 +439,11 @@ impl MihomoShadowsocksProxy {
             "mihomo Shadowsocks proxy {} uses SIP003 plugin; Aerion Shadowsocks does not implement plugins",
             self.name
         );
-        ensure!(
-            !self
-                .udp_over_tcp
-                .as_ref()
-                .map(|opts| opts.enabled)
-                .unwrap_or(false),
-            "mihomo Shadowsocks proxy {} enables UDP-over-TCP; Aerion Shadowsocks does not implement UDP-over-TCP",
-            self.name
-        );
+        let udp_over_tcp = self
+            .udp_over_tcp
+            .as_ref()
+            .map(|opts| opts.enabled)
+            .unwrap_or(false);
         Ok(ShadowsocksClientConfig {
             listen,
             server_host: self.server.clone(),
@@ -455,6 +451,7 @@ impl MihomoShadowsocksProxy {
             method: self.cipher.clone(),
             password: self.password.clone(),
             udp: self.udp,
+            udp_over_tcp,
         })
     }
 }
@@ -912,6 +909,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_shadowsocks_udp_over_tcp_profile() -> Result<()> {
+        let yaml = r#"
+proxies:
+  - name: ss-uot
+    type: ss
+    server: example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: secret
+    udp: true
+    udp-over-tcp:
+      enabled: true
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let MihomoClientConfig::Shadowsocks(shadowsocks) =
+            config.proxies[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Shadowsocks")
+        };
+        assert!(shadowsocks.udp);
+        assert!(shadowsocks.udp_over_tcp);
+        Ok(())
+    }
 
     #[test]
     fn parses_vless_reality_profile() -> Result<()> {

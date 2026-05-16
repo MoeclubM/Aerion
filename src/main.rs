@@ -634,6 +634,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
                 .context("Shadowsocks client requires cipher")?,
             password: client.password,
             udp: client.udp,
+            udp_over_tcp: client.udp_over_tcp,
         })
         .await;
     }
@@ -794,6 +795,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             password: server.password,
             users: server.users,
             udp: server.udp,
+            udp_over_tcp: server.udp_over_tcp,
         })
         .await;
     }
