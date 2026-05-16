@@ -11,7 +11,7 @@ use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::VlessClientConfig;
 use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
 use crate::vmess::{VmessClientConfig, ensure_vmess_packet_encoding};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Deserializer, de};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -923,6 +923,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use anyhow::bail;
+
     use super::*;
 
     #[test]

@@ -99,12 +99,13 @@ pub async fn run_trojan_server_with_core(
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind Trojan server on {}", config.listen))?;
-    let mut server_config = tls::server_config(&config.cert_path, &config.key_path)?;
+    let mut server_config =
+        Arc::unwrap_or_clone(tls::server_config(&config.cert_path, &config.key_path)?);
     let alpn = config.transport.alpn_protocols();
     if !alpn.is_empty() {
         server_config.alpn_protocols = alpn;
     }
-    let acceptor = TlsAcceptor::from(server_config);
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
     let auth = trojan_auth_map(&config.password, &config.users);
     let transport = config.transport.clone();
     tracing::info!("Trojan server listening on {}", listener.local_addr()?);
