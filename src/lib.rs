@@ -72,6 +72,6 @@ pub use vless::{
     run_vless_server, run_vless_server_with_core,
 };
 pub use vmess::{
-    VmessClientConfig, VmessServerConfig, run_vmess_client, run_vmess_client_listener,
-    run_vmess_server, run_vmess_server_with_core,
+    VmessClientConfig, VmessServerConfig, ensure_vmess_packet_encoding, run_vmess_client,
+    run_vmess_client_listener, run_vmess_server, run_vmess_server_with_core,
 };
