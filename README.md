@@ -59,7 +59,7 @@ Aerion now provides these server/client protocol stacks:
   - Cubic / BBR / NewReno congestion control selection
   - multi-user UUID/password credentials and `ProxyCore` accounting
 - VLESS:
-  - TLS client/server core
+  - raw TCP, TLS, and REALITY client/server core
   - TCP / WebSocket / HTTPUpgrade / HTTP/2 / gRPC transports
   - XHTTP/SplitHTTP stream-one transport over HTTP/1.1
   - TCP command

@@ -389,22 +389,40 @@ impl SingBoxVlessOutbound {
             self.network.as_deref(),
             self.transport.as_ref(),
         )?;
-        let tls = self
-            .tls
-            .as_ref()
-            .with_context(|| format!("sing-box VLESS outbound {name} is missing tls"))?;
-        ensure!(
-            tls.enabled,
-            "sing-box VLESS outbound {name} disables TLS; Aerion VLESS client currently requires TLS"
-        );
-        ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
+        let tls_enabled = self.tls.as_ref().map(|tls| tls.enabled).unwrap_or(false);
+        let reality = if tls_enabled {
+            self.tls
+                .as_ref()
+                .map(|tls| tls.reality_client_config(name))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        if let Some(tls) = &self.tls {
+            if tls_enabled || reality.is_some() {
+                ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
+            } else {
+                ensure_disabled_utls(name, tls)?;
+                ensure_disabled_reality(name, tls)?;
+                ensure_no_alpn("sing-box", name, tls.alpn.as_ref())?;
+            }
+        }
         Ok(VlessClientConfig {
             listen,
             server_host: self.server.clone(),
             server_port: self.server_port,
             user_id: self.uuid.clone(),
-            sni: sni_or_server(tls.server_name.as_deref(), &self.server),
-            insecure: tls.insecure,
+            tls: tls_enabled && reality.is_none(),
+            sni: sni_or_server(
+                self.tls.as_ref().and_then(|tls| tls.server_name.as_deref()),
+                &self.server,
+            ),
+            insecure: if tls_enabled {
+                self.tls.as_ref().map(|tls| tls.insecure).unwrap_or(false)
+            } else {
+                false
+            },
             flow: self.flow.clone(),
             packet_encoding: self
                 .packet_encoding
@@ -412,8 +430,13 @@ impl SingBoxVlessOutbound {
                 .unwrap_or_else(|| "xudp".to_string()),
             mux: false,
             udp: network_allows_udp(self.network.as_deref()),
-            client_fingerprint: tls.utls_fingerprint(name)?,
-            reality: tls.reality_client_config(name)?,
+            client_fingerprint: self
+                .tls
+                .as_ref()
+                .map(|tls| tls.utls_fingerprint(name))
+                .transpose()?
+                .flatten(),
+            reality,
             transport,
         })
     }
@@ -674,6 +697,16 @@ fn ensure_disabled_utls(name: &str, tls: &SingBoxTlsOptions) -> Result<()> {
             .as_ref()
             .is_none_or(|utls| !utls.enabled && utls.fingerprint.is_none()),
         "sing-box outbound {name} sets uTLS but this Aerion transport does not implement uTLS"
+    );
+    Ok(())
+}
+
+fn ensure_disabled_reality(name: &str, tls: &SingBoxTlsOptions) -> Result<()> {
+    ensure!(
+        tls.reality.as_ref().is_none_or(|reality| {
+            !reality.enabled && reality.public_key.is_none() && reality.short_id.is_none()
+        }),
+        "sing-box outbound {name} sets REALITY but TLS is disabled"
     );
     Ok(())
 }
@@ -949,6 +982,32 @@ mod tests {
         assert_eq!(vless.sni, "www.example.com");
         assert_eq!(vless.client_fingerprint, Some(UtlsFingerprint::Chrome));
         assert!(vless.reality.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn parses_vless_raw_outbound() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [{
+    "type": "vless",
+    "tag": "vless-raw",
+    "server": "example.com",
+    "server_port": 80,
+    "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+    "tls": { "enabled": false }
+  }]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxClientConfig::Vless(vless) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected VLESS")
+        };
+        assert!(!vless.tls);
+        assert!(vless.reality.is_none());
+        assert_eq!(vless.server_port, 80);
         Ok(())
     }
 

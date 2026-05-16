@@ -30,6 +30,7 @@ pub struct VlessClientConfig {
     pub server_host: String,
     pub server_port: u16,
     pub user_id: String,
+    pub tls: bool,
     pub sni: String,
     pub insecure: bool,
     pub flow: String,
@@ -46,6 +47,7 @@ pub struct VlessServerConfig {
     pub listen: SocketAddr,
     pub user_id: String,
     pub users: Vec<String>,
+    pub tls: bool,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
     pub flow: String,
@@ -105,7 +107,7 @@ pub async fn run_vless_server_with_core(config: VlessServerConfig, core: ProxyCo
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind VLESS server on {}", config.listen))?;
-    let acceptor = if config.reality.is_none() {
+    let acceptor = if config.reality.is_none() && config.tls {
         let mut server_config =
             Arc::unwrap_or_clone(tls::server_config(&config.cert_path, &config.key_path)?);
         server_config.alpn_protocols = config.transport.alpn_protocols();
@@ -348,6 +350,9 @@ async fn connect_vless_server(config: &VlessClientConfig) -> Result<BoxedVlessSt
             .context("REALITY connect to VLESS server")?;
         return apply_client_transport(stream, config).await;
     }
+    if !config.tls {
+        return apply_client_transport(tcp, config).await;
+    }
     let mut client_config = Arc::unwrap_or_clone(tls::client_config_with_fingerprint(
         config.insecure,
         config.client_fingerprint,
@@ -429,19 +434,17 @@ async fn handle_vless_client(
     transport: VlessTransportConfig,
     peer: SocketAddr,
 ) -> Result<()> {
-    let stream = if let Some(reality) = reality {
+    let mut stream = if let Some(reality) = reality {
         let Some(stream) = accept_reality_tls(stream, &reality).await? else {
             return Ok(());
         };
-        stream
+        apply_server_transport(stream, &transport).await?
+    } else if let Some(acceptor) = acceptor {
+        let stream = acceptor.accept(stream).await.context("accept VLESS TLS")?;
+        apply_server_transport(stream, &transport).await?
     } else {
-        acceptor
-            .context("VLESS TLS acceptor is not configured")?
-            .accept(stream)
-            .await
-            .context("accept VLESS TLS")?
+        apply_server_transport(stream, &transport).await?
     };
-    let mut stream = apply_server_transport(stream, &transport).await?;
     let request = read_vless_request(&mut stream).await?;
     let credential = users
         .get(&request.user)

@@ -336,16 +336,44 @@ impl XrayOutbound {
             self.name(),
             peer.user.encryption
         );
-        ensure_tls_or_reality("xray VLESS", self.name(), &self.stream_settings.security)?;
+        let stream_security = self.stream_settings.security.trim();
+        ensure!(
+            stream_security.is_empty()
+                || stream_security.eq_ignore_ascii_case("none")
+                || stream_security.eq_ignore_ascii_case("tls")
+                || stream_security.eq_ignore_ascii_case("reality"),
+            "xray VLESS outbound {} uses stream security {}; Aerion VLESS supports raw TCP, TLS, or REALITY",
+            self.name(),
+            stream_security
+        );
         let transport = self.vless_transport_config()?;
-        ensure_vless_alpn("xray", self.name(), &transport, self.stream_alpn())?;
+        let tls_enabled = stream_security.eq_ignore_ascii_case("tls");
         let reality = if self.is_reality() {
             Some(self.reality_client_config()?)
         } else {
             None
         };
+        if tls_enabled || reality.is_some() {
+            ensure_vless_alpn("xray", self.name(), &transport, self.stream_alpn())?;
+        } else {
+            ensure_no_alpn("xray", self.name(), self.stream_alpn())?;
+        }
         let tls = self.stream_settings.tls_settings.as_ref();
         let reality_settings = self.stream_settings.reality_settings.as_ref();
+        let tls_server_name = if reality.is_some() {
+            reality_settings.and_then(|settings| settings.server_name.as_deref())
+        } else if tls_enabled {
+            tls.and_then(|settings| settings.server_name.as_deref())
+        } else {
+            None
+        };
+        let client_fingerprint = if reality.is_some() {
+            reality_settings.and_then(|settings| settings.fingerprint)
+        } else if tls_enabled {
+            tls.and_then(|settings| settings.fingerprint)
+        } else {
+            None
+        };
         let server_host = peer.address.clone();
         Ok(VlessClientConfig {
             listen,
@@ -354,14 +382,13 @@ impl XrayOutbound {
             user_id: peer.user.id.with_context(|| {
                 format!("xray VLESS outbound {} is missing user id", self.name())
             })?,
-            sni: sni_or_server(
-                reality_settings
-                    .and_then(|settings| settings.server_name.as_deref())
-                    .or_else(|| tls.and_then(|settings| settings.server_name.as_deref())),
-                &server_host,
-                self.name(),
-            ),
-            insecure: tls.map(|settings| settings.allow_insecure).unwrap_or(false),
+            tls: tls_enabled,
+            sni: sni_or_server(tls_server_name, &server_host, self.name()),
+            insecure: if tls_enabled {
+                tls.map(|settings| settings.allow_insecure).unwrap_or(false)
+            } else {
+                false
+            },
             flow: peer
                 .user
                 .flow
@@ -374,9 +401,7 @@ impl XrayOutbound {
                 .unwrap_or_default(),
             mux: self.mux.as_ref().map(|mux| mux.enabled).unwrap_or(false),
             udp: true,
-            client_fingerprint: reality_settings
-                .and_then(|settings| settings.fingerprint)
-                .or_else(|| tls.and_then(|settings| settings.fingerprint)),
+            client_fingerprint,
             reality,
             transport,
         })
@@ -886,6 +911,36 @@ mod tests {
         assert_eq!(vless.sni, "www.example.com");
         assert_eq!(vless.client_fingerprint, Some(UtlsFingerprint::Chrome));
         assert!(vless.reality.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn parses_vless_raw_outbound() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [{
+    "tag": "vless-raw",
+    "protocol": "vless",
+    "settings": {
+      "vnext": [{
+        "address": "example.com",
+        "port": 80,
+        "users": [{ "id": "a3482e88-686a-4a58-8126-99c9df64b7bf", "encryption": "none" }]
+      }]
+    },
+    "streamSettings": { "network": "tcp", "security": "none" }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let XrayClientConfig::Vless(vless) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected VLESS")
+        };
+        assert!(!vless.tls);
+        assert!(vless.reality.is_none());
+        assert_eq!(vless.server_port, 80);
         Ok(())
     }
 

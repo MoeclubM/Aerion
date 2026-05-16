@@ -662,15 +662,13 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
                 )
             })
             .transpose()?;
-        ensure!(
-            reality.is_some() || client.tls.unwrap_or(true),
-            "VLESS client requires TLS or REALITY"
-        );
+        let tls = reality.is_none() && client.tls.unwrap_or(true);
         return run_vless_client(VlessClientConfig {
             listen: client.listen,
             server_host,
             server_port,
             user_id,
+            tls,
             sni,
             insecure: client.insecure,
             flow: client.flow,
@@ -841,7 +839,8 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
                 )
             })
             .transpose()?;
-        let (cert_path, key_path) = if reality.is_some() {
+        let tls = reality.is_none() && server.tls.unwrap_or(true);
+        let (cert_path, key_path) = if !tls {
             (PathBuf::new(), PathBuf::new())
         } else {
             (
@@ -853,6 +852,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             listen: server.listen,
             user_id: native_user_id(server.user_id, &server.username, "VLESS server")?,
             users: server.users,
+            tls,
             cert_path,
             key_path,
             flow: server.flow,

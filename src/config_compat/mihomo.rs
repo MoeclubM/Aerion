@@ -461,11 +461,11 @@ impl MihomoShadowsocksProxy {
 
 impl MihomoVlessProxy {
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<VlessClientConfig> {
-        ensure!(
-            self.tls,
-            "mihomo VLESS proxy {} disables TLS; Aerion VLESS client currently requires TLS",
-            self.name
-        );
+        let reality = self
+            .reality_opts
+            .as_ref()
+            .map(MihomoRealityOpts::to_client_config)
+            .transpose()?;
         let network = self.network.trim();
         let transport = if network.eq_ignore_ascii_case("grpc") {
             VlessTransportConfig::from_network(
@@ -496,25 +496,35 @@ impl MihomoVlessProxy {
                     .unwrap_or_default(),
             )?
         };
-        ensure_vless_alpn(&self.name, &transport, self.alpn.as_ref())?;
+        if self.tls || reality.is_some() {
+            ensure_vless_alpn(&self.name, &transport, self.alpn.as_ref())?;
+        } else {
+            ensure!(
+                self.client_fingerprint.is_none(),
+                "mihomo VLESS proxy {} sets client-fingerprint while TLS is disabled",
+                self.name
+            );
+            ensure_no_alpn(&self.name, self.alpn.as_ref())?;
+        }
         ensure_no_smux(&self.name, self.smux.as_ref())?;
         Ok(VlessClientConfig {
             listen,
             server_host: self.server.clone(),
             server_port: self.port,
             user_id: self.uuid.clone(),
+            tls: self.tls && reality.is_none(),
             sni: sni_or_server(self.servername.as_deref(), &self.server),
-            insecure: self.skip_cert_verify,
+            insecure: if self.tls || reality.is_some() {
+                self.skip_cert_verify
+            } else {
+                false
+            },
             flow: self.flow.clone(),
             packet_encoding: self.packet_encoding.clone(),
             mux: self.mux,
             udp: self.udp,
             client_fingerprint: self.client_fingerprint,
-            reality: self
-                .reality_opts
-                .as_ref()
-                .map(MihomoRealityOpts::to_client_config)
-                .transpose()?,
+            reality,
             transport,
         })
     }
@@ -906,6 +916,29 @@ proxies:
         assert_eq!(vless.client_fingerprint, Some(UtlsFingerprint::Chrome));
         assert!(vless.reality.is_some());
         assert_eq!(vless.packet_encoding, "xudp");
+        Ok(())
+    }
+
+    #[test]
+    fn parses_vless_raw_profile() -> Result<()> {
+        let yaml = r#"
+proxies:
+  - name: vless-raw
+    type: vless
+    server: example.com
+    port: 80
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    tls: false
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let MihomoClientConfig::Vless(vless) =
+            config.proxies[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected VLESS")
+        };
+        assert!(!vless.tls);
+        assert!(vless.reality.is_none());
+        assert_eq!(vless.server_port, 80);
         Ok(())
     }
 
