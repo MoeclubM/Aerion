@@ -184,6 +184,8 @@ pub struct XrayHysteriaSettings {
     #[serde(default)]
     pub congestion: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_xray_bandwidth")]
+    pub up: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_xray_bandwidth")]
     pub down: Option<u64>,
     #[serde(default, rename = "udpHop", alias = "udphop", alias = "udp_hop")]
     pub udp_hop: Option<Value>,
@@ -213,6 +215,17 @@ pub struct XrayMask {
 pub struct XrayQuicParams {
     #[serde(default)]
     pub congestion: Option<String>,
+    #[serde(default)]
+    pub debug: bool,
+    #[serde(default, rename = "bbrProfile", alias = "bbr_profile")]
+    pub bbr_profile: Option<String>,
+    #[serde(
+        default,
+        rename = "brutalUp",
+        alias = "brutal_up",
+        deserialize_with = "deserialize_optional_xray_bandwidth"
+    )]
+    pub brutal_up: Option<u64>,
     #[serde(
         default,
         rename = "brutalDown",
@@ -655,6 +668,11 @@ impl XrayOutbound {
             self.name()
         );
         ensure!(
+            hysteria.and_then(|settings| settings.up).is_none(),
+            "xray Hysteria outbound {} sets upload bandwidth; Aerion Hysteria2 client does not expose upload bandwidth",
+            self.name()
+        );
+        ensure!(
             !hysteria
                 .and_then(|settings| settings.masquerade.as_ref())
                 .map(value_has_data)
@@ -682,6 +700,39 @@ impl XrayOutbound {
                     .map(value_has_data)
                     .unwrap_or(false),
                 "xray Hysteria outbound {} enables finalmask UDP port hopping; Aerion Hysteria2 client expects one fixed port",
+                self.name()
+            );
+            ensure!(
+                finalmask
+                    .quic_params
+                    .as_ref()
+                    .and_then(|params| params.brutal_up)
+                    .is_none(),
+                "xray Hysteria outbound {} sets finalmask brutalUp; Aerion Hysteria2 client does not expose upload bandwidth",
+                self.name()
+            );
+            ensure!(
+                finalmask
+                    .quic_params
+                    .as_ref()
+                    .and_then(|params| params.bbr_profile.as_deref())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none_or(|value| value.eq_ignore_ascii_case("standard")),
+                "xray Hysteria outbound {} sets finalmask bbrProfile {:?}; Aerion Hysteria2 uses the default BBR profile",
+                self.name(),
+                finalmask
+                    .quic_params
+                    .as_ref()
+                    .and_then(|params| params.bbr_profile.as_ref())
+            );
+            ensure!(
+                !finalmask
+                    .quic_params
+                    .as_ref()
+                    .map(|params| params.debug)
+                    .unwrap_or(false),
+                "xray Hysteria outbound {} enables finalmask quicParams debug; Aerion Hysteria2 client does not expose QUIC debug toggles",
                 self.name()
             );
         }
@@ -1401,6 +1452,92 @@ mod tests {
         assert_eq!(hysteria2.obfs_password.as_deref(), Some("obfs-pass"));
         assert_eq!(hysteria2.download_bandwidth, Some(80));
         assert_eq!(hysteria2.congestion_control, "reno");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_hysteria2_unmapped_quic_options() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "tag": "hy2-up",
+      "protocol": "hysteria",
+      "settings": {
+        "version": 2,
+        "address": "example.com",
+        "port": 443
+      },
+      "streamSettings": {
+        "network": "hysteria",
+        "security": "tls",
+        "hysteriaSettings": {
+          "version": 2,
+          "auth": "secret",
+          "up": "10mbps"
+        }
+      }
+    },
+    {
+      "tag": "hy2-brutal-up",
+      "protocol": "hysteria",
+      "settings": {
+        "version": 2,
+        "address": "example.com",
+        "port": 443
+      },
+      "streamSettings": {
+        "network": "hysteria",
+        "security": "tls",
+        "hysteriaSettings": {
+          "version": 2,
+          "auth": "secret"
+        },
+        "finalmask": {
+          "quicParams": {
+            "brutalUp": "10mbps"
+          }
+        }
+      }
+    },
+    {
+      "tag": "hy2-bbr-profile",
+      "protocol": "hysteria",
+      "settings": {
+        "version": 2,
+        "address": "example.com",
+        "port": 443
+      },
+      "streamSettings": {
+        "network": "hysteria",
+        "security": "tls",
+        "hysteriaSettings": {
+          "version": 2,
+          "auth": "secret"
+        },
+        "finalmask": {
+          "quicParams": {
+            "bbrProfile": "aggressive"
+          }
+        }
+      }
+    }
+  ]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let up_error = config.outbounds[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("upload bandwidth must be explicit");
+        assert!(up_error.to_string().contains("upload bandwidth"));
+        let brutal_up_error = config.outbounds[1]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("brutalUp must be explicit");
+        assert!(brutal_up_error.to_string().contains("brutalUp"));
+        let bbr_profile_error = config.outbounds[2]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("bbrProfile must be explicit");
+        assert!(bbr_profile_error.to_string().contains("bbrProfile"));
         Ok(())
     }
 
