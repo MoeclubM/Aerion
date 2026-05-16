@@ -724,7 +724,6 @@ async fn socks_client_reaches_tcp_target_through_trojan_server() -> Result<()> {
             insecure: true,
             udp: true,
             client_fingerprint: None,
-            transport: VlessTransportConfig::tcp(),
         },
     ));
 
