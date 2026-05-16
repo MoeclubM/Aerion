@@ -13,8 +13,9 @@ use aerion::vless_transport::VlessTransportConfig;
 use aerion::{
     ClientConfig, MihomoClientConfig, MihomoProxy, RealityClientConfig, RealityServerConfig,
     ServerConfig, ShadowsocksClientConfig, SingBoxClientConfig, SingBoxOutbound,
-    TrojanClientConfig, VlessClientConfig, VmessClientConfig, XrayClientConfig, XrayOutbound,
-    run_client, run_hysteria2_client, run_hysteria2_server, run_mieru_client, run_mieru_server,
+    TrojanClientConfig, TrojanServerConfig, VlessClientConfig, VlessServerConfig,
+    VmessClientConfig, VmessServerConfig, XrayClientConfig, XrayOutbound, run_client,
+    run_hysteria2_client, run_hysteria2_server, run_mieru_client, run_mieru_server,
     run_naive_client, run_server, run_shadowsocks_client, run_trojan_client, run_trojan_server,
     run_tuic_client, run_tuic_server, run_vless_client, run_vless_server, run_vmess_client,
     run_vmess_server, tls,
