@@ -2,8 +2,9 @@ use crate::protocol::{ProxyTarget, target_name};
 use crate::{socket_protect, socks, tls, uot};
 use anyhow::{Context, Result, bail, ensure};
 use bytes::{Buf, Bytes};
-use quinn::crypto::rustls::QuicClientConfig;
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -17,6 +18,7 @@ const NAIVE_H2_ALPN: &[u8] = b"h2";
 const NAIVE_H3_ALPN: &[u8] = b"h3";
 const NAIVE_HTTP11_ALPN: &[u8] = b"http/1.1";
 const NAIVE_QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const NAIVE_UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 pub struct NaiveClientConfig {
@@ -30,6 +32,25 @@ pub struct NaiveClientConfig {
     pub extra_headers: Vec<(String, String)>,
     pub udp_over_tcp: bool,
     pub quic: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct NaiveServerConfig {
+    pub listen: SocketAddr,
+    pub username: String,
+    pub password: String,
+    pub users: Vec<String>,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    pub udp_over_tcp: bool,
+    pub quic: bool,
+}
+
+#[derive(Clone)]
+struct NaiveServerRuntime {
+    credentials: Arc<Vec<String>>,
+    tls_config: Arc<rustls::ServerConfig>,
+    udp_over_tcp: bool,
 }
 
 #[derive(Default)]
@@ -87,6 +108,376 @@ pub async fn run_naive_client_listener(
             }
         });
     }
+}
+
+pub async fn run_naive_server(config: NaiveServerConfig) -> Result<()> {
+    let runtime = NaiveServerRuntime::from_config(&config)?;
+    let listener = TcpListener::bind(config.listen)
+        .await
+        .with_context(|| format!("bind Naive HTTPS listener on {}", config.listen))?;
+    tracing::info!("Naive HTTPS server listening on {}", listener.local_addr()?);
+    if config.quic {
+        let runtime = runtime.clone();
+        let config = config.clone();
+        tokio::spawn(async move {
+            if let Err(error) = run_naive_h3_server(config, runtime).await {
+                tracing::warn!("Naive HTTP/3 server exited: {error:?}");
+            }
+        });
+    }
+    let acceptor = tokio_rustls::TlsAcceptor::from(runtime.tls_config.clone());
+    loop {
+        let (stream, peer) = listener.accept().await.context("accept Naive TCP client")?;
+        let runtime = runtime.clone();
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_naive_server_tcp(stream, acceptor, runtime).await {
+                tracing::warn!("Naive TCP client {peer} failed: {error:?}");
+            }
+        });
+    }
+}
+
+impl NaiveServerRuntime {
+    fn from_config(config: &NaiveServerConfig) -> Result<Self> {
+        let mut tls_config =
+            Arc::unwrap_or_clone(tls::server_config(&config.cert_path, &config.key_path)?);
+        tls_config.alpn_protocols = vec![NAIVE_H2_ALPN.to_vec(), NAIVE_HTTP11_ALPN.to_vec()];
+        Ok(Self {
+            credentials: Arc::new(naive_credentials(
+                &config.username,
+                &config.password,
+                &config.users,
+            )),
+            tls_config: Arc::new(tls_config),
+            udp_over_tcp: config.udp_over_tcp,
+        })
+    }
+}
+
+async fn handle_naive_server_tcp(
+    stream: TcpStream,
+    acceptor: tokio_rustls::TlsAcceptor,
+    runtime: NaiveServerRuntime,
+) -> Result<()> {
+    let mut tls = acceptor.accept(stream).await.context("accept Naive TLS")?;
+    if tls.get_ref().1.alpn_protocol() == Some(NAIVE_H2_ALPN) {
+        return handle_naive_h2_connection(tls, runtime).await;
+    }
+    handle_naive_http1_connection(tls, runtime).await
+}
+
+async fn handle_naive_http1_connection(
+    mut tls: tokio_rustls::server::TlsStream<TcpStream>,
+    runtime: NaiveServerRuntime,
+) -> Result<()> {
+    let (target, authorization, pending) = read_naive_http1_connect(&mut tls).await?;
+    if !naive_authorized(authorization.as_deref(), &runtime.credentials) {
+        tls.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"naive\"\r\n\r\n")
+            .await
+            .context("write Naive HTTP/1.1 auth failure")?;
+        return Ok(());
+    }
+    if uot::is_magic_target(&target) {
+        ensure!(
+            runtime.udp_over_tcp,
+            "Naive HTTP/1.1 UDP-over-TCP is disabled by server config"
+        );
+        tls.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .context("write Naive HTTP/1.1 UOT response")?;
+        return relay_naive_http1_uot(tls, pending, target).await;
+    }
+    let mut remote = connect_proxy_target(&target).await?;
+    tls.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await
+        .context("write Naive HTTP/1.1 CONNECT response")?;
+    tracing::info!("Naive serving HTTP/1.1 {}", target_name(&target));
+    relay_naive_http1_server_tcp(tls, pending, remote).await
+}
+
+async fn handle_naive_h2_connection(
+    tls: tokio_rustls::server::TlsStream<TcpStream>,
+    runtime: NaiveServerRuntime,
+) -> Result<()> {
+    let mut h2 = h2::server::handshake(tls)
+        .await
+        .context("initialize Naive HTTP/2 server")?;
+    while let Some(request) = h2.accept().await {
+        let (request, respond) = request.context("accept Naive HTTP/2 request")?;
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_naive_h2_request(request, respond, runtime).await {
+                tracing::warn!("Naive HTTP/2 stream failed: {error:?}");
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn handle_naive_h2_request(
+    request: http::Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<Bytes>,
+    runtime: NaiveServerRuntime,
+) -> Result<()> {
+    let (parts, recv) = request.into_parts();
+    let target = naive_request_target(&parts.method, &parts.uri)?;
+    if !naive_authorized(
+        parts
+            .headers
+            .get(http::header::PROXY_AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        &runtime.credentials,
+    ) {
+        send_h2_status(&mut respond, 407)?;
+        return Ok(());
+    }
+    let response = http::Response::builder()
+        .status(http::StatusCode::OK)
+        .body(())
+        .context("build Naive HTTP/2 CONNECT response")?;
+    let send = respond
+        .send_response(response, false)
+        .context("send Naive HTTP/2 CONNECT response")?;
+    if uot::is_magic_target(&target) {
+        ensure!(
+            runtime.udp_over_tcp,
+            "Naive HTTP/2 UDP-over-TCP is disabled by server config"
+        );
+        return relay_naive_http2_uot(send, recv, target).await;
+    }
+    let remote = connect_proxy_target(&target).await?;
+    tracing::info!("Naive serving HTTP/2 {}", target_name(&target));
+    relay_naive_http2_server_tcp(send, recv, remote).await
+}
+
+async fn run_naive_h3_server(config: NaiveServerConfig, runtime: NaiveServerRuntime) -> Result<()> {
+    let endpoint = build_naive_server_endpoint(&config)?;
+    tracing::info!(
+        "Naive HTTP/3 server listening on {}",
+        endpoint.local_addr()?
+    );
+    while let Some(connecting) = endpoint.accept().await {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            match connecting.await {
+                Ok(connection) => {
+                    if let Err(error) = handle_naive_h3_connection(connection, runtime).await {
+                        tracing::warn!("Naive HTTP/3 connection failed: {error:?}");
+                    }
+                }
+                Err(error) => tracing::warn!("Naive HTTP/3 handshake failed: {error:?}"),
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn handle_naive_h3_connection(
+    connection: quinn::Connection,
+    runtime: NaiveServerRuntime,
+) -> Result<()> {
+    let mut h3 = h3::server::builder()
+        .build(h3_quinn::Connection::new(connection))
+        .await
+        .context("initialize Naive HTTP/3 server")?;
+    loop {
+        let Some(resolver) = h3.accept().await.context("accept Naive HTTP/3 request")? else {
+            return Ok(());
+        };
+        let (request, stream) = resolver
+            .resolve_request()
+            .await
+            .context("resolve Naive HTTP/3 request")?;
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_naive_h3_request(request, stream, runtime).await {
+                tracing::warn!("Naive HTTP/3 stream failed: {error:?}");
+            }
+        });
+    }
+}
+
+async fn handle_naive_h3_request<S>(
+    request: http::Request<()>,
+    mut stream: h3::server::RequestStream<S, Bytes>,
+    runtime: NaiveServerRuntime,
+) -> Result<()>
+where
+    S: h3::quic::BidiStream<Bytes> + Send + 'static,
+    S::SendStream: Send + 'static,
+    S::RecvStream: Send + 'static,
+{
+    let target = naive_request_target(request.method(), request.uri())?;
+    if !naive_authorized(
+        request
+            .headers()
+            .get(http::header::PROXY_AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        &runtime.credentials,
+    ) {
+        send_h3_status(&mut stream, 407).await?;
+        return Ok(());
+    }
+    let response = http::Response::builder()
+        .status(http::StatusCode::OK)
+        .body(())
+        .context("build Naive HTTP/3 CONNECT response")?;
+    stream
+        .send_response(response)
+        .await
+        .context("send Naive HTTP/3 CONNECT response")?;
+    let (send, recv) = stream.split();
+    if uot::is_magic_target(&target) {
+        ensure!(
+            runtime.udp_over_tcp,
+            "Naive HTTP/3 UDP-over-TCP is disabled by server config"
+        );
+        return relay_naive_http3_uot(send, recv, target).await;
+    }
+    let remote = connect_proxy_target(&target).await?;
+    tracing::info!("Naive serving HTTP/3 {}", target_name(&target));
+    relay_naive_http3_server_tcp(send, recv, remote).await
+}
+
+async fn read_naive_http1_connect(
+    stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+) -> Result<(ProxyTarget, Option<String>, Vec<u8>)> {
+    let mut request = Vec::new();
+    let mut buffer = [0u8; 1024];
+    loop {
+        let read = stream
+            .read(&mut buffer)
+            .await
+            .context("read Naive HTTP/1.1 CONNECT request")?;
+        ensure!(read > 0, "Naive HTTP/1.1 client closed before request");
+        request.extend_from_slice(&buffer[..read]);
+        ensure!(
+            request.len() <= 16 * 1024,
+            "Naive HTTP/1.1 request header is too large"
+        );
+        if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header = String::from_utf8_lossy(&request[..end]);
+            let mut lines = header.lines();
+            let request_line = lines.next().context("Naive HTTP/1.1 request is empty")?;
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or_default();
+            let authority = parts.next().unwrap_or_default();
+            ensure!(
+                method.eq_ignore_ascii_case("CONNECT"),
+                "Naive HTTP/1.1 request is not CONNECT"
+            );
+            let mut authorization = None;
+            for line in lines {
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.trim().eq_ignore_ascii_case("proxy-authorization") {
+                        authorization = Some(value.trim().to_string());
+                    }
+                }
+            }
+            return Ok((
+                parse_authority(authority)?,
+                authorization,
+                request[end + 4..].to_vec(),
+            ));
+        }
+    }
+}
+
+fn naive_request_target(method: &http::Method, uri: &http::Uri) -> Result<ProxyTarget> {
+    ensure!(
+        *method == http::Method::CONNECT,
+        "Naive request is not CONNECT"
+    );
+    let authority = uri
+        .authority()
+        .map(http::uri::Authority::as_str)
+        .or_else(|| {
+            let path = uri.path();
+            (!path.is_empty()).then_some(path)
+        })
+        .context("Naive CONNECT request has no authority")?;
+    parse_authority(authority)
+}
+
+fn parse_authority(authority: &str) -> Result<ProxyTarget> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, port) = rest
+            .split_once("]:")
+            .with_context(|| format!("invalid Naive IPv6 authority {authority}"))?;
+        let port = port
+            .parse::<u16>()
+            .with_context(|| format!("invalid Naive authority port {authority}"))?;
+        let ip = host
+            .parse::<IpAddr>()
+            .with_context(|| format!("invalid Naive IPv6 authority {authority}"))?;
+        return Ok(ProxyTarget::Ip(SocketAddr::new(ip, port)));
+    }
+    let (host, port) = authority
+        .rsplit_once(':')
+        .with_context(|| format!("Naive authority is missing port: {authority}"))?;
+    let port = port
+        .parse::<u16>()
+        .with_context(|| format!("invalid Naive authority port {authority}"))?;
+    Ok(host
+        .parse::<IpAddr>()
+        .map(|ip| ProxyTarget::Ip(SocketAddr::new(ip, port)))
+        .unwrap_or_else(|_| ProxyTarget::Domain(host.to_string(), port)))
+}
+
+fn naive_credentials(username: &str, password: &str, users: &[String]) -> Vec<String> {
+    std::iter::once(format!("{username}:{password}"))
+        .chain(users.iter().cloned())
+        .map(|credential| credential.trim().to_string())
+        .filter(|credential| !credential.is_empty() && credential != ":")
+        .collect()
+}
+
+fn naive_authorized(header: Option<&str>, credentials: &[String]) -> bool {
+    if credentials.is_empty() {
+        return true;
+    }
+    let Some(header) = header.map(str::trim) else {
+        return false;
+    };
+    credentials
+        .iter()
+        .any(|credential| header == format!("Basic {}", base64_standard(credential.as_bytes())))
+}
+
+fn send_h2_status(respond: &mut h2::server::SendResponse<Bytes>, status: u16) -> Result<()> {
+    let response = http::Response::builder()
+        .status(status)
+        .body(())
+        .with_context(|| format!("build Naive HTTP/2 {status} response"))?;
+    let mut send = respond
+        .send_response(response, false)
+        .with_context(|| format!("send Naive HTTP/2 {status} response"))?;
+    send.send_data(Bytes::new(), true)
+        .with_context(|| format!("finish Naive HTTP/2 {status} response"))?;
+    Ok(())
+}
+
+async fn send_h3_status<S>(
+    stream: &mut h3::server::RequestStream<S, Bytes>,
+    status: u16,
+) -> Result<()>
+where
+    S: h3::quic::SendStream<Bytes>,
+{
+    let response = http::Response::builder()
+        .status(status)
+        .body(())
+        .with_context(|| format!("build Naive HTTP/3 {status} response"))?;
+    stream
+        .send_response(response)
+        .await
+        .with_context(|| format!("send Naive HTTP/3 {status} response"))?;
+    stream
+        .finish()
+        .await
+        .with_context(|| format!("finish Naive HTTP/3 {status} response"))?;
+    Ok(())
 }
 
 async fn handle_naive_socks_client(mut local: TcpStream, config: NaiveClientConfig) -> Result<()> {
@@ -348,6 +739,543 @@ fn build_naive_quic_endpoint(
     .context("bind Naive QUIC endpoint")?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
+}
+
+fn build_naive_server_endpoint(config: &NaiveServerConfig) -> Result<quinn::Endpoint> {
+    let mut tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            tls::load_certs(&config.cert_path)?,
+            tls::load_key(&config.key_path)?,
+        )
+        .with_context(|| {
+            format!(
+                "build Naive HTTP/3 TLS server config with cert {} and key {}",
+                config.cert_path.display(),
+                config.key_path.display()
+            )
+        })?;
+    tls_config.alpn_protocols = vec![NAIVE_H3_ALPN.to_vec()];
+    let crypto =
+        QuicServerConfig::try_from(tls_config).context("build Naive QUIC TLS server config")?;
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    let idle_timeout = quinn::IdleTimeout::try_from(NAIVE_QUIC_IDLE_TIMEOUT)
+        .context("build Naive H3 idle timeout")?;
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(idle_timeout));
+    server_config.transport_config(Arc::new(transport));
+    let socket = socket_protect::bind_udp_std(config.listen)?;
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .context("bind Naive HTTP/3 server endpoint")
+}
+
+async fn relay_naive_http1_server_tcp(
+    stream: tokio_rustls::server::TlsStream<TcpStream>,
+    mut pending: Vec<u8>,
+    remote: TcpStream,
+) -> Result<()> {
+    let (mut inbound_reader, mut inbound_writer) = tokio::io::split(stream);
+    let (mut remote_reader, mut remote_writer) = remote.into_split();
+    let upload = async {
+        let mut state = NaiveReadState::default();
+        let mut buffer = vec![0u8; 16 * 1024];
+        loop {
+            let read =
+                read_naive_h1_data(&mut inbound_reader, &mut pending, &mut state, &mut buffer)
+                    .await?;
+            if read == 0 {
+                remote_writer
+                    .shutdown()
+                    .await
+                    .context("shutdown Naive HTTP/1.1 upstream writer")?;
+                return Ok::<(), anyhow::Error>(());
+            }
+            remote_writer
+                .write_all(&buffer[..read])
+                .await
+                .context("write Naive HTTP/1.1 upstream payload")?;
+        }
+    };
+    let download = async {
+        let mut state = NaiveWriteState::default();
+        let mut buffer = vec![0u8; 16 * 1024];
+        loop {
+            let read = remote_reader
+                .read(&mut buffer)
+                .await
+                .context("read Naive HTTP/1.1 upstream response")?;
+            if read == 0 {
+                inbound_writer
+                    .shutdown()
+                    .await
+                    .context("shutdown Naive HTTP/1.1 downstream writer")?;
+                return Ok::<(), anyhow::Error>(());
+            }
+            write_naive_h1_data(&mut inbound_writer, &mut state, &buffer[..read]).await?;
+        }
+    };
+    let _ = tokio::try_join!(upload, download)?;
+    Ok(())
+}
+
+async fn relay_naive_http2_server_tcp(
+    mut send: h2::SendStream<Bytes>,
+    mut recv: h2::RecvStream,
+    remote: TcpStream,
+) -> Result<()> {
+    let (mut remote_reader, mut remote_writer) = remote.into_split();
+    let upload = async {
+        let mut state = NaiveReadState::default();
+        let mut pending = Vec::new();
+        let mut flow = recv.flow_control().clone();
+        let mut buffer = vec![0u8; 16 * 1024];
+        loop {
+            let read =
+                read_naive_h2_data(&mut recv, &mut flow, &mut pending, &mut state, &mut buffer)
+                    .await?;
+            if read == 0 {
+                remote_writer
+                    .shutdown()
+                    .await
+                    .context("shutdown Naive HTTP/2 upstream writer")?;
+                return Ok::<(), anyhow::Error>(());
+            }
+            remote_writer
+                .write_all(&buffer[..read])
+                .await
+                .context("write Naive HTTP/2 upstream payload")?;
+        }
+    };
+    let download = async {
+        let mut state = NaiveWriteState::default();
+        let mut buffer = vec![0u8; 16 * 1024];
+        loop {
+            let read = remote_reader
+                .read(&mut buffer)
+                .await
+                .context("read Naive HTTP/2 upstream response")?;
+            if read == 0 {
+                send.send_data(Bytes::new(), true)
+                    .context("finish Naive HTTP/2 response body")?;
+                return Ok::<(), anyhow::Error>(());
+            }
+            send_naive_h2_data(&mut send, &mut state, &buffer[..read]).await?;
+        }
+    };
+    let _ = tokio::try_join!(upload, download)?;
+    Ok(())
+}
+
+async fn relay_naive_http3_server_tcp<S1, S2>(
+    mut send: h3::server::RequestStream<S1, Bytes>,
+    mut recv: h3::server::RequestStream<S2, Bytes>,
+    remote: TcpStream,
+) -> Result<()>
+where
+    S1: h3::quic::SendStream<Bytes>,
+    S2: h3::quic::RecvStream,
+{
+    let (mut remote_reader, mut remote_writer) = remote.into_split();
+    let upload = async {
+        let mut state = NaiveReadState::default();
+        let mut pending = Vec::new();
+        let mut buffer = vec![0u8; 16 * 1024];
+        loop {
+            let read =
+                read_naive_h3_server_data(&mut recv, &mut pending, &mut state, &mut buffer).await?;
+            if read == 0 {
+                remote_writer
+                    .shutdown()
+                    .await
+                    .context("shutdown Naive HTTP/3 upstream writer")?;
+                return Ok::<(), anyhow::Error>(());
+            }
+            remote_writer
+                .write_all(&buffer[..read])
+                .await
+                .context("write Naive HTTP/3 upstream payload")?;
+        }
+    };
+    let download = async {
+        let mut state = NaiveWriteState::default();
+        let mut buffer = vec![0u8; 16 * 1024];
+        loop {
+            let read = remote_reader
+                .read(&mut buffer)
+                .await
+                .context("read Naive HTTP/3 upstream response")?;
+            if read == 0 {
+                send.finish()
+                    .await
+                    .context("finish Naive HTTP/3 response body")?;
+                return Ok::<(), anyhow::Error>(());
+            }
+            send_naive_h3_server_data(&mut send, &mut state, &buffer[..read]).await?;
+        }
+    };
+    let _ = tokio::try_join!(upload, download)?;
+    Ok(())
+}
+
+async fn relay_naive_http1_uot(
+    stream: tokio_rustls::server::TlsStream<TcpStream>,
+    pending: Vec<u8>,
+    target: ProxyTarget,
+) -> Result<()> {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut read_state = NaiveReadState::default();
+    let mut naive_pending = pending;
+    let (request, mut raw_pending) =
+        read_uot_request_h1(&mut reader, &mut naive_pending, &mut read_state, &target).await?;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+    let writer_task = tokio::spawn(async move {
+        let mut write_state = NaiveWriteState::default();
+        while let Some(packet) = rx.recv().await {
+            write_naive_h1_data(&mut writer, &mut write_state, &packet).await?;
+        }
+        writer
+            .shutdown()
+            .await
+            .context("shutdown Naive HTTP/1.1 UOT writer")?;
+        Ok::<(), anyhow::Error>(())
+    });
+    let mut buffer = vec![0u8; 16 * 1024];
+    loop {
+        while let Some((destination, payload, connected)) =
+            take_uot_stream_packet(&request, &mut raw_pending)?
+        {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    relay_naive_uot_packet(tx, destination, payload, connected).await
+                {
+                    tracing::warn!("Naive HTTP/1.1 UOT packet failed: {error:?}");
+                }
+            });
+        }
+        let read = read_naive_h1_data(
+            &mut reader,
+            &mut naive_pending,
+            &mut read_state,
+            &mut buffer,
+        )
+        .await?;
+        if read == 0 {
+            drop(tx);
+            writer_task
+                .await
+                .context("join Naive HTTP/1.1 UOT writer")??;
+            return Ok(());
+        }
+        raw_pending.extend_from_slice(&buffer[..read]);
+    }
+}
+
+async fn relay_naive_http2_uot(
+    mut send: h2::SendStream<Bytes>,
+    mut recv: h2::RecvStream,
+    target: ProxyTarget,
+) -> Result<()> {
+    let mut read_state = NaiveReadState::default();
+    let mut naive_pending = Vec::new();
+    let mut flow = recv.flow_control().clone();
+    let (request, mut raw_pending) = read_uot_request_h2(
+        &mut recv,
+        &mut flow,
+        &mut naive_pending,
+        &mut read_state,
+        &target,
+    )
+    .await?;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+    let writer_task = tokio::spawn(async move {
+        let mut write_state = NaiveWriteState::default();
+        while let Some(packet) = rx.recv().await {
+            send_naive_h2_data(&mut send, &mut write_state, &packet).await?;
+        }
+        send.send_data(Bytes::new(), true)
+            .context("finish Naive HTTP/2 UOT response")?;
+        Ok::<(), anyhow::Error>(())
+    });
+    let mut buffer = vec![0u8; 16 * 1024];
+    loop {
+        while let Some((destination, payload, connected)) =
+            take_uot_stream_packet(&request, &mut raw_pending)?
+        {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    relay_naive_uot_packet(tx, destination, payload, connected).await
+                {
+                    tracing::warn!("Naive HTTP/2 UOT packet failed: {error:?}");
+                }
+            });
+        }
+        let read = read_naive_h2_data(
+            &mut recv,
+            &mut flow,
+            &mut naive_pending,
+            &mut read_state,
+            &mut buffer,
+        )
+        .await?;
+        if read == 0 {
+            drop(tx);
+            writer_task
+                .await
+                .context("join Naive HTTP/2 UOT writer")??;
+            return Ok(());
+        }
+        raw_pending.extend_from_slice(&buffer[..read]);
+    }
+}
+
+async fn relay_naive_http3_uot<S1, S2>(
+    mut send: h3::server::RequestStream<S1, Bytes>,
+    mut recv: h3::server::RequestStream<S2, Bytes>,
+    target: ProxyTarget,
+) -> Result<()>
+where
+    S1: h3::quic::SendStream<Bytes> + Send + 'static,
+    S2: h3::quic::RecvStream,
+{
+    let mut read_state = NaiveReadState::default();
+    let mut naive_pending = Vec::new();
+    let (request, mut raw_pending) =
+        read_uot_request_h3(&mut recv, &mut naive_pending, &mut read_state, &target).await?;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+    let writer_task = tokio::spawn(async move {
+        let mut write_state = NaiveWriteState::default();
+        while let Some(packet) = rx.recv().await {
+            send_naive_h3_server_data(&mut send, &mut write_state, &packet).await?;
+        }
+        send.finish()
+            .await
+            .context("finish Naive HTTP/3 UOT response")?;
+        Ok::<(), anyhow::Error>(())
+    });
+    let mut buffer = vec![0u8; 16 * 1024];
+    loop {
+        while let Some((destination, payload, connected)) =
+            take_uot_stream_packet(&request, &mut raw_pending)?
+        {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    relay_naive_uot_packet(tx, destination, payload, connected).await
+                {
+                    tracing::warn!("Naive HTTP/3 UOT packet failed: {error:?}");
+                }
+            });
+        }
+        let read =
+            read_naive_h3_server_data(&mut recv, &mut naive_pending, &mut read_state, &mut buffer)
+                .await?;
+        if read == 0 {
+            drop(tx);
+            writer_task
+                .await
+                .context("join Naive HTTP/3 UOT writer")??;
+            return Ok(());
+        }
+        raw_pending.extend_from_slice(&buffer[..read]);
+    }
+}
+
+async fn read_uot_request_h1<R>(
+    reader: &mut R,
+    naive_pending: &mut Vec<u8>,
+    read_state: &mut NaiveReadState,
+    target: &ProxyTarget,
+) -> Result<(uot::UotRequest, Vec<u8>)>
+where
+    R: AsyncRead + Unpin,
+{
+    if uot::is_legacy_magic_target(target) {
+        return Ok((legacy_uot_request(), Vec::new()));
+    }
+    let mut raw_pending = Vec::new();
+    let mut buffer = vec![0u8; 1024];
+    loop {
+        if let Some(request) = take_uot_request(&mut raw_pending)? {
+            return Ok((request, raw_pending));
+        }
+        let read = read_naive_h1_data(reader, naive_pending, read_state, &mut buffer).await?;
+        ensure!(read > 0, "Naive HTTP/1.1 UOT stream closed before request");
+        raw_pending.extend_from_slice(&buffer[..read]);
+    }
+}
+
+async fn read_uot_request_h2(
+    recv: &mut h2::RecvStream,
+    flow: &mut h2::FlowControl,
+    naive_pending: &mut Vec<u8>,
+    read_state: &mut NaiveReadState,
+    target: &ProxyTarget,
+) -> Result<(uot::UotRequest, Vec<u8>)> {
+    if uot::is_legacy_magic_target(target) {
+        return Ok((legacy_uot_request(), Vec::new()));
+    }
+    let mut raw_pending = Vec::new();
+    let mut buffer = vec![0u8; 1024];
+    loop {
+        if let Some(request) = take_uot_request(&mut raw_pending)? {
+            return Ok((request, raw_pending));
+        }
+        let read = read_naive_h2_data(recv, flow, naive_pending, read_state, &mut buffer).await?;
+        ensure!(read > 0, "Naive HTTP/2 UOT stream closed before request");
+        raw_pending.extend_from_slice(&buffer[..read]);
+    }
+}
+
+async fn read_uot_request_h3<S>(
+    recv: &mut h3::server::RequestStream<S, Bytes>,
+    naive_pending: &mut Vec<u8>,
+    read_state: &mut NaiveReadState,
+    target: &ProxyTarget,
+) -> Result<(uot::UotRequest, Vec<u8>)>
+where
+    S: h3::quic::RecvStream,
+{
+    if uot::is_legacy_magic_target(target) {
+        return Ok((legacy_uot_request(), Vec::new()));
+    }
+    let mut raw_pending = Vec::new();
+    let mut buffer = vec![0u8; 1024];
+    loop {
+        if let Some(request) = take_uot_request(&mut raw_pending)? {
+            return Ok((request, raw_pending));
+        }
+        let read = read_naive_h3_server_data(recv, naive_pending, read_state, &mut buffer).await?;
+        ensure!(read > 0, "Naive HTTP/3 UOT stream closed before request");
+        raw_pending.extend_from_slice(&buffer[..read]);
+    }
+}
+
+fn take_uot_request(pending: &mut Vec<u8>) -> Result<Option<uot::UotRequest>> {
+    let Some(length) = uot_request_len(pending)? else {
+        return Ok(None);
+    };
+    if pending.len() < length {
+        return Ok(None);
+    }
+    let request = uot::decode_v2_request(&pending[..length])?;
+    pending.drain(..length);
+    Ok(Some(request))
+}
+
+fn uot_request_len(packet: &[u8]) -> Result<Option<usize>> {
+    if packet.len() < 2 {
+        return Ok(None);
+    }
+    let address_offset = 1;
+    match packet[address_offset] {
+        0x01 => Ok(Some(address_offset + 7)),
+        0x04 => Ok(Some(address_offset + 19)),
+        0x03 => {
+            if packet.len() < address_offset + 2 {
+                return Ok(None);
+            }
+            Ok(Some(
+                address_offset + 2 + packet[address_offset + 1] as usize + 2,
+            ))
+        }
+        other => bail!("unsupported Naive UOT request address type: {other}"),
+    }
+}
+
+fn take_uot_stream_packet(
+    request: &uot::UotRequest,
+    pending: &mut Vec<u8>,
+) -> Result<Option<(ProxyTarget, Vec<u8>, bool)>> {
+    if request.is_connect {
+        let Some(length) = uot_connect_packet_len(pending)? else {
+            return Ok(None);
+        };
+        if pending.len() < length {
+            return Ok(None);
+        }
+        let payload = uot::decode_connect_packet(&pending[..length])?.to_vec();
+        pending.drain(..length);
+        return Ok(Some((request.destination.clone(), payload, true)));
+    }
+    let Some(packet) = take_next_uot_packet(pending)? else {
+        return Ok(None);
+    };
+    let (destination, payload) = uot::decode_associate_packet(&packet)?;
+    Ok(Some((destination, payload.to_vec(), false)))
+}
+
+fn uot_connect_packet_len(packet: &[u8]) -> Result<Option<usize>> {
+    if packet.len() < 2 {
+        return Ok(None);
+    }
+    let payload_len = u16::from_be_bytes([packet[0], packet[1]]) as usize;
+    Ok(Some(2 + payload_len))
+}
+
+fn legacy_uot_request() -> uot::UotRequest {
+    uot::UotRequest {
+        is_connect: false,
+        destination: ProxyTarget::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
+    }
+}
+
+async fn relay_naive_uot_packet(
+    tx: mpsc::Sender<Vec<u8>>,
+    destination: ProxyTarget,
+    payload: Vec<u8>,
+    connected: bool,
+) -> Result<()> {
+    let target_addr = resolve_proxy_target_addr(&destination).await?;
+    let bind_addr = if target_addr.is_ipv6() {
+        SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    };
+    let outbound = socket_protect::bind_udp(bind_addr).await?;
+    outbound
+        .send_to(&payload, target_addr)
+        .await
+        .with_context(|| format!("send Naive UOT payload to {target_addr}"))?;
+    let mut buffer = vec![0u8; u16::MAX as usize];
+    while let Ok(read) =
+        tokio::time::timeout(NAIVE_UDP_SESSION_TIMEOUT, outbound.recv_from(&mut buffer)).await
+    {
+        let (read, _) = read.context("receive Naive UOT response")?;
+        let packet = if connected {
+            uot::encode_connect_packet(&buffer[..read])?
+        } else {
+            uot::encode_associate_packet(&destination, &buffer[..read])?
+        };
+        if tx.send(packet).await.is_err() {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+async fn connect_proxy_target(target: &ProxyTarget) -> Result<TcpStream> {
+    match target {
+        ProxyTarget::Ip(addr) => socket_protect::connect_tcp_addr(*addr).await,
+        ProxyTarget::Domain(host, port) => socket_protect::connect_tcp_host_port(host, *port).await,
+    }
+}
+
+async fn resolve_proxy_target_addr(target: &ProxyTarget) -> Result<SocketAddr> {
+    match target {
+        ProxyTarget::Ip(addr) => Ok(*addr),
+        ProxyTarget::Domain(host, port) => tokio::net::lookup_host((host.as_str(), *port))
+            .await
+            .with_context(|| format!("resolve Naive UOT target {host}:{port}"))?
+            .next()
+            .with_context(|| format!("Naive UOT target resolved to no addresses: {host}:{port}")),
+    }
 }
 
 async fn relay_naive_tcp(local: TcpStream, tunnel: NaiveTunnel) -> Result<()> {
@@ -801,6 +1729,22 @@ async fn send_naive_h3_data(
     Ok(())
 }
 
+async fn send_naive_h3_server_data<S>(
+    send: &mut h3::server::RequestStream<S, Bytes>,
+    state: &mut NaiveWriteState,
+    data: &[u8],
+) -> Result<()>
+where
+    S: h3::quic::SendStream<Bytes>,
+{
+    for chunk in encode_naive_chunks(state, data)? {
+        send.send_data(Bytes::from(chunk))
+            .await
+            .context("send Naive HTTP/3 server padded data")?;
+    }
+    Ok(())
+}
+
 fn encode_naive_chunks(state: &mut NaiveWriteState, data: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut chunks = Vec::new();
     for chunk in data.chunks(NAIVE_MAX_CHUNK) {
@@ -1037,6 +1981,94 @@ async fn pull_h3_data(
     pending: &mut Vec<u8>,
 ) -> Result<bool> {
     let Some(mut chunk) = recv.recv_data().await.context("read Naive HTTP/3 data")? else {
+        return Ok(false);
+    };
+    let len = chunk.remaining();
+    pending.extend_from_slice(&chunk.copy_to_bytes(len));
+    Ok(true)
+}
+
+async fn read_naive_h3_server_data<S>(
+    recv: &mut h3::server::RequestStream<S, Bytes>,
+    pending: &mut Vec<u8>,
+    state: &mut NaiveReadState,
+    buffer: &mut [u8],
+) -> Result<usize>
+where
+    S: h3::quic::RecvStream,
+{
+    if state.read_remaining > 0 {
+        let take = state.read_remaining.min(buffer.len());
+        let read = read_raw_h3_server_some(recv, pending, &mut buffer[..take]).await?;
+        state.read_remaining -= read;
+        return Ok(read);
+    }
+    if state.padding_remaining > 0 {
+        read_raw_h3_server_exact(recv, pending, state.padding_remaining).await?;
+        state.padding_remaining = 0;
+    }
+    if state.read_padding < NAIVE_PADDING_COUNT {
+        let header = read_raw_h3_server_exact(recv, pending, 3).await?;
+        let data_size = u16::from_be_bytes([header[0], header[1]]) as usize;
+        let padding_size = header[2] as usize;
+        let take = data_size.min(buffer.len());
+        let read = read_raw_h3_server_some(recv, pending, &mut buffer[..take]).await?;
+        state.read_padding += 1;
+        state.read_remaining = data_size - read;
+        state.padding_remaining = padding_size;
+        return Ok(read);
+    }
+    read_raw_h3_server_some(recv, pending, buffer).await
+}
+
+async fn read_raw_h3_server_some<S>(
+    recv: &mut h3::server::RequestStream<S, Bytes>,
+    pending: &mut Vec<u8>,
+    buffer: &mut [u8],
+) -> Result<usize>
+where
+    S: h3::quic::RecvStream,
+{
+    if pending.is_empty() && !pull_h3_server_data(recv, pending).await? {
+        return Ok(0);
+    }
+    let take = pending.len().min(buffer.len());
+    buffer[..take].copy_from_slice(&pending[..take]);
+    pending.drain(..take);
+    Ok(take)
+}
+
+async fn read_raw_h3_server_exact<S>(
+    recv: &mut h3::server::RequestStream<S, Bytes>,
+    pending: &mut Vec<u8>,
+    size: usize,
+) -> Result<Vec<u8>>
+where
+    S: h3::quic::RecvStream,
+{
+    while pending.len() < size {
+        ensure!(
+            pull_h3_server_data(recv, pending).await?,
+            "Naive HTTP/3 server stream closed early"
+        );
+    }
+    let output = pending[..size].to_vec();
+    pending.drain(..size);
+    Ok(output)
+}
+
+async fn pull_h3_server_data<S>(
+    recv: &mut h3::server::RequestStream<S, Bytes>,
+    pending: &mut Vec<u8>,
+) -> Result<bool>
+where
+    S: h3::quic::RecvStream,
+{
+    let Some(mut chunk) = recv
+        .recv_data()
+        .await
+        .context("read Naive HTTP/3 server data")?
+    else {
         return Ok(false);
     };
     let len = chunk.remaining();

@@ -45,7 +45,10 @@ pub use mieru::{
     MieruTrafficPattern, MieruTransport, MieruUser, parse_mieru_user, run_mieru_client,
     run_mieru_client_listener, run_mieru_server, run_mieru_server_with_core,
 };
-pub use naive::{NaiveClientConfig, run_naive_client, run_naive_client_listener};
+pub use naive::{
+    NaiveClientConfig, NaiveServerConfig, run_naive_client, run_naive_client_listener,
+    run_naive_server,
+};
 pub use reality::{
     BuiltRealityClientHello, RealityClientConfig, RealityServerConfig, build_reality_client_hello,
     build_reality_client_hello_with_alpn,

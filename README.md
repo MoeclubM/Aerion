@@ -32,7 +32,8 @@ Aerion now provides these server/client protocol stacks:
   - base64 protobuf traffic-pattern TCP fragmentation and nonce-pattern shaping
 - Naive:
   - local SOCKS5 CONNECT client over HTTPS proxy CONNECT
-  - HTTP/1.1, HTTP/2, and HTTP/3 client tunnels
+  - HTTPS proxy CONNECT server
+  - HTTP/1.1, HTTP/2, and HTTP/3 client/server tunnels
   - Basic authentication, TLS SNI verification, optional extra headers
   - UOT-style SOCKS5 UDP ASSOCIATE when UDP-over-TCP is enabled
   - Naive-compatible randomized padding chunks for tunnel payloads
@@ -181,6 +182,7 @@ cargo run -- run --config config.server.example.toml --profile hysteria2
 cargo run -- run --config config.server.example.toml --profile mieru-tcp
 cargo run -- run --config config.server.example.toml --profile tuic
 cargo run -- run --config config.server.example.toml --profile shadowsocks
+cargo run -- run --config config.server.example.toml --profile naive-h2
 cargo run -- run --config config.server.example.toml --profile trojan
 cargo run -- run --config config.server.example.toml --profile vless
 cargo run -- run --config config.server.example.toml --profile vmess
@@ -207,12 +209,10 @@ Use `protocol = "hysteria2"` to select Hysteria2, or `protocol = "mieru"` to
 select Mieru. Mieru defaults to `transport = "tcp"`; set `transport = "udp"` to
 use the native packet underlay. Use `protocol = "tuic"` with `username` as the
 TUIC UUID and `password` as the TUIC password; extra server users use
-`uuid:password` entries. Use `protocol = "naive"` for an HTTPS Naive client;
-set `transport = "quic"` or `protocol = "naive+quic"` for HTTP/3.
-Aerion-native TOML also runs Shadowsocks, Trojan, VLESS, and VMess client
-profiles plus Shadowsocks, Trojan, VLESS, and VMess server profiles. Naive
-server profiles are not exposed because Aerion currently provides that stack as
-a local client only.
+`uuid:password` entries. Use `protocol = "naive"` for an HTTPS Naive client or
+server; set `transport = "quic"` or `protocol = "naive+quic"` for HTTP/3.
+Aerion-native TOML also runs Shadowsocks, Trojan, VLESS, and VMess client and
+server profiles.
 
 The CLI can run mihomo YAML, Xray JSON/JSONC, and sing-box JSON/JSONC client
 profiles directly. If those files contain multiple proxies/outbounds, select one

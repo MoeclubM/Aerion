@@ -70,6 +70,19 @@ udp = true
 # users = ["alice:AAAAAAAAAAAAAAAAAAAAAA=="]
 
 [[servers]]
+name = "naive-h2"
+protocol = "naive"
+listen = "0.0.0.0:8449"
+username = "default"
+password = "change-me"
+# Extra users use "username:password" entries.
+users = ["alice:alice-password"]
+cert = "server.crt"
+key = "server.key"
+udp = true
+# Set transport = "quic" or protocol = "naive+quic" to also bind HTTP/3.
+
+[[servers]]
 name = "trojan"
 protocol = "trojan"
 listen = "0.0.0.0:8445"

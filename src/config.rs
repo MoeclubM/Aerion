@@ -449,7 +449,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.server.example.toml");
         assert!(matches!(
             load_config(&path).expect("server config"),
-            FileConfig::Aerion(config) if config.clients.is_empty() && config.servers.len() == 8
+            FileConfig::Aerion(config) if config.clients.is_empty() && config.servers.len() == 9
         ));
     }
 

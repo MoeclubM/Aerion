@@ -6,7 +6,7 @@ use aerion::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
 use aerion::mieru::{
     MieruClientConfig, MieruServerConfig, MieruTrafficPattern, MieruTransport, parse_mieru_user,
 };
-use aerion::naive::NaiveClientConfig;
+use aerion::naive::{NaiveClientConfig, NaiveServerConfig};
 use aerion::padding::PaddingScheme;
 use aerion::tuic::{TuicClientConfig, TuicServerConfig, parse_tuic_user};
 use aerion::vless_transport::VlessTransportConfig;
@@ -16,7 +16,7 @@ use aerion::{
     SingBoxOutbound, TrojanClientConfig, TrojanServerConfig, VlessClientConfig, VlessServerConfig,
     VmessClientConfig, VmessServerConfig, XrayClientConfig, XrayOutbound, run_client,
     run_hysteria2_client, run_hysteria2_server, run_mieru_client, run_mieru_server,
-    run_naive_client, run_server, run_shadowsocks_client, run_shadowsocks_server,
+    run_naive_client, run_naive_server, run_server, run_shadowsocks_client, run_shadowsocks_server,
     run_trojan_client, run_trojan_server, run_tuic_client, run_tuic_server, run_vless_client,
     run_vless_server, run_vmess_client, run_vmess_server, tls,
 };
@@ -790,6 +790,20 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             password: server.password,
             users: server.users,
             udp: server.udp,
+        })
+        .await;
+    }
+    if is_naive(&server.protocol) {
+        return run_naive_server(NaiveServerConfig {
+            listen: server.listen,
+            username: server.username,
+            password: server.password,
+            users: server.users,
+            cert_path: server.cert.context("server cert is required for Naive")?,
+            key_path: server.key.context("server key is required for Naive")?,
+            udp_over_tcp: server.udp,
+            quic: server.transport.eq_ignore_ascii_case("quic")
+                || server.protocol.eq_ignore_ascii_case("naive+quic"),
         })
         .await;
     }
