@@ -463,10 +463,58 @@ pub struct MihomoXhttpOptions {
     pub headers: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MihomoUdpOverTcpOptions {
-    #[serde(default)]
     pub enabled: bool,
+    pub version: Option<Value>,
+}
+
+impl<'de> Deserialize<'de> for MihomoUdpOverTcpOptions {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Object {
+                #[serde(default)]
+                enabled: bool,
+                #[serde(default)]
+                version: Option<Value>,
+            },
+        }
+
+        match Raw::deserialize(deserializer)? {
+            Raw::Bool(enabled) => Ok(Self {
+                enabled,
+                version: None,
+            }),
+            Raw::Object { enabled, version } => Ok(Self { enabled, version }),
+        }
+    }
+}
+
+impl MihomoUdpOverTcpOptions {
+    fn enabled_for(&self, protocol: &str, name: &str) -> Result<bool> {
+        if !self.enabled {
+            return Ok(false);
+        }
+        if let Some(version) = &self.version {
+            let is_v2 = match version {
+                Value::Number(number) => number.as_u64() == Some(2),
+                Value::String(text) => text.trim() == "2",
+                _ => false,
+            };
+            ensure!(
+                is_v2,
+                "mihomo {protocol} proxy {name} sets udp-over-tcp version {:?}; Aerion UDP-over-TCP uses version 2 framing",
+                version
+            );
+        }
+        Ok(true)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -565,7 +613,8 @@ impl MihomoShadowsocksProxy {
         let udp_over_tcp = self
             .udp_over_tcp
             .as_ref()
-            .map(|opts| opts.enabled)
+            .map(|opts| opts.enabled_for("Shadowsocks", &self.name))
+            .transpose()?
             .unwrap_or(false);
         Ok(ShadowsocksClientConfig {
             listen,
@@ -919,7 +968,8 @@ impl MihomoNaiveProxy {
             udp_over_tcp: self
                 .udp_over_tcp
                 .as_ref()
-                .map(|options| options.enabled)
+                .map(|options| options.enabled_for("Naive", &self.name))
+                .transpose()?
                 .unwrap_or(false),
             quic: self.quic,
         })
@@ -1262,8 +1312,7 @@ proxies:
     cipher: aes-128-gcm
     password: secret
     udp: true
-    udp-over-tcp:
-      enabled: true
+    udp-over-tcp: true
 "#;
         let config: MihomoConfig = serde_yaml::from_str(yaml)?;
         let MihomoClientConfig::Shadowsocks(shadowsocks) =
@@ -1273,6 +1322,38 @@ proxies:
         };
         assert!(shadowsocks.udp);
         assert!(shadowsocks.udp_over_tcp);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unsupported_udp_over_tcp_version() -> Result<()> {
+        let yaml = r#"
+proxies:
+  - name: ss-uot-v1
+    type: ss
+    server: example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: secret
+    udp-over-tcp:
+      enabled: true
+      version: 1
+  - name: naive-uot-v1
+    type: naive
+    server: naive.example.com
+    udp-over-tcp:
+      enabled: true
+      version: "1"
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let ss_error = config.proxies[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("Shadowsocks UOT v1 must be explicit");
+        assert!(ss_error.to_string().contains("version 2"));
+        let naive_error = config.proxies[1]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("Naive UOT v1 must be explicit");
+        assert!(naive_error.to_string().contains("version 2"));
         Ok(())
     }
 
@@ -1636,6 +1717,7 @@ proxies:
     quic: true
     udp-over-tcp:
       enabled: true
+      version: 2
     servername: front.example.com
     skip-cert-verify: true
     extra-headers:
