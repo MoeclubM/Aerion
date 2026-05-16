@@ -429,6 +429,7 @@ impl SingBoxVlessOutbound {
             None
         };
         if let Some(tls) = &self.tls {
+            tls.ensure_supported_client_options("VLESS", name)?;
             if tls_enabled || reality.is_some() {
                 ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
             } else {
@@ -489,6 +490,7 @@ impl SingBoxVmessOutbound {
         ensure_vmess_packet_encoding(&packet_encoding)
             .with_context(|| format!("sing-box VMess outbound {name} packet_encoding"))?;
         if let Some(tls) = &self.tls {
+            tls.ensure_supported_client_options("VMess", name)?;
             if tls.enabled {
                 ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
             } else {
@@ -544,6 +546,7 @@ impl SingBoxTrojanOutbound {
             tls.enabled,
             "sing-box Trojan outbound {name} disables TLS; Trojan requires TLS in Aerion"
         );
+        tls.ensure_supported_client_options("Trojan", name)?;
         ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
         Ok(TrojanClientConfig {
             listen,
@@ -612,6 +615,7 @@ impl SingBoxHysteria2Outbound {
             tls.enabled,
             "sing-box Hysteria2 outbound {name} disables TLS; Hysteria2 requires TLS in Aerion"
         );
+        tls.ensure_supported_client_options("Hysteria2", name)?;
         ensure_hy2_alpn("sing-box", name, tls.alpn.as_ref())?;
         let (obfs, obfs_password) = match &self.obfs {
             Some(obfs) => {
@@ -650,6 +654,7 @@ impl SingBoxAnyTlsOutbound {
             tls.enabled,
             "sing-box AnyTLS outbound {name} disables TLS; AnyTLS requires TLS"
         );
+        tls.ensure_supported_client_options("AnyTLS", name)?;
         Ok(ClientConfig {
             listen,
             server_host: self.server.clone(),
@@ -673,22 +678,7 @@ impl SingBoxNaiveOutbound {
             tls.enabled,
             "sing-box Naive outbound {name} disables TLS; Naive requires HTTPS/TLS"
         );
-        ensure!(
-            !tls.certificate
-                .as_ref()
-                .map(json_value_non_empty)
-                .unwrap_or(false)
-                && !tls
-                    .certificate_path
-                    .as_ref()
-                    .map(json_value_non_empty)
-                    .unwrap_or(false),
-            "sing-box Naive outbound {name} sets custom TLS certificate roots; Aerion Naive client does not expose custom trust roots"
-        );
-        ensure!(
-            !singbox_enabled_option("Naive", name, "tls.ech", tls.ech.as_ref())?,
-            "sing-box Naive outbound {name} enables ECH; Aerion Naive client does not implement ECH"
-        );
+        tls.ensure_supported_client_options("Naive", name)?;
         ensure!(
             self.insecure_concurrency.unwrap_or(0) == 0,
             "sing-box Naive outbound {name} sets insecure_concurrency; Aerion Naive client does not implement speculative parallel connections"
@@ -751,6 +741,7 @@ impl SingBoxTuicOutbound {
             tls.enabled,
             "sing-box TUIC outbound {name} disables TLS; TUIC requires QUIC TLS"
         );
+        tls.ensure_supported_client_options("TUIC", name)?;
         ensure_tuic_alpn("sing-box", name, tls.alpn.as_ref())?;
         Ok(TuicClientConfig {
             listen,
@@ -781,6 +772,27 @@ impl SingBoxTuicOutbound {
 }
 
 impl SingBoxTlsOptions {
+    fn ensure_supported_client_options(&self, protocol: &str, name: &str) -> Result<()> {
+        ensure!(
+            !self
+                .certificate
+                .as_ref()
+                .map(json_value_non_empty)
+                .unwrap_or(false)
+                && !self
+                    .certificate_path
+                    .as_ref()
+                    .map(json_value_non_empty)
+                    .unwrap_or(false),
+            "sing-box {protocol} outbound {name} sets custom TLS certificate roots; Aerion client does not expose custom trust roots"
+        );
+        ensure!(
+            !singbox_enabled_option(protocol, name, "tls.ech", self.ech.as_ref())?,
+            "sing-box {protocol} outbound {name} enables ECH; Aerion client does not implement ECH"
+        );
+        Ok(())
+    }
+
     fn utls_fingerprint(&self, name: &str) -> Result<Option<UtlsFingerprint>> {
         let Some(utls) = &self.utls else {
             return Ok(None);
