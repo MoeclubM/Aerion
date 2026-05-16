@@ -307,6 +307,8 @@ pub struct MihomoTuicProxy {
     pub server: String,
     pub port: u16,
     #[serde(default)]
+    pub ip: Option<String>,
+    #[serde(default)]
     pub uuid: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
@@ -318,8 +320,28 @@ pub struct MihomoTuicProxy {
     pub servername: Option<String>,
     #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
     pub skip_cert_verify: bool,
+    #[serde(default, rename = "disable-sni", alias = "disable_sni")]
+    pub disable_sni: bool,
+    #[serde(default, rename = "reduce-rtt", alias = "reduce_rtt")]
+    pub reduce_rtt: bool,
+    #[serde(default, rename = "fast-open", alias = "fast_open")]
+    pub fast_open: bool,
     #[serde(default)]
     pub alpn: Option<OneOrManyStrings>,
+    #[serde(default, rename = "heartbeat-interval", alias = "heartbeat_interval")]
+    pub heartbeat_interval: Option<u64>,
+    #[serde(default, rename = "max-open-streams", alias = "max_open_streams")]
+    pub max_open_streams: Option<Value>,
+    #[serde(
+        default,
+        rename = "max-udp-relay-packet-size",
+        alias = "max_udp_relay_packet_size"
+    )]
+    pub max_udp_relay_packet_size: Option<Value>,
+    #[serde(default, rename = "request-timeout", alias = "request_timeout")]
+    pub request_timeout: Option<Value>,
+    #[serde(default, rename = "bbr-profile", alias = "bbr_profile")]
+    pub bbr_profile: Option<String>,
     #[serde(
         default = "default_tuic_congestion_control",
         rename = "congestion-controller",
@@ -847,10 +869,55 @@ impl MihomoTuicProxy {
             "mihomo TUIC proxy {} uses TUIC v4 token; Aerion implements TUIC v5 UUID/password auth",
             self.name
         );
+        ensure!(
+            !self.reduce_rtt,
+            "mihomo TUIC proxy {} enables reduce-rtt; Aerion TUIC client does not expose 0-RTT handshakes",
+            self.name
+        );
+        ensure!(
+            !self.disable_sni,
+            "mihomo TUIC proxy {} disables SNI; Aerion TUIC client requires a TLS server name",
+            self.name
+        );
+        ensure!(
+            !self.fast_open,
+            "mihomo TUIC proxy {} enables fast-open; Aerion TUIC client does not expose TCP fast open",
+            self.name
+        );
+        ensure!(
+            self.bbr_profile
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none_or(|value| value.eq_ignore_ascii_case("standard")),
+            "mihomo TUIC proxy {} sets bbr-profile {:?}; Aerion TUIC uses the default BBR profile",
+            self.name,
+            self.bbr_profile
+        );
+        for (field, value) in [
+            ("max-open-streams", self.max_open_streams.as_ref()),
+            (
+                "max-udp-relay-packet-size",
+                self.max_udp_relay_packet_size.as_ref(),
+            ),
+            ("request-timeout", self.request_timeout.as_ref()),
+        ] {
+            ensure!(
+                !value.map(value_has_data).unwrap_or(false),
+                "mihomo TUIC proxy {} sets {field}; Aerion TUIC client does not expose this option",
+                self.name
+            );
+        }
         ensure_tuic_alpn(&self.name, self.alpn.as_ref())?;
+        let server_host = self
+            .ip
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&self.server);
         Ok(TuicClientConfig {
             listen,
-            server_host: self.server.clone(),
+            server_host: server_host.to_string(),
             server_port: self.port,
             uuid: self
                 .uuid
@@ -866,7 +933,10 @@ impl MihomoTuicProxy {
             udp_relay_mode: self.udp_relay_mode.clone(),
             congestion_control: self.congestion_control.clone(),
             alpn_protocols: alpn_values(self.alpn.as_ref()),
-            heartbeat_interval_secs: 10,
+            heartbeat_interval_secs: self
+                .heartbeat_interval
+                .map(|millis| millis.saturating_add(999) / 1000)
+                .unwrap_or(10),
         })
     }
 }
@@ -1445,12 +1515,14 @@ proxies:
   - name: tuic-v5
     type: tuic
     server: tuic.example.com
+    ip: 203.0.113.10
     port: 443
     uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
     password: secret
     udp: true
     udp-relay-mode: quic
     congestion-controller: bbr
+    heartbeat-interval: 1500
     alpn:
       - h3
 "#;
@@ -1475,10 +1547,54 @@ proxies:
         else {
             bail!("expected TUIC")
         };
-        assert_eq!(tuic.server_host, "tuic.example.com");
+        assert_eq!(tuic.server_host, "203.0.113.10");
+        assert_eq!(tuic.sni, "tuic.example.com");
         assert_eq!(tuic.udp_relay_mode, "quic");
         assert_eq!(tuic.congestion_control, "bbr");
         assert_eq!(tuic.alpn_protocols, vec!["h3".to_string()]);
+        assert_eq!(tuic.heartbeat_interval_secs, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_tuic_unsupported_fields() -> Result<()> {
+        let yaml = r#"
+proxies:
+  - name: tuic-reduce-rtt
+    type: tuic
+    server: tuic.example.com
+    port: 443
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    password: secret
+    reduce-rtt: true
+  - name: tuic-disable-sni
+    type: tuic
+    server: tuic.example.com
+    port: 443
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    password: secret
+    disable-sni: true
+  - name: tuic-open-streams
+    type: tuic
+    server: tuic.example.com
+    port: 443
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    password: secret
+    max-open-streams: 64
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let reduce_rtt_error = config.proxies[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("reduce-rtt must be explicit");
+        assert!(reduce_rtt_error.to_string().contains("reduce-rtt"));
+        let disable_sni_error = config.proxies[1]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("disable-sni must be explicit");
+        assert!(disable_sni_error.to_string().contains("SNI"));
+        let stream_error = config.proxies[2]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("max-open-streams must be explicit");
+        assert!(stream_error.to_string().contains("max-open-streams"));
         Ok(())
     }
 
