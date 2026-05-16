@@ -13,6 +13,7 @@ use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
 use crate::vmess::{VmessClientConfig, ensure_vmess_packet_encoding};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Deserializer, de};
+use serde_yaml::Value;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -192,17 +193,51 @@ pub struct MihomoHysteria2Proxy {
     pub port: Option<u16>,
     #[serde(default)]
     pub ports: Option<String>,
+    #[serde(default, rename = "hop-interval", alias = "hop_interval")]
+    pub hop_interval: Option<Value>,
     pub password: String,
     #[serde(default, alias = "servername", alias = "server-name")]
     pub sni: Option<String>,
     #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
     pub skip_cert_verify: bool,
     #[serde(default)]
+    pub fingerprint: Option<String>,
+    #[serde(default)]
     pub obfs: Option<String>,
     #[serde(default, rename = "obfs-password", alias = "obfs_password")]
     pub obfs_password: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_bandwidth_mbps")]
+    pub up: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_bandwidth_mbps")]
     pub down: Option<u64>,
+    #[serde(default, rename = "bbr-profile", alias = "bbr_profile")]
+    pub bbr_profile: Option<String>,
+    #[serde(default, rename = "realm-opts", alias = "realm_opts")]
+    pub realm_opts: Option<Value>,
+    #[serde(
+        default,
+        rename = "initial-stream-receive-window",
+        alias = "initial_stream_receive_window"
+    )]
+    pub initial_stream_receive_window: Option<Value>,
+    #[serde(
+        default,
+        rename = "max-stream-receive-window",
+        alias = "max_stream_receive_window"
+    )]
+    pub max_stream_receive_window: Option<Value>,
+    #[serde(
+        default,
+        rename = "initial-connection-receive-window",
+        alias = "initial_connection_receive_window"
+    )]
+    pub initial_connection_receive_window: Option<Value>,
+    #[serde(
+        default,
+        rename = "max-connection-receive-window",
+        alias = "max_connection_receive_window"
+    )]
+    pub max_connection_receive_window: Option<Value>,
     #[serde(
         default = "default_hy2_congestion_control",
         rename = "congestion-control"
@@ -643,6 +678,85 @@ impl MihomoHysteria2Proxy {
             "mihomo Hysteria2 proxy {} uses port hopping; Aerion Hysteria2 client expects one fixed port",
             self.name
         );
+        ensure!(
+            !self
+                .hop_interval
+                .as_ref()
+                .map(value_has_data)
+                .unwrap_or(false),
+            "mihomo Hysteria2 proxy {} sets hop-interval; Aerion Hysteria2 client expects one fixed port",
+            self.name
+        );
+        ensure!(
+            self.up.is_none(),
+            "mihomo Hysteria2 proxy {} sets up bandwidth; Aerion Hysteria2 client does not expose upload bandwidth",
+            self.name
+        );
+        ensure!(
+            self.fingerprint
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none(),
+            "mihomo Hysteria2 proxy {} sets certificate fingerprint pinning; Aerion Hysteria2 client does not expose fingerprint pinning",
+            self.name
+        );
+        ensure!(
+            self.bbr_profile
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none_or(|value| value.eq_ignore_ascii_case("standard")),
+            "mihomo Hysteria2 proxy {} sets bbr-profile {:?}; Aerion Hysteria2 uses the default BBR profile",
+            self.name,
+            self.bbr_profile
+        );
+        ensure!(
+            !self
+                .realm_opts
+                .as_ref()
+                .map(value_has_data)
+                .unwrap_or(false),
+            "mihomo Hysteria2 proxy {} sets realm-opts; Aerion Hysteria2 client does not expose realm override",
+            self.name
+        );
+        for (field, value) in [
+            (
+                "initial-stream-receive-window",
+                self.initial_stream_receive_window.as_ref(),
+            ),
+            (
+                "max-stream-receive-window",
+                self.max_stream_receive_window.as_ref(),
+            ),
+            (
+                "initial-connection-receive-window",
+                self.initial_connection_receive_window.as_ref(),
+            ),
+            (
+                "max-connection-receive-window",
+                self.max_connection_receive_window.as_ref(),
+            ),
+        ] {
+            ensure!(
+                !value.map(value_has_data).unwrap_or(false),
+                "mihomo Hysteria2 proxy {} sets {field}; Aerion Hysteria2 client does not expose QUIC receive window override",
+                self.name
+            );
+        }
+        if let Some(obfs) = self
+            .obfs
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            ensure!(
+                obfs.eq_ignore_ascii_case("salamander"),
+                "mihomo Hysteria2 proxy {} uses obfs {}; Aerion supports salamander",
+                self.name,
+                obfs
+            );
+        }
         let port = self
             .port
             .with_context(|| format!("mihomo Hysteria2 proxy {} is missing port", self.name))?;
@@ -775,6 +889,18 @@ impl OneOrManyStrings {
             Self::One(value) => vec![value.clone()],
             Self::Many(values) => values.clone(),
         }
+    }
+}
+
+fn value_has_data(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(_) => true,
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Sequence(value) => !value.is_empty(),
+        Value::Mapping(value) => !value.is_empty(),
+        Value::Tagged(value) => value_has_data(&value.value),
     }
 }
 
@@ -1209,6 +1335,93 @@ proxies:
             "edge.example.com"
         );
         assert_eq!(vless.transport.mode, "stream-one");
+        Ok(())
+    }
+
+    #[test]
+    fn parses_hysteria2_profile() -> Result<()> {
+        let yaml = r#"
+proxies:
+  - name: hy2
+    type: hysteria2
+    server: example.com
+    port: 443
+    password: secret
+    servername: hy2.example.com
+    skip-cert-verify: true
+    obfs: salamander
+    obfs-password: obfs-pass
+    down: 80 Mbps
+    congestion-control: reno
+    udp: true
+    alpn:
+      - h3
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let MihomoClientConfig::Hysteria2(hysteria2) =
+            config.proxies[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Hysteria2")
+        };
+        assert_eq!(hysteria2.server_host, "example.com");
+        assert_eq!(hysteria2.server_port, 443);
+        assert_eq!(hysteria2.password, "secret");
+        assert_eq!(hysteria2.sni, "hy2.example.com");
+        assert!(hysteria2.insecure);
+        assert_eq!(hysteria2.obfs.as_deref(), Some("salamander"));
+        assert_eq!(hysteria2.obfs_password.as_deref(), Some("obfs-pass"));
+        assert_eq!(hysteria2.download_bandwidth, Some(80));
+        assert_eq!(hysteria2.congestion_control, "reno");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_hysteria2_unsupported_fields() -> Result<()> {
+        let yaml = r#"
+proxies:
+  - name: hy2-up
+    type: hysteria2
+    server: example.com
+    port: 443
+    password: secret
+    up: 10 Mbps
+  - name: hy2-hop
+    type: hysteria2
+    server: example.com
+    ports: 443,8443
+    hop-interval: 30s
+    password: secret
+  - name: hy2-realm
+    type: hysteria2
+    server: example.com
+    port: 443
+    password: secret
+    realm-opts:
+      name: test
+  - name: hy2-window
+    type: hysteria2
+    server: example.com
+    port: 443
+    password: secret
+    max-stream-receive-window: 8388608
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let up_error = config.proxies[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("up bandwidth must be explicit");
+        assert!(up_error.to_string().contains("up bandwidth"));
+        let hop_error = config.proxies[1]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("port hopping must be explicit");
+        assert!(hop_error.to_string().contains("port hopping"));
+        let realm_error = config.proxies[2]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("realm opts must be explicit");
+        assert!(realm_error.to_string().contains("realm-opts"));
+        let window_error = config.proxies[3]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("receive window override must be explicit");
+        assert!(window_error.to_string().contains("receive window"));
         Ok(())
     }
 
