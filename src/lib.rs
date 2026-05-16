@@ -47,7 +47,7 @@ pub use mieru::{
 };
 pub use naive::{
     NaiveClientConfig, NaiveServerConfig, run_naive_client, run_naive_client_listener,
-    run_naive_server,
+    run_naive_server, run_naive_server_with_core,
 };
 pub use reality::{
     BuiltRealityClientHello, RealityClientConfig, RealityServerConfig, build_reality_client_hello,

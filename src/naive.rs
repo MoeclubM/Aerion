@@ -1,3 +1,4 @@
+use crate::core::{CoreSession, CoreUser, ProxyCore};
 use crate::protocol::{ProxyTarget, target_name};
 use crate::{socket_protect, socks, tls, uot};
 use anyhow::{Context, Result, bail, ensure};
@@ -49,6 +50,7 @@ pub struct NaiveServerConfig {
 #[derive(Clone)]
 struct NaiveServerRuntime {
     credentials: Arc<Vec<String>>,
+    core: ProxyCore,
     tls_config: Arc<rustls::ServerConfig>,
     udp_over_tcp: bool,
 }
@@ -111,7 +113,18 @@ pub async fn run_naive_client_listener(
 }
 
 pub async fn run_naive_server(config: NaiveServerConfig) -> Result<()> {
-    let runtime = NaiveServerRuntime::from_config(&config)?;
+    let credentials = naive_credentials(&config.username, &config.password, &config.users);
+    let core = ProxyCore::new(
+        credentials
+            .iter()
+            .map(|credential| CoreUser::password(credential, credential))
+            .collect(),
+    )?;
+    run_naive_server_with_core(config, core).await
+}
+
+pub async fn run_naive_server_with_core(config: NaiveServerConfig, core: ProxyCore) -> Result<()> {
+    let runtime = NaiveServerRuntime::from_config(&config, core)?;
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind Naive HTTPS listener on {}", config.listen))?;
@@ -131,7 +144,7 @@ pub async fn run_naive_server(config: NaiveServerConfig) -> Result<()> {
         let runtime = runtime.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_naive_server_tcp(stream, acceptor, runtime).await {
+            if let Err(error) = handle_naive_server_tcp(stream, peer, acceptor, runtime).await {
                 tracing::warn!("Naive TCP client {peer} failed: {error:?}");
             }
         });
@@ -139,7 +152,7 @@ pub async fn run_naive_server(config: NaiveServerConfig) -> Result<()> {
 }
 
 impl NaiveServerRuntime {
-    fn from_config(config: &NaiveServerConfig) -> Result<Self> {
+    fn from_config(config: &NaiveServerConfig, core: ProxyCore) -> Result<Self> {
         let mut tls_config =
             Arc::unwrap_or_clone(tls::server_config(&config.cert_path, &config.key_path)?);
         tls_config.alpn_protocols = vec![NAIVE_H2_ALPN.to_vec(), NAIVE_HTTP11_ALPN.to_vec()];
@@ -149,6 +162,7 @@ impl NaiveServerRuntime {
                 &config.password,
                 &config.users,
             )),
+            core,
             tls_config: Arc::new(tls_config),
             udp_over_tcp: config.udp_over_tcp,
         })
@@ -157,27 +171,37 @@ impl NaiveServerRuntime {
 
 async fn handle_naive_server_tcp(
     stream: TcpStream,
+    peer: SocketAddr,
     acceptor: tokio_rustls::TlsAcceptor,
     runtime: NaiveServerRuntime,
 ) -> Result<()> {
     let mut tls = acceptor.accept(stream).await.context("accept Naive TLS")?;
     if tls.get_ref().1.alpn_protocol() == Some(NAIVE_H2_ALPN) {
-        return handle_naive_h2_connection(tls, runtime).await;
+        return handle_naive_h2_connection(tls, peer, runtime).await;
     }
-    handle_naive_http1_connection(tls, runtime).await
+    handle_naive_http1_connection(tls, peer, runtime).await
 }
 
 async fn handle_naive_http1_connection(
     mut tls: tokio_rustls::server::TlsStream<TcpStream>,
+    peer: SocketAddr,
     runtime: NaiveServerRuntime,
 ) -> Result<()> {
     let (target, authorization, pending) = read_naive_http1_connect(&mut tls).await?;
-    if !naive_authorized(authorization.as_deref(), &runtime.credentials) {
-        tls.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"naive\"\r\n\r\n")
-            .await
-            .context("write Naive HTTP/1.1 auth failure")?;
-        return Ok(());
-    }
+    let credential = if runtime.credentials.is_empty() {
+        None
+    } else {
+        let Some(credential) =
+            naive_auth_credential(authorization.as_deref(), &runtime.credentials)
+        else {
+            tls.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"naive\"\r\n\r\n")
+                .await
+                .context("write Naive HTTP/1.1 auth failure")?;
+            return Ok(());
+        };
+        Some(credential)
+    };
+    let session = naive_core_session(&runtime, credential.as_deref(), peer).await?;
     if uot::is_magic_target(&target) {
         ensure!(
             runtime.udp_over_tcp,
@@ -186,18 +210,19 @@ async fn handle_naive_http1_connection(
         tls.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
             .context("write Naive HTTP/1.1 UOT response")?;
-        return relay_naive_http1_uot(tls, pending, target).await;
+        return relay_naive_http1_uot(tls, pending, target, session).await;
     }
     let mut remote = connect_proxy_target(&target).await?;
     tls.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await
         .context("write Naive HTTP/1.1 CONNECT response")?;
     tracing::info!("Naive serving HTTP/1.1 {}", target_name(&target));
-    relay_naive_http1_server_tcp(tls, pending, remote).await
+    relay_naive_http1_server_tcp(tls, pending, remote, session).await
 }
 
 async fn handle_naive_h2_connection(
     tls: tokio_rustls::server::TlsStream<TcpStream>,
+    peer: SocketAddr,
     runtime: NaiveServerRuntime,
 ) -> Result<()> {
     let mut h2 = h2::server::handshake(tls)
@@ -207,7 +232,7 @@ async fn handle_naive_h2_connection(
         let (request, respond) = request.context("accept Naive HTTP/2 request")?;
         let runtime = runtime.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_naive_h2_request(request, respond, runtime).await {
+            if let Err(error) = handle_naive_h2_request(request, respond, peer, runtime).await {
                 tracing::warn!("Naive HTTP/2 stream failed: {error:?}");
             }
         });
@@ -218,20 +243,27 @@ async fn handle_naive_h2_connection(
 async fn handle_naive_h2_request(
     request: http::Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
+    peer: SocketAddr,
     runtime: NaiveServerRuntime,
 ) -> Result<()> {
     let (parts, recv) = request.into_parts();
     let target = naive_request_target(&parts.method, &parts.uri)?;
-    if !naive_authorized(
-        parts
-            .headers
-            .get(http::header::PROXY_AUTHORIZATION)
-            .and_then(|value| value.to_str().ok()),
-        &runtime.credentials,
-    ) {
-        send_h2_status(&mut respond, 407)?;
-        return Ok(());
-    }
+    let credential = if runtime.credentials.is_empty() {
+        None
+    } else {
+        let Some(credential) = naive_auth_credential(
+            parts
+                .headers
+                .get(http::header::PROXY_AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            &runtime.credentials,
+        ) else {
+            send_h2_status(&mut respond, 407)?;
+            return Ok(());
+        };
+        Some(credential)
+    };
+    let session = naive_core_session(&runtime, credential.as_deref(), peer).await?;
     let response = http::Response::builder()
         .status(http::StatusCode::OK)
         .body(())
@@ -244,11 +276,11 @@ async fn handle_naive_h2_request(
             runtime.udp_over_tcp,
             "Naive HTTP/2 UDP-over-TCP is disabled by server config"
         );
-        return relay_naive_http2_uot(send, recv, target).await;
+        return relay_naive_http2_uot(send, recv, target, session).await;
     }
     let remote = connect_proxy_target(&target).await?;
     tracing::info!("Naive serving HTTP/2 {}", target_name(&target));
-    relay_naive_http2_server_tcp(send, recv, remote).await
+    relay_naive_http2_server_tcp(send, recv, remote, session).await
 }
 
 async fn run_naive_h3_server(config: NaiveServerConfig, runtime: NaiveServerRuntime) -> Result<()> {
@@ -277,6 +309,7 @@ async fn handle_naive_h3_connection(
     connection: quinn::Connection,
     runtime: NaiveServerRuntime,
 ) -> Result<()> {
+    let peer = connection.remote_address();
     let mut h3 = h3::server::builder()
         .build(h3_quinn::Connection::new(connection))
         .await
@@ -291,7 +324,7 @@ async fn handle_naive_h3_connection(
             .context("resolve Naive HTTP/3 request")?;
         let runtime = runtime.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_naive_h3_request(request, stream, runtime).await {
+            if let Err(error) = handle_naive_h3_request(request, stream, peer, runtime).await {
                 tracing::warn!("Naive HTTP/3 stream failed: {error:?}");
             }
         });
@@ -301,6 +334,7 @@ async fn handle_naive_h3_connection(
 async fn handle_naive_h3_request<S>(
     request: http::Request<()>,
     mut stream: h3::server::RequestStream<S, Bytes>,
+    peer: SocketAddr,
     runtime: NaiveServerRuntime,
 ) -> Result<()>
 where
@@ -309,16 +343,22 @@ where
     S::RecvStream: Send + 'static,
 {
     let target = naive_request_target(request.method(), request.uri())?;
-    if !naive_authorized(
-        request
-            .headers()
-            .get(http::header::PROXY_AUTHORIZATION)
-            .and_then(|value| value.to_str().ok()),
-        &runtime.credentials,
-    ) {
-        send_h3_status(&mut stream, 407).await?;
-        return Ok(());
-    }
+    let credential = if runtime.credentials.is_empty() {
+        None
+    } else {
+        let Some(credential) = naive_auth_credential(
+            request
+                .headers()
+                .get(http::header::PROXY_AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            &runtime.credentials,
+        ) else {
+            send_h3_status(&mut stream, 407).await?;
+            return Ok(());
+        };
+        Some(credential)
+    };
+    let session = naive_core_session(&runtime, credential.as_deref(), peer).await?;
     let response = http::Response::builder()
         .status(http::StatusCode::OK)
         .body(())
@@ -333,11 +373,11 @@ where
             runtime.udp_over_tcp,
             "Naive HTTP/3 UDP-over-TCP is disabled by server config"
         );
-        return relay_naive_http3_uot(send, recv, target).await;
+        return relay_naive_http3_uot(send, recv, target, session).await;
     }
     let remote = connect_proxy_target(&target).await?;
     tracing::info!("Naive serving HTTP/3 {}", target_name(&target));
-    relay_naive_http3_server_tcp(send, recv, remote).await
+    relay_naive_http3_server_tcp(send, recv, remote, session).await
 }
 
 async fn read_naive_http1_connect(
@@ -433,16 +473,44 @@ fn naive_credentials(username: &str, password: &str, users: &[String]) -> Vec<St
         .collect()
 }
 
-fn naive_authorized(header: Option<&str>, credentials: &[String]) -> bool {
+fn naive_auth_credential(header: Option<&str>, credentials: &[String]) -> Option<String> {
     if credentials.is_empty() {
-        return true;
+        return None;
     }
-    let Some(header) = header.map(str::trim) else {
-        return false;
+    let header = header.map(str::trim)?;
+    credentials.iter().find_map(|credential| {
+        (header == format!("Basic {}", base64_standard(credential.as_bytes())))
+            .then(|| credential.clone())
+    })
+}
+
+async fn naive_core_session(
+    runtime: &NaiveServerRuntime,
+    credential: Option<&str>,
+    peer: SocketAddr,
+) -> Result<Option<CoreSession>> {
+    let Some(credential) = credential else {
+        return Ok(None);
     };
-    credentials
-        .iter()
-        .any(|credential| header == format!("Basic {}", base64_standard(credential.as_bytes())))
+    runtime
+        .core
+        .authenticate_from(credential, peer)
+        .await
+        .map(Some)
+}
+
+async fn record_naive_upload(session: &Option<CoreSession>, bytes: usize) -> Result<()> {
+    if let Some(session) = session {
+        session.record_upload(bytes).await?;
+    }
+    Ok(())
+}
+
+async fn record_naive_download(session: &Option<CoreSession>, bytes: usize) -> Result<()> {
+    if let Some(session) = session {
+        session.record_download(bytes).await?;
+    }
+    Ok(())
 }
 
 fn send_h2_status(respond: &mut h2::server::SendResponse<Bytes>, status: u16) -> Result<()> {
@@ -778,6 +846,7 @@ async fn relay_naive_http1_server_tcp(
     stream: tokio_rustls::server::TlsStream<TcpStream>,
     mut pending: Vec<u8>,
     remote: TcpStream,
+    session: Option<CoreSession>,
 ) -> Result<()> {
     let (mut inbound_reader, mut inbound_writer) = tokio::io::split(stream);
     let (mut remote_reader, mut remote_writer) = remote.into_split();
@@ -795,6 +864,7 @@ async fn relay_naive_http1_server_tcp(
                     .context("shutdown Naive HTTP/1.1 upstream writer")?;
                 return Ok::<(), anyhow::Error>(());
             }
+            record_naive_upload(&session, read).await?;
             remote_writer
                 .write_all(&buffer[..read])
                 .await
@@ -816,6 +886,7 @@ async fn relay_naive_http1_server_tcp(
                     .context("shutdown Naive HTTP/1.1 downstream writer")?;
                 return Ok::<(), anyhow::Error>(());
             }
+            record_naive_download(&session, read).await?;
             write_naive_h1_data(&mut inbound_writer, &mut state, &buffer[..read]).await?;
         }
     };
@@ -827,6 +898,7 @@ async fn relay_naive_http2_server_tcp(
     mut send: h2::SendStream<Bytes>,
     mut recv: h2::RecvStream,
     remote: TcpStream,
+    session: Option<CoreSession>,
 ) -> Result<()> {
     let (mut remote_reader, mut remote_writer) = remote.into_split();
     let upload = async {
@@ -845,6 +917,7 @@ async fn relay_naive_http2_server_tcp(
                     .context("shutdown Naive HTTP/2 upstream writer")?;
                 return Ok::<(), anyhow::Error>(());
             }
+            record_naive_upload(&session, read).await?;
             remote_writer
                 .write_all(&buffer[..read])
                 .await
@@ -864,6 +937,7 @@ async fn relay_naive_http2_server_tcp(
                     .context("finish Naive HTTP/2 response body")?;
                 return Ok::<(), anyhow::Error>(());
             }
+            record_naive_download(&session, read).await?;
             send_naive_h2_data(&mut send, &mut state, &buffer[..read]).await?;
         }
     };
@@ -875,6 +949,7 @@ async fn relay_naive_http3_server_tcp<S1, S2>(
     mut send: h3::server::RequestStream<S1, Bytes>,
     mut recv: h3::server::RequestStream<S2, Bytes>,
     remote: TcpStream,
+    session: Option<CoreSession>,
 ) -> Result<()>
 where
     S1: h3::quic::SendStream<Bytes>,
@@ -895,6 +970,7 @@ where
                     .context("shutdown Naive HTTP/3 upstream writer")?;
                 return Ok::<(), anyhow::Error>(());
             }
+            record_naive_upload(&session, read).await?;
             remote_writer
                 .write_all(&buffer[..read])
                 .await
@@ -915,6 +991,7 @@ where
                     .context("finish Naive HTTP/3 response body")?;
                 return Ok::<(), anyhow::Error>(());
             }
+            record_naive_download(&session, read).await?;
             send_naive_h3_server_data(&mut send, &mut state, &buffer[..read]).await?;
         }
     };
@@ -926,6 +1003,7 @@ async fn relay_naive_http1_uot(
     stream: tokio_rustls::server::TlsStream<TcpStream>,
     pending: Vec<u8>,
     target: ProxyTarget,
+    session: Option<CoreSession>,
 ) -> Result<()> {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut read_state = NaiveReadState::default();
@@ -950,9 +1028,10 @@ async fn relay_naive_http1_uot(
             take_uot_stream_packet(&request, &mut raw_pending)?
         {
             let tx = tx.clone();
+            let session = session.clone();
             tokio::spawn(async move {
                 if let Err(error) =
-                    relay_naive_uot_packet(tx, destination, payload, connected).await
+                    relay_naive_uot_packet(tx, destination, payload, connected, session).await
                 {
                     tracing::warn!("Naive HTTP/1.1 UOT packet failed: {error:?}");
                 }
@@ -980,6 +1059,7 @@ async fn relay_naive_http2_uot(
     mut send: h2::SendStream<Bytes>,
     mut recv: h2::RecvStream,
     target: ProxyTarget,
+    session: Option<CoreSession>,
 ) -> Result<()> {
     let mut read_state = NaiveReadState::default();
     let mut naive_pending = Vec::new();
@@ -1008,9 +1088,10 @@ async fn relay_naive_http2_uot(
             take_uot_stream_packet(&request, &mut raw_pending)?
         {
             let tx = tx.clone();
+            let session = session.clone();
             tokio::spawn(async move {
                 if let Err(error) =
-                    relay_naive_uot_packet(tx, destination, payload, connected).await
+                    relay_naive_uot_packet(tx, destination, payload, connected, session).await
                 {
                     tracing::warn!("Naive HTTP/2 UOT packet failed: {error:?}");
                 }
@@ -1039,6 +1120,7 @@ async fn relay_naive_http3_uot<S1, S2>(
     mut send: h3::server::RequestStream<S1, Bytes>,
     mut recv: h3::server::RequestStream<S2, Bytes>,
     target: ProxyTarget,
+    session: Option<CoreSession>,
 ) -> Result<()>
 where
     S1: h3::quic::SendStream<Bytes> + Send + 'static,
@@ -1065,9 +1147,10 @@ where
             take_uot_stream_packet(&request, &mut raw_pending)?
         {
             let tx = tx.clone();
+            let session = session.clone();
             tokio::spawn(async move {
                 if let Err(error) =
-                    relay_naive_uot_packet(tx, destination, payload, connected).await
+                    relay_naive_uot_packet(tx, destination, payload, connected, session).await
                 {
                     tracing::warn!("Naive HTTP/3 UOT packet failed: {error:?}");
                 }
@@ -1231,6 +1314,7 @@ async fn relay_naive_uot_packet(
     destination: ProxyTarget,
     payload: Vec<u8>,
     connected: bool,
+    session: Option<CoreSession>,
 ) -> Result<()> {
     let target_addr = resolve_proxy_target_addr(&destination).await?;
     let bind_addr = if target_addr.is_ipv6() {
@@ -1239,6 +1323,7 @@ async fn relay_naive_uot_packet(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
     };
     let outbound = socket_protect::bind_udp(bind_addr).await?;
+    record_naive_upload(&session, payload.len()).await?;
     outbound
         .send_to(&payload, target_addr)
         .await
@@ -1248,6 +1333,7 @@ async fn relay_naive_uot_packet(
         tokio::time::timeout(NAIVE_UDP_SESSION_TIMEOUT, outbound.recv_from(&mut buffer)).await
     {
         let (read, _) = read.context("receive Naive UOT response")?;
+        record_naive_download(&session, read).await?;
         let packet = if connected {
             uot::encode_connect_packet(&buffer[..read])?
         } else {
