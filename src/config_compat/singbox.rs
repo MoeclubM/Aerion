@@ -187,6 +187,10 @@ pub struct SingBoxNaiveOutbound {
     pub udp_over_tcp: Option<Value>,
     #[serde(default)]
     pub quic: bool,
+    #[serde(default, rename = "insecure_concurrency")]
+    pub insecure_concurrency: Option<u16>,
+    #[serde(default, rename = "quic_congestion_control")]
+    pub quic_congestion_control: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -226,6 +230,12 @@ pub struct SingBoxTlsOptions {
     pub utls: Option<SingBoxUtlsOptions>,
     #[serde(default)]
     pub reality: Option<SingBoxRealityOptions>,
+    #[serde(default)]
+    pub certificate: Option<Value>,
+    #[serde(default, rename = "certificate_path")]
+    pub certificate_path: Option<Value>,
+    #[serde(default)]
+    pub ech: Option<Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -386,7 +396,7 @@ impl SingBoxShadowsocksOutbound {
             self.plugin.is_none() && self.plugin_opts.is_none(),
             "sing-box Shadowsocks outbound {name} sets SIP003 plugin; Aerion Shadowsocks does not implement plugins"
         );
-        let udp_over_tcp = value_bool_or_object(self.udp_over_tcp.as_ref());
+        let udp_over_tcp = singbox_uot_enabled("Shadowsocks", name, self.udp_over_tcp.as_ref())?;
         Ok(ShadowsocksClientConfig {
             listen,
             server_host: self.server.clone(),
@@ -663,6 +673,35 @@ impl SingBoxNaiveOutbound {
             tls.enabled,
             "sing-box Naive outbound {name} disables TLS; Naive requires HTTPS/TLS"
         );
+        ensure!(
+            !tls.certificate
+                .as_ref()
+                .map(json_value_non_empty)
+                .unwrap_or(false)
+                && !tls
+                    .certificate_path
+                    .as_ref()
+                    .map(json_value_non_empty)
+                    .unwrap_or(false),
+            "sing-box Naive outbound {name} sets custom TLS certificate roots; Aerion Naive client does not expose custom trust roots"
+        );
+        ensure!(
+            !singbox_enabled_option("Naive", name, "tls.ech", tls.ech.as_ref())?,
+            "sing-box Naive outbound {name} enables ECH; Aerion Naive client does not implement ECH"
+        );
+        ensure!(
+            self.insecure_concurrency.unwrap_or(0) == 0,
+            "sing-box Naive outbound {name} sets insecure_concurrency; Aerion Naive client does not implement speculative parallel connections"
+        );
+        ensure!(
+            self.quic_congestion_control
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty(),
+            "sing-box Naive outbound {name} sets quic_congestion_control; Aerion Naive client does not expose configurable QUIC congestion control"
+        );
+        let udp_over_tcp = singbox_uot_enabled("Naive", name, self.udp_over_tcp.as_ref())?;
         Ok(NaiveClientConfig {
             listen,
             server_host: self.server.clone(),
@@ -672,7 +711,7 @@ impl SingBoxNaiveOutbound {
             sni: sni_or_server(tls.server_name.as_deref(), &self.server),
             insecure: tls.insecure,
             extra_headers: self.extra_headers.clone().into_iter().collect(),
-            udp_over_tcp: value_bool_or_object(self.udp_over_tcp.as_ref()),
+            udp_over_tcp,
             quic: self.quic
                 || self
                     .network
@@ -696,7 +735,12 @@ impl SingBoxTuicOutbound {
             "sing-box TUIC outbound {name} enables zero_rtt_handshake; Aerion TUIC client does not expose 0-RTT handshakes"
         );
         ensure!(
-            !value_bool_or_object(self.udp_over_stream.as_ref()),
+            !singbox_enabled_option(
+                "TUIC",
+                name,
+                "udp_over_stream",
+                self.udp_over_stream.as_ref()
+            )?,
             "sing-box TUIC outbound {name} enables udp_over_stream; Aerion TUIC client does not implement UDP-over-stream"
         );
         let tls = self
@@ -955,11 +999,60 @@ fn alpn_values(alpn: Option<&OneOrManyStrings>) -> Vec<String> {
         .collect()
 }
 
-fn value_bool_or_object(value: Option<&Value>) -> bool {
+fn singbox_enabled_option(
+    protocol: &str,
+    name: &str,
+    field: &str,
+    value: Option<&Value>,
+) -> Result<bool> {
     match value {
-        Some(Value::Bool(value)) => *value,
-        Some(Value::Object(_)) => true,
-        _ => false,
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(Value::Object(map)) => match map.get("enabled") {
+            Some(Value::Bool(value)) => Ok(*value),
+            Some(other) => {
+                bail!(
+                    "sing-box {protocol} outbound {name} sets {field}.enabled to {other}; expected boolean"
+                )
+            }
+            None => Ok(true),
+        },
+        Some(other) => {
+            bail!(
+                "sing-box {protocol} outbound {name} sets {field} to {other}; expected boolean or object"
+            )
+        }
+        None => Ok(false),
+    }
+}
+
+fn singbox_uot_enabled(protocol: &str, name: &str, value: Option<&Value>) -> Result<bool> {
+    let enabled = singbox_enabled_option(protocol, name, "udp_over_tcp", value)?;
+    if !enabled {
+        return Ok(false);
+    }
+    if let Some(Value::Object(map)) = value {
+        if let Some(version) = map.get("version") {
+            let is_v2 = match version {
+                Value::Number(number) => number.as_u64() == Some(2),
+                Value::String(text) => text.trim() == "2",
+                _ => false,
+            };
+            ensure!(
+                is_v2,
+                "sing-box {protocol} outbound {name} sets udp_over_tcp version {version}; Aerion UDP-over-TCP uses version 2 framing"
+            );
+        }
+    }
+    Ok(true)
+}
+
+fn json_value_non_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+        _ => true,
     }
 }
 
@@ -1026,16 +1119,28 @@ mod tests {
     fn parses_shadowsocks_udp_over_tcp_outbound() -> Result<()> {
         let json = r#"
 {
-  "outbounds": [{
-    "type": "shadowsocks",
-    "tag": "ss-uot",
-    "server": "example.com",
-    "server_port": 8388,
-    "method": "aes-128-gcm",
-    "password": "secret",
-    "network": "tcp",
-    "udp_over_tcp": { "enabled": true }
-  }]
+  "outbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "ss-uot",
+      "server": "example.com",
+      "server_port": 8388,
+      "method": "aes-128-gcm",
+      "password": "secret",
+      "network": "tcp",
+      "udp_over_tcp": { "enabled": true, "version": 2 }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-no-uot",
+      "server": "example.com",
+      "server_port": 8388,
+      "method": "aes-128-gcm",
+      "password": "secret",
+      "network": "tcp",
+      "udp_over_tcp": { "enabled": false, "version": 1 }
+    }
+  ]
 }
 "#;
         let config: SingBoxConfig = serde_json::from_str(json)?;
@@ -1046,6 +1151,13 @@ mod tests {
         };
         assert!(shadowsocks.udp);
         assert!(shadowsocks.udp_over_tcp);
+        let SingBoxClientConfig::Shadowsocks(disabled) =
+            config.outbounds[1].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Shadowsocks")
+        };
+        assert!(!disabled.udp);
+        assert!(!disabled.udp_over_tcp);
         Ok(())
     }
 
@@ -1482,7 +1594,7 @@ mod tests {
       "username": "user",
       "password": "pass",
       "quic": true,
-      "udp_over_tcp": { "enabled": true },
+      "udp_over_tcp": { "enabled": true, "version": 2 },
       "tls": {
         "enabled": true,
         "server_name": "front.example.com",
@@ -1533,6 +1645,95 @@ mod tests {
         assert_eq!(tuic.congestion_control, "bbr");
         assert_eq!(tuic.alpn_protocols, vec!["h3".to_string()]);
         assert_eq!(tuic.heartbeat_interval_secs, 15);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unmapped_naive_options() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "type": "naive",
+      "tag": "naive-uot-v1",
+      "server": "naive.example.com",
+      "server_port": 443,
+      "udp_over_tcp": { "enabled": true, "version": 1 },
+      "tls": { "enabled": true }
+    },
+    {
+      "type": "naive",
+      "tag": "naive-concurrency",
+      "server": "naive.example.com",
+      "server_port": 443,
+      "insecure_concurrency": 2,
+      "tls": { "enabled": true }
+    },
+    {
+      "type": "naive",
+      "tag": "naive-quic-cc",
+      "server": "naive.example.com",
+      "server_port": 443,
+      "quic": true,
+      "quic_congestion_control": "bbr",
+      "tls": { "enabled": true }
+    },
+    {
+      "type": "naive",
+      "tag": "naive-cert",
+      "server": "naive.example.com",
+      "server_port": 443,
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/tmp/ca.pem"
+      }
+    },
+    {
+      "type": "naive",
+      "tag": "naive-ech",
+      "server": "naive.example.com",
+      "server_port": 443,
+      "tls": {
+        "enabled": true,
+        "ech": { "enabled": true }
+      }
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let uot_error = config.outbounds[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("UOT v1 must be explicit");
+        assert!(uot_error.to_string().contains("version 2"));
+
+        let concurrency_error = config.outbounds[1]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("insecure_concurrency must be explicit");
+        assert!(
+            concurrency_error
+                .to_string()
+                .contains("insecure_concurrency")
+        );
+
+        let congestion_error = config.outbounds[2]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("quic_congestion_control must be explicit");
+        assert!(
+            congestion_error
+                .to_string()
+                .contains("quic_congestion_control")
+        );
+
+        let cert_error = config.outbounds[3]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("custom certificate roots must be explicit");
+        assert!(cert_error.to_string().contains("certificate roots"));
+
+        let ech_error = config.outbounds[4]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("ECH must be explicit");
+        assert!(ech_error.to_string().contains("ECH"));
         Ok(())
     }
 
