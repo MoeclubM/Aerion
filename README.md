@@ -38,6 +38,7 @@ Aerion now provides these server/client protocol stacks:
   - Naive-compatible randomized padding chunks for tunnel payloads
 - Shadowsocks:
   - local SOCKS5 CONNECT and UDP ASSOCIATE client
+  - TCP and UDP server relay
   - TCP relay through the configured Shadowsocks server
   - UDP relay with the Shadowsocks UDP packet format
   - AEAD, AEAD-2022, AEAD-2022 extra, AEAD extra, and stream ciphers enabled by the bundled `shadowsocks-rust` features
@@ -179,6 +180,7 @@ cargo run -- run --config config.server.example.toml --profile anytls
 cargo run -- run --config config.server.example.toml --profile hysteria2
 cargo run -- run --config config.server.example.toml --profile mieru-tcp
 cargo run -- run --config config.server.example.toml --profile tuic
+cargo run -- run --config config.server.example.toml --profile shadowsocks
 cargo run -- run --config config.server.example.toml --profile trojan
 cargo run -- run --config config.server.example.toml --profile vless
 cargo run -- run --config config.server.example.toml --profile vmess
@@ -208,9 +210,9 @@ TUIC UUID and `password` as the TUIC password; extra server users use
 `uuid:password` entries. Use `protocol = "naive"` for an HTTPS Naive client;
 set `transport = "quic"` or `protocol = "naive+quic"` for HTTP/3.
 Aerion-native TOML also runs Shadowsocks, Trojan, VLESS, and VMess client
-profiles plus Trojan, VLESS, and VMess server profiles. Shadowsocks and Naive
-server profiles are not exposed because Aerion currently provides those stacks
-as local clients only.
+profiles plus Shadowsocks, Trojan, VLESS, and VMess server profiles. Naive
+server profiles are not exposed because Aerion currently provides that stack as
+a local client only.
 
 The CLI can run mihomo YAML, Xray JSON/JSONC, and sing-box JSON/JSONC client
 profiles directly. If those files contain multiple proxies/outbounds, select one

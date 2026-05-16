@@ -60,6 +60,16 @@ alpn = ["h3"]
 heartbeat_interval_secs = 10
 
 [[servers]]
+name = "shadowsocks"
+protocol = "shadowsocks"
+listen = "0.0.0.0:8388"
+cipher = "aes-128-gcm"
+password = "change-me"
+udp = true
+# AEAD-2022 EIH users use "name:base64-user-key" entries.
+# users = ["alice:AAAAAAAAAAAAAAAAAAAAAA=="]
+
+[[servers]]
 name = "trojan"
 protocol = "trojan"
 listen = "0.0.0.0:8445"

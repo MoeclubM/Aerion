@@ -52,7 +52,8 @@ pub use reality::{
 };
 pub use server::{ServerConfig, run_server, run_server_listener, run_server_listener_with_core};
 pub use shadowsocks::{
-    ShadowsocksClientConfig, run_shadowsocks_client, run_shadowsocks_client_listener,
+    ShadowsocksClientConfig, ShadowsocksServerConfig, run_shadowsocks_client,
+    run_shadowsocks_client_listener, run_shadowsocks_server,
 };
 pub use trojan::{
     TrojanClientConfig, TrojanServerConfig, run_trojan_client, run_trojan_client_listener,

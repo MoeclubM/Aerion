@@ -149,6 +149,8 @@ pub struct ServerFileConfig {
     pub key: Option<PathBuf>,
     #[serde(default)]
     pub tls: Option<bool>,
+    #[serde(default, alias = "cipher")]
+    pub security: Option<String>,
     #[serde(default)]
     pub flow: String,
     #[serde(default)]
@@ -447,7 +449,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.server.example.toml");
         assert!(matches!(
             load_config(&path).expect("server config"),
-            FileConfig::Aerion(config) if config.clients.is_empty() && config.servers.len() == 7
+            FileConfig::Aerion(config) if config.clients.is_empty() && config.servers.len() == 8
         ));
     }
 

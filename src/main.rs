@@ -12,13 +12,13 @@ use aerion::tuic::{TuicClientConfig, TuicServerConfig, parse_tuic_user};
 use aerion::vless_transport::VlessTransportConfig;
 use aerion::{
     ClientConfig, MihomoClientConfig, MihomoProxy, RealityClientConfig, RealityServerConfig,
-    ServerConfig, ShadowsocksClientConfig, SingBoxClientConfig, SingBoxOutbound,
-    TrojanClientConfig, TrojanServerConfig, VlessClientConfig, VlessServerConfig,
+    ServerConfig, ShadowsocksClientConfig, ShadowsocksServerConfig, SingBoxClientConfig,
+    SingBoxOutbound, TrojanClientConfig, TrojanServerConfig, VlessClientConfig, VlessServerConfig,
     VmessClientConfig, VmessServerConfig, XrayClientConfig, XrayOutbound, run_client,
     run_hysteria2_client, run_hysteria2_server, run_mieru_client, run_mieru_server,
-    run_naive_client, run_server, run_shadowsocks_client, run_trojan_client, run_trojan_server,
-    run_tuic_client, run_tuic_server, run_vless_client, run_vless_server, run_vmess_client,
-    run_vmess_server, tls,
+    run_naive_client, run_server, run_shadowsocks_client, run_shadowsocks_server,
+    run_trojan_client, run_trojan_server, run_tuic_client, run_tuic_server, run_vless_client,
+    run_vless_server, run_vmess_client, run_vmess_server, tls,
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
@@ -778,6 +778,18 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             congestion_control: server.congestion_control,
             alpn_protocols: server.alpn_protocols,
             heartbeat_interval_secs: server.heartbeat_interval_secs,
+        })
+        .await;
+    }
+    if is_shadowsocks(&server.protocol) {
+        return run_shadowsocks_server(ShadowsocksServerConfig {
+            listen: server.listen,
+            method: server
+                .security
+                .context("Shadowsocks server requires cipher")?,
+            password: server.password,
+            users: server.users,
+            udp: server.udp,
         })
         .await;
     }
