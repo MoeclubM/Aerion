@@ -117,6 +117,8 @@ pub struct XrayOutboundSettings {
     #[serde(default)]
     pub password: Option<String>,
     #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
     pub flow: Option<String>,
     #[serde(default, rename = "packetEncoding", alias = "packet_encoding")]
     pub packet_encoding: Option<String>,
@@ -128,7 +130,7 @@ pub struct XrayOutboundSettings {
     pub decryption: Option<String>,
     #[serde(default, rename = "alterId", alias = "alter_id")]
     pub alter_id: Option<u16>,
-    #[serde(default)]
+    #[serde(default, alias = "users")]
     pub clients: Vec<XrayUser>,
     #[serde(default)]
     pub fallbacks: Vec<Value>,
@@ -152,6 +154,8 @@ pub struct XrayUser {
     pub id: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+    #[serde(default)]
+    pub method: Option<String>,
     #[serde(default)]
     pub encryption: Option<String>,
     #[serde(default)]
@@ -500,7 +504,7 @@ impl XrayInbound {
         );
         let primary = self.settings.clients.first();
         let method = primary
-            .and_then(|user| user.security.clone())
+            .and_then(|user| user.method.clone().or(user.security.clone()))
             .or(self.settings.method.clone())
             .or(self.settings.security.clone())
             .with_context(|| {
@@ -515,6 +519,7 @@ impl XrayInbound {
                     self.name()
                 )
             })?;
+        let (tcp, udp) = xray_tcp_udp_network(self.settings.network.as_deref())?;
         Ok(ShadowsocksServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
@@ -530,6 +535,17 @@ impl XrayInbound {
                 .iter()
                 .skip(1)
                 .map(|user| {
+                    let user_method = user
+                        .method
+                        .as_deref()
+                        .or(user.security.as_deref())
+                        .unwrap_or_default();
+                    ensure!(
+                        user_method.trim().is_empty() || user_method.eq_ignore_ascii_case(&method),
+                        "xray Shadowsocks inbound {} extra client uses method {}; Aerion Shadowsocks server expects one method per inbound",
+                        self.name(),
+                        user_method
+                    );
                     user.password.clone().with_context(|| {
                         format!(
                             "xray Shadowsocks inbound {} extra client is missing password",
@@ -538,8 +554,8 @@ impl XrayInbound {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
-            tcp: true,
-            udp: true,
+            tcp,
+            udp,
             udp_over_tcp: false,
         })
     }
@@ -1529,6 +1545,20 @@ fn ensure_tcp_network(format: &str, name: &str, network: &str) -> Result<()> {
     )
 }
 
+fn xray_tcp_udp_network(network: Option<&str>) -> Result<(bool, bool)> {
+    match network
+        .unwrap_or("tcp")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "tcp" => Ok((true, false)),
+        "udp" => Ok((false, true)),
+        "tcp,udp" | "tcp+udp" | "both" => Ok((true, true)),
+        other => bail!("xray Shadowsocks inbound uses network {other}; Aerion supports tcp or udp"),
+    }
+}
+
 fn ensure_tls_or_reality(format: &str, name: &str, security: &str) -> Result<()> {
     let security = security.trim();
     ensure!(
@@ -2102,7 +2132,8 @@ mod tests {
     "port": 8388,
     "settings": {
       "method": "aes-128-gcm",
-      "password": "secret"
+      "password": "secret",
+      "network": "tcp,udp"
     }
   }]
 }
