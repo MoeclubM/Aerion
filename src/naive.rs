@@ -34,6 +34,7 @@ pub struct NaiveClientConfig {
     pub password: String,
     pub sni: String,
     pub insecure: bool,
+    pub ca_cert_paths: Vec<PathBuf>,
     pub extra_headers: Vec<(String, String)>,
     pub udp_over_tcp: bool,
     pub quic: bool,
@@ -600,7 +601,7 @@ async fn open_naive_tunnel(
     let tls = tokio_rustls::TlsConnector::from(naive_tls_config(
         config,
         vec![NAIVE_H2_ALPN.to_vec(), NAIVE_HTTP11_ALPN.to_vec()],
-    ))
+    )?)
     .connect(server_name, tcp)
     .await
     .context("connect Naive HTTPS proxy")?;
@@ -610,10 +611,16 @@ async fn open_naive_tunnel(
     open_naive_http1_tunnel(config, target, tls).await
 }
 
-fn naive_tls_config(config: &NaiveClientConfig, alpn: Vec<Vec<u8>>) -> Arc<rustls::ClientConfig> {
-    let mut tls_config = Arc::unwrap_or_clone(tls::client_config(config.insecure));
+fn naive_tls_config(
+    config: &NaiveClientConfig,
+    alpn: Vec<Vec<u8>>,
+) -> Result<Arc<rustls::ClientConfig>> {
+    let mut tls_config = Arc::unwrap_or_clone(tls::client_config_with_custom_roots(
+        config.insecure,
+        &config.ca_cert_paths,
+    )?);
     tls_config.alpn_protocols = alpn;
-    Arc::new(tls_config)
+    Ok(Arc::new(tls_config))
 }
 
 async fn open_naive_http1_tunnel(
@@ -798,7 +805,10 @@ fn build_naive_quic_endpoint(
     config: &NaiveClientConfig,
     bind_ipv6: bool,
 ) -> Result<quinn::Endpoint> {
-    let mut tls = Arc::unwrap_or_clone(tls::client_config(config.insecure));
+    let mut tls = Arc::unwrap_or_clone(tls::client_config_with_custom_roots(
+        config.insecure,
+        &config.ca_cert_paths,
+    )?);
     tls.alpn_protocols = vec![NAIVE_H3_ALPN.to_vec()];
     let quic_tls =
         QuicClientConfig::try_from(Arc::new(tls)).context("build Naive QUIC TLS client config")?;

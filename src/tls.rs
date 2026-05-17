@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const MAX_EARLY_DATA_SIZE: u32 = 64 * 1024;
@@ -180,6 +180,29 @@ pub fn client_config_with_fingerprint_early_data(
     fingerprint: Option<UtlsFingerprint>,
 ) -> Arc<ClientConfig> {
     build_client_config(insecure, fingerprint, true)
+}
+
+pub fn client_config_with_custom_roots(
+    insecure: bool,
+    ca_cert_paths: &[PathBuf],
+) -> Result<Arc<ClientConfig>> {
+    if ca_cert_paths.is_empty() || insecure {
+        return Ok(client_config(insecure));
+    }
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for path in ca_cert_paths {
+        for cert in load_certs(path)? {
+            roots
+                .add(cert)
+                .with_context(|| format!("add custom root certificate {}", path.display()))?;
+        }
+    }
+    Ok(Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ))
 }
 
 fn build_client_config(

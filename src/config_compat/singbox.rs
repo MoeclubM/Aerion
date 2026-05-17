@@ -1541,7 +1541,7 @@ impl SingBoxNaiveOutbound {
             tls.enabled,
             "sing-box Naive outbound {name} disables TLS; Naive requires HTTPS/TLS"
         );
-        tls.ensure_supported_client_options("Naive", name, false)?;
+        tls.ensure_supported_client_options("Naive", name, true)?;
         ensure!(
             self.insecure_concurrency.unwrap_or(0) == 0,
             "sing-box Naive outbound {name} sets insecure_concurrency; Aerion Naive client does not implement speculative parallel connections"
@@ -1555,6 +1555,7 @@ impl SingBoxNaiveOutbound {
             password: self.password.clone().unwrap_or_default(),
             sni: sni_or_server(tls.server_name.as_deref(), &self.server),
             insecure: tls.insecure,
+            ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
             extra_headers: self.extra_headers.clone().into_iter().collect(),
             udp_over_tcp,
             quic: self.quic
@@ -3035,7 +3036,7 @@ mod tests {
       "tls": {
         "enabled": true,
         "server_name": "front.example.com",
-        "insecure": true
+        "certificate_path": ["ca.pem", "backup-ca.pem"]
       }
     },
     {
@@ -3066,7 +3067,11 @@ mod tests {
         };
         assert_eq!(naive.server_host, "naive.example.com");
         assert_eq!(naive.sni, "front.example.com");
-        assert!(naive.insecure);
+        assert!(!naive.insecure);
+        assert_eq!(
+            naive.ca_cert_paths,
+            vec![PathBuf::from("ca.pem"), PathBuf::from("backup-ca.pem")]
+        );
         assert!(naive.quic);
         assert!(naive.udp_over_tcp);
         assert_eq!(naive.quic_congestion_control, "reno");
@@ -3109,16 +3114,6 @@ mod tests {
     },
     {
       "type": "naive",
-      "tag": "naive-cert",
-      "server": "naive.example.com",
-      "server_port": 443,
-      "tls": {
-        "enabled": true,
-        "certificate_path": "/tmp/ca.pem"
-      }
-    },
-    {
-      "type": "naive",
       "tag": "naive-ech",
       "server": "naive.example.com",
       "server_port": 443,
@@ -3145,12 +3140,7 @@ mod tests {
                 .contains("insecure_concurrency")
         );
 
-        let cert_error = config.outbounds[2]
-            .to_client_config("127.0.0.1:1080".parse()?)
-            .expect_err("custom certificate roots must be explicit");
-        assert!(cert_error.to_string().contains("certificate roots"));
-
-        let ech_error = config.outbounds[3]
+        let ech_error = config.outbounds[2]
             .to_client_config("127.0.0.1:1080".parse()?)
             .expect_err("ECH must be explicit");
         assert!(ech_error.to_string().contains("ECH"));

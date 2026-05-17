@@ -1032,6 +1032,7 @@ impl MihomoNaiveProxy {
             password: self.password.clone().unwrap_or_default(),
             sni: sni_or_server(self.servername.as_deref(), &self.server),
             insecure: self.skip_cert_verify,
+            ca_cert_paths: Vec::new(),
             extra_headers: self.extra_headers.clone().into_iter().collect(),
             udp_over_tcp: self
                 .udp_over_tcp

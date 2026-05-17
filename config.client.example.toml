@@ -52,6 +52,7 @@ username = "user"
 password = "change-me"
 sni = "example.com"
 insecure = false
+# ca_cert_paths = ["ca.pem"]
 # Enable SOCKS5 UDP ASSOCIATE over UOT-style UDP-over-TCP.
 udp_over_tcp = false
 # Set transport = "quic" or protocol = "naive+quic" for HTTP/3.
