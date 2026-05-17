@@ -31,6 +31,7 @@ pub struct ClientConfig {
     pub sni: String,
     pub insecure: bool,
     pub ca_cert_paths: Vec<PathBuf>,
+    pub ca_certificates: Vec<String>,
     pub padding_scheme: Vec<String>,
     pub heartbeat_interval_secs: u64,
 }
@@ -43,8 +44,11 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
 }
 
 pub async fn run_client_listener(listener: TcpListener, config: ClientConfig) -> Result<()> {
-    let tls_config =
-        tls::client_config_with_custom_roots_early_data(config.insecure, &config.ca_cert_paths)?;
+    let tls_config = tls::client_config_with_custom_root_material_early_data(
+        config.insecure,
+        &config.ca_cert_paths,
+        &config.ca_certificates,
+    )?;
     let session = ClientSession::connect(&config, tls_config).await?;
     tracing::info!("client listening on socks5://{}", listener.local_addr()?);
     loop {

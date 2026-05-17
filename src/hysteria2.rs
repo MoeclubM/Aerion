@@ -54,6 +54,7 @@ pub struct Hysteria2ClientConfig {
     pub insecure: bool,
     pub certificate_fingerprint: Option<String>,
     pub ca_cert_paths: Vec<PathBuf>,
+    pub ca_certificates: Vec<String>,
     pub obfs: Option<String>,
     pub obfs_password: Option<String>,
     pub download_bandwidth: Option<u64>,
@@ -1119,6 +1120,16 @@ fn build_client_endpoint(config: &Hysteria2ClientConfig, bind_ipv6: bool) -> Res
             for cert in tls::load_certs(path)? {
                 roots.add(cert).with_context(|| {
                     format!("add Hysteria2 custom root certificate {}", path.display())
+                })?;
+            }
+        }
+        for (index, pem) in config.ca_certificates.iter().enumerate() {
+            for cert in tls::load_certs_from_pem(
+                &format!("Hysteria2 inline custom root certificate {}", index + 1),
+                pem,
+            )? {
+                roots.add(cert).with_context(|| {
+                    format!("add Hysteria2 inline custom root certificate {}", index + 1)
                 })?;
             }
         }

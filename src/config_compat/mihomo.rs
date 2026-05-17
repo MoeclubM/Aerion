@@ -764,6 +764,7 @@ impl MihomoVlessProxy {
                 false
             },
             ca_cert_paths: Vec::new(),
+            ca_certificates: Vec::new(),
             flow: self.flow.clone(),
             packet_encoding: self.packet_encoding.clone(),
             mux: self.mux,
@@ -831,6 +832,7 @@ impl MihomoVmessProxy {
                 false
             },
             ca_cert_paths: Vec::new(),
+            ca_certificates: Vec::new(),
             client_fingerprint: if self.tls {
                 self.client_fingerprint
             } else {
@@ -877,6 +879,7 @@ impl MihomoTrojanProxy {
             sni: sni_or_server(self.sni.as_deref(), &self.server),
             insecure: self.skip_cert_verify,
             ca_cert_paths: Vec::new(),
+            ca_certificates: Vec::new(),
             udp: self.udp,
             client_fingerprint: self.client_fingerprint,
             transport,
@@ -974,6 +977,7 @@ impl MihomoHysteria2Proxy {
             insecure: self.skip_cert_verify,
             certificate_fingerprint: self.fingerprint.clone(),
             ca_cert_paths: Vec::new(),
+            ca_certificates: Vec::new(),
             obfs: self.obfs.clone(),
             obfs_password: self.obfs_password.clone(),
             download_bandwidth: self.down,
@@ -993,6 +997,7 @@ impl MihomoAnyTlsProxy {
             sni: sni_or_server(self.servername.as_deref(), &self.server),
             insecure: self.skip_cert_verify,
             ca_cert_paths: Vec::new(),
+            ca_certificates: Vec::new(),
             padding_scheme: if self.padding_scheme.is_empty() {
                 PaddingScheme::default_lines()
             } else {
@@ -1037,6 +1042,7 @@ impl MihomoNaiveProxy {
             sni: sni_or_server(self.servername.as_deref(), &self.server),
             insecure: self.skip_cert_verify,
             ca_cert_paths: Vec::new(),
+            ca_certificates: Vec::new(),
             extra_headers: self.extra_headers.clone().into_iter().collect(),
             udp_over_tcp: self
                 .udp_over_tcp
@@ -1118,6 +1124,7 @@ impl MihomoTuicProxy {
             sni: sni_or_server(self.servername.as_deref(), &self.server),
             insecure: self.skip_cert_verify,
             ca_cert_paths: Vec::new(),
+            ca_certificates: Vec::new(),
             udp: self.udp,
             udp_relay_mode: self.udp_relay_mode.clone(),
             congestion_control: self.congestion_control.clone(),

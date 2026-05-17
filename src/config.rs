@@ -73,6 +73,15 @@ pub struct ClientFileConfig {
         alias = "certificate_path"
     )]
     pub ca_cert_paths: Vec<PathBuf>,
+    #[serde(
+        default,
+        alias = "ca-cert-pem",
+        alias = "ca_cert_pem",
+        alias = "ca-certificates",
+        alias = "ca_certificates",
+        alias = "certificate"
+    )]
+    pub ca_certificates: Vec<String>,
     #[serde(default)]
     pub tls: Option<bool>,
     #[serde(default, alias = "cipher")]

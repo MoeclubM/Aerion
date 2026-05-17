@@ -35,6 +35,7 @@ pub struct NaiveClientConfig {
     pub sni: String,
     pub insecure: bool,
     pub ca_cert_paths: Vec<PathBuf>,
+    pub ca_certificates: Vec<String>,
     pub extra_headers: Vec<(String, String)>,
     pub udp_over_tcp: bool,
     pub quic: bool,
@@ -615,9 +616,10 @@ fn naive_tls_config(
     config: &NaiveClientConfig,
     alpn: Vec<Vec<u8>>,
 ) -> Result<Arc<rustls::ClientConfig>> {
-    let mut tls_config = Arc::unwrap_or_clone(tls::client_config_with_custom_roots(
+    let mut tls_config = Arc::unwrap_or_clone(tls::client_config_with_custom_root_material(
         config.insecure,
         &config.ca_cert_paths,
+        &config.ca_certificates,
     )?);
     tls_config.alpn_protocols = alpn;
     Ok(Arc::new(tls_config))
@@ -805,9 +807,10 @@ fn build_naive_quic_endpoint(
     config: &NaiveClientConfig,
     bind_ipv6: bool,
 ) -> Result<quinn::Endpoint> {
-    let mut tls = Arc::unwrap_or_clone(tls::client_config_with_custom_roots(
+    let mut tls = Arc::unwrap_or_clone(tls::client_config_with_custom_root_material(
         config.insecure,
         &config.ca_cert_paths,
+        &config.ca_certificates,
     )?);
     tls.alpn_protocols = vec![NAIVE_H3_ALPN.to_vec()];
     let quic_tls =

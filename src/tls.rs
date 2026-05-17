@@ -186,14 +186,35 @@ pub fn client_config_with_custom_roots(
     insecure: bool,
     ca_cert_paths: &[PathBuf],
 ) -> Result<Arc<ClientConfig>> {
-    client_config_with_fingerprint_and_custom_roots(insecure, None, ca_cert_paths)
+    client_config_with_custom_root_material(insecure, ca_cert_paths, &[])
 }
 
 pub fn client_config_with_custom_roots_early_data(
     insecure: bool,
     ca_cert_paths: &[PathBuf],
 ) -> Result<Arc<ClientConfig>> {
-    build_client_config_with_custom_roots(insecure, None, true, ca_cert_paths)
+    client_config_with_custom_root_material_early_data(insecure, ca_cert_paths, &[])
+}
+
+pub fn client_config_with_custom_root_material(
+    insecure: bool,
+    ca_cert_paths: &[PathBuf],
+    ca_certificates: &[String],
+) -> Result<Arc<ClientConfig>> {
+    client_config_with_fingerprint_and_custom_root_material(
+        insecure,
+        None,
+        ca_cert_paths,
+        ca_certificates,
+    )
+}
+
+pub fn client_config_with_custom_root_material_early_data(
+    insecure: bool,
+    ca_cert_paths: &[PathBuf],
+    ca_certificates: &[String],
+) -> Result<Arc<ClientConfig>> {
+    build_client_config_with_custom_roots(insecure, None, true, ca_cert_paths, ca_certificates)
 }
 
 pub fn client_config_with_fingerprint_and_custom_roots(
@@ -201,7 +222,27 @@ pub fn client_config_with_fingerprint_and_custom_roots(
     fingerprint: Option<UtlsFingerprint>,
     ca_cert_paths: &[PathBuf],
 ) -> Result<Arc<ClientConfig>> {
-    build_client_config_with_custom_roots(insecure, fingerprint, false, ca_cert_paths)
+    client_config_with_fingerprint_and_custom_root_material(
+        insecure,
+        fingerprint,
+        ca_cert_paths,
+        &[],
+    )
+}
+
+pub fn client_config_with_fingerprint_and_custom_root_material(
+    insecure: bool,
+    fingerprint: Option<UtlsFingerprint>,
+    ca_cert_paths: &[PathBuf],
+    ca_certificates: &[String],
+) -> Result<Arc<ClientConfig>> {
+    build_client_config_with_custom_roots(
+        insecure,
+        fingerprint,
+        false,
+        ca_cert_paths,
+        ca_certificates,
+    )
 }
 
 fn build_client_config_with_custom_roots(
@@ -209,8 +250,9 @@ fn build_client_config_with_custom_roots(
     fingerprint: Option<UtlsFingerprint>,
     early_data: bool,
     ca_cert_paths: &[PathBuf],
+    ca_certificates: &[String],
 ) -> Result<Arc<ClientConfig>> {
-    if ca_cert_paths.is_empty() || insecure {
+    if (ca_cert_paths.is_empty() && ca_certificates.is_empty()) || insecure {
         return Ok(build_client_config(insecure, fingerprint, early_data));
     }
     let mut roots = RootCertStore::empty();
@@ -220,6 +262,12 @@ fn build_client_config_with_custom_roots(
             roots
                 .add(cert)
                 .with_context(|| format!("add custom root certificate {}", path.display()))?;
+        }
+    }
+    for (index, pem) in ca_certificates.iter().enumerate() {
+        let label = format!("inline custom root certificate {}", index + 1);
+        for cert in load_certs_from_pem(&label, pem)? {
+            roots.add(cert).with_context(|| format!("add {label}"))?;
         }
     }
     let mut config = ClientConfig::builder()
@@ -304,6 +352,15 @@ pub(crate) fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
         !certs.is_empty(),
         "certificate file contains no certificate"
     );
+    Ok(certs)
+}
+
+pub(crate) fn load_certs_from_pem(label: &str, pem: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let mut reader = BufReader::new(pem.as_bytes());
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("read {label}"))?;
+    anyhow::ensure!(!certs.is_empty(), "{label} contains no certificate");
     Ok(certs)
 }
 

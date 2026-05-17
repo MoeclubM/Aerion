@@ -1319,6 +1319,9 @@ impl SingBoxVlessOutbound {
                     .as_ref()
                     .and_then(|tls| tls.certificate_path.as_ref()),
             )?,
+            ca_certificates: value_strings(
+                self.tls.as_ref().and_then(|tls| tls.certificate.as_ref()),
+            )?,
             flow: self.flow.clone(),
             packet_encoding: self
                 .packet_encoding
@@ -1386,6 +1389,9 @@ impl SingBoxVmessOutbound {
                     .as_ref()
                     .and_then(|tls| tls.certificate_path.as_ref()),
             )?,
+            ca_certificates: value_strings(
+                self.tls.as_ref().and_then(|tls| tls.certificate.as_ref()),
+            )?,
             client_fingerprint: if tls_enabled {
                 self.tls
                     .as_ref()
@@ -1427,6 +1433,7 @@ impl SingBoxTrojanOutbound {
             sni: sni_or_server(tls.server_name.as_deref(), &self.server),
             insecure: tls.insecure,
             ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
+            ca_certificates: value_strings(tls.certificate.as_ref())?,
             udp: network_allows_udp(self.network.as_deref()),
             client_fingerprint: tls.utls_fingerprint(name)?,
             transport,
@@ -1509,6 +1516,7 @@ impl SingBoxHysteria2Outbound {
             insecure: tls.insecure,
             certificate_fingerprint: None,
             ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
+            ca_certificates: value_strings(tls.certificate.as_ref())?,
             obfs,
             obfs_password,
             download_bandwidth: self.down_mbps.or(self.down),
@@ -1537,6 +1545,7 @@ impl SingBoxAnyTlsOutbound {
             sni: sni_or_server(tls.server_name.as_deref(), &self.server),
             insecure: tls.insecure,
             ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
+            ca_certificates: value_strings(tls.certificate.as_ref())?,
             padding_scheme: PaddingScheme::default_lines(),
             heartbeat_interval_secs: 30,
         })
@@ -1568,6 +1577,7 @@ impl SingBoxNaiveOutbound {
             sni: sni_or_server(tls.server_name.as_deref(), &self.server),
             insecure: tls.insecure,
             ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
+            ca_certificates: value_strings(tls.certificate.as_ref())?,
             extra_headers: self.extra_headers.clone().into_iter().collect(),
             udp_over_tcp,
             quic: self.quic
@@ -1624,6 +1634,7 @@ impl SingBoxTuicOutbound {
             sni: sni_or_server(tls.server_name.as_deref(), &self.server),
             insecure: tls.insecure,
             ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
+            ca_certificates: value_strings(tls.certificate.as_ref())?,
             udp: network_allows_udp(self.network.as_deref()),
             udp_relay_mode: self
                 .udp_relay_mode
@@ -1652,18 +1663,14 @@ impl SingBoxTlsOptions {
         allow_certificate_path: bool,
     ) -> Result<()> {
         ensure!(
-            !self
-                .certificate
-                .as_ref()
-                .map(json_value_non_empty)
-                .unwrap_or(false)
+            (allow_certificate_path || !json_value_non_empty_option(self.certificate.as_ref()))
                 && !self.key.as_ref().map(json_value_non_empty).unwrap_or(false)
                 && !self
                     .key_path
                     .as_ref()
                     .map(json_value_non_empty)
                     .unwrap_or(false),
-            "sing-box {protocol} outbound {name} sets inline TLS certificate or private key material; Aerion client expects certificate_path for custom trust roots"
+            "sing-box {protocol} outbound {name} sets unsupported TLS private key material"
         );
         ensure!(
             allow_certificate_path
@@ -2074,6 +2081,27 @@ fn value_paths(value: Option<&Value>) -> Result<Vec<PathBuf>> {
             })
             .collect(),
         Some(_) => bail!("sing-box TLS certificate_path must be a string or string array"),
+    }
+}
+
+fn value_strings(value: Option<&Value>) -> Result<Vec<String>> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(value)) if !value.trim().is_empty() => {
+            Ok(vec![value.trim().to_string()])
+        }
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .context("sing-box TLS certificate array contains a non-string certificate")
+            })
+            .collect(),
+        Some(_) => bail!("sing-box TLS certificate must be a string or string array"),
     }
 }
 
@@ -2954,7 +2982,8 @@ mod tests {
       "server_name": "hy2.example.com",
       "insecure": true,
       "alpn": ["h3"],
-      "certificate_path": ["ca.pem", "backup-ca.pem"]
+      "certificate_path": ["ca.pem", "backup-ca.pem"],
+      "certificate": ["hy2-inline-ca"]
     },
     "obfs": {
       "type": "salamander",
@@ -2978,6 +3007,7 @@ mod tests {
             hysteria2.ca_cert_paths,
             vec![PathBuf::from("ca.pem"), PathBuf::from("backup-ca.pem")]
         );
+        assert_eq!(hysteria2.ca_certificates, vec!["hy2-inline-ca"]);
         assert!(hysteria2.udp);
         assert_eq!(hysteria2.obfs.as_deref(), Some("salamander"));
         assert_eq!(hysteria2.obfs_password.as_deref(), Some("obfs-pass"));
@@ -2996,7 +3026,11 @@ mod tests {
       "server": "vless.example.com",
       "server_port": 443,
       "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
-      "tls": { "enabled": true, "certificate_path": ["vless-ca.pem"] }
+      "tls": {
+        "enabled": true,
+        "certificate_path": ["vless-ca.pem"],
+        "certificate": ["vless-inline-ca"]
+      }
     },
     {
       "type": "vmess",
@@ -3005,7 +3039,11 @@ mod tests {
       "server_port": 443,
       "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
       "alter_id": 0,
-      "tls": { "enabled": true, "certificate_path": "vmess-ca.pem" }
+      "tls": {
+        "enabled": true,
+        "certificate_path": "vmess-ca.pem",
+        "certificate": "vmess-inline-ca"
+      }
     },
     {
       "type": "trojan",
@@ -3013,7 +3051,11 @@ mod tests {
       "server": "trojan.example.com",
       "server_port": 443,
       "password": "secret",
-      "tls": { "enabled": true, "certificate_path": "trojan-ca.pem" }
+      "tls": {
+        "enabled": true,
+        "certificate_path": "trojan-ca.pem",
+        "certificate": "trojan-inline-ca"
+      }
     },
     {
       "type": "anytls",
@@ -3021,7 +3063,11 @@ mod tests {
       "server": "anytls.example.com",
       "server_port": 443,
       "password": "secret",
-      "tls": { "enabled": true, "certificate_path": "anytls-ca.pem" }
+      "tls": {
+        "enabled": true,
+        "certificate_path": "anytls-ca.pem",
+        "certificate": ["anytls-inline-ca"]
+      }
     },
     {
       "type": "tuic",
@@ -3030,7 +3076,11 @@ mod tests {
       "server_port": 443,
       "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
       "password": "secret",
-      "tls": { "enabled": true, "certificate_path": "tuic-ca.pem" }
+      "tls": {
+        "enabled": true,
+        "certificate_path": "tuic-ca.pem",
+        "certificate": "tuic-inline-ca"
+      }
     }
   ]
 }
@@ -3042,6 +3092,7 @@ mod tests {
             bail!("expected VLESS")
         };
         assert_eq!(vless.ca_cert_paths, vec![PathBuf::from("vless-ca.pem")]);
+        assert_eq!(vless.ca_certificates, vec!["vless-inline-ca"]);
 
         let SingBoxClientConfig::Vmess(vmess) =
             config.outbounds[1].to_client_config("127.0.0.1:1080".parse()?)?
@@ -3049,6 +3100,7 @@ mod tests {
             bail!("expected VMess")
         };
         assert_eq!(vmess.ca_cert_paths, vec![PathBuf::from("vmess-ca.pem")]);
+        assert_eq!(vmess.ca_certificates, vec!["vmess-inline-ca"]);
 
         let SingBoxClientConfig::Trojan(trojan) =
             config.outbounds[2].to_client_config("127.0.0.1:1080".parse()?)?
@@ -3056,6 +3108,7 @@ mod tests {
             bail!("expected Trojan")
         };
         assert_eq!(trojan.ca_cert_paths, vec![PathBuf::from("trojan-ca.pem")]);
+        assert_eq!(trojan.ca_certificates, vec!["trojan-inline-ca"]);
 
         let SingBoxClientConfig::AnyTls(anytls) =
             config.outbounds[3].to_client_config("127.0.0.1:1080".parse()?)?
@@ -3063,6 +3116,7 @@ mod tests {
             bail!("expected AnyTLS")
         };
         assert_eq!(anytls.ca_cert_paths, vec![PathBuf::from("anytls-ca.pem")]);
+        assert_eq!(anytls.ca_certificates, vec!["anytls-inline-ca"]);
 
         let SingBoxClientConfig::Tuic(tuic) =
             config.outbounds[4].to_client_config("127.0.0.1:1080".parse()?)?
@@ -3070,6 +3124,7 @@ mod tests {
             bail!("expected TUIC")
         };
         assert_eq!(tuic.ca_cert_paths, vec![PathBuf::from("tuic-ca.pem")]);
+        assert_eq!(tuic.ca_certificates, vec!["tuic-inline-ca"]);
         Ok(())
     }
 
@@ -3137,7 +3192,8 @@ mod tests {
       "tls": {
         "enabled": true,
         "server_name": "front.example.com",
-        "certificate_path": ["ca.pem", "backup-ca.pem"]
+        "certificate_path": ["ca.pem", "backup-ca.pem"],
+        "certificate": "naive-inline-ca"
       }
     },
     {
@@ -3154,7 +3210,8 @@ mod tests {
       "tls": {
         "enabled": true,
         "server_name": "front.example.com",
-        "alpn": ["h3"]
+        "alpn": ["h3"],
+        "certificate": ["tuic-inline-ca"]
       }
     }
   ]
@@ -3173,6 +3230,7 @@ mod tests {
             naive.ca_cert_paths,
             vec![PathBuf::from("ca.pem"), PathBuf::from("backup-ca.pem")]
         );
+        assert_eq!(naive.ca_certificates, vec!["naive-inline-ca"]);
         assert!(naive.quic);
         assert!(naive.udp_over_tcp);
         assert_eq!(naive.quic_congestion_control, "reno");
@@ -3189,6 +3247,7 @@ mod tests {
         assert_eq!(tuic.congestion_control, "bbr");
         assert_eq!(tuic.alpn_protocols, vec!["h3".to_string()]);
         assert_eq!(tuic.heartbeat_interval_secs, 15);
+        assert_eq!(tuic.ca_certificates, vec!["tuic-inline-ca"]);
         Ok(())
     }
 

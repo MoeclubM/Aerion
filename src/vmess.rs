@@ -58,6 +58,7 @@ pub struct VmessClientConfig {
     pub sni: String,
     pub insecure: bool,
     pub ca_cert_paths: Vec<PathBuf>,
+    pub ca_certificates: Vec<String>,
     pub client_fingerprint: Option<utls::UtlsFingerprint>,
     pub transport: VlessTransportConfig,
 }
@@ -250,12 +251,14 @@ async fn connect_vmess_transport(config: &VmessClientConfig) -> Result<VmessTran
     if !config.tls {
         return apply_vmess_client_transport(tcp, config).await;
     }
-    let mut client_config =
-        Arc::unwrap_or_clone(tls::client_config_with_fingerprint_and_custom_roots(
+    let mut client_config = Arc::unwrap_or_clone(
+        tls::client_config_with_fingerprint_and_custom_root_material(
             config.insecure,
             config.client_fingerprint,
             &config.ca_cert_paths,
-        )?);
+            &config.ca_certificates,
+        )?,
+    );
     let alpn = config.transport.alpn_protocols();
     if !alpn.is_empty() {
         client_config.alpn_protocols = alpn;

@@ -1218,6 +1218,7 @@ impl XrayOutbound {
                 false
             },
             ca_cert_paths: Vec::new(),
+            ca_certificates: Vec::new(),
             flow: peer
                 .user
                 .flow
@@ -1332,6 +1333,7 @@ impl XrayOutbound {
                 false
             },
             ca_cert_paths: Vec::new(),
+            ca_certificates: Vec::new(),
             client_fingerprint: if tls_enabled {
                 tls.and_then(|settings| settings.fingerprint)
             } else {
@@ -1367,6 +1369,7 @@ impl XrayOutbound {
             ),
             insecure: tls.map(|settings| settings.allow_insecure).unwrap_or(false),
             ca_cert_paths: Vec::new(),
+            ca_certificates: Vec::new(),
             udp: true,
             client_fingerprint: tls.and_then(|settings| settings.fingerprint),
             transport,
@@ -1557,6 +1560,7 @@ impl XrayOutbound {
             insecure: tls.map(|settings| settings.allow_insecure).unwrap_or(false),
             certificate_fingerprint: None,
             ca_cert_paths: Vec::new(),
+            ca_certificates: Vec::new(),
             obfs,
             obfs_password,
             download_bandwidth,
