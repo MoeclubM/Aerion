@@ -628,19 +628,12 @@ impl SingBoxNaiveInbound {
         let (tcp, quic) = naive_inbound_network(name, self.network.as_deref())?;
         ensure_naive_inbound_alpn(name, self.tls.alpn.as_ref(), tcp, quic)?;
         ensure!(
-            !json_value_non_empty_option(self.tls.certificate.as_ref()),
-            "sing-box Naive inbound {name} embeds certificate data; Aerion Naive server expects certificate_path"
-        );
-        ensure!(
             !json_value_non_empty_option(self.tls.ech.as_ref()),
             "sing-box Naive inbound {name} sets ECH; Aerion Naive server does not expose ECH"
         );
         let (username, password, users) = self.credentials();
-        let cert_path = value_path(self.tls.certificate_path.as_ref()).with_context(|| {
-            format!("sing-box Naive inbound {name} is missing certificate_path")
-        })?;
-        let key_path = value_path(self.tls.key_path.as_ref())
-            .with_context(|| format!("sing-box Naive inbound {name} is missing key_path"))?;
+        let (cert_path, key_path, certificates, key) =
+            singbox_tls_server_identity(&self.tls, "Naive", name)?;
         Ok(NaiveServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
@@ -653,6 +646,8 @@ impl SingBoxNaiveInbound {
             users,
             cert_path,
             key_path,
+            certificates,
+            key,
             udp_over_tcp: false,
             tcp,
             quic,
@@ -759,18 +754,11 @@ impl SingBoxVlessInbound {
         } else {
             None
         };
-        let (cert_path, key_path) = if tls_enabled && reality.is_none() {
+        let (cert_path, key_path, certificates, key) = if tls_enabled && reality.is_none() {
             let tls =
                 tls.with_context(|| format!("sing-box VLESS inbound {name} is missing tls"))?;
             tls.ensure_supported_server_options("VLESS", name, false)?;
-            (
-                value_path(tls.certificate_path.as_ref()).with_context(|| {
-                    format!("sing-box VLESS inbound {name} is missing certificate_path")
-                })?,
-                value_path(tls.key_path.as_ref()).with_context(|| {
-                    format!("sing-box VLESS inbound {name} is missing key_path")
-                })?,
-            )
+            singbox_tls_server_identity(tls, "VLESS", name)?
         } else {
             if let Some(tls) = tls {
                 ensure_disabled_utls(name, tls)?;
@@ -786,7 +774,7 @@ impl SingBoxVlessInbound {
                     "sing-box VLESS inbound {name} sets ECH; Aerion VLESS server does not expose ECH"
                 );
             }
-            (PathBuf::new(), PathBuf::new())
+            (PathBuf::new(), PathBuf::new(), Vec::new(), None)
         };
         Ok(VlessServerConfig {
             listen: SocketAddr::new(
@@ -800,6 +788,8 @@ impl SingBoxVlessInbound {
             tls: tls_enabled && reality.is_none(),
             cert_path,
             key_path,
+            certificates,
+            key,
             flow,
             reality,
             transport,
@@ -824,6 +814,8 @@ impl SingBoxAnyTlsInbound {
             .users
             .first()
             .with_context(|| format!("sing-box AnyTLS inbound {name} is missing users"))?;
+        let (cert_path, key_path, certificates, key) =
+            singbox_tls_server_identity(&self.tls, "AnyTLS", name)?;
         Ok(ServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
@@ -838,11 +830,10 @@ impl SingBoxAnyTlsInbound {
                 .skip(1)
                 .map(|user| user.password.clone())
                 .collect(),
-            cert_path: value_path(self.tls.certificate_path.as_ref()).with_context(|| {
-                format!("sing-box AnyTLS inbound {name} is missing certificate_path")
-            })?,
-            key_path: value_path(self.tls.key_path.as_ref())
-                .with_context(|| format!("sing-box AnyTLS inbound {name} is missing key_path"))?,
+            cert_path,
+            key_path,
+            certificates,
+            key,
             padding_scheme: if self.padding_scheme.is_empty() {
                 PaddingScheme::default_lines()
             } else {
@@ -915,6 +906,8 @@ impl SingBoxHysteria2Inbound {
             }
             None => (None, None),
         };
+        let (cert_path, key_path, certificates, key) =
+            singbox_tls_server_identity(&self.tls, "Hysteria2", name)?;
         Ok(Hysteria2ServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
@@ -924,12 +917,10 @@ impl SingBoxHysteria2Inbound {
             ),
             password,
             users,
-            cert_path: value_path(self.tls.certificate_path.as_ref()).with_context(|| {
-                format!("sing-box Hysteria2 inbound {name} is missing certificate_path")
-            })?,
-            key_path: value_path(self.tls.key_path.as_ref()).with_context(|| {
-                format!("sing-box Hysteria2 inbound {name} is missing key_path")
-            })?,
+            cert_path,
+            key_path,
+            certificates,
+            key,
             obfs: obfs.0,
             obfs_password: obfs.1,
             udp: network_allows_udp(self.network.as_deref()),
@@ -974,6 +965,8 @@ impl SingBoxTuicInbound {
             .users
             .first()
             .with_context(|| format!("sing-box TUIC inbound {name} is missing users"))?;
+        let (cert_path, key_path, certificates, key) =
+            singbox_tls_server_identity(&self.tls, "TUIC", name)?;
         Ok(TuicServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
@@ -989,11 +982,10 @@ impl SingBoxTuicInbound {
                 .skip(1)
                 .map(|user| format!("{}:{}", user.uuid, user.password))
                 .collect(),
-            cert_path: value_path(self.tls.certificate_path.as_ref()).with_context(|| {
-                format!("sing-box TUIC inbound {name} is missing certificate_path")
-            })?,
-            key_path: value_path(self.tls.key_path.as_ref())
-                .with_context(|| format!("sing-box TUIC inbound {name} is missing key_path"))?,
+            cert_path,
+            key_path,
+            certificates,
+            key,
             udp: network_allows_udp(self.network.as_deref()),
             congestion_control: self
                 .congestion_control
@@ -1082,6 +1074,8 @@ impl SingBoxTrojanInbound {
             .users
             .first()
             .with_context(|| format!("sing-box Trojan inbound {name} is missing users"))?;
+        let (cert_path, key_path, certificates, key) =
+            singbox_tls_server_identity(&self.tls, "Trojan", name)?;
         Ok(TrojanServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
@@ -1096,11 +1090,10 @@ impl SingBoxTrojanInbound {
                 .skip(1)
                 .map(|user| user.password.clone())
                 .collect(),
-            cert_path: value_path(self.tls.certificate_path.as_ref()).with_context(|| {
-                format!("sing-box Trojan inbound {name} is missing certificate_path")
-            })?,
-            key_path: value_path(self.tls.key_path.as_ref())
-                .with_context(|| format!("sing-box Trojan inbound {name} is missing key_path"))?,
+            cert_path,
+            key_path,
+            certificates,
+            key,
             transport,
         })
     }
@@ -1155,6 +1148,8 @@ impl SingBoxVmessInbound {
                 .with_context(|| format!("sing-box VMess inbound {name} is missing tls"))?;
             tls.ensure_supported_server_options("VMess", name, false)?;
             ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
+            let (cert_path, key_path, certificates, key) =
+                singbox_tls_server_identity(tls, "VMess", name)?;
             Ok(VmessServerConfig {
                 listen: SocketAddr::new(
                     parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
@@ -1165,12 +1160,10 @@ impl SingBoxVmessInbound {
                 user_id,
                 users,
                 tls: true,
-                cert_path: Some(value_path(tls.certificate_path.as_ref()).with_context(|| {
-                    format!("sing-box VMess inbound {name} is missing certificate_path")
-                })?),
-                key_path: Some(value_path(tls.key_path.as_ref()).with_context(|| {
-                    format!("sing-box VMess inbound {name} is missing key_path")
-                })?),
+                cert_path: Some(cert_path),
+                key_path: Some(key_path),
+                certificates,
+                key,
                 transport,
             })
         } else {
@@ -1190,6 +1183,8 @@ impl SingBoxVmessInbound {
                 tls: false,
                 cert_path: None,
                 key_path: None,
+                certificates: Vec::new(),
+                key: None,
                 transport,
             })
         }
@@ -1723,18 +1718,15 @@ impl SingBoxTlsOptions {
         ensure_disabled_utls(name, self)?;
         ensure_disabled_reality(name, self)?;
         ensure!(
-            !json_value_non_empty_option(self.certificate.as_ref())
-                && !json_value_non_empty_option(self.key.as_ref()),
-            "sing-box {protocol} inbound {name} embeds TLS certificate data; Aerion server expects certificate_path and key_path"
-        );
-        ensure!(
             !json_value_non_empty_option(self.ech.as_ref()),
             "sing-box {protocol} inbound {name} sets ECH; Aerion server does not expose ECH"
         );
         if tls_disabled {
             ensure!(
                 !json_value_non_empty_option(self.certificate_path.as_ref())
-                    && !json_value_non_empty_option(self.key_path.as_ref()),
+                    && !json_value_non_empty_option(self.key_path.as_ref())
+                    && !json_value_non_empty_option(self.certificate.as_ref())
+                    && !json_value_non_empty_option(self.key.as_ref()),
                 "sing-box {protocol} inbound {name} sets TLS certificate fields while TLS is disabled"
             );
         }
@@ -2116,19 +2108,51 @@ fn value_strings(value: Option<&Value>) -> Result<Vec<String>> {
         Some(Value::String(value)) if !value.trim().is_empty() => {
             Ok(vec![value.trim().to_string()])
         }
-        Some(Value::Array(values)) => values
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-                    .context("sing-box TLS certificate array contains a non-string certificate")
-            })
-            .collect(),
+        Some(Value::Array(values)) => {
+            let lines = values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .context("sing-box TLS certificate array contains a non-string certificate")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if lines.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![lines.join("\n")])
+            }
+        }
         Some(_) => bail!("sing-box TLS certificate must be a string or string array"),
     }
+}
+
+fn singbox_tls_server_identity(
+    tls: &SingBoxTlsOptions,
+    protocol: &str,
+    name: &str,
+) -> Result<(PathBuf, PathBuf, Vec<String>, Option<String>)> {
+    let cert_path = value_path(tls.certificate_path.as_ref());
+    let key_path = value_path(tls.key_path.as_ref());
+    let certificates = value_strings(tls.certificate.as_ref())?;
+    let key = value_strings(tls.key.as_ref())?.into_iter().next();
+    ensure!(
+        cert_path.is_some() || !certificates.is_empty(),
+        "sing-box {protocol} inbound {name} is missing certificate_path or certificate"
+    );
+    ensure!(
+        key_path.is_some() || key.is_some(),
+        "sing-box {protocol} inbound {name} is missing key_path or key"
+    );
+    Ok((
+        cert_path.unwrap_or_default(),
+        key_path.unwrap_or_default(),
+        certificates,
+        key,
+    ))
 }
 
 fn parse_duration_secs(value: &str) -> Result<u64> {
@@ -2362,6 +2386,39 @@ mod tests {
         assert_eq!(vless.transport.kind, VlessTransportKind::WebSocket);
         assert_eq!(vless.transport.path, "/ws");
         assert_eq!(vless.transport.host, Some("front.example.com".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn converts_vless_inline_tls_inbound_to_server_config() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-inline-tls",
+      "listen": "127.0.0.1",
+      "listen_port": 9443,
+      "users": [
+        { "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf" }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate": ["cert-line-1", "cert-line-2"],
+        "key": ["key-line-1", "key-line-2"]
+      }
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxServerConfig::Vless(vless) = config.inbounds[0].to_server_config()? else {
+            bail!("expected VLESS")
+        };
+        assert_eq!(vless.cert_path, PathBuf::new());
+        assert_eq!(vless.key_path, PathBuf::new());
+        assert_eq!(vless.certificates, vec!["cert-line-1\ncert-line-2"]);
+        assert_eq!(vless.key.as_deref(), Some("key-line-1\nkey-line-2"));
         Ok(())
     }
 

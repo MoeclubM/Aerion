@@ -46,6 +46,8 @@ pub struct TrojanServerConfig {
     pub users: Vec<String>,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+    pub certificates: Vec<String>,
+    pub key: Option<String>,
     pub transport: VlessTransportConfig,
 }
 
@@ -103,8 +105,13 @@ pub async fn run_trojan_server_with_core(
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind Trojan server on {}", config.listen))?;
-    let mut server_config =
-        Arc::unwrap_or_clone(tls::server_config(&config.cert_path, &config.key_path)?);
+    let mut server_config = Arc::unwrap_or_clone(tls::server_config_from_material(
+        tls::present_path(&config.cert_path),
+        tls::present_path(&config.key_path),
+        &config.certificates,
+        config.key.as_deref(),
+        "Trojan server TLS",
+    )?);
     let alpn = config.transport.alpn_protocols();
     if !alpn.is_empty() {
         server_config.alpn_protocols = alpn;

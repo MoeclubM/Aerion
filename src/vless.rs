@@ -54,6 +54,8 @@ pub struct VlessServerConfig {
     pub tls: bool,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+    pub certificates: Vec<String>,
+    pub key: Option<String>,
     pub flow: String,
     pub reality: Option<reality::RealityServerConfig>,
     pub transport: VlessTransportConfig,
@@ -112,8 +114,13 @@ pub async fn run_vless_server_with_core(config: VlessServerConfig, core: ProxyCo
         .await
         .with_context(|| format!("bind VLESS server on {}", config.listen))?;
     let acceptor = if config.reality.is_none() && config.tls {
-        let mut server_config =
-            Arc::unwrap_or_clone(tls::server_config(&config.cert_path, &config.key_path)?);
+        let mut server_config = Arc::unwrap_or_clone(tls::server_config_from_material(
+            tls::present_path(&config.cert_path),
+            tls::present_path(&config.key_path),
+            &config.certificates,
+            config.key.as_deref(),
+            "VLESS server TLS",
+        )?);
         server_config.alpn_protocols = config.transport.alpn_protocols();
         Some(TlsAcceptor::from(Arc::new(server_config)))
     } else {

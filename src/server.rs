@@ -30,6 +30,8 @@ pub struct ServerConfig {
     pub users: Vec<String>,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+    pub certificates: Vec<String>,
+    pub key: Option<String>,
     pub padding_scheme: Vec<String>,
     pub heartbeat_interval_secs: u64,
 }
@@ -105,7 +107,13 @@ pub async fn run_server_listener_with_core(
     config: ServerConfig,
     core: ProxyCore,
 ) -> Result<()> {
-    let tls_config = tls::server_config_early_data(&config.cert_path, &config.key_path)?;
+    let tls_config = tls::server_config_early_data_from_material(
+        tls::present_path(&config.cert_path),
+        tls::present_path(&config.key_path),
+        &config.certificates,
+        config.key.as_deref(),
+        "AnyTLS server TLS",
+    )?;
     let acceptor = TlsAcceptor::from(tls_config);
     let padding = PaddingScheme::from_lines(config.padding_scheme.clone())?;
     tracing::info!("server listening on {}", listener.local_addr()?);

@@ -553,18 +553,16 @@ fn build_client_config(
 }
 
 pub fn server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConfig>> {
-    let certs = load_certs(cert_path)?;
-    let key = load_key(key_path)?;
-    let mut config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .with_context(|| {
-            format!(
-                "build TLS server config with cert {} and key {}",
-                DisplayPath(cert_path),
-                DisplayPath(key_path)
-            )
-        })?;
+    let (certs, key) = server_identity(Some(cert_path), Some(key_path), &[], None, "TLS server")?;
+    let mut config = build_server_config(
+        certs,
+        key,
+        &format!(
+            "cert {} and key {}",
+            DisplayPath(cert_path),
+            DisplayPath(key_path)
+        ),
+    )?;
     config.alpn_protocols.clear();
     Ok(Arc::new(config))
 }
@@ -573,6 +571,76 @@ pub fn server_config_early_data(cert_path: &Path, key_path: &Path) -> Result<Arc
     let mut config = Arc::unwrap_or_clone(server_config(cert_path, key_path)?);
     config.max_early_data_size = MAX_EARLY_DATA_SIZE;
     Ok(Arc::new(config))
+}
+
+pub fn server_config_from_material(
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+    certificates: &[String],
+    key: Option<&str>,
+    label: &str,
+) -> Result<Arc<ServerConfig>> {
+    let (certs, key) = server_identity(cert_path, key_path, certificates, key, label)?;
+    let mut config = build_server_config(certs, key, label)?;
+    config.alpn_protocols.clear();
+    Ok(Arc::new(config))
+}
+
+pub fn server_config_early_data_from_material(
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+    certificates: &[String],
+    key: Option<&str>,
+    label: &str,
+) -> Result<Arc<ServerConfig>> {
+    let mut config = Arc::unwrap_or_clone(server_config_from_material(
+        cert_path,
+        key_path,
+        certificates,
+        key,
+        label,
+    )?);
+    config.max_early_data_size = MAX_EARLY_DATA_SIZE;
+    Ok(Arc::new(config))
+}
+
+pub fn server_identity(
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+    certificates: &[String],
+    key: Option<&str>,
+    label: &str,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let certs = if let Some(path) = cert_path {
+        load_certs(path)?
+    } else {
+        ensure!(!certificates.is_empty(), "{label} is missing certificate");
+        load_certs_from_pem(&format!("{label} certificate"), &certificates.join("\n"))?
+    };
+    let key = if let Some(path) = key_path {
+        load_key(path)?
+    } else {
+        load_key_from_pem(
+            &format!("{label} private key"),
+            key.with_context(|| format!("{label} is missing private key"))?,
+        )?
+    };
+    Ok((certs, key))
+}
+
+pub fn present_path(path: &Path) -> Option<&Path> {
+    (!path.as_os_str().is_empty()).then_some(path)
+}
+
+fn build_server_config(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    label: &str,
+) -> Result<ServerConfig> {
+    ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .with_context(|| format!("build TLS server config with {label}"))
 }
 
 pub(crate) fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
@@ -605,6 +673,13 @@ pub(crate) fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut reader)
         .with_context(|| format!("read private key {}", DisplayPath(path)))?
         .with_context(|| format!("private key file contains no key: {}", DisplayPath(path)))
+}
+
+pub(crate) fn load_key_from_pem(label: &str, pem: &str) -> Result<PrivateKeyDer<'static>> {
+    let mut reader = BufReader::new(pem.as_bytes());
+    rustls_pemfile::private_key(&mut reader)
+        .with_context(|| format!("read {label}"))?
+        .with_context(|| format!("{label} contains no private key"))
 }
 
 struct DisplayPath<'a>(&'a Path);
@@ -677,6 +752,47 @@ mod tests {
         assert_eq!(body, b"EARLY:worldLATE:");
 
         server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepts_inline_server_certificate_material() -> Result<()> {
+        init_crypto();
+
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
+        let cert_pem = certified.cert.pem();
+        let key_pem = certified.key_pair.serialize_pem();
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let acceptor = TlsAcceptor::from(server_config_from_material(
+            None,
+            None,
+            std::slice::from_ref(&cert_pem),
+            Some(&key_pem),
+            "inline TLS test",
+        )?);
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut stream = acceptor.accept(stream).await?;
+            let mut buf = [0u8; 5];
+            stream.read_exact(&mut buf).await?;
+            stream.write_all(&buf).await?;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let config =
+            client_config_with_custom_root_material(false, &[], std::slice::from_ref(&cert_pem))?;
+        let tcp = TcpStream::connect(addr).await?;
+        let server_name = ServerName::try_from("localhost").context("build server name")?;
+        let mut stream = TlsConnector::from(config)
+            .connect(server_name, tcp)
+            .await
+            .context("connect inline TLS server")?;
+        stream.write_all(b"hello").await?;
+        let mut echoed = [0u8; 5];
+        stream.read_exact(&mut echoed).await?;
+        assert_eq!(&echoed, b"hello");
+        server_task.await??;
         Ok(())
     }
 

@@ -73,6 +73,8 @@ pub struct VmessServerConfig {
     pub tls: bool,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
+    pub certificates: Vec<String>,
+    pub key: Option<String>,
     pub transport: VlessTransportConfig,
 }
 
@@ -177,15 +179,13 @@ pub async fn run_vmess_server_with_core(config: VmessServerConfig, core: ProxyCo
         .with_context(|| format!("bind VMess server on {}", config.listen))?;
     let users = vmess_users(&config.user_id, &config.users)?;
     let acceptor = if config.tls {
-        let cert_path = config
-            .cert_path
-            .as_ref()
-            .context("VMess TLS server requires cert_path")?;
-        let key_path = config
-            .key_path
-            .as_ref()
-            .context("VMess TLS server requires key_path")?;
-        let mut server_config = Arc::unwrap_or_clone(tls::server_config(cert_path, key_path)?);
+        let mut server_config = Arc::unwrap_or_clone(tls::server_config_from_material(
+            config.cert_path.as_deref().and_then(tls::present_path),
+            config.key_path.as_deref().and_then(tls::present_path),
+            &config.certificates,
+            config.key.as_deref(),
+            "VMess server TLS",
+        )?);
         server_config.alpn_protocols = config.transport.alpn_protocols();
         Some(TlsAcceptor::from(Arc::new(server_config)))
     } else {

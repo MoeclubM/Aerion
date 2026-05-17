@@ -392,6 +392,8 @@ pub struct XrayCertificate {
     pub usage: Option<String>,
     #[serde(default)]
     pub certificate: Vec<String>,
+    #[serde(default)]
+    pub key: Vec<String>,
     #[serde(default, rename = "certificateFile", alias = "certificate_file")]
     pub certificate_file: Option<PathBuf>,
     #[serde(default, rename = "keyFile", alias = "key_file")]
@@ -645,14 +647,7 @@ impl XrayInbound {
             self.name(),
             tls.and_then(|settings| settings.alpn.as_ref()),
         )?;
-        let certificate = tls
-            .and_then(|tls| tls.certificates.first())
-            .with_context(|| {
-                format!(
-                    "xray Hysteria inbound {} TLS is missing certificates",
-                    self.name()
-                )
-            })?;
+        let certificate = xray_first_server_certificate(tls, "Hysteria", self.name())?;
         let finalmask = self.stream_settings.finalmask.as_ref();
         if let Some(finalmask) = finalmask {
             ensure!(
@@ -778,6 +773,8 @@ impl XrayInbound {
             .or_else(|| hysteria.and_then(|settings| settings.down))
             .map(|mbps| mbps.saturating_mul(125_000).to_string())
             .unwrap_or_else(|| "0".to_string());
+        let (cert_path, key_path, certificates, key) =
+            xray_tls_server_identity(certificate, "Hysteria", self.name())?;
         Ok(Hysteria2ServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
@@ -787,18 +784,10 @@ impl XrayInbound {
             ),
             password,
             users,
-            cert_path: certificate.certificate_file.clone().with_context(|| {
-                format!(
-                    "xray Hysteria inbound {} TLS certificate is missing certificateFile",
-                    self.name()
-                )
-            })?,
-            key_path: certificate.key_file.clone().with_context(|| {
-                format!(
-                    "xray Hysteria inbound {} TLS certificate is missing keyFile",
-                    self.name()
-                )
-            })?,
+            cert_path,
+            key_path,
+            certificates,
+            key,
             obfs,
             obfs_password,
             udp: true,
@@ -838,17 +827,18 @@ impl XrayInbound {
                 .as_ref()
                 .and_then(|tls| tls.alpn.as_ref()),
         )?;
-        let certificate = self
-            .stream_settings
-            .tls_settings
-            .as_ref()
-            .and_then(|tls| tls.certificates.first())
-            .context("xray Trojan inbound TLS is missing certificates")?;
+        let certificate = xray_first_server_certificate(
+            self.stream_settings.tls_settings.as_ref(),
+            "Trojan",
+            self.name(),
+        )?;
         let primary = self
             .settings
             .clients
             .first()
             .context("xray Trojan inbound is missing settings.clients")?;
+        let (cert_path, key_path, certificates, key) =
+            xray_tls_server_identity(certificate, "Trojan", self.name())?;
         Ok(TrojanServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
@@ -871,14 +861,10 @@ impl XrayInbound {
                         .context("xray Trojan inbound extra client is missing password")
                 })
                 .collect::<Result<Vec<_>>>()?,
-            cert_path: certificate
-                .certificate_file
-                .clone()
-                .context("xray Trojan inbound TLS certificate is missing certificateFile")?,
-            key_path: certificate
-                .key_file
-                .clone()
-                .context("xray Trojan inbound TLS certificate is missing keyFile")?,
+            cert_path,
+            key_path,
+            certificates,
+            key,
             transport,
         })
     }
@@ -970,23 +956,13 @@ impl XrayInbound {
                 Ok(id)
             })
             .collect::<Result<Vec<_>>>()?;
-        let (cert_path, key_path) = if stream_security.eq_ignore_ascii_case("tls") {
-            let certificate = tls
-                .and_then(|tls| tls.certificates.first())
-                .context("xray VLESS inbound TLS is missing certificates")?;
-            (
-                certificate
-                    .certificate_file
-                    .clone()
-                    .context("xray VLESS inbound TLS certificate is missing certificateFile")?,
-                certificate
-                    .key_file
-                    .clone()
-                    .context("xray VLESS inbound TLS certificate is missing keyFile")?,
-            )
-        } else {
-            (PathBuf::new(), PathBuf::new())
-        };
+        let (cert_path, key_path, certificates, key) =
+            if stream_security.eq_ignore_ascii_case("tls") {
+                let certificate = xray_first_server_certificate(tls, "VLESS", self.name())?;
+                xray_tls_server_identity(certificate, "VLESS", self.name())?
+            } else {
+                (PathBuf::new(), PathBuf::new(), Vec::new(), None)
+            };
         let reality = if stream_security.eq_ignore_ascii_case("reality") {
             let settings = reality_settings.with_context(|| {
                 format!(
@@ -1014,6 +990,8 @@ impl XrayInbound {
             tls: stream_security.eq_ignore_ascii_case("tls"),
             cert_path,
             key_path,
+            certificates,
+            key,
             flow,
             reality,
             transport,
@@ -1094,28 +1072,18 @@ impl XrayInbound {
                     .context("xray VMess inbound extra client is missing id")
             })
             .collect::<Result<Vec<_>>>()?;
-        let (cert_path, key_path) =
-            if tls_enabled {
-                let certificate = self
-                    .stream_settings
-                    .tls_settings
-                    .as_ref()
-                    .and_then(|tls| tls.certificates.first())
-                    .context("xray VMess inbound TLS is missing certificates")?;
-                (
-                    Some(certificate.certificate_file.clone().context(
-                        "xray VMess inbound TLS certificate is missing certificateFile",
-                    )?),
-                    Some(
-                        certificate
-                            .key_file
-                            .clone()
-                            .context("xray VMess inbound TLS certificate is missing keyFile")?,
-                    ),
-                )
-            } else {
-                (None, None)
-            };
+        let (cert_path, key_path, certificates, key) = if tls_enabled {
+            let certificate = xray_first_server_certificate(
+                self.stream_settings.tls_settings.as_ref(),
+                "VMess",
+                self.name(),
+            )?;
+            let (cert_path, key_path, certificates, key) =
+                xray_tls_server_identity(certificate, "VMess", self.name())?;
+            (Some(cert_path), Some(key_path), certificates, key)
+        } else {
+            (None, None, Vec::new(), None)
+        };
         Ok(VmessServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
@@ -1128,6 +1096,8 @@ impl XrayInbound {
             tls: tls_enabled,
             cert_path,
             key_path,
+            certificates,
+            key,
             transport,
         })
     }
@@ -1939,6 +1909,54 @@ fn value_has_data(value: &Value) -> bool {
     }
 }
 
+fn xray_tls_server_identity(
+    certificate: &XrayCertificate,
+    protocol: &str,
+    name: &str,
+) -> Result<(PathBuf, PathBuf, Vec<String>, Option<String>)> {
+    let certificates = if certificate.certificate.is_empty() {
+        Vec::new()
+    } else {
+        vec![certificate.certificate.join("\n")]
+    };
+    let key = if certificate.key.is_empty() {
+        None
+    } else {
+        Some(certificate.key.join("\n"))
+    };
+    ensure!(
+        certificate.certificate_file.is_some() || !certificates.is_empty(),
+        "xray {protocol} inbound {name} TLS certificate is missing certificate or certificateFile"
+    );
+    ensure!(
+        certificate.key_file.is_some() || key.is_some(),
+        "xray {protocol} inbound {name} TLS certificate is missing key or keyFile"
+    );
+    Ok((
+        certificate.certificate_file.clone().unwrap_or_default(),
+        certificate.key_file.clone().unwrap_or_default(),
+        certificates,
+        key,
+    ))
+}
+
+fn xray_first_server_certificate<'a>(
+    tls: Option<&'a XrayTlsSettings>,
+    protocol: &str,
+    name: &str,
+) -> Result<&'a XrayCertificate> {
+    tls.and_then(|tls| {
+        tls.certificates.iter().find(|certificate| {
+            !certificate
+                .usage
+                .as_deref()
+                .map(|usage| usage.eq_ignore_ascii_case("verify"))
+                .unwrap_or(false)
+        })
+    })
+    .with_context(|| format!("xray {protocol} inbound {name} TLS is missing certificates"))
+}
+
 fn xray_tls_client_roots(tls: Option<&XrayTlsSettings>) -> Result<(Vec<PathBuf>, Vec<String>)> {
     let Some(tls) = tls else {
         return Ok((Vec::new(), Vec::new()));
@@ -2312,6 +2330,45 @@ mod tests {
             vless.transport.request_host("example.com"),
             "edge.example.com"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_vless_inline_tls_inbound_to_server_config() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [{
+    "tag": "vless-inline-server",
+    "protocol": "vless",
+    "listen": "127.0.0.1",
+    "port": 8443,
+    "settings": {
+      "decryption": "none",
+      "clients": [
+        { "id": "a3482e88-686a-4a58-8126-99c9df64b7bf" }
+      ]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "tls",
+      "tlsSettings": {
+        "certificates": [{
+          "certificate": ["cert-line-1", "cert-line-2"],
+          "key": ["key-line-1", "key-line-2"]
+        }]
+      }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let XrayServerConfig::Vless(vless) = config.inbounds[0].to_server_config()? else {
+            bail!("expected VLESS")
+        };
+        assert_eq!(vless.cert_path, PathBuf::new());
+        assert_eq!(vless.key_path, PathBuf::new());
+        assert_eq!(vless.certificates, vec!["cert-line-1\ncert-line-2"]);
+        assert_eq!(vless.key.as_deref(), Some("key-line-1\nkey-line-2"));
         Ok(())
     }
 

@@ -198,6 +198,16 @@ pub struct ServerFileConfig {
     pub cert: Option<PathBuf>,
     #[serde(default)]
     pub key: Option<PathBuf>,
+    #[serde(default, alias = "certificate", alias = "cert-pem", alias = "cert_pem")]
+    pub certificates: Vec<String>,
+    #[serde(
+        default,
+        alias = "key-pem",
+        alias = "key_pem",
+        alias = "private-key",
+        alias = "private_key"
+    )]
+    pub key_pem: Option<String>,
     #[serde(default)]
     pub tls: Option<bool>,
     #[serde(default, alias = "cipher")]

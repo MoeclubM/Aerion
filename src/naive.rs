@@ -52,6 +52,8 @@ pub struct NaiveServerConfig {
     pub users: Vec<String>,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+    pub certificates: Vec<String>,
+    pub key: Option<String>,
     pub udp_over_tcp: bool,
     pub tcp: bool,
     pub quic: bool,
@@ -171,8 +173,13 @@ pub async fn run_naive_server_with_core(config: NaiveServerConfig, core: ProxyCo
 
 impl NaiveServerRuntime {
     fn from_config(config: &NaiveServerConfig, core: ProxyCore) -> Result<Self> {
-        let mut tls_config =
-            Arc::unwrap_or_clone(tls::server_config(&config.cert_path, &config.key_path)?);
+        let mut tls_config = Arc::unwrap_or_clone(tls::server_config_from_material(
+            tls::present_path(&config.cert_path),
+            tls::present_path(&config.key_path),
+            &config.certificates,
+            config.key.as_deref(),
+            "Naive server TLS",
+        )?);
         tls_config.alpn_protocols = vec![NAIVE_H2_ALPN.to_vec(), NAIVE_HTTP11_ALPN.to_vec()];
         Ok(Self {
             credentials: Arc::new(naive_credentials(
@@ -842,12 +849,16 @@ fn build_naive_quic_endpoint(
 }
 
 fn build_naive_server_endpoint(config: &NaiveServerConfig) -> Result<quinn::Endpoint> {
+    let (certs, key) = tls::server_identity(
+        tls::present_path(&config.cert_path),
+        tls::present_path(&config.key_path),
+        &config.certificates,
+        config.key.as_deref(),
+        "Naive HTTP/3 server TLS",
+    )?;
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(
-            tls::load_certs(&config.cert_path)?,
-            tls::load_key(&config.key_path)?,
-        )
+        .with_single_cert(certs, key)
         .with_context(|| {
             format!(
                 "build Naive HTTP/3 TLS server config with cert {} and key {}",

@@ -263,6 +263,8 @@ async fn main() -> Result<()> {
                 users,
                 cert_path: cert,
                 key_path: key,
+                certificates: Vec::new(),
+                key: None,
                 padding_scheme: if padding_scheme.is_empty() {
                     PaddingScheme::default_lines()
                 } else {
@@ -326,6 +328,8 @@ async fn main() -> Result<()> {
                 users,
                 cert_path: cert,
                 key_path: key,
+                certificates: Vec::new(),
+                key: None,
                 obfs,
                 obfs_password,
                 udp,
@@ -441,6 +445,8 @@ async fn main() -> Result<()> {
                 users,
                 cert_path: cert,
                 key_path: key,
+                certificates: Vec::new(),
+                key: None,
                 udp,
                 congestion_control,
                 alpn_protocols,
@@ -792,14 +798,15 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
         server.listen = listen;
     }
     if is_hysteria2(&server.protocol) {
+        let (cert_path, key_path) = native_tls_paths(&server, "Hysteria2")?;
         return run_hysteria2_server(Hysteria2ServerConfig {
             listen: server.listen,
             password: server.password,
             users: server.users,
-            cert_path: server
-                .cert
-                .context("server cert is required for Hysteria2")?,
-            key_path: server.key.context("server key is required for Hysteria2")?,
+            cert_path,
+            key_path,
+            certificates: server.certificates,
+            key: server.key_pem,
             obfs: server.obfs,
             obfs_password: server.obfs_password,
             udp: server.udp,
@@ -830,6 +837,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
         .await;
     }
     if is_tuic(&server.protocol) {
+        let (cert_path, key_path) = native_tls_paths(&server, "TUIC")?;
         let users = server
             .users
             .iter()
@@ -842,8 +850,10 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             uuid: server.username,
             password: server.password,
             users,
-            cert_path: server.cert.context("server cert is required for TUIC")?,
-            key_path: server.key.context("server key is required for TUIC")?,
+            cert_path,
+            key_path,
+            certificates: server.certificates,
+            key: server.key_pem,
             udp: server.udp,
             congestion_control: server.congestion_control,
             alpn_protocols: server.alpn_protocols,
@@ -866,13 +876,16 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
         .await;
     }
     if is_naive(&server.protocol) {
+        let (cert_path, key_path) = native_tls_paths(&server, "Naive")?;
         return run_naive_server(NaiveServerConfig {
             listen: server.listen,
             username: server.username,
             password: server.password,
             users: server.users,
-            cert_path: server.cert.context("server cert is required for Naive")?,
-            key_path: server.key.context("server key is required for Naive")?,
+            cert_path,
+            key_path,
+            certificates: server.certificates,
+            key: server.key_pem,
             udp_over_tcp: server.udp_over_tcp,
             tcp: true,
             quic: server.transport.eq_ignore_ascii_case("quic")
@@ -882,12 +895,15 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
         .await;
     }
     if is_trojan(&server.protocol) {
+        let (cert_path, key_path) = native_tls_paths(&server, "Trojan")?;
         return run_trojan_server(TrojanServerConfig {
             listen: server.listen,
             password: server.password,
             users: server.users,
-            cert_path: server.cert.context("server cert is required for Trojan")?,
-            key_path: server.key.context("server key is required for Trojan")?,
+            cert_path,
+            key_path,
+            certificates: server.certificates,
+            key: server.key_pem,
             transport: native_vless_transport(
                 server.network.as_deref(),
                 server.path,
@@ -925,11 +941,10 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
         let (cert_path, key_path) = if !tls {
             (PathBuf::new(), PathBuf::new())
         } else {
-            (
-                server.cert.context("server cert is required for VLESS")?,
-                server.key.context("server key is required for VLESS")?,
-            )
+            native_tls_paths(&server, "VLESS")?
         };
+        let certificates = if tls { server.certificates } else { Vec::new() };
+        let key = if tls { server.key_pem } else { None };
         return run_vless_server(VlessServerConfig {
             listen: server.listen,
             user_id: native_user_id(server.user_id, &server.username, "VLESS server")?,
@@ -937,6 +952,8 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             tls,
             cert_path,
             key_path,
+            certificates,
+            key,
             flow: server.flow,
             reality,
             transport,
@@ -944,20 +961,22 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
         .await;
     }
     if is_vmess(&server.protocol) {
-        let tls = server
-            .tls
-            .unwrap_or_else(|| server.cert.is_some() || server.key.is_some());
-        let (cert_path, key_path) = if tls {
+        let tls = server.tls.unwrap_or_else(|| {
+            server.cert.is_some()
+                || server.key.is_some()
+                || !server.certificates.is_empty()
+                || server.key_pem.is_some()
+        });
+        let (cert_path, key_path, certificates, key) = if tls {
+            let (cert_path, key_path) = native_tls_paths(&server, "VMess TLS")?;
             (
-                Some(
-                    server
-                        .cert
-                        .context("server cert is required for VMess TLS")?,
-                ),
-                Some(server.key.context("server key is required for VMess TLS")?),
+                Some(cert_path),
+                Some(key_path),
+                server.certificates,
+                server.key_pem,
             )
         } else {
-            (None, None)
+            (None, None, Vec::new(), None)
         };
         return run_vmess_server(VmessServerConfig {
             listen: server.listen,
@@ -966,6 +985,8 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             tls,
             cert_path,
             key_path,
+            certificates,
+            key,
             transport: native_vless_transport(
                 server.network.as_deref(),
                 server.path,
@@ -976,16 +997,43 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
         .await;
     }
     ensure_supported_protocol(&server.protocol)?;
+    let (cert_path, key_path) = native_tls_paths(&server, "AnyTLS")?;
     run_server(ServerConfig {
         listen: server.listen,
         password: server.password,
         users: server.users,
-        cert_path: server.cert.context("server cert is required for AnyTLS")?,
-        key_path: server.key.context("server key is required for AnyTLS")?,
+        cert_path,
+        key_path,
+        certificates: server.certificates,
+        key: server.key_pem,
         padding_scheme: server.padding_scheme,
         heartbeat_interval_secs: server.heartbeat_interval_secs,
     })
     .await
+}
+
+fn native_tls_paths(server: &ServerFileConfig, protocol: &str) -> Result<(PathBuf, PathBuf)> {
+    let cert_path = match &server.cert {
+        Some(path) => path.clone(),
+        None => {
+            ensure!(
+                !server.certificates.is_empty(),
+                "server cert or certificate is required for {protocol}"
+            );
+            PathBuf::new()
+        }
+    };
+    let key_path = match &server.key {
+        Some(path) => path.clone(),
+        None => {
+            ensure!(
+                server.key_pem.is_some(),
+                "server key or key_pem is required for {protocol}"
+            );
+            PathBuf::new()
+        }
+    };
+    Ok((cert_path, key_path))
 }
 
 async fn run_client_config(config: RunnableClientConfig) -> Result<()> {

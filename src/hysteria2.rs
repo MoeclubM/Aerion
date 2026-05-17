@@ -71,6 +71,8 @@ pub struct Hysteria2ServerConfig {
     pub users: Vec<String>,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+    pub certificates: Vec<String>,
+    pub key: Option<String>,
     pub obfs: Option<String>,
     pub obfs_password: Option<String>,
     pub udp: bool,
@@ -1180,12 +1182,16 @@ fn build_client_endpoint(config: &Hysteria2ClientConfig, bind_ipv6: bool) -> Res
 }
 
 fn build_server_endpoint(config: &Hysteria2ServerConfig) -> Result<Endpoint> {
+    let (certs, key) = tls::server_identity(
+        tls::present_path(&config.cert_path),
+        tls::present_path(&config.key_path),
+        &config.certificates,
+        config.key.as_deref(),
+        "Hysteria2 server TLS",
+    )?;
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(
-            tls::load_certs(&config.cert_path)?,
-            tls::load_key(&config.key_path)?,
-        )
+        .with_single_cert(certs, key)
         .with_context(|| {
             format!(
                 "build Hysteria2 TLS server config with cert {} and key {}",

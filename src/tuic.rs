@@ -68,6 +68,8 @@ pub struct TuicServerConfig {
     pub users: Vec<String>,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+    pub certificates: Vec<String>,
+    pub key: Option<String>,
     pub udp: bool,
     pub congestion_control: String,
     pub alpn_protocols: Vec<String>,
@@ -1598,12 +1600,16 @@ fn build_client_endpoint(config: &TuicClientConfig, bind_ipv6: bool) -> Result<E
 }
 
 fn build_server_endpoint(config: &TuicServerConfig) -> Result<Endpoint> {
+    let (certs, key) = tls::server_identity(
+        tls::present_path(&config.cert_path),
+        tls::present_path(&config.key_path),
+        &config.certificates,
+        config.key.as_deref(),
+        "TUIC server TLS",
+    )?;
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(
-            tls::load_certs(&config.cert_path)?,
-            tls::load_key(&config.key_path)?,
-        )
+        .with_single_cert(certs, key)
         .with_context(|| {
             format!(
                 "build TUIC TLS server config with cert {} and key {}",
