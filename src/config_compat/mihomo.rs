@@ -10,6 +10,7 @@ use crate::routing::{
 use crate::shadowsocks::ShadowsocksClientConfig;
 use crate::trojan::TrojanClientConfig;
 use crate::tuic::TuicClientConfig;
+use crate::tun::{TunConfig, TunDnsStrategy, socks_proxy_url};
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::VlessClientConfig;
 use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
@@ -37,6 +38,52 @@ pub struct MihomoConfig {
     pub proxies: Vec<MihomoProxy>,
     #[serde(default)]
     pub rules: Vec<String>,
+    #[serde(default)]
+    pub ipv6: bool,
+    #[serde(default)]
+    pub dns: MihomoDnsConfig,
+    #[serde(default)]
+    pub tun: Option<MihomoTunConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct MihomoDnsConfig {
+    #[serde(default, rename = "enhanced-mode", alias = "enhanced_mode")]
+    pub enhanced_mode: Option<String>,
+    #[serde(default, rename = "fake-ip-range", alias = "fake_ip_range")]
+    pub fake_ip_range: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct MihomoTunConfig {
+    #[serde(default)]
+    pub enable: bool,
+    #[serde(
+        default,
+        alias = "interface-name",
+        alias = "interface_name",
+        alias = "tun-name",
+        alias = "tun_name"
+    )]
+    pub device: Option<String>,
+    #[serde(default, rename = "auto-route", alias = "auto_route")]
+    pub auto_route: Option<bool>,
+    #[serde(default)]
+    pub mtu: Option<u16>,
+    #[serde(default, rename = "dns-hijack", alias = "dns_hijack")]
+    pub dns_hijack: Option<OneOrManyStrings>,
+    #[serde(
+        default,
+        rename = "route-exclude-address",
+        alias = "route_exclude_address"
+    )]
+    pub route_exclude_address: Option<OneOrManyStrings>,
+    #[serde(
+        default,
+        rename = "route-exclude-address-set",
+        alias = "route_exclude_address_set"
+    )]
+    pub route_exclude_address_set: Option<OneOrManyStrings>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -581,6 +628,51 @@ impl MihomoConfig {
             table.rules.push(parse_mihomo_route_rule(rule, index)?);
         }
         Ok(table)
+    }
+
+    pub fn tun_enabled(&self) -> bool {
+        self.tun.as_ref().map(|tun| tun.enable).unwrap_or(false)
+    }
+
+    pub fn tun_config(&self, proxy_listen: SocketAddr) -> Result<Option<TunConfig>> {
+        let Some(tun) = &self.tun else {
+            return Ok(None);
+        };
+        if !tun.enable {
+            return Ok(None);
+        }
+        ensure!(
+            tun.route_exclude_address_set.is_none(),
+            "mihomo tun route-exclude-address-set requires rule-set data"
+        );
+        let mut config = TunConfig::new(socks_proxy_url(proxy_listen));
+        config.tun_name = tun.device.as_ref().map(|value| value.trim().to_string());
+        if let Some(auto_route) = tun.auto_route {
+            config.setup = auto_route;
+        }
+        if let Some(mtu) = tun.mtu {
+            config.mtu = mtu;
+        }
+        config.ipv6 = self.ipv6;
+        if self
+            .dns
+            .enhanced_mode
+            .as_deref()
+            .map(|mode| mode.eq_ignore_ascii_case("fake-ip"))
+            .unwrap_or(false)
+        {
+            config.dns = TunDnsStrategy::Virtual;
+        }
+        if let Some(fake_ip_range) = &self.dns.fake_ip_range {
+            config.virtual_dns_pool = fake_ip_range.trim().to_string();
+        }
+        if tun.dns_hijack.is_some() && config.dns == TunDnsStrategy::Direct {
+            config.dns = TunDnsStrategy::OverTcp;
+        }
+        if let Some(bypass) = &tun.route_exclude_address {
+            config.bypass = bypass.to_vec();
+        }
+        Ok(Some(config))
     }
 }
 
@@ -1482,6 +1574,39 @@ rules:
             ),
             RouteDecision::Proxy("proxy-b".to_string())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn compiles_mihomo_tun_config() -> Result<()> {
+        let yaml = r#"
+mixed-port: 7890
+ipv6: true
+dns:
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.0/15
+tun:
+  enable: true
+  device: utun9
+  auto-route: true
+  mtu: 9000
+  dns-hijack:
+    - any:53
+  route-exclude-address:
+    - 10.0.0.0/8
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        assert!(config.tun_enabled());
+        let tun = config
+            .tun_config("127.0.0.1:7890".parse()?)?
+            .context("tun config")?;
+        assert_eq!(tun.proxy_url, "socks5://127.0.0.1:7890");
+        assert_eq!(tun.tun_name.as_deref(), Some("utun9"));
+        assert_eq!(tun.mtu, 9000);
+        assert_eq!(tun.dns, TunDnsStrategy::Virtual);
+        assert_eq!(tun.virtual_dns_pool, "198.18.0.0/15");
+        assert_eq!(tun.bypass, vec!["10.0.0.0/8"]);
+        assert!(tun.ipv6);
         Ok(())
     }
 

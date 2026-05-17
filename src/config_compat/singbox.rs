@@ -11,6 +11,7 @@ use crate::server::ServerConfig;
 use crate::shadowsocks::{ShadowsocksClientConfig, ShadowsocksServerConfig};
 use crate::trojan::{TrojanClientConfig, TrojanServerConfig};
 use crate::tuic::{TuicClientConfig, TuicServerConfig};
+use crate::tun::{TunConfig, socks_proxy_url};
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::{VlessClientConfig, VlessServerConfig};
 use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
@@ -87,6 +88,24 @@ pub struct SingBoxInbound {
     pub listen_port: Option<u16>,
     #[serde(flatten)]
     pub fields: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct SingBoxTunInbound {
+    #[serde(default, rename = "interface_name")]
+    pub interface_name: Option<String>,
+    #[serde(default)]
+    pub mtu: Option<u16>,
+    #[serde(default, rename = "auto_route")]
+    pub auto_route: Option<bool>,
+    #[serde(default, rename = "route_exclude_address")]
+    pub route_exclude_address: Option<Value>,
+    #[serde(default, rename = "route_exclude_address_set")]
+    pub route_exclude_address_set: Option<Value>,
+    #[serde(default)]
+    pub address: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -585,6 +604,52 @@ impl SingBoxConfig {
             .as_ref()
             .map(SingBoxRouteConfig::to_route_table)
             .unwrap_or_else(|| Ok(RouteTable::default()))
+    }
+
+    pub fn tun_enabled(&self) -> bool {
+        self.inbounds
+            .iter()
+            .any(|inbound| inbound.kind.eq_ignore_ascii_case("tun"))
+    }
+
+    pub fn tun_config(&self, proxy_listen: SocketAddr) -> Result<Option<TunConfig>> {
+        let Some(inbound) = self
+            .inbounds
+            .iter()
+            .find(|inbound| inbound.kind.eq_ignore_ascii_case("tun"))
+        else {
+            return Ok(None);
+        };
+        let tun = inbound.decode::<SingBoxTunInbound>()?;
+        ensure!(
+            tun.extra.is_empty(),
+            "sing-box TUN inbound {} has unsupported fields {:?}",
+            inbound.name(),
+            tun.extra.keys().collect::<Vec<_>>()
+        );
+        ensure!(
+            tun.route_exclude_address_set.is_none(),
+            "sing-box TUN inbound {} route_exclude_address_set requires rule-set data",
+            inbound.name()
+        );
+        let mut config = TunConfig::new(socks_proxy_url(proxy_listen));
+        config.tun_name = tun
+            .interface_name
+            .as_ref()
+            .map(|value| value.trim().to_string());
+        if let Some(auto_route) = tun.auto_route {
+            config.setup = auto_route;
+        }
+        if let Some(mtu) = tun.mtu {
+            config.mtu = mtu;
+        }
+        config.bypass = route_value_strings(tun.route_exclude_address.as_ref())?;
+        for value in route_value_strings(tun.address.as_ref())? {
+            if value.contains(':') {
+                config.ipv6 = true;
+            }
+        }
+        Ok(Some(config))
     }
 }
 
@@ -2436,6 +2501,46 @@ mod tests {
             ),
             RouteDecision::Proxy("proxy-b".to_string())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn compiles_singbox_tun_inbound() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun0",
+      "mtu": 9000,
+      "auto_route": true,
+      "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+      "route_exclude_address": ["10.0.0.0/8"]
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "proxy-a",
+      "server": "example.com",
+      "server_port": 8388,
+      "method": "aes-128-gcm",
+      "password": "secret"
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        assert!(config.tun_enabled());
+        let tun = config
+            .tun_config("127.0.0.1:7890".parse()?)?
+            .context("tun config")?;
+        assert_eq!(tun.proxy_url, "socks5://127.0.0.1:7890");
+        assert_eq!(tun.tun_name.as_deref(), Some("tun0"));
+        assert_eq!(tun.mtu, 9000);
+        assert_eq!(tun.bypass, vec!["10.0.0.0/8"]);
+        assert!(tun.ipv6);
         Ok(())
     }
 

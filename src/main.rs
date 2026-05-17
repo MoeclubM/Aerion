@@ -18,10 +18,13 @@ use aerion::{
     ServerConfig, ShadowsocksClientConfig, ShadowsocksServerConfig, SingBoxClientConfig,
     SingBoxOutbound, SingBoxServerConfig, TrojanClientConfig, TrojanServerConfig,
     VlessClientConfig, VlessServerConfig, VmessClientConfig, VmessServerConfig, XrayClientConfig,
-    XrayOutbound, XrayServerConfig, run_client, run_hysteria2_client, run_hysteria2_server,
-    run_mieru_client, run_mieru_server, run_naive_client, run_naive_server, run_server,
-    run_shadowsocks_client, run_shadowsocks_server, run_trojan_client, run_trojan_server,
-    run_tuic_client, run_tuic_server, run_vless_client, run_vless_server, run_vmess_client,
+    XrayOutbound, XrayServerConfig, run_client, run_client_listener, run_hysteria2_client,
+    run_hysteria2_client_listener, run_hysteria2_server, run_mieru_client,
+    run_mieru_client_listener, run_mieru_server, run_naive_client, run_naive_client_listener,
+    run_naive_server, run_server, run_shadowsocks_client, run_shadowsocks_client_listener,
+    run_shadowsocks_server, run_trojan_client, run_trojan_client_listener, run_trojan_server,
+    run_tuic_client, run_tuic_client_listener, run_tuic_server, run_vless_client,
+    run_vless_client_listener, run_vless_server, run_vmess_client, run_vmess_client_listener,
     run_vmess_server, tls,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -29,6 +32,7 @@ use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -609,6 +613,23 @@ async fn run_file_config(
         FileConfig::Server { server } => run_native_server(server, listen).await,
         FileConfig::Aerion(config) => run_aerion_config(config, profile, listen).await,
         FileConfig::Mihomo(config) => {
+            if config.tun_enabled() {
+                let listen = listen
+                    .or(config.local_socks_listen()?)
+                    .unwrap_or("127.0.0.1:0".parse()?);
+                let listener = bind_client_listener("mihomo", listen).await?;
+                let listen = listener.local_addr()?;
+                let proxy = select_mihomo_proxy(&config.proxies, profile)?;
+                let tun = config
+                    .tun_config(listen)?
+                    .context("mihomo TUN is enabled but no TUN config was produced")?;
+                return run_client_config_with_tun(
+                    listener,
+                    proxy.to_client_config(listen)?.into(),
+                    tun,
+                )
+                .await;
+            }
             let listen = listen
                 .or(config.local_socks_listen()?)
                 .context("mihomo config has no mixed-port/socks-port/port; pass --listen")?;
@@ -630,6 +651,23 @@ async fn run_file_config(
             if config.outbounds.is_empty() {
                 let inbound = select_singbox_inbound(&config.inbounds, profile)?;
                 return run_singbox_server_config(inbound.to_server_config()?).await;
+            }
+            if config.tun_enabled() {
+                let listen = listen
+                    .or(config.local_socks_listen()?)
+                    .unwrap_or("127.0.0.1:0".parse()?);
+                let listener = bind_client_listener("sing-box", listen).await?;
+                let listen = listener.local_addr()?;
+                let outbound = select_singbox_outbound(&config.outbounds, profile)?;
+                let tun = config
+                    .tun_config(listen)?
+                    .context("sing-box TUN inbound was found but no TUN config was produced")?;
+                return run_client_config_with_tun(
+                    listener,
+                    outbound.to_client_config(listen)?.into(),
+                    tun,
+                )
+                .await;
             }
             let listen = listen
                 .or(config.local_socks_listen()?)
@@ -1136,6 +1174,48 @@ async fn run_client_config(config: RunnableClientConfig) -> Result<()> {
         RunnableClientConfig::Tuic(config) => run_tuic_client(config).await,
         RunnableClientConfig::Vless(config) => run_vless_client(config).await,
         RunnableClientConfig::Vmess(config) => run_vmess_client(config).await,
+    }
+}
+
+async fn bind_client_listener(format: &str, listen: SocketAddr) -> Result<TcpListener> {
+    TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("bind {format} local SOCKS listener on {listen}"))
+}
+
+async fn run_client_config_with_listener(
+    listener: TcpListener,
+    config: RunnableClientConfig,
+) -> Result<()> {
+    match config {
+        RunnableClientConfig::AnyTls(config) => run_client_listener(listener, config).await,
+        RunnableClientConfig::Hysteria2(config) => {
+            run_hysteria2_client_listener(listener, config).await
+        }
+        RunnableClientConfig::Mieru(config) => run_mieru_client_listener(listener, config).await,
+        RunnableClientConfig::Naive(config) => run_naive_client_listener(listener, config).await,
+        RunnableClientConfig::Shadowsocks(config) => {
+            run_shadowsocks_client_listener(listener, config).await
+        }
+        RunnableClientConfig::Trojan(config) => run_trojan_client_listener(listener, config).await,
+        RunnableClientConfig::Tuic(config) => run_tuic_client_listener(listener, config).await,
+        RunnableClientConfig::Vless(config) => run_vless_client_listener(listener, config).await,
+        RunnableClientConfig::Vmess(config) => run_vmess_client_listener(listener, config).await,
+    }
+}
+
+async fn run_client_config_with_tun(
+    listener: TcpListener,
+    config: RunnableClientConfig,
+    tun: TunConfig,
+) -> Result<()> {
+    let shutdown = TunCancellationToken::new();
+    tokio::select! {
+        result = run_client_config_with_listener(listener, config) => {
+            shutdown.cancel();
+            result
+        }
+        result = run_tun(tun, shutdown.clone()) => result.map(|_| ()),
     }
 }
 
