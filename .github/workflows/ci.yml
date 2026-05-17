@@ -55,4 +55,19 @@ jobs:
       - name: Check iOS simulator target
         run: cargo check --locked --target aarch64-apple-ios-sim
 
+  android-check:
+    name: Android target check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Check Android arm64 target
+        run: cargo check --locked --target aarch64-linux-android
+
 
