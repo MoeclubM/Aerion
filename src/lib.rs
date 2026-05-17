@@ -10,6 +10,7 @@ pub mod padding;
 pub mod protocol;
 pub mod reality;
 pub mod reality_tls_client;
+pub mod router;
 pub mod routing;
 pub mod server;
 pub mod shadowsocks;
@@ -57,6 +58,7 @@ pub use reality::{
     BuiltRealityClientHello, RealityClientConfig, RealityServerConfig, build_reality_client_hello,
     build_reality_client_hello_with_alpn,
 };
+pub use router::{RouteProxyConfig, run_route_proxy};
 pub use routing::{
     DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
 };

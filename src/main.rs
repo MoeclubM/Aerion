@@ -15,24 +15,25 @@ use aerion::tun::{
 use aerion::vless_transport::VlessTransportConfig;
 use aerion::{
     ClientConfig, MihomoClientConfig, MihomoProxy, RealityClientConfig, RealityServerConfig,
-    ServerConfig, ShadowsocksClientConfig, ShadowsocksServerConfig, SingBoxClientConfig,
-    SingBoxOutbound, SingBoxServerConfig, TrojanClientConfig, TrojanServerConfig,
-    VlessClientConfig, VlessServerConfig, VmessClientConfig, VmessServerConfig, XrayClientConfig,
-    XrayOutbound, XrayServerConfig, run_client, run_client_listener, run_hysteria2_client,
-    run_hysteria2_client_listener, run_hysteria2_server, run_mieru_client,
-    run_mieru_client_listener, run_mieru_server, run_naive_client, run_naive_client_listener,
-    run_naive_server, run_server, run_shadowsocks_client, run_shadowsocks_client_listener,
-    run_shadowsocks_server, run_trojan_client, run_trojan_client_listener, run_trojan_server,
-    run_tuic_client, run_tuic_client_listener, run_tuic_server, run_vless_client,
-    run_vless_client_listener, run_vless_server, run_vmess_client, run_vmess_client_listener,
-    run_vmess_server, tls,
+    RouteDecision, RouteProxyConfig, RouteTable, ServerConfig, ShadowsocksClientConfig,
+    ShadowsocksServerConfig, SingBoxClientConfig, SingBoxOutbound, SingBoxServerConfig,
+    TrojanClientConfig, TrojanServerConfig, VlessClientConfig, VlessServerConfig,
+    VmessClientConfig, VmessServerConfig, XrayClientConfig, XrayOutbound, XrayServerConfig,
+    run_client, run_client_listener, run_hysteria2_client, run_hysteria2_client_listener,
+    run_hysteria2_server, run_mieru_client, run_mieru_client_listener, run_mieru_server,
+    run_naive_client, run_naive_client_listener, run_naive_server, run_route_proxy, run_server,
+    run_shadowsocks_client, run_shadowsocks_client_listener, run_shadowsocks_server,
+    run_trojan_client, run_trojan_client_listener, run_trojan_server, run_tuic_client,
+    run_tuic_client_listener, run_tuic_server, run_vless_client, run_vless_client_listener,
+    run_vless_server, run_vmess_client, run_vmess_client_listener, run_vmess_server, tls,
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -613,6 +614,9 @@ async fn run_file_config(
         FileConfig::Server { server } => run_native_server(server, listen).await,
         FileConfig::Aerion(config) => run_aerion_config(config, profile, listen).await,
         FileConfig::Mihomo(config) => {
+            if profile.is_none() && !config.rules.is_empty() {
+                return run_mihomo_route_config(config, listen).await;
+            }
             if config.tun_enabled() {
                 let listen = listen
                     .or(config.local_socks_listen()?)
@@ -641,6 +645,9 @@ async fn run_file_config(
                 let inbound = select_xray_inbound(&config.inbounds, profile)?;
                 return run_xray_server_config(inbound.to_server_config()?).await;
             }
+            if profile.is_none() && !config.routing.rules.is_empty() {
+                return run_xray_route_config(config, listen).await;
+            }
             let listen = listen
                 .or(config.local_socks_listen()?)
                 .context("xray config has no socks inbound; pass --listen")?;
@@ -651,6 +658,15 @@ async fn run_file_config(
             if config.outbounds.is_empty() {
                 let inbound = select_singbox_inbound(&config.inbounds, profile)?;
                 return run_singbox_server_config(inbound.to_server_config()?).await;
+            }
+            if profile.is_none()
+                && config
+                    .route
+                    .as_ref()
+                    .map(|route| !route.rules.is_empty() || route.final_outbound.is_some())
+                    .unwrap_or(false)
+            {
+                return run_singbox_route_config(config, listen).await;
             }
             if config.tun_enabled() {
                 let listen = listen
@@ -676,6 +692,128 @@ async fn run_file_config(
             run_client_config(outbound.to_client_config(listen)?.into()).await
         }
     }
+}
+
+async fn run_mihomo_route_config(
+    config: aerion::MihomoConfig,
+    listen: Option<SocketAddr>,
+) -> Result<()> {
+    let routes = config.route_table()?;
+    let listen = listen
+        .or(config.local_socks_listen()?)
+        .or_else(|| config.tun_enabled().then(ephemeral_loopback))
+        .context("mihomo route config has no mixed-port/socks-port/port; pass --listen")?;
+    let router_listener = bind_client_listener("mihomo route", listen).await?;
+    let router_listen = router_listener.local_addr()?;
+    let (outbound_tx, outbound_rx) = mpsc::channel(8);
+    let mut upstreams = BTreeMap::new();
+    for tag in route_proxy_tags(&routes) {
+        let listener = bind_client_listener(
+            &format!("mihomo route outbound {tag}"),
+            ephemeral_loopback(),
+        )
+        .await?;
+        let upstream = listener.local_addr()?;
+        let proxy = config
+            .proxy(&tag)
+            .with_context(|| format!("mihomo route outbound {tag} was not found"))?;
+        let runnable = proxy.to_client_config(upstream)?.into();
+        spawn_route_outbound(tag.clone(), listener, runnable, outbound_tx.clone());
+        upstreams.insert(tag, upstream);
+    }
+    let tun = if config.tun_enabled() {
+        Some(
+            config
+                .tun_config(router_listen)?
+                .context("mihomo TUN is enabled but no TUN config was produced")?,
+        )
+    } else {
+        None
+    };
+    run_route_stack(
+        router_listener,
+        RouteProxyConfig { routes, upstreams },
+        tun,
+        outbound_rx,
+    )
+    .await
+}
+
+async fn run_singbox_route_config(
+    config: aerion::SingBoxConfig,
+    listen: Option<SocketAddr>,
+) -> Result<()> {
+    let routes = config.route_table()?;
+    let listen = listen
+        .or(config.local_socks_listen()?)
+        .or_else(|| config.tun_enabled().then(ephemeral_loopback))
+        .context("sing-box route config has no mixed/socks inbound; pass --listen")?;
+    let router_listener = bind_client_listener("sing-box route", listen).await?;
+    let router_listen = router_listener.local_addr()?;
+    let (outbound_tx, outbound_rx) = mpsc::channel(8);
+    let mut upstreams = BTreeMap::new();
+    for tag in route_proxy_tags(&routes) {
+        let listener = bind_client_listener(
+            &format!("sing-box route outbound {tag}"),
+            ephemeral_loopback(),
+        )
+        .await?;
+        let upstream = listener.local_addr()?;
+        let outbound = config
+            .outbound(&tag)
+            .with_context(|| format!("sing-box route outbound {tag} was not found"))?;
+        let runnable = outbound.to_client_config(upstream)?.into();
+        spawn_route_outbound(tag.clone(), listener, runnable, outbound_tx.clone());
+        upstreams.insert(tag, upstream);
+    }
+    let tun = if config.tun_enabled() {
+        Some(
+            config
+                .tun_config(router_listen)?
+                .context("sing-box TUN inbound was found but no TUN config was produced")?,
+        )
+    } else {
+        None
+    };
+    run_route_stack(
+        router_listener,
+        RouteProxyConfig { routes, upstreams },
+        tun,
+        outbound_rx,
+    )
+    .await
+}
+
+async fn run_xray_route_config(
+    config: aerion::XrayConfig,
+    listen: Option<SocketAddr>,
+) -> Result<()> {
+    let routes = config.route_table()?;
+    let listen = listen
+        .or(config.local_socks_listen()?)
+        .context("xray route config has no socks inbound; pass --listen")?;
+    let router_listener = bind_client_listener("xray route", listen).await?;
+    let (outbound_tx, outbound_rx) = mpsc::channel(8);
+    let mut upstreams = BTreeMap::new();
+    for tag in route_proxy_tags(&routes) {
+        let listener =
+            bind_client_listener(&format!("xray route outbound {tag}"), ephemeral_loopback())
+                .await?;
+        let upstream = listener.local_addr()?;
+        let outbound = config
+            .outbound(&tag)
+            .with_context(|| format!("xray route outbound {tag} was not found"))?;
+        let runnable = outbound.to_client_config(upstream)?.into();
+        spawn_route_outbound(tag.clone(), listener, runnable, outbound_tx.clone());
+        upstreams.insert(tag, upstream);
+    }
+    run_route_stack(
+        router_listener,
+        RouteProxyConfig { routes, upstreams },
+        None,
+        outbound_rx,
+    )
+    .await
 }
 
 async fn run_aerion_config(
@@ -1217,6 +1355,71 @@ async fn run_client_config_with_tun(
         }
         result = run_tun(tun, shutdown.clone()) => result.map(|_| ()),
     }
+}
+
+fn route_proxy_tags(routes: &RouteTable) -> Vec<String> {
+    let mut tags = BTreeSet::new();
+    for rule in &routes.rules {
+        if let RouteDecision::Proxy(tag) = &rule.action {
+            tags.insert(tag.clone());
+        }
+    }
+    if let RouteDecision::Proxy(tag) = &routes.default {
+        tags.insert(tag.clone());
+    }
+    tags.into_iter().collect()
+}
+
+fn spawn_route_outbound(
+    tag: String,
+    listener: TcpListener,
+    config: RunnableClientConfig,
+    exit_tx: mpsc::Sender<(String, std::result::Result<(), String>)>,
+) {
+    tokio::spawn(async move {
+        let result = run_client_config_with_listener(listener, config)
+            .await
+            .map_err(|error| format!("{error:?}"));
+        let _ = exit_tx.send((tag, result)).await;
+    });
+}
+
+async fn run_route_stack(
+    listener: TcpListener,
+    config: RouteProxyConfig,
+    tun: Option<TunConfig>,
+    mut outbound_rx: mpsc::Receiver<(String, std::result::Result<(), String>)>,
+) -> Result<()> {
+    if let Some(tun) = tun {
+        let shutdown = TunCancellationToken::new();
+        return tokio::select! {
+            result = run_route_proxy(listener, config) => {
+                shutdown.cancel();
+                result
+            }
+            result = run_tun(tun, shutdown.clone()) => result.map(|_| ()),
+            ended = outbound_rx.recv() => {
+                shutdown.cancel();
+                route_outbound_result(ended)
+            }
+        };
+    }
+    tokio::select! {
+        result = run_route_proxy(listener, config) => result,
+        ended = outbound_rx.recv() => route_outbound_result(ended),
+    }
+}
+
+fn route_outbound_result(ended: Option<(String, std::result::Result<(), String>)>) -> Result<()> {
+    let (tag, result) = ended.context("route outbound task channel closed")?;
+    match result {
+        Ok(()) => bail!("route outbound {tag} exited"),
+        Err(error) => bail!("route outbound {tag} failed: {error}"),
+    }
+}
+
+fn ephemeral_loopback() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)
 }
 
 async fn run_singbox_server_config(config: SingBoxServerConfig) -> Result<()> {

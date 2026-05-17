@@ -86,6 +86,107 @@ pub async fn write_reply(stream: &mut TcpStream, code: u8) -> Result<()> {
     .await
 }
 
+pub async fn connect_tcp(upstream: SocketAddr, target: &ProxyTarget) -> Result<TcpStream> {
+    let mut stream = TcpStream::connect(upstream)
+        .await
+        .with_context(|| format!("connect SOCKS upstream {upstream}"))?;
+    stream
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .context("write SOCKS greeting")?;
+    let mut method = [0u8; 2];
+    stream
+        .read_exact(&mut method)
+        .await
+        .context("read SOCKS method response")?;
+    ensure!(
+        method == [0x05, 0x00],
+        "SOCKS upstream {upstream} rejected no-auth method"
+    );
+    write_connect_request(&mut stream, target).await?;
+    read_connect_reply(&mut stream, upstream).await?;
+    Ok(stream)
+}
+
+async fn write_connect_request(stream: &mut TcpStream, target: &ProxyTarget) -> Result<()> {
+    let mut request = vec![0x05, 0x01, 0x00];
+    match target {
+        ProxyTarget::Ip(addr) => match addr.ip() {
+            IpAddr::V4(ip) => {
+                request.push(0x01);
+                request.extend_from_slice(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                request.push(0x04);
+                request.extend_from_slice(&ip.octets());
+            }
+        },
+        ProxyTarget::Domain(host, _) => {
+            ensure!(
+                host.len() <= u8::MAX as usize,
+                "SOCKS domain target is too long: {host}"
+            );
+            request.push(0x03);
+            request.push(host.len() as u8);
+            request.extend_from_slice(host.as_bytes());
+        }
+    }
+    request.extend_from_slice(&target_port(target).to_be_bytes());
+    stream
+        .write_all(&request)
+        .await
+        .context("write SOCKS connect request")
+}
+
+async fn read_connect_reply(stream: &mut TcpStream, upstream: SocketAddr) -> Result<()> {
+    let mut header = [0u8; 4];
+    stream
+        .read_exact(&mut header)
+        .await
+        .context("read SOCKS connect reply")?;
+    ensure!(header[0] == 0x05, "invalid SOCKS reply version");
+    ensure!(
+        header[1] == 0x00,
+        "SOCKS upstream {upstream} connect failed with code {}",
+        header[1]
+    );
+    match header[3] {
+        0x01 => {
+            let mut bound = [0u8; 4];
+            stream
+                .read_exact(&mut bound)
+                .await
+                .context("read SOCKS IPv4 bind address")?;
+        }
+        0x03 => {
+            let mut length = [0u8; 1];
+            stream
+                .read_exact(&mut length)
+                .await
+                .context("read SOCKS domain bind length")?;
+            let mut bound = vec![0u8; length[0] as usize];
+            stream
+                .read_exact(&mut bound)
+                .await
+                .context("read SOCKS domain bind address")?;
+        }
+        0x04 => {
+            let mut bound = [0u8; 16];
+            stream
+                .read_exact(&mut bound)
+                .await
+                .context("read SOCKS IPv6 bind address")?;
+        }
+        other => bail!("unsupported SOCKS bind address type: {other}"),
+    }
+    let mut port = [0u8; 2];
+    stream
+        .read_exact(&mut port)
+        .await
+        .context("read SOCKS bind port")?;
+    Ok(())
+}
+
 pub async fn write_reply_with_bind(
     stream: &mut TcpStream,
     code: u8,
@@ -117,4 +218,11 @@ async fn read_port(stream: &mut TcpStream) -> Result<u16> {
         .await
         .context("read SOCKS target port")?;
     Ok(u16::from_be_bytes(port))
+}
+
+fn target_port(target: &ProxyTarget) -> u16 {
+    match target {
+        ProxyTarget::Ip(addr) => addr.port(),
+        ProxyTarget::Domain(_, port) => *port,
+    }
 }
