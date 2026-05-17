@@ -238,6 +238,7 @@ async fn main() -> Result<()> {
                 ca_cert_paths: Vec::new(),
                 ca_certificates: Vec::new(),
                 disable_system_roots: false,
+                pinned_cert_sha256: Vec::new(),
                 padding_scheme: if padding_scheme.is_empty() {
                     PaddingScheme::default_lines()
                 } else {
@@ -298,6 +299,7 @@ async fn main() -> Result<()> {
                 ca_cert_paths,
                 ca_certificates: Vec::new(),
                 disable_system_roots: false,
+                pinned_cert_sha256: Vec::new(),
                 obfs,
                 obfs_password,
                 download_bandwidth,
@@ -405,6 +407,7 @@ async fn main() -> Result<()> {
                 ca_cert_paths: Vec::new(),
                 ca_certificates: Vec::new(),
                 disable_system_roots: false,
+                pinned_cert_sha256: Vec::new(),
                 udp,
                 udp_relay_mode,
                 congestion_control,
@@ -595,6 +598,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             ca_cert_paths: client.ca_cert_paths,
             ca_certificates: client.ca_certificates,
             disable_system_roots: client.disable_system_roots,
+            pinned_cert_sha256: client.pinned_cert_sha256,
             obfs: client.obfs,
             obfs_password: client.obfs_password,
             download_bandwidth: client.download_bandwidth,
@@ -632,6 +636,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             ca_cert_paths: client.ca_cert_paths,
             ca_certificates: client.ca_certificates,
             disable_system_roots: client.disable_system_roots,
+            pinned_cert_sha256: client.pinned_cert_sha256,
             udp: client.udp,
             udp_relay_mode: client.udp_relay_mode,
             congestion_control: client.congestion_control,
@@ -652,6 +657,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             ca_cert_paths: client.ca_cert_paths,
             ca_certificates: client.ca_certificates,
             disable_system_roots: client.disable_system_roots,
+            pinned_cert_sha256: client.pinned_cert_sha256,
             extra_headers: client.headers.into_iter().collect(),
             udp_over_tcp: client.udp_over_tcp,
             quic: client.transport.eq_ignore_ascii_case("quic")
@@ -685,6 +691,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             ca_cert_paths: client.ca_cert_paths,
             ca_certificates: client.ca_certificates,
             disable_system_roots: client.disable_system_roots,
+            pinned_cert_sha256: client.pinned_cert_sha256,
             udp: client.udp,
             client_fingerprint: client.client_fingerprint,
             transport: native_vless_transport(
@@ -720,6 +727,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             ca_cert_paths: client.ca_cert_paths,
             ca_certificates: client.ca_certificates,
             disable_system_roots: client.disable_system_roots,
+            pinned_cert_sha256: client.pinned_cert_sha256,
             flow: client.flow,
             packet_encoding: client.packet_encoding,
             mux: client.mux,
@@ -750,6 +758,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             ca_cert_paths: client.ca_cert_paths,
             ca_certificates: client.ca_certificates,
             disable_system_roots: client.disable_system_roots,
+            pinned_cert_sha256: client.pinned_cert_sha256,
             client_fingerprint: client.client_fingerprint,
             transport: native_vless_transport(
                 client.network.as_deref(),
@@ -771,6 +780,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
         ca_cert_paths: client.ca_cert_paths,
         ca_certificates: client.ca_certificates,
         disable_system_roots: client.disable_system_roots,
+        pinned_cert_sha256: client.pinned_cert_sha256,
         padding_scheme: client.padding_scheme,
         heartbeat_interval_secs: client.heartbeat_interval_secs,
     })

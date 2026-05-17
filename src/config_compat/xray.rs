@@ -375,6 +375,13 @@ pub struct XrayTlsSettings {
     pub alpn: Option<OneOrManyStrings>,
     #[serde(default, rename = "disableSystemRoot", alias = "disable_system_root")]
     pub disable_system_root: bool,
+    #[serde(
+        default,
+        rename = "pinnedPeerCertSha256",
+        alias = "pinned_peer_cert_sha256",
+        alias = "pinnedPeerCertificateChainSha256"
+    )]
+    pub pinned_peer_cert_sha256: Option<String>,
     #[serde(default)]
     pub certificates: Vec<XrayCertificate>,
 }
@@ -1231,6 +1238,7 @@ impl XrayOutbound {
             ca_cert_paths,
             ca_certificates,
             disable_system_roots: xray_disable_system_roots(tls, tls_enabled),
+            pinned_cert_sha256: xray_pinned_cert_sha256(tls, tls_enabled),
             flow: peer
                 .user
                 .flow
@@ -1352,6 +1360,7 @@ impl XrayOutbound {
             ca_cert_paths,
             ca_certificates,
             disable_system_roots: xray_disable_system_roots(tls, tls_enabled),
+            pinned_cert_sha256: xray_pinned_cert_sha256(tls, tls_enabled),
             client_fingerprint: if tls_enabled {
                 tls.and_then(|settings| settings.fingerprint)
             } else {
@@ -1390,6 +1399,7 @@ impl XrayOutbound {
             ca_cert_paths,
             ca_certificates,
             disable_system_roots: xray_disable_system_roots(tls, true),
+            pinned_cert_sha256: xray_pinned_cert_sha256(tls, true),
             udp: true,
             client_fingerprint: tls.and_then(|settings| settings.fingerprint),
             transport,
@@ -1583,6 +1593,7 @@ impl XrayOutbound {
             ca_cert_paths,
             ca_certificates,
             disable_system_roots: xray_disable_system_roots(tls, true),
+            pinned_cert_sha256: xray_pinned_cert_sha256(tls, true),
             obfs,
             obfs_password,
             download_bandwidth,
@@ -1963,6 +1974,15 @@ fn xray_disable_system_roots(tls: Option<&XrayTlsSettings>, tls_enabled: bool) -
         && tls
             .map(|settings| settings.disable_system_root)
             .unwrap_or(false)
+}
+
+fn xray_pinned_cert_sha256(tls: Option<&XrayTlsSettings>, tls_enabled: bool) -> Vec<String> {
+    if !tls_enabled {
+        return Vec::new();
+    }
+    tls.and_then(|settings| settings.pinned_peer_cert_sha256.clone())
+        .into_iter()
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -2566,6 +2586,7 @@ mod tests {
       "tlsSettings": {
         "serverName": "vmess.example.com",
         "disableSystemRoot": true,
+        "pinnedPeerCertSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "certificates": [
           { "usage": "verify", "certificateFile": "vmess-ca.pem" },
           { "usage": "verify", "certificate": ["vmess-inline-ca"] },
@@ -2587,6 +2608,10 @@ mod tests {
         assert_eq!(vmess.ca_cert_paths, vec![PathBuf::from("vmess-ca.pem")]);
         assert_eq!(vmess.ca_certificates, vec!["vmess-inline-ca"]);
         assert!(vmess.disable_system_roots);
+        assert_eq!(
+            vmess.pinned_cert_sha256,
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+        );
         Ok(())
     }
 

@@ -52,6 +52,7 @@ pub struct TuicClientConfig {
     pub ca_cert_paths: Vec<PathBuf>,
     pub ca_certificates: Vec<String>,
     pub disable_system_roots: bool,
+    pub pinned_cert_sha256: Vec<String>,
     pub udp: bool,
     pub udp_relay_mode: String,
     pub congestion_control: String,
@@ -1567,14 +1568,13 @@ async fn resolve_host_addr(host: &str, port: u16) -> Result<SocketAddr> {
 }
 
 fn build_client_endpoint(config: &TuicClientConfig, bind_ipv6: bool) -> Result<Endpoint> {
-    let mut tls = Arc::unwrap_or_clone(
-        tls::client_config_with_custom_root_material_and_system_roots(
-            config.insecure,
-            &config.ca_cert_paths,
-            &config.ca_certificates,
-            config.disable_system_roots,
-        )?,
-    );
+    let mut tls = Arc::unwrap_or_clone(tls::client_config_with_custom_root_material_options(
+        config.insecure,
+        &config.ca_cert_paths,
+        &config.ca_certificates,
+        config.disable_system_roots,
+        &config.pinned_cert_sha256,
+    )?);
     tls.alpn_protocols = alpn_protocols(&config.alpn_protocols);
     let quic_tls =
         QuicClientConfig::try_from(Arc::new(tls)).context("build TUIC QUIC TLS client config")?;

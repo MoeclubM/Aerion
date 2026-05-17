@@ -56,6 +56,7 @@ pub struct Hysteria2ClientConfig {
     pub ca_cert_paths: Vec<PathBuf>,
     pub ca_certificates: Vec<String>,
     pub disable_system_roots: bool,
+    pub pinned_cert_sha256: Vec<String>,
     pub obfs: Option<String>,
     pub obfs_password: Option<String>,
     pub download_bandwidth: Option<u64>,
@@ -1113,6 +1114,13 @@ fn build_client_endpoint(config: &Hysteria2ClientConfig, bind_ipv6: bool) -> Res
         rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(tls::InsecureVerifier))
+            .with_no_client_auth()
+    } else if !config.pinned_cert_sha256.is_empty() {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(
+                tls::CertificatePinsVerifier::from_sha256_values(&config.pinned_cert_sha256)?,
+            ))
             .with_no_client_auth()
     } else {
         let mut roots = RootCertStore::empty();

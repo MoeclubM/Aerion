@@ -90,6 +90,15 @@ pub struct ClientFileConfig {
         alias = "disableSystemRoot"
     )]
     pub disable_system_roots: bool,
+    #[serde(
+        default,
+        alias = "pinned-peer-cert-sha256",
+        alias = "pinned_peer_cert_sha256",
+        alias = "pinnedPeerCertSha256",
+        alias = "certificate-sha256",
+        alias = "certificateSha256"
+    )]
+    pub pinned_cert_sha256: Vec<String>,
     #[serde(default)]
     pub tls: Option<bool>,
     #[serde(default, alias = "cipher")]

@@ -142,6 +142,114 @@ impl ServerCertVerifier for CertificateFingerprintVerifier {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct CertificatePinsVerifier {
+    fingerprints: Vec<[u8; 32]>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl CertificatePinsVerifier {
+    pub(crate) fn from_sha256_values(values: &[String]) -> Result<Self> {
+        Ok(Self {
+            fingerprints: parse_certificate_sha256_pins(values)?,
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+        })
+    }
+}
+
+impl ServerCertVerifier for CertificatePinsVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, RustlsError> {
+        let digest = Sha256::digest(end_entity.as_ref());
+        if self
+            .fingerprints
+            .iter()
+            .any(|fingerprint| digest.as_slice() == fingerprint.as_slice())
+        {
+            return Ok(ServerCertVerified::assertion());
+        }
+        Err(RustlsError::General(
+            "server certificate SHA-256 pin mismatch".to_string(),
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+pub(crate) fn parse_certificate_sha256_pins(values: &[String]) -> Result<Vec<[u8; 32]>> {
+    let mut fingerprints = Vec::new();
+    for value in values {
+        for value in value.split(',') {
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            let value = if value
+                .get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sha256:"))
+            {
+                &value[7..]
+            } else {
+                value
+            };
+            let value = value
+                .chars()
+                .filter(|ch| !ch.is_ascii_whitespace() && *ch != ':')
+                .collect::<String>();
+            ensure!(
+                value.len() == 64,
+                "certificate SHA-256 pin must be a hex digest"
+            );
+            let bytes = hex::decode(&value).context("decode certificate SHA-256 pin")?;
+            fingerprints.push(
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("certificate SHA-256 pin length is invalid"))?,
+            );
+        }
+    }
+    Ok(fingerprints)
+}
+
 fn supported_signature_schemes() -> Vec<SignatureScheme> {
     vec![
         SignatureScheme::ECDSA_NISTP256_SHA256,
@@ -215,12 +323,29 @@ pub fn client_config_with_custom_root_material_and_system_roots(
     ca_certificates: &[String],
     disable_system_roots: bool,
 ) -> Result<Arc<ClientConfig>> {
-    client_config_with_fingerprint_and_custom_root_material_and_system_roots(
+    client_config_with_custom_root_material_options(
+        insecure,
+        ca_cert_paths,
+        ca_certificates,
+        disable_system_roots,
+        &[],
+    )
+}
+
+pub fn client_config_with_custom_root_material_options(
+    insecure: bool,
+    ca_cert_paths: &[PathBuf],
+    ca_certificates: &[String],
+    disable_system_roots: bool,
+    pinned_cert_sha256: &[String],
+) -> Result<Arc<ClientConfig>> {
+    client_config_with_fingerprint_and_custom_root_material_options(
         insecure,
         None,
         ca_cert_paths,
         ca_certificates,
         disable_system_roots,
+        pinned_cert_sha256,
     )
 }
 
@@ -243,6 +368,22 @@ pub fn client_config_with_custom_root_material_early_data_and_system_roots(
     ca_certificates: &[String],
     disable_system_roots: bool,
 ) -> Result<Arc<ClientConfig>> {
+    client_config_with_custom_root_material_early_data_options(
+        insecure,
+        ca_cert_paths,
+        ca_certificates,
+        disable_system_roots,
+        &[],
+    )
+}
+
+pub fn client_config_with_custom_root_material_early_data_options(
+    insecure: bool,
+    ca_cert_paths: &[PathBuf],
+    ca_certificates: &[String],
+    disable_system_roots: bool,
+    pinned_cert_sha256: &[String],
+) -> Result<Arc<ClientConfig>> {
     build_client_config_with_custom_roots(
         insecure,
         None,
@@ -250,6 +391,7 @@ pub fn client_config_with_custom_root_material_early_data_and_system_roots(
         ca_cert_paths,
         ca_certificates,
         disable_system_roots,
+        pinned_cert_sha256,
     )
 }
 
@@ -288,6 +430,24 @@ pub fn client_config_with_fingerprint_and_custom_root_material_and_system_roots(
     ca_certificates: &[String],
     disable_system_roots: bool,
 ) -> Result<Arc<ClientConfig>> {
+    client_config_with_fingerprint_and_custom_root_material_options(
+        insecure,
+        fingerprint,
+        ca_cert_paths,
+        ca_certificates,
+        disable_system_roots,
+        &[],
+    )
+}
+
+pub fn client_config_with_fingerprint_and_custom_root_material_options(
+    insecure: bool,
+    fingerprint: Option<UtlsFingerprint>,
+    ca_cert_paths: &[PathBuf],
+    ca_certificates: &[String],
+    disable_system_roots: bool,
+    pinned_cert_sha256: &[String],
+) -> Result<Arc<ClientConfig>> {
     build_client_config_with_custom_roots(
         insecure,
         fingerprint,
@@ -295,6 +455,7 @@ pub fn client_config_with_fingerprint_and_custom_root_material_and_system_roots(
         ca_cert_paths,
         ca_certificates,
         disable_system_roots,
+        pinned_cert_sha256,
     )
 }
 
@@ -305,9 +466,25 @@ fn build_client_config_with_custom_roots(
     ca_cert_paths: &[PathBuf],
     ca_certificates: &[String],
     disable_system_roots: bool,
+    pinned_cert_sha256: &[String],
 ) -> Result<Arc<ClientConfig>> {
-    if (ca_cert_paths.is_empty() && ca_certificates.is_empty() && !disable_system_roots) || insecure
-    {
+    if insecure {
+        return Ok(build_client_config(insecure, fingerprint, early_data));
+    }
+    if !pinned_cert_sha256.is_empty() {
+        let mut config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(
+                CertificatePinsVerifier::from_sha256_values(pinned_cert_sha256)?,
+            ))
+            .with_no_client_auth();
+        config.alpn_protocols = fingerprint
+            .map(UtlsFingerprint::rustls_alpn_protocols)
+            .unwrap_or_default();
+        config.enable_early_data = early_data;
+        return Ok(Arc::new(config));
+    }
+    if ca_cert_paths.is_empty() && ca_certificates.is_empty() && !disable_system_roots {
         return Ok(build_client_config(insecure, fingerprint, early_data));
     }
     let mut roots = RootCertStore::empty();

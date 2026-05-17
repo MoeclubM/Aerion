@@ -1330,6 +1330,7 @@ impl SingBoxVlessOutbound {
                     .as_ref()
                     .map(|tls| tls.disable_system_root)
                     .unwrap_or(false),
+            pinned_cert_sha256: Vec::new(),
             flow: self.flow.clone(),
             packet_encoding: self
                 .packet_encoding
@@ -1406,6 +1407,7 @@ impl SingBoxVmessOutbound {
                     .as_ref()
                     .map(|tls| tls.disable_system_root)
                     .unwrap_or(false),
+            pinned_cert_sha256: Vec::new(),
             client_fingerprint: if tls_enabled {
                 self.tls
                     .as_ref()
@@ -1449,6 +1451,7 @@ impl SingBoxTrojanOutbound {
             ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
             ca_certificates: value_strings(tls.certificate.as_ref())?,
             disable_system_roots: tls.disable_system_root,
+            pinned_cert_sha256: Vec::new(),
             udp: network_allows_udp(self.network.as_deref()),
             client_fingerprint: tls.utls_fingerprint(name)?,
             transport,
@@ -1533,6 +1536,7 @@ impl SingBoxHysteria2Outbound {
             ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
             ca_certificates: value_strings(tls.certificate.as_ref())?,
             disable_system_roots: tls.disable_system_root,
+            pinned_cert_sha256: Vec::new(),
             obfs,
             obfs_password,
             download_bandwidth: self.down_mbps.or(self.down),
@@ -1563,6 +1567,7 @@ impl SingBoxAnyTlsOutbound {
             ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
             ca_certificates: value_strings(tls.certificate.as_ref())?,
             disable_system_roots: tls.disable_system_root,
+            pinned_cert_sha256: Vec::new(),
             padding_scheme: PaddingScheme::default_lines(),
             heartbeat_interval_secs: 30,
         })
@@ -1596,6 +1601,7 @@ impl SingBoxNaiveOutbound {
             ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
             ca_certificates: value_strings(tls.certificate.as_ref())?,
             disable_system_roots: tls.disable_system_root,
+            pinned_cert_sha256: Vec::new(),
             extra_headers: self.extra_headers.clone().into_iter().collect(),
             udp_over_tcp,
             quic: self.quic
@@ -1654,6 +1660,7 @@ impl SingBoxTuicOutbound {
             ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
             ca_certificates: value_strings(tls.certificate.as_ref())?,
             disable_system_roots: tls.disable_system_root,
+            pinned_cert_sha256: Vec::new(),
             udp: network_allows_udp(self.network.as_deref()),
             udp_relay_mode: self
                 .udp_relay_mode

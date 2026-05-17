@@ -36,6 +36,7 @@ pub struct VlessClientConfig {
     pub ca_cert_paths: Vec<PathBuf>,
     pub ca_certificates: Vec<String>,
     pub disable_system_roots: bool,
+    pub pinned_cert_sha256: Vec<String>,
     pub flow: String,
     pub packet_encoding: String,
     pub mux: bool,
@@ -357,12 +358,13 @@ async fn connect_vless_server(config: &VlessClientConfig) -> Result<BoxedVlessSt
         return apply_client_transport(tcp, config).await;
     }
     let mut client_config = Arc::unwrap_or_clone(
-        tls::client_config_with_fingerprint_and_custom_root_material_and_system_roots(
+        tls::client_config_with_fingerprint_and_custom_root_material_options(
             config.insecure,
             config.client_fingerprint,
             &config.ca_cert_paths,
             &config.ca_certificates,
             config.disable_system_roots,
+            &config.pinned_cert_sha256,
         )?,
     );
     let alpn = config.transport.alpn_protocols();
