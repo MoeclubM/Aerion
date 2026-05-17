@@ -4,6 +4,9 @@ use crate::mieru::{MieruClientConfig, MieruTrafficPattern, MieruTransport};
 use crate::naive::{NaiveClientConfig, default_naive_quic_congestion_control};
 use crate::padding::PaddingScheme;
 use crate::reality::RealityClientConfig;
+use crate::routing::{
+    DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
+};
 use crate::shadowsocks::ShadowsocksClientConfig;
 use crate::trojan::TrojanClientConfig;
 use crate::tuic::TuicClientConfig;
@@ -32,6 +35,8 @@ pub struct MihomoConfig {
     pub bind_address: Option<String>,
     #[serde(default)]
     pub proxies: Vec<MihomoProxy>,
+    #[serde(default)]
+    pub rules: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -568,6 +573,14 @@ impl MihomoConfig {
                 .with_context(|| format!("parse mihomo bind-address {value}"))?,
         };
         Ok(Some(SocketAddr::new(ip, port)))
+    }
+
+    pub fn route_table(&self) -> Result<RouteTable> {
+        let mut table = RouteTable::default();
+        for (index, rule) in self.rules.iter().enumerate() {
+            table.rules.push(parse_mihomo_route_rule(rule, index)?);
+        }
+        Ok(table)
     }
 }
 
@@ -1281,6 +1294,43 @@ fn sni_or_server(value: Option<&str>, server: &str) -> String {
         .to_string()
 }
 
+fn parse_mihomo_route_rule(raw: &str, index: usize) -> Result<RouteRule> {
+    let parts = raw.split(',').map(str::trim).collect::<Vec<_>>();
+    ensure!(
+        !parts.is_empty() && !parts[0].is_empty(),
+        "mihomo rules[{index}] is empty"
+    );
+    let kind = parts[0].to_ascii_uppercase();
+    let action_index = if matches!(kind.as_str(), "MATCH" | "FINAL") {
+        1
+    } else {
+        2
+    };
+    ensure!(
+        parts.len() > action_index,
+        "mihomo rules[{index}] is missing outbound"
+    );
+    let mut rule = RouteRule::new(RouteDecision::from_outbound(parts[action_index])?);
+    match kind.as_str() {
+        "DOMAIN" => rule.domains.push(DomainMatcher::exact(parts[1])),
+        "DOMAIN-SUFFIX" => rule.domains.push(DomainMatcher::suffix(parts[1])),
+        "DOMAIN-KEYWORD" => rule.domains.push(DomainMatcher::keyword(parts[1])),
+        "DOMAIN-REGEX" => rule.domains.push(DomainMatcher::regex(parts[1])?),
+        "IP-CIDR" | "IP-CIDR6" => rule.ip_cidrs.push(IpCidr::parse(parts[1])?),
+        "GEOIP" if parts[1].eq_ignore_ascii_case("private") => rule.ip_is_private = true,
+        "GEOIP" => bail!("mihomo rules[{index}] GEOIP requires geoip data"),
+        "DST-PORT" => rule.ports.push(PortRange::parse(parts[1])?),
+        "NETWORK" => rule.networks.push(RouteNetwork::parse(parts[1])?),
+        "MATCH" | "FINAL" => {}
+        "RULE-SET" => bail!("mihomo rules[{index}] RULE-SET requires rule-set data"),
+        "PROCESS-NAME" | "PROCESS-PATH" => {
+            bail!("mihomo rules[{index}] process rules require process metadata")
+        }
+        other => bail!("unsupported mihomo route rule type {other}"),
+    }
+    Ok(rule)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1346,6 +1396,7 @@ mod tests {
     use anyhow::bail;
 
     use super::*;
+    use crate::protocol::ProxyTarget;
 
     #[test]
     fn parses_unsupported_proxy_entries_without_breaking_selected_proxy() -> Result<()> {
@@ -1390,6 +1441,47 @@ proxies:
             bail!("expected Naive")
         };
         assert!(naive.quic);
+        Ok(())
+    }
+
+    #[test]
+    fn compiles_mihomo_route_rules() -> Result<()> {
+        let yaml = r#"
+proxies: []
+rules:
+  - DOMAIN-SUFFIX,example.com,DIRECT
+  - DOMAIN-KEYWORD,video,proxy-a
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - DST-PORT,53,DIRECT
+  - MATCH,proxy-b
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let routes = config.route_table()?;
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("video.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-a".to_string())
+        );
+        assert_eq!(
+            routes.decide(&ProxyTarget::Ip("10.1.2.3:443".parse()?), RouteNetwork::Tcp),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("unmatched.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-b".to_string())
+        );
         Ok(())
     }
 

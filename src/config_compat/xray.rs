@@ -1,6 +1,9 @@
 use crate::config_compat::mihomo::OneOrManyStrings;
 use crate::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
 use crate::reality::{RealityClientConfig, RealityServerConfig};
+use crate::routing::{
+    DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
+};
 use crate::shadowsocks::{ShadowsocksClientConfig, ShadowsocksServerConfig};
 use crate::trojan::{TrojanClientConfig, TrojanServerConfig};
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
@@ -21,6 +24,34 @@ pub struct XrayConfig {
     pub inbounds: Vec<XrayInbound>,
     #[serde(default)]
     pub outbounds: Vec<XrayOutbound>,
+    #[serde(default)]
+    pub routing: XrayRoutingConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct XrayRoutingConfig {
+    #[serde(default)]
+    pub rules: Vec<XrayRoutingRule>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct XrayRoutingRule {
+    #[serde(default, rename = "type")]
+    pub kind: String,
+    #[serde(default, rename = "outboundTag", alias = "outbound_tag")]
+    pub outbound_tag: String,
+    #[serde(default, rename = "balancerTag", alias = "balancer_tag")]
+    pub balancer_tag: String,
+    #[serde(default)]
+    pub domain: Vec<String>,
+    #[serde(default)]
+    pub ip: Vec<String>,
+    #[serde(default)]
+    pub port: Option<Value>,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -479,6 +510,65 @@ impl XrayConfig {
         let port = inbound.port.context("xray socks inbound is missing port")?;
         let host = inbound.listen.as_deref().unwrap_or("0.0.0.0");
         Ok(Some(SocketAddr::new(parse_listen_ip("xray", host)?, port)))
+    }
+
+    pub fn route_table(&self) -> Result<RouteTable> {
+        self.routing.to_route_table()
+    }
+}
+
+impl XrayRoutingConfig {
+    pub fn to_route_table(&self) -> Result<RouteTable> {
+        let mut table = RouteTable::default();
+        for (index, rule) in self.rules.iter().enumerate() {
+            table.rules.push(rule.to_route_rule(index)?);
+        }
+        Ok(table)
+    }
+}
+
+impl XrayRoutingRule {
+    fn to_route_rule(&self, index: usize) -> Result<RouteRule> {
+        ensure!(
+            self.extra.is_empty(),
+            "xray routing.rules[{index}] has unsupported fields {:?}",
+            self.extra.keys().collect::<Vec<_>>()
+        );
+        ensure!(
+            self.kind.trim().is_empty() || self.kind.eq_ignore_ascii_case("field"),
+            "unsupported xray routing.rules[{index}] type {}",
+            self.kind
+        );
+        ensure!(
+            self.balancer_tag.trim().is_empty(),
+            "xray routing.rules[{index}] balancerTag requires balancer support"
+        );
+        let mut rule = RouteRule::new(RouteDecision::from_outbound(&self.outbound_tag)?);
+        for domain in &self.domain {
+            if let Some(matcher) = DomainMatcher::from_prefixed(domain)? {
+                rule.domains.push(matcher);
+            }
+        }
+        for ip in &self.ip {
+            if ip.eq_ignore_ascii_case("geoip:private") {
+                rule.ip_is_private = true;
+            } else {
+                rule.ip_cidrs.push(IpCidr::parse(ip)?);
+            }
+        }
+        if let Some(network) = &self.network {
+            for value in network
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                rule.networks.push(RouteNetwork::parse(value)?);
+            }
+        }
+        for value in xray_route_value_strings(self.port.as_ref())? {
+            rule.ports.push(PortRange::parse(&value)?);
+        }
+        Ok(rule)
     }
 }
 
@@ -2053,6 +2143,37 @@ where
     }
 }
 
+fn xray_route_value_strings(value: Option<&Value>) -> Result<Vec<String>> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(value)) => Ok(value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Some(Value::Number(value)) => Ok(vec![value.to_string()]),
+        Some(Value::Array(values)) => {
+            let mut result = Vec::new();
+            for value in values {
+                match value {
+                    Value::String(text) => result.extend(
+                        text.split(',')
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string),
+                    ),
+                    Value::Number(number) => result.push(number.to_string()),
+                    Value::Null => {}
+                    _ => bail!("xray route array value must contain strings or numbers"),
+                }
+            }
+            Ok(result)
+        }
+        Some(_) => bail!("xray route value must be a string, number, or array"),
+    }
+}
+
 fn sni_or_server(value: Option<&str>, server: &str, name: &str) -> String {
     value
         .map(str::trim)
@@ -2130,6 +2251,7 @@ fn default_tcp_network() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::ProxyTarget;
 
     #[test]
     fn parses_vless_reality_outbound() -> Result<()> {
@@ -2178,6 +2300,42 @@ mod tests {
         assert_eq!(vless.sni, "www.example.com");
         assert_eq!(vless.client_fingerprint, Some(UtlsFingerprint::Chrome));
         assert!(vless.reality.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn compiles_xray_routing_rules() -> Result<()> {
+        let json = r#"
+{
+  "routing": {
+    "rules": [
+      { "type": "field", "domain": ["domain:example.com"], "outboundTag": "direct" },
+      { "type": "field", "domain": ["keyword:video"], "outboundTag": "proxy-a" },
+      { "type": "field", "ip": ["10.0.0.0/8"], "port": "53", "network": "udp", "outboundTag": "direct" }
+    ]
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let routes = config.route_table()?;
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("video.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-a".to_string())
+        );
+        assert_eq!(
+            routes.decide(&ProxyTarget::Ip("10.1.2.3:53".parse()?), RouteNetwork::Udp),
+            RouteDecision::Direct
+        );
         Ok(())
     }
 

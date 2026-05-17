@@ -4,6 +4,9 @@ use crate::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
 use crate::naive::{NaiveClientConfig, NaiveServerConfig, default_naive_quic_congestion_control};
 use crate::padding::PaddingScheme;
 use crate::reality::{RealityClientConfig, RealityServerConfig};
+use crate::routing::{
+    DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
+};
 use crate::server::ServerConfig;
 use crate::shadowsocks::{ShadowsocksClientConfig, ShadowsocksServerConfig};
 use crate::trojan::{TrojanClientConfig, TrojanServerConfig};
@@ -26,6 +29,46 @@ pub struct SingBoxConfig {
     pub inbounds: Vec<SingBoxInbound>,
     #[serde(default)]
     pub outbounds: Vec<SingBoxOutbound>,
+    #[serde(default)]
+    pub route: Option<SingBoxRouteConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct SingBoxRouteConfig {
+    #[serde(default)]
+    pub rules: Vec<SingBoxRouteRule>,
+    #[serde(default, rename = "final")]
+    pub final_outbound: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct SingBoxRouteRule {
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub outbound: Option<String>,
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub network: Option<Value>,
+    #[serde(default)]
+    pub domain: Option<Value>,
+    #[serde(default, rename = "domain_suffix")]
+    pub domain_suffix: Option<Value>,
+    #[serde(default, rename = "domain_keyword")]
+    pub domain_keyword: Option<Value>,
+    #[serde(default, rename = "domain_regex")]
+    pub domain_regex: Option<Value>,
+    #[serde(default, rename = "ip_cidr")]
+    pub ip_cidr: Option<Value>,
+    #[serde(default, rename = "ip_is_private")]
+    pub ip_is_private: bool,
+    #[serde(default)]
+    pub port: Option<Value>,
+    #[serde(default, rename = "port_range")]
+    pub port_range: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -535,6 +578,84 @@ impl SingBoxConfig {
             parse_listen_ip("sing-box", host)?,
             port,
         )))
+    }
+
+    pub fn route_table(&self) -> Result<RouteTable> {
+        self.route
+            .as_ref()
+            .map(SingBoxRouteConfig::to_route_table)
+            .unwrap_or_else(|| Ok(RouteTable::default()))
+    }
+}
+
+impl SingBoxRouteConfig {
+    pub fn to_route_table(&self) -> Result<RouteTable> {
+        let mut table = RouteTable {
+            rules: Vec::new(),
+            default: self
+                .final_outbound
+                .as_deref()
+                .map(RouteDecision::from_outbound)
+                .transpose()?
+                .unwrap_or(RouteDecision::Direct),
+        };
+        for (index, rule) in self.rules.iter().enumerate() {
+            table.rules.push(rule.to_route_rule(index)?);
+        }
+        Ok(table)
+    }
+}
+
+impl SingBoxRouteRule {
+    fn to_route_rule(&self, index: usize) -> Result<RouteRule> {
+        ensure!(
+            self.extra.is_empty(),
+            "sing-box route.rules[{index}] has unsupported fields {:?}",
+            self.extra.keys().collect::<Vec<_>>()
+        );
+        if let Some(kind) = self
+            .kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty())
+        {
+            ensure!(
+                kind.eq_ignore_ascii_case("default"),
+                "unsupported sing-box route.rules[{index}] type {kind}"
+            );
+        }
+        let action = self
+            .outbound
+            .as_deref()
+            .or(self.action.as_deref())
+            .with_context(|| format!("sing-box route.rules[{index}] is missing outbound"))?;
+        let mut rule = RouteRule::new(RouteDecision::from_outbound(action)?);
+        for value in route_value_strings(self.network.as_ref())? {
+            rule.networks.push(RouteNetwork::parse(&value)?);
+        }
+        for value in route_value_strings(self.domain.as_ref())? {
+            rule.domains.push(DomainMatcher::exact(&value));
+        }
+        for value in route_value_strings(self.domain_suffix.as_ref())? {
+            rule.domains.push(DomainMatcher::suffix(&value));
+        }
+        for value in route_value_strings(self.domain_keyword.as_ref())? {
+            rule.domains.push(DomainMatcher::keyword(&value));
+        }
+        for value in route_value_strings(self.domain_regex.as_ref())? {
+            rule.domains.push(DomainMatcher::regex(&value)?);
+        }
+        for value in route_value_strings(self.ip_cidr.as_ref())? {
+            rule.ip_cidrs.push(IpCidr::parse(&value)?);
+        }
+        rule.ip_is_private = self.ip_is_private;
+        for value in route_value_strings(self.port.as_ref())? {
+            rule.ports.push(PortRange::parse(&value)?);
+        }
+        for value in route_value_strings(self.port_range.as_ref())? {
+            rule.ports.push(PortRange::parse(&value)?);
+        }
+        Ok(rule)
     }
 }
 
@@ -2124,6 +2245,37 @@ fn value_strings(value: Option<&Value>) -> Result<Vec<String>> {
     }
 }
 
+fn route_value_strings(value: Option<&Value>) -> Result<Vec<String>> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Some(Value::Number(value)) => Ok(vec![value.to_string()]),
+        Some(Value::Array(values)) => {
+            let mut result = Vec::new();
+            for value in values {
+                match value {
+                    Value::String(text) => result.extend(
+                        text.split(',')
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string),
+                    ),
+                    Value::Number(number) => result.push(number.to_string()),
+                    Value::Null => {}
+                    _ => bail!("sing-box route array value must contain strings or numbers"),
+                }
+            }
+            Ok(result)
+        }
+        Some(_) => bail!("sing-box route value must be a string, number, or array"),
+    }
+}
+
 fn singbox_tls_server_identity(
     tls: &SingBoxTlsOptions,
     protocol: &str,
@@ -2222,6 +2374,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::ProxyTarget;
 
     #[test]
     fn parses_singbox_inbound_string_ports() -> Result<()> {
@@ -2238,6 +2391,50 @@ mod tests {
         assert_eq!(
             config.local_socks_listen()?,
             Some("127.0.0.1:7890".parse()?)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compiles_singbox_route_rules() -> Result<()> {
+        let json = r#"
+{
+  "route": {
+    "rules": [
+      { "domain_suffix": ["example.com"], "outbound": "direct" },
+      { "domain_keyword": "video", "outbound": "proxy-a" },
+      { "ip_cidr": ["10.0.0.0/8"], "port": [53], "network": "udp", "outbound": "direct" }
+    ],
+    "final": "proxy-b"
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let routes = config.route_table()?;
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("video.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-a".to_string())
+        );
+        assert_eq!(
+            routes.decide(&ProxyTarget::Ip("10.1.2.3:53".parse()?), RouteNetwork::Udp),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("unmatched.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-b".to_string())
         );
         Ok(())
     }
