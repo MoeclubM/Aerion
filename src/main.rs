@@ -15,10 +15,11 @@ use aerion::{
     ServerConfig, ShadowsocksClientConfig, ShadowsocksServerConfig, SingBoxClientConfig,
     SingBoxOutbound, SingBoxServerConfig, TrojanClientConfig, TrojanServerConfig,
     VlessClientConfig, VlessServerConfig, VmessClientConfig, VmessServerConfig, XrayClientConfig,
-    XrayOutbound, run_client, run_hysteria2_client, run_hysteria2_server, run_mieru_client,
-    run_mieru_server, run_naive_client, run_naive_server, run_server, run_shadowsocks_client,
-    run_shadowsocks_server, run_trojan_client, run_trojan_server, run_tuic_client, run_tuic_server,
-    run_vless_client, run_vless_server, run_vmess_client, run_vmess_server, tls,
+    XrayOutbound, XrayServerConfig, run_client, run_hysteria2_client, run_hysteria2_server,
+    run_mieru_client, run_mieru_server, run_naive_client, run_naive_server, run_server,
+    run_shadowsocks_client, run_shadowsocks_server, run_trojan_client, run_trojan_server,
+    run_tuic_client, run_tuic_server, run_vless_client, run_vless_server, run_vmess_client,
+    run_vmess_server, tls,
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
@@ -503,6 +504,10 @@ async fn run_file_config(
             run_client_config(proxy.to_client_config(listen)?.into()).await
         }
         FileConfig::Xray(config) => {
+            if config.outbounds.is_empty() {
+                let inbound = select_xray_inbound(&config.inbounds, profile)?;
+                return run_xray_server_config(inbound.to_server_config()?).await;
+            }
             let listen = listen
                 .or(config.local_socks_listen()?)
                 .context("xray config has no socks inbound; pass --listen")?;
@@ -954,6 +959,12 @@ async fn run_singbox_server_config(config: SingBoxServerConfig) -> Result<()> {
     }
 }
 
+async fn run_xray_server_config(config: XrayServerConfig) -> Result<()> {
+    match config {
+        XrayServerConfig::Vless(config) => run_vless_server(config).await,
+    }
+}
+
 fn select_mihomo_proxy<'a>(
     proxies: &'a [MihomoProxy],
     profile: Option<&str>,
@@ -996,6 +1007,30 @@ fn select_xray_outbound<'a>(
             outbounds
                 .iter()
                 .map(XrayOutbound::name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn select_xray_inbound<'a>(
+    inbounds: &'a [aerion::config_compat::xray::XrayInbound],
+    profile: Option<&str>,
+) -> Result<&'a aerion::config_compat::xray::XrayInbound> {
+    if let Some(profile) = profile {
+        return inbounds
+            .iter()
+            .find(|inbound| inbound.name() == profile)
+            .with_context(|| format!("xray config has no inbound profile {profile}"));
+    }
+    match inbounds {
+        [] => bail!("xray server config has no inbounds"),
+        [inbound] => Ok(inbound),
+        _ => bail!(
+            "xray config has multiple inbound profiles [{}]; pass --profile",
+            inbounds
+                .iter()
+                .map(|inbound| inbound.name())
                 .collect::<Vec<_>>()
                 .join(", ")
         ),

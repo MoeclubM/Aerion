@@ -4,7 +4,7 @@ use crate::reality::RealityClientConfig;
 use crate::shadowsocks::ShadowsocksClientConfig;
 use crate::trojan::TrojanClientConfig;
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
-use crate::vless::VlessClientConfig;
+use crate::vless::{VlessClientConfig, VlessServerConfig};
 use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
 use crate::vmess::{VmessClientConfig, ensure_vmess_packet_encoding};
 use anyhow::{Context, Result, bail, ensure};
@@ -13,6 +13,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct XrayConfig {
@@ -32,6 +33,10 @@ pub struct XrayInbound {
     pub port: Option<u16>,
     #[serde(default)]
     pub protocol: String,
+    #[serde(default)]
+    pub settings: XrayOutboundSettings,
+    #[serde(default, rename = "streamSettings")]
+    pub stream_settings: XrayStreamSettings,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -119,8 +124,14 @@ pub struct XrayOutboundSettings {
     pub security: Option<String>,
     #[serde(default)]
     pub method: Option<String>,
+    #[serde(default)]
+    pub decryption: Option<String>,
     #[serde(default, rename = "alterId", alias = "alter_id")]
     pub alter_id: Option<u16>,
+    #[serde(default)]
+    pub clients: Vec<XrayUser>,
+    #[serde(default)]
+    pub fallbacks: Vec<Value>,
     #[serde(default)]
     pub vnext: Vec<XrayVnext>,
     #[serde(default)]
@@ -354,6 +365,16 @@ pub struct XrayTlsSettings {
     pub fingerprint: Option<UtlsFingerprint>,
     #[serde(default)]
     pub alpn: Option<OneOrManyStrings>,
+    #[serde(default)]
+    pub certificates: Vec<XrayCertificate>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct XrayCertificate {
+    #[serde(default, rename = "certificateFile", alias = "certificate_file")]
+    pub certificate_file: Option<PathBuf>,
+    #[serde(default, rename = "keyFile", alias = "key_file")]
+    pub key_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -395,6 +416,10 @@ pub enum XrayClientConfig {
     Hysteria2(Hysteria2ClientConfig),
 }
 
+pub enum XrayServerConfig {
+    Vless(VlessServerConfig),
+}
+
 struct XrayServerUser {
     address: String,
     port: u16,
@@ -419,6 +444,140 @@ impl XrayConfig {
         let port = inbound.port.context("xray socks inbound is missing port")?;
         let host = inbound.listen.as_deref().unwrap_or("0.0.0.0");
         Ok(Some(SocketAddr::new(parse_listen_ip("xray", host)?, port)))
+    }
+}
+
+impl XrayInbound {
+    pub fn name(&self) -> &str {
+        self.tag.as_deref().unwrap_or(&self.protocol)
+    }
+
+    pub fn to_server_config(&self) -> Result<XrayServerConfig> {
+        match self.protocol.trim().to_ascii_lowercase().as_str() {
+            "vless" => Ok(XrayServerConfig::Vless(
+                self.to_vless_server_config()
+                    .with_context(|| format!("convert xray VLESS inbound {}", self.name()))?,
+            )),
+            other => bail!(
+                "unsupported xray inbound {} protocol {}; Aerion cannot run this inbound protocol as a server",
+                self.name(),
+                other
+            ),
+        }
+    }
+
+    fn to_vless_server_config(&self) -> Result<VlessServerConfig> {
+        let decryption = self.settings.decryption.as_deref().unwrap_or("none");
+        ensure!(
+            decryption.trim().is_empty() || decryption.eq_ignore_ascii_case("none"),
+            "xray VLESS inbound {} uses decryption {}; Aerion supports VLESS decryption none",
+            self.name(),
+            decryption
+        );
+        ensure!(
+            self.settings.fallbacks.is_empty(),
+            "xray VLESS inbound {} sets fallbacks; Aerion VLESS server does not expose fallback routing",
+            self.name()
+        );
+        let stream_security = self.stream_settings.security.trim();
+        ensure!(
+            stream_security.is_empty()
+                || stream_security.eq_ignore_ascii_case("none")
+                || stream_security.eq_ignore_ascii_case("tls"),
+            "xray VLESS inbound {} uses stream security {}; Aerion maps raw TCP or TLS VLESS server configs",
+            self.name(),
+            stream_security
+        );
+        let tls = self.stream_settings.tls_settings.as_ref();
+        let transport = XrayOutbound {
+            tag: self.tag.clone(),
+            protocol: self.protocol.clone(),
+            settings: XrayOutboundSettings::default(),
+            stream_settings: self.stream_settings.clone(),
+            mux: None,
+            decode_error: None,
+        }
+        .vless_transport_config()?;
+        if stream_security.eq_ignore_ascii_case("tls") {
+            ensure_vless_alpn(
+                "xray",
+                self.name(),
+                &transport,
+                tls.and_then(|tls| tls.alpn.as_ref()),
+            )?;
+        } else {
+            ensure_no_alpn("xray", self.name(), tls.and_then(|tls| tls.alpn.as_ref()))?;
+        }
+        let primary = self
+            .settings
+            .clients
+            .first()
+            .context("xray VLESS inbound is missing settings.clients")?;
+        let user_id = primary
+            .id
+            .clone()
+            .context("xray VLESS inbound primary client is missing id")?;
+        let flow = primary
+            .flow
+            .clone()
+            .or(self.settings.flow.clone())
+            .unwrap_or_default();
+        let users = self
+            .settings
+            .clients
+            .iter()
+            .skip(1)
+            .map(|user| {
+                let id = user
+                    .id
+                    .clone()
+                    .context("xray VLESS inbound extra client is missing id")?;
+                let user_flow = user
+                    .flow
+                    .clone()
+                    .or(self.settings.flow.clone())
+                    .unwrap_or_default();
+                ensure!(
+                    user_flow == flow,
+                    "xray VLESS inbound {} uses per-client flow; Aerion VLESS server expects one flow for the inbound",
+                    self.name()
+                );
+                Ok(id)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (cert_path, key_path) = if stream_security.eq_ignore_ascii_case("tls") {
+            let certificate = tls
+                .and_then(|tls| tls.certificates.first())
+                .context("xray VLESS inbound TLS is missing certificates")?;
+            (
+                certificate
+                    .certificate_file
+                    .clone()
+                    .context("xray VLESS inbound TLS certificate is missing certificateFile")?,
+                certificate
+                    .key_file
+                    .clone()
+                    .context("xray VLESS inbound TLS certificate is missing keyFile")?,
+            )
+        } else {
+            (PathBuf::new(), PathBuf::new())
+        };
+        Ok(VlessServerConfig {
+            listen: SocketAddr::new(
+                parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
+                self.port.with_context(|| {
+                    format!("xray VLESS inbound {} is missing port", self.name())
+                })?,
+            ),
+            user_id,
+            users,
+            tls: stream_security.eq_ignore_ascii_case("tls"),
+            cert_path,
+            key_path,
+            flow,
+            reality: None,
+            transport,
+        })
     }
 }
 
@@ -1402,6 +1561,60 @@ mod tests {
         assert_eq!(
             config.local_socks_listen()?,
             Some("127.0.0.1:1080".parse()?)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_vless_tls_inbound_to_server_config() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [{
+    "tag": "vless-server",
+    "protocol": "vless",
+    "listen": "127.0.0.1",
+    "port": 8443,
+    "settings": {
+      "decryption": "none",
+      "clients": [
+        { "id": "a3482e88-686a-4a58-8126-99c9df64b7bf" },
+        { "id": "e4d909c2-0a31-4ebf-8a8e-582c8f1f6e5a" }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws",
+      "security": "tls",
+      "tlsSettings": {
+        "certificates": [{
+          "certificateFile": "server.crt",
+          "keyFile": "server.key"
+        }]
+      },
+      "wsSettings": {
+        "path": "/vless",
+        "headers": { "Host": "edge.example.com" }
+      }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let XrayServerConfig::Vless(vless) = config.inbounds[0].to_server_config()?;
+        assert_eq!(vless.listen, "127.0.0.1:8443".parse()?);
+        assert_eq!(vless.user_id, "a3482e88-686a-4a58-8126-99c9df64b7bf");
+        assert_eq!(
+            vless.users,
+            vec!["e4d909c2-0a31-4ebf-8a8e-582c8f1f6e5a".to_string()]
+        );
+        assert!(vless.tls);
+        assert_eq!(vless.cert_path, PathBuf::from("server.crt"));
+        assert_eq!(vless.key_path, PathBuf::from("server.key"));
+        assert_eq!(vless.flow, "");
+        assert_eq!(vless.transport.kind, VlessTransportKind::WebSocket);
+        assert_eq!(vless.transport.path, "/vless");
+        assert_eq!(
+            vless.transport.request_host("example.com"),
+            "edge.example.com"
         );
         Ok(())
     }

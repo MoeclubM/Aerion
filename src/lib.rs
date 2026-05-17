@@ -37,7 +37,7 @@ pub use config_compat::mihomo::{MihomoClientConfig, MihomoConfig, MihomoProxy};
 pub use config_compat::singbox::{
     SingBoxClientConfig, SingBoxConfig, SingBoxOutbound, SingBoxServerConfig,
 };
-pub use config_compat::xray::{XrayClientConfig, XrayConfig, XrayOutbound};
+pub use config_compat::xray::{XrayClientConfig, XrayConfig, XrayOutbound, XrayServerConfig};
 pub use hysteria2::{
     Hysteria2ClientConfig, Hysteria2ServerConfig, run_hysteria2_client,
     run_hysteria2_client_listener, run_hysteria2_server, run_hysteria2_server_with_core,

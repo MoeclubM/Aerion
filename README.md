@@ -224,6 +224,8 @@ with `--profile`; unsupported transports still fail explicitly instead of being
 silently downgraded.
 Inbound-only sing-box JSON can also run Naive server profiles, including
 TCP-only and HTTP/3-only listener networks.
+Inbound-only Xray JSON can run VLESS server profiles with raw or TLS stream
+security.
 
 ## Run Hysteria2
 
