@@ -566,7 +566,15 @@ impl XrayInbound {
             decode_error: None,
         }
         .vless_transport_config()?;
-        ensure_vless_alpn("xray", self.name(), &transport, self.stream_alpn())?;
+        ensure_vless_alpn(
+            "xray",
+            self.name(),
+            &transport,
+            self.stream_settings
+                .tls_settings
+                .as_ref()
+                .and_then(|tls| tls.alpn.as_ref()),
+        )?;
         let certificate = self
             .stream_settings
             .tls_settings
@@ -770,9 +778,24 @@ impl XrayInbound {
             .trim()
             .eq_ignore_ascii_case("tls");
         if tls_enabled {
-            ensure_vless_alpn("xray", self.name(), &transport, self.stream_alpn())?;
+            ensure_vless_alpn(
+                "xray",
+                self.name(),
+                &transport,
+                self.stream_settings
+                    .tls_settings
+                    .as_ref()
+                    .and_then(|tls| tls.alpn.as_ref()),
+            )?;
         } else {
-            ensure_no_alpn("xray", self.name(), self.stream_alpn())?;
+            ensure_no_alpn(
+                "xray",
+                self.name(),
+                self.stream_settings
+                    .tls_settings
+                    .as_ref()
+                    .and_then(|tls| tls.alpn.as_ref()),
+            )?;
         }
         let primary = self
             .settings
