@@ -617,7 +617,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             password: client.password,
             sni,
             insecure: client.insecure,
-            extra_headers: Vec::new(),
+            extra_headers: client.headers.into_iter().collect(),
             udp_over_tcp: client.udp_over_tcp,
             quic: client.transport.eq_ignore_ascii_case("quic")
                 || client.protocol.eq_ignore_ascii_case("naive+quic"),
