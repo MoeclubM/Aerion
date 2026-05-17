@@ -527,7 +527,7 @@ impl XrayInbound {
                     format!("xray Shadowsocks inbound {} is missing port", self.name())
                 })?,
             ),
-            method,
+            method: method.clone(),
             password,
             users: self
                 .settings
@@ -1352,6 +1352,7 @@ impl XrayOutbound {
             user: XrayUser {
                 id: self.settings.id.clone(),
                 password: self.settings.password.clone(),
+                method: self.settings.method.clone(),
                 encryption: None,
                 flow: self.settings.flow.clone(),
                 packet_encoding: self.settings.packet_encoding.clone(),
