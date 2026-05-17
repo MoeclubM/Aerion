@@ -4,13 +4,14 @@ use crate::hysteria2::Hysteria2ClientConfig;
 use crate::naive::{NaiveClientConfig, NaiveServerConfig, default_naive_quic_congestion_control};
 use crate::padding::PaddingScheme;
 use crate::reality::{RealityClientConfig, RealityServerConfig};
-use crate::shadowsocks::ShadowsocksClientConfig;
-use crate::trojan::TrojanClientConfig;
+use crate::server::ServerConfig;
+use crate::shadowsocks::{ShadowsocksClientConfig, ShadowsocksServerConfig};
+use crate::trojan::{TrojanClientConfig, TrojanServerConfig};
 use crate::tuic::TuicClientConfig;
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::{VlessClientConfig, VlessServerConfig};
 use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
-use crate::vmess::{VmessClientConfig, ensure_vmess_packet_encoding};
+use crate::vmess::{VmessClientConfig, VmessServerConfig, ensure_vmess_packet_encoding};
 use anyhow::{Context, Result, bail, ensure};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
@@ -85,6 +86,86 @@ pub struct SingBoxVlessUser {
     pub uuid: String,
     #[serde(default)]
     pub flow: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxShadowsocksInbound {
+    #[serde(default)]
+    pub network: Option<String>,
+    pub method: String,
+    pub password: String,
+    #[serde(default)]
+    pub users: Vec<SingBoxShadowsocksUser>,
+    #[serde(default)]
+    pub managed: bool,
+    #[serde(default)]
+    pub multiplex: Option<SingBoxMultiplexOptions>,
+    #[serde(default)]
+    pub destinations: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxShadowsocksUser {
+    pub name: String,
+    pub password: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxVmessInbound {
+    #[serde(default)]
+    pub users: Vec<SingBoxVmessUser>,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub tls: Option<SingBoxTlsOptions>,
+    #[serde(default)]
+    pub multiplex: Option<SingBoxMultiplexOptions>,
+    #[serde(default)]
+    pub transport: Option<Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct SingBoxVmessUser {
+    #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default, rename = "alterId", alias = "alter_id")]
+    pub alter_id: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxTrojanInbound {
+    #[serde(default)]
+    pub users: Vec<SingBoxTrojanUser>,
+    #[serde(default)]
+    pub network: Option<String>,
+    pub tls: SingBoxTlsOptions,
+    #[serde(default)]
+    pub multiplex: Option<SingBoxMultiplexOptions>,
+    #[serde(default)]
+    pub transport: Option<Value>,
+    #[serde(default)]
+    pub fallback: Option<Value>,
+    #[serde(default, rename = "fallback_for_alpn")]
+    pub fallback_for_alpn: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxTrojanUser {
+    pub password: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxAnyTlsInbound {
+    #[serde(default)]
+    pub users: Vec<SingBoxAnyTlsUser>,
+    pub tls: SingBoxTlsOptions,
+    #[serde(default)]
+    pub padding_scheme: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxAnyTlsUser {
+    pub password: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -281,6 +362,8 @@ pub struct SingBoxTlsOptions {
     pub reality: Option<SingBoxRealityOptions>,
     #[serde(default)]
     pub certificate: Option<Value>,
+    #[serde(default)]
+    pub key: Option<Value>,
     #[serde(default, rename = "certificate_path")]
     pub certificate_path: Option<Value>,
     #[serde(default, rename = "key_path")]
@@ -366,8 +449,12 @@ pub enum SingBoxClientConfig {
 }
 
 pub enum SingBoxServerConfig {
+    AnyTls(ServerConfig),
     Naive(NaiveServerConfig),
+    Shadowsocks(ShadowsocksServerConfig),
+    Trojan(TrojanServerConfig),
     Vless(VlessServerConfig),
+    Vmess(VmessServerConfig),
 }
 
 impl SingBoxConfig {
@@ -408,8 +495,33 @@ impl SingBoxInbound {
                     self.listen_port,
                 )?,
             )),
+            "anytls" => Ok(SingBoxServerConfig::AnyTls(
+                self.decode::<SingBoxAnyTlsInbound>()?.to_server_config(
+                    self.name(),
+                    self.listen.as_deref(),
+                    self.listen_port,
+                )?,
+            )),
+            "shadowsocks" | "ss" => Ok(SingBoxServerConfig::Shadowsocks(
+                self.decode::<SingBoxShadowsocksInbound>()?
+                    .to_server_config(self.name(), self.listen.as_deref(), self.listen_port)?,
+            )),
+            "trojan" => Ok(SingBoxServerConfig::Trojan(
+                self.decode::<SingBoxTrojanInbound>()?.to_server_config(
+                    self.name(),
+                    self.listen.as_deref(),
+                    self.listen_port,
+                )?,
+            )),
             "vless" => Ok(SingBoxServerConfig::Vless(
                 self.decode::<SingBoxVlessInbound>()?.to_server_config(
+                    self.name(),
+                    self.listen.as_deref(),
+                    self.listen_port,
+                )?,
+            )),
+            "vmess" => Ok(SingBoxServerConfig::Vmess(
+                self.decode::<SingBoxVmessInbound>()?.to_server_config(
                     self.name(),
                     self.listen.as_deref(),
                     self.listen_port,
@@ -579,16 +691,7 @@ impl SingBoxVlessInbound {
         let (cert_path, key_path) = if tls_enabled && reality.is_none() {
             let tls =
                 tls.with_context(|| format!("sing-box VLESS inbound {name} is missing tls"))?;
-            ensure_disabled_utls(name, tls)?;
-            ensure_disabled_reality(name, tls)?;
-            ensure!(
-                !json_value_non_empty_option(tls.certificate.as_ref()),
-                "sing-box VLESS inbound {name} embeds certificate data; Aerion VLESS server expects certificate_path"
-            );
-            ensure!(
-                !json_value_non_empty_option(tls.ech.as_ref()),
-                "sing-box VLESS inbound {name} sets ECH; Aerion VLESS server does not expose ECH"
-            );
+            tls.ensure_supported_server_options("VLESS", name, false)?;
             (
                 value_path(tls.certificate_path.as_ref()).with_context(|| {
                     format!("sing-box VLESS inbound {name} is missing certificate_path")
@@ -602,6 +705,7 @@ impl SingBoxVlessInbound {
                 ensure_disabled_utls(name, tls)?;
                 ensure!(
                     !json_value_non_empty_option(tls.certificate.as_ref())
+                        && !json_value_non_empty_option(tls.key.as_ref())
                         && !json_value_non_empty_option(tls.certificate_path.as_ref())
                         && !json_value_non_empty_option(tls.key_path.as_ref()),
                     "sing-box VLESS inbound {name} sets TLS certificate fields while TLS certificate mode is disabled"
@@ -629,6 +733,238 @@ impl SingBoxVlessInbound {
             reality,
             transport,
         })
+    }
+}
+
+impl SingBoxAnyTlsInbound {
+    pub fn to_server_config(
+        &self,
+        name: &str,
+        listen: Option<&str>,
+        listen_port: Option<u16>,
+    ) -> Result<ServerConfig> {
+        ensure!(
+            self.tls.enabled,
+            "sing-box AnyTLS inbound {name} disables TLS; AnyTLS requires TLS"
+        );
+        self.tls
+            .ensure_supported_server_options("AnyTLS", name, false)?;
+        let primary = self
+            .users
+            .first()
+            .with_context(|| format!("sing-box AnyTLS inbound {name} is missing users"))?;
+        Ok(ServerConfig {
+            listen: SocketAddr::new(
+                parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
+                listen_port.with_context(|| {
+                    format!("sing-box AnyTLS inbound {name} is missing listen_port")
+                })?,
+            ),
+            password: primary.password.clone(),
+            users: self
+                .users
+                .iter()
+                .skip(1)
+                .map(|user| user.password.clone())
+                .collect(),
+            cert_path: value_path(self.tls.certificate_path.as_ref()).with_context(|| {
+                format!("sing-box AnyTLS inbound {name} is missing certificate_path")
+            })?,
+            key_path: value_path(self.tls.key_path.as_ref())
+                .with_context(|| format!("sing-box AnyTLS inbound {name} is missing key_path"))?,
+            padding_scheme: if self.padding_scheme.is_empty() {
+                PaddingScheme::default_lines()
+            } else {
+                self.padding_scheme.clone()
+            },
+            heartbeat_interval_secs: 30,
+        })
+    }
+}
+
+impl SingBoxShadowsocksInbound {
+    pub fn to_server_config(
+        &self,
+        name: &str,
+        listen: Option<&str>,
+        listen_port: Option<u16>,
+    ) -> Result<ShadowsocksServerConfig> {
+        ensure!(
+            !self.managed,
+            "sing-box Shadowsocks inbound {name} enables managed users; Aerion does not implement the SSM API"
+        );
+        ensure_multiplex_disabled("sing-box", name, self.multiplex.as_ref())?;
+        ensure!(
+            !json_value_non_empty_option(self.destinations.as_ref()),
+            "sing-box Shadowsocks inbound {name} sets relay destinations; Aerion Shadowsocks server does not implement relay mode"
+        );
+        let (tcp, udp) = tcp_udp_network(
+            "sing-box Shadowsocks inbound",
+            name,
+            self.network.as_deref(),
+        )?;
+        Ok(ShadowsocksServerConfig {
+            listen: SocketAddr::new(
+                parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
+                listen_port.with_context(|| {
+                    format!("sing-box Shadowsocks inbound {name} is missing listen_port")
+                })?,
+            ),
+            method: self.method.clone(),
+            password: self.password.clone(),
+            users: self
+                .users
+                .iter()
+                .map(|user| format!("{}:{}", user.name, user.password))
+                .collect(),
+            tcp,
+            udp,
+            udp_over_tcp: false,
+        })
+    }
+}
+
+impl SingBoxTrojanInbound {
+    pub fn to_server_config(
+        &self,
+        name: &str,
+        listen: Option<&str>,
+        listen_port: Option<u16>,
+    ) -> Result<TrojanServerConfig> {
+        ensure_multiplex_disabled("sing-box", name, self.multiplex.as_ref())?;
+        ensure!(
+            !json_value_non_empty_option(self.fallback.as_ref())
+                && self.fallback_for_alpn.is_empty(),
+            "sing-box Trojan inbound {name} sets fallback; Aerion Trojan server does not expose fallback routing"
+        );
+        ensure!(
+            self.tls.enabled,
+            "sing-box Trojan inbound {name} disables TLS; Trojan requires TLS in Aerion"
+        );
+        self.tls
+            .ensure_supported_server_options("Trojan", name, false)?;
+        let transport = vless_transport_config(
+            "sing-box",
+            name,
+            self.network.as_deref(),
+            self.transport.as_ref(),
+        )?;
+        ensure_vless_alpn("sing-box", name, &transport, self.tls.alpn.as_ref())?;
+        let primary = self
+            .users
+            .first()
+            .with_context(|| format!("sing-box Trojan inbound {name} is missing users"))?;
+        Ok(TrojanServerConfig {
+            listen: SocketAddr::new(
+                parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
+                listen_port.with_context(|| {
+                    format!("sing-box Trojan inbound {name} is missing listen_port")
+                })?,
+            ),
+            password: primary.password.clone(),
+            users: self
+                .users
+                .iter()
+                .skip(1)
+                .map(|user| user.password.clone())
+                .collect(),
+            cert_path: value_path(self.tls.certificate_path.as_ref()).with_context(|| {
+                format!("sing-box Trojan inbound {name} is missing certificate_path")
+            })?,
+            key_path: value_path(self.tls.key_path.as_ref())
+                .with_context(|| format!("sing-box Trojan inbound {name} is missing key_path"))?,
+            transport,
+        })
+    }
+}
+
+impl SingBoxVmessInbound {
+    pub fn to_server_config(
+        &self,
+        name: &str,
+        listen: Option<&str>,
+        listen_port: Option<u16>,
+    ) -> Result<VmessServerConfig> {
+        ensure_multiplex_disabled("sing-box", name, self.multiplex.as_ref())?;
+        let transport = vless_transport_config(
+            "sing-box",
+            name,
+            self.network.as_deref(),
+            self.transport.as_ref(),
+        )?;
+        let primary = self
+            .users
+            .first()
+            .with_context(|| format!("sing-box VMess inbound {name} is missing users"))?;
+        ensure!(
+            primary.alter_id == 0,
+            "sing-box VMess inbound {name} primary user uses legacy alterId {}; Aerion implements AEAD VMess only",
+            primary.alter_id
+        );
+        let user_id = primary.uuid.clone().with_context(|| {
+            format!("sing-box VMess inbound {name} primary user is missing uuid")
+        })?;
+        let users = self
+            .users
+            .iter()
+            .skip(1)
+            .map(|user| {
+                ensure!(
+                    user.alter_id == 0,
+                    "sing-box VMess inbound {name} extra user uses legacy alterId {}; Aerion implements AEAD VMess only",
+                    user.alter_id
+                );
+                user.uuid
+                    .clone()
+                    .with_context(|| format!("sing-box VMess inbound {name} extra user is missing uuid"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let tls_enabled = self.tls.as_ref().map(|tls| tls.enabled).unwrap_or(false);
+        if tls_enabled {
+            let tls = self
+                .tls
+                .as_ref()
+                .with_context(|| format!("sing-box VMess inbound {name} is missing tls"))?;
+            tls.ensure_supported_server_options("VMess", name, false)?;
+            ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
+            Ok(VmessServerConfig {
+                listen: SocketAddr::new(
+                    parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
+                    listen_port.with_context(|| {
+                        format!("sing-box VMess inbound {name} is missing listen_port")
+                    })?,
+                ),
+                user_id,
+                users,
+                tls: true,
+                cert_path: Some(value_path(tls.certificate_path.as_ref()).with_context(|| {
+                    format!("sing-box VMess inbound {name} is missing certificate_path")
+                })?),
+                key_path: Some(value_path(tls.key_path.as_ref()).with_context(|| {
+                    format!("sing-box VMess inbound {name} is missing key_path")
+                })?),
+                transport,
+            })
+        } else {
+            if let Some(tls) = &self.tls {
+                tls.ensure_supported_server_options("VMess", name, true)?;
+                ensure_no_alpn("sing-box", name, tls.alpn.as_ref())?;
+            }
+            Ok(VmessServerConfig {
+                listen: SocketAddr::new(
+                    parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
+                    listen_port.with_context(|| {
+                        format!("sing-box VMess inbound {name} is missing listen_port")
+                    })?,
+                ),
+                user_id,
+                users,
+                tls: false,
+                cert_path: None,
+                key_path: None,
+                transport,
+            })
+        }
     }
 }
 
@@ -1079,6 +1415,7 @@ impl SingBoxTlsOptions {
                     .as_ref()
                     .map(json_value_non_empty)
                     .unwrap_or(false)
+                && !self.key.as_ref().map(json_value_non_empty).unwrap_or(false)
                 && !self
                     .key_path
                     .as_ref()
@@ -1090,6 +1427,33 @@ impl SingBoxTlsOptions {
             !singbox_enabled_option(protocol, name, "tls.ech", self.ech.as_ref())?,
             "sing-box {protocol} outbound {name} enables ECH; Aerion client does not implement ECH"
         );
+        Ok(())
+    }
+
+    fn ensure_supported_server_options(
+        &self,
+        protocol: &str,
+        name: &str,
+        tls_disabled: bool,
+    ) -> Result<()> {
+        ensure_disabled_utls(name, self)?;
+        ensure_disabled_reality(name, self)?;
+        ensure!(
+            !json_value_non_empty_option(self.certificate.as_ref())
+                && !json_value_non_empty_option(self.key.as_ref()),
+            "sing-box {protocol} inbound {name} embeds TLS certificate data; Aerion server expects certificate_path and key_path"
+        );
+        ensure!(
+            !json_value_non_empty_option(self.ech.as_ref()),
+            "sing-box {protocol} inbound {name} sets ECH; Aerion server does not expose ECH"
+        );
+        if tls_disabled {
+            ensure!(
+                !json_value_non_empty_option(self.certificate_path.as_ref())
+                    && !json_value_non_empty_option(self.key_path.as_ref()),
+                "sing-box {protocol} inbound {name} sets TLS certificate fields while TLS is disabled"
+            );
+        }
         Ok(())
     }
 
@@ -1168,6 +1532,21 @@ fn ensure_supported_network(format: &str, name: &str, network: Option<&str>) -> 
         "{format} outbound {name} uses network {network}; Aerion supports sing-box tcp or udp network selection"
     );
     Ok(())
+}
+
+fn tcp_udp_network(format: &str, name: &str, network: Option<&str>) -> Result<(bool, bool)> {
+    match network
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" => Ok((true, true)),
+        "tcp" => Ok((true, false)),
+        "udp" => Ok((false, true)),
+        "both" | "tcp+udp" | "tcp,udp" | "tcp_and_udp" => Ok((true, true)),
+        other => bail!("{format} {name} uses network {other}; Aerion supports tcp or udp"),
+    }
 }
 
 fn value_has_data(value: &Value) -> bool {
@@ -1264,7 +1643,7 @@ fn ensure_multiplex_disabled(
         !multiplex
             .map(|multiplex| multiplex.enabled)
             .unwrap_or(false),
-        "{format} outbound {name} enables multiplex; Aerion VLESS mux.cool is not wire-compatible with sing-box multiplex"
+        "{format} profile {name} enables multiplex; Aerion does not implement sing-box multiplex"
     );
     Ok(())
 }
@@ -1423,6 +1802,7 @@ fn json_value_non_empty_option(value: Option<&Value>) -> bool {
 fn value_path(value: Option<&Value>) -> Option<PathBuf> {
     match value {
         Some(Value::String(value)) if !value.trim().is_empty() => Some(PathBuf::from(value)),
+        Some(Value::Array(values)) if values.len() == 1 => value_path(values.first()),
         _ => None,
     }
 }
@@ -1658,6 +2038,165 @@ mod tests {
         assert_eq!(vless.transport.kind, VlessTransportKind::WebSocket);
         assert_eq!(vless.transport.path, "/ws");
         assert_eq!(vless.transport.host, Some("front.example.com".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn converts_anytls_inbound_to_server_config() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [
+    {
+      "type": "anytls",
+      "tag": "anytls",
+      "listen": "127.0.0.1",
+      "listen_port": 8444,
+      "users": [
+        { "password": "primary-pass" },
+        { "password": "alice-pass" }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "server.crt",
+        "key_path": "server.key"
+      },
+      "padding_scheme": ["stop=8"]
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxServerConfig::AnyTls(anytls) = config.inbounds[0].to_server_config()? else {
+            bail!("expected AnyTLS")
+        };
+        assert_eq!(anytls.listen, "127.0.0.1:8444".parse()?);
+        assert_eq!(anytls.password, "primary-pass");
+        assert_eq!(anytls.users, vec!["alice-pass".to_string()]);
+        assert_eq!(anytls.cert_path, PathBuf::from("server.crt"));
+        assert_eq!(anytls.key_path, PathBuf::from("server.key"));
+        assert_eq!(anytls.padding_scheme, vec!["stop=8".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn converts_shadowsocks_inbound_to_server_config() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "ss-udp",
+      "listen": "127.0.0.1",
+      "listen_port": 8388,
+      "network": "udp",
+      "method": "aes-128-gcm",
+      "password": "primary-pass",
+      "users": [
+        { "name": "alice", "password": "alice-pass" }
+      ]
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxServerConfig::Shadowsocks(shadowsocks) =
+            config.inbounds[0].to_server_config()?
+        else {
+            bail!("expected Shadowsocks")
+        };
+        assert_eq!(shadowsocks.listen, "127.0.0.1:8388".parse()?);
+        assert_eq!(shadowsocks.method, "aes-128-gcm");
+        assert_eq!(shadowsocks.password, "primary-pass");
+        assert_eq!(shadowsocks.users, vec!["alice:alice-pass".to_string()]);
+        assert!(!shadowsocks.tcp);
+        assert!(shadowsocks.udp);
+        Ok(())
+    }
+
+    #[test]
+    fn converts_trojan_inbound_to_server_config() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [
+    {
+      "type": "trojan",
+      "tag": "trojan-ws",
+      "listen": "127.0.0.1",
+      "listen_port": 9443,
+      "users": [
+        { "password": "primary-pass" },
+        { "password": "alice-pass" }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": ["server.crt"],
+        "key_path": "server.key"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/trojan"
+      }
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxServerConfig::Trojan(trojan) = config.inbounds[0].to_server_config()? else {
+            bail!("expected Trojan")
+        };
+        assert_eq!(trojan.listen, "127.0.0.1:9443".parse()?);
+        assert_eq!(trojan.password, "primary-pass");
+        assert_eq!(trojan.users, vec!["alice-pass".to_string()]);
+        assert_eq!(trojan.cert_path, PathBuf::from("server.crt"));
+        assert_eq!(trojan.key_path, PathBuf::from("server.key"));
+        assert_eq!(trojan.transport.kind, VlessTransportKind::WebSocket);
+        assert_eq!(trojan.transport.path, "/trojan");
+        Ok(())
+    }
+
+    #[test]
+    fn converts_vmess_tls_inbound_to_server_config() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [
+    {
+      "type": "vmess",
+      "tag": "vmess-h2",
+      "listen": "127.0.0.1",
+      "listen_port": 9444,
+      "users": [
+        { "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf", "alterId": 0 },
+        { "uuid": "433722e1-0f8c-4724-9089-d5bc6d0c51ef" }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "server.crt",
+        "key_path": "server.key",
+        "alpn": ["h2"]
+      },
+      "transport": {
+        "type": "http",
+        "path": "/vmess"
+      }
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxServerConfig::Vmess(vmess) = config.inbounds[0].to_server_config()? else {
+            bail!("expected VMess")
+        };
+        assert_eq!(vmess.listen, "127.0.0.1:9444".parse()?);
+        assert!(vmess.tls);
+        assert_eq!(vmess.cert_path, Some(PathBuf::from("server.crt")));
+        assert_eq!(vmess.key_path, Some(PathBuf::from("server.key")));
+        assert_eq!(vmess.user_id, "a3482e88-686a-4a58-8126-99c9df64b7bf");
+        assert_eq!(
+            vmess.users,
+            vec!["433722e1-0f8c-4724-9089-d5bc6d0c51ef".to_string()]
+        );
+        assert_eq!(vmess.transport.kind, VlessTransportKind::Http2);
+        assert_eq!(vmess.transport.path, "/vmess");
         Ok(())
     }
 

@@ -811,6 +811,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
                 .context("Shadowsocks server requires cipher")?,
             password: server.password,
             users: server.users,
+            tcp: true,
             udp: server.udp,
             udp_over_tcp: server.udp_over_tcp,
         })
@@ -955,8 +956,12 @@ async fn run_client_config(config: RunnableClientConfig) -> Result<()> {
 
 async fn run_singbox_server_config(config: SingBoxServerConfig) -> Result<()> {
     match config {
+        SingBoxServerConfig::AnyTls(config) => run_server(config).await,
         SingBoxServerConfig::Naive(config) => run_naive_server(config).await,
+        SingBoxServerConfig::Shadowsocks(config) => run_shadowsocks_server(config).await,
+        SingBoxServerConfig::Trojan(config) => run_trojan_server(config).await,
         SingBoxServerConfig::Vless(config) => run_vless_server(config).await,
+        SingBoxServerConfig::Vmess(config) => run_vmess_server(config).await,
     }
 }
 

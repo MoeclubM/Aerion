@@ -47,6 +47,7 @@ pub struct ShadowsocksServerConfig {
     pub method: String,
     pub password: String,
     pub users: Vec<String>,
+    pub tcp: bool,
     pub udp: bool,
     pub udp_over_tcp: bool,
 }
@@ -65,6 +66,7 @@ struct ShadowsocksRuntime {
 struct ShadowsocksServerRuntime {
     server: ShadowsocksInnerConfig,
     context: ShadowsocksSharedContext,
+    tcp: bool,
     udp: bool,
     udp_over_tcp: bool,
 }
@@ -149,6 +151,7 @@ impl ShadowsocksServerRuntime {
         Ok(Self {
             server,
             context: ShadowsocksContext::new_shared(ServerType::Server),
+            tcp: config.tcp,
             udp: config.udp,
             udp_over_tcp: config.udp_over_tcp,
         })
@@ -157,6 +160,13 @@ impl ShadowsocksServerRuntime {
 
 pub async fn run_shadowsocks_server(config: ShadowsocksServerConfig) -> Result<()> {
     let runtime = ShadowsocksServerRuntime::from_config(config)?;
+    ensure!(
+        runtime.tcp || runtime.udp,
+        "Shadowsocks server must enable TCP or UDP"
+    );
+    if runtime.udp && !runtime.tcp {
+        return run_shadowsocks_udp_server(runtime).await;
+    }
     let listener = ProxyListener::bind(runtime.context.clone(), &runtime.server)
         .await
         .context("bind Shadowsocks server TCP listener")?;

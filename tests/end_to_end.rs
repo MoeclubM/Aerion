@@ -249,6 +249,7 @@ async fn socks_udp_associate_reaches_udp_target_through_shadowsocks_uot() -> Res
         method: "aes-128-gcm".to_string(),
         password: "test-password".to_string(),
         users: Vec::new(),
+        tcp: true,
         udp: false,
         udp_over_tcp: true,
     }));

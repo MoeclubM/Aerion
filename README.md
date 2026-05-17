@@ -222,9 +222,9 @@ The CLI can run mihomo YAML, Xray JSON/JSONC, and sing-box JSON/JSONC client
 profiles directly. If those files contain multiple proxies/outbounds, select one
 with `--profile`; unsupported transports still fail explicitly instead of being
 silently downgraded.
-Inbound-only sing-box JSON can also run Naive server profiles, including
-TCP-only and HTTP/3-only listener networks, plus VLESS server profiles with raw,
-TLS, or REALITY inbound TLS settings.
+Inbound-only sing-box JSON can also run AnyTLS, Shadowsocks, Trojan, VMess,
+Naive, and VLESS server profiles, including Naive TCP-only / HTTP/3-only
+listener networks and VLESS raw, TLS, or REALITY inbound TLS settings.
 Inbound-only Xray JSON can run VLESS server profiles with raw, TLS, or REALITY
 stream security.
 
