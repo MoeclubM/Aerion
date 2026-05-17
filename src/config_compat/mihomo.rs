@@ -765,6 +765,7 @@ impl MihomoVlessProxy {
             },
             ca_cert_paths: Vec::new(),
             ca_certificates: Vec::new(),
+            disable_system_roots: false,
             flow: self.flow.clone(),
             packet_encoding: self.packet_encoding.clone(),
             mux: self.mux,
@@ -833,6 +834,7 @@ impl MihomoVmessProxy {
             },
             ca_cert_paths: Vec::new(),
             ca_certificates: Vec::new(),
+            disable_system_roots: false,
             client_fingerprint: if self.tls {
                 self.client_fingerprint
             } else {
@@ -880,6 +882,7 @@ impl MihomoTrojanProxy {
             insecure: self.skip_cert_verify,
             ca_cert_paths: Vec::new(),
             ca_certificates: Vec::new(),
+            disable_system_roots: false,
             udp: self.udp,
             client_fingerprint: self.client_fingerprint,
             transport,
@@ -978,6 +981,7 @@ impl MihomoHysteria2Proxy {
             certificate_fingerprint: self.fingerprint.clone(),
             ca_cert_paths: Vec::new(),
             ca_certificates: Vec::new(),
+            disable_system_roots: false,
             obfs: self.obfs.clone(),
             obfs_password: self.obfs_password.clone(),
             download_bandwidth: self.down,
@@ -998,6 +1002,7 @@ impl MihomoAnyTlsProxy {
             insecure: self.skip_cert_verify,
             ca_cert_paths: Vec::new(),
             ca_certificates: Vec::new(),
+            disable_system_roots: false,
             padding_scheme: if self.padding_scheme.is_empty() {
                 PaddingScheme::default_lines()
             } else {
@@ -1043,6 +1048,7 @@ impl MihomoNaiveProxy {
             insecure: self.skip_cert_verify,
             ca_cert_paths: Vec::new(),
             ca_certificates: Vec::new(),
+            disable_system_roots: false,
             extra_headers: self.extra_headers.clone().into_iter().collect(),
             udp_over_tcp: self
                 .udp_over_tcp
@@ -1125,6 +1131,7 @@ impl MihomoTuicProxy {
             insecure: self.skip_cert_verify,
             ca_cert_paths: Vec::new(),
             ca_certificates: Vec::new(),
+            disable_system_roots: false,
             udp: self.udp,
             udp_relay_mode: self.udp_relay_mode.clone(),
             congestion_control: self.congestion_control.clone(),

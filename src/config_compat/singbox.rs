@@ -407,6 +407,8 @@ pub struct SingBoxTlsOptions {
     pub server_name: Option<String>,
     #[serde(default)]
     pub insecure: bool,
+    #[serde(default, rename = "disable_system_root")]
+    pub disable_system_root: bool,
     #[serde(default)]
     pub alpn: Option<OneOrManyStrings>,
     #[serde(default)]
@@ -1322,6 +1324,12 @@ impl SingBoxVlessOutbound {
             ca_certificates: value_strings(
                 self.tls.as_ref().and_then(|tls| tls.certificate.as_ref()),
             )?,
+            disable_system_roots: tls_enabled
+                && self
+                    .tls
+                    .as_ref()
+                    .map(|tls| tls.disable_system_root)
+                    .unwrap_or(false),
             flow: self.flow.clone(),
             packet_encoding: self
                 .packet_encoding
@@ -1392,6 +1400,12 @@ impl SingBoxVmessOutbound {
             ca_certificates: value_strings(
                 self.tls.as_ref().and_then(|tls| tls.certificate.as_ref()),
             )?,
+            disable_system_roots: tls_enabled
+                && self
+                    .tls
+                    .as_ref()
+                    .map(|tls| tls.disable_system_root)
+                    .unwrap_or(false),
             client_fingerprint: if tls_enabled {
                 self.tls
                     .as_ref()
@@ -1434,6 +1448,7 @@ impl SingBoxTrojanOutbound {
             insecure: tls.insecure,
             ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
             ca_certificates: value_strings(tls.certificate.as_ref())?,
+            disable_system_roots: tls.disable_system_root,
             udp: network_allows_udp(self.network.as_deref()),
             client_fingerprint: tls.utls_fingerprint(name)?,
             transport,
@@ -1517,6 +1532,7 @@ impl SingBoxHysteria2Outbound {
             certificate_fingerprint: None,
             ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
             ca_certificates: value_strings(tls.certificate.as_ref())?,
+            disable_system_roots: tls.disable_system_root,
             obfs,
             obfs_password,
             download_bandwidth: self.down_mbps.or(self.down),
@@ -1546,6 +1562,7 @@ impl SingBoxAnyTlsOutbound {
             insecure: tls.insecure,
             ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
             ca_certificates: value_strings(tls.certificate.as_ref())?,
+            disable_system_roots: tls.disable_system_root,
             padding_scheme: PaddingScheme::default_lines(),
             heartbeat_interval_secs: 30,
         })
@@ -1578,6 +1595,7 @@ impl SingBoxNaiveOutbound {
             insecure: tls.insecure,
             ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
             ca_certificates: value_strings(tls.certificate.as_ref())?,
+            disable_system_roots: tls.disable_system_root,
             extra_headers: self.extra_headers.clone().into_iter().collect(),
             udp_over_tcp,
             quic: self.quic
@@ -1635,6 +1653,7 @@ impl SingBoxTuicOutbound {
             insecure: tls.insecure,
             ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
             ca_certificates: value_strings(tls.certificate.as_ref())?,
+            disable_system_roots: tls.disable_system_root,
             udp: network_allows_udp(self.network.as_deref()),
             udp_relay_mode: self
                 .udp_relay_mode
@@ -2981,6 +3000,7 @@ mod tests {
       "enabled": true,
       "server_name": "hy2.example.com",
       "insecure": true,
+      "disable_system_root": true,
       "alpn": ["h3"],
       "certificate_path": ["ca.pem", "backup-ca.pem"],
       "certificate": ["hy2-inline-ca"]
@@ -3003,6 +3023,7 @@ mod tests {
         assert_eq!(hysteria2.password, "secret");
         assert_eq!(hysteria2.sni, "hy2.example.com");
         assert!(hysteria2.insecure);
+        assert!(hysteria2.disable_system_roots);
         assert_eq!(
             hysteria2.ca_cert_paths,
             vec![PathBuf::from("ca.pem"), PathBuf::from("backup-ca.pem")]
@@ -3066,6 +3087,7 @@ mod tests {
       "tls": {
         "enabled": true,
         "certificate_path": "anytls-ca.pem",
+        "disable_system_root": true,
         "certificate": ["anytls-inline-ca"]
       }
     },
@@ -3117,6 +3139,7 @@ mod tests {
         };
         assert_eq!(anytls.ca_cert_paths, vec![PathBuf::from("anytls-ca.pem")]);
         assert_eq!(anytls.ca_certificates, vec!["anytls-inline-ca"]);
+        assert!(anytls.disable_system_roots);
 
         let SingBoxClientConfig::Tuic(tuic) =
             config.outbounds[4].to_client_config("127.0.0.1:1080".parse()?)?

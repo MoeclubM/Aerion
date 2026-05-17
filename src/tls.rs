@@ -201,11 +201,26 @@ pub fn client_config_with_custom_root_material(
     ca_cert_paths: &[PathBuf],
     ca_certificates: &[String],
 ) -> Result<Arc<ClientConfig>> {
-    client_config_with_fingerprint_and_custom_root_material(
+    client_config_with_custom_root_material_and_system_roots(
+        insecure,
+        ca_cert_paths,
+        ca_certificates,
+        false,
+    )
+}
+
+pub fn client_config_with_custom_root_material_and_system_roots(
+    insecure: bool,
+    ca_cert_paths: &[PathBuf],
+    ca_certificates: &[String],
+    disable_system_roots: bool,
+) -> Result<Arc<ClientConfig>> {
+    client_config_with_fingerprint_and_custom_root_material_and_system_roots(
         insecure,
         None,
         ca_cert_paths,
         ca_certificates,
+        disable_system_roots,
     )
 }
 
@@ -214,7 +229,28 @@ pub fn client_config_with_custom_root_material_early_data(
     ca_cert_paths: &[PathBuf],
     ca_certificates: &[String],
 ) -> Result<Arc<ClientConfig>> {
-    build_client_config_with_custom_roots(insecure, None, true, ca_cert_paths, ca_certificates)
+    client_config_with_custom_root_material_early_data_and_system_roots(
+        insecure,
+        ca_cert_paths,
+        ca_certificates,
+        false,
+    )
+}
+
+pub fn client_config_with_custom_root_material_early_data_and_system_roots(
+    insecure: bool,
+    ca_cert_paths: &[PathBuf],
+    ca_certificates: &[String],
+    disable_system_roots: bool,
+) -> Result<Arc<ClientConfig>> {
+    build_client_config_with_custom_roots(
+        insecure,
+        None,
+        true,
+        ca_cert_paths,
+        ca_certificates,
+        disable_system_roots,
+    )
 }
 
 pub fn client_config_with_fingerprint_and_custom_roots(
@@ -236,12 +272,29 @@ pub fn client_config_with_fingerprint_and_custom_root_material(
     ca_cert_paths: &[PathBuf],
     ca_certificates: &[String],
 ) -> Result<Arc<ClientConfig>> {
+    client_config_with_fingerprint_and_custom_root_material_and_system_roots(
+        insecure,
+        fingerprint,
+        ca_cert_paths,
+        ca_certificates,
+        false,
+    )
+}
+
+pub fn client_config_with_fingerprint_and_custom_root_material_and_system_roots(
+    insecure: bool,
+    fingerprint: Option<UtlsFingerprint>,
+    ca_cert_paths: &[PathBuf],
+    ca_certificates: &[String],
+    disable_system_roots: bool,
+) -> Result<Arc<ClientConfig>> {
     build_client_config_with_custom_roots(
         insecure,
         fingerprint,
         false,
         ca_cert_paths,
         ca_certificates,
+        disable_system_roots,
     )
 }
 
@@ -251,12 +304,16 @@ fn build_client_config_with_custom_roots(
     early_data: bool,
     ca_cert_paths: &[PathBuf],
     ca_certificates: &[String],
+    disable_system_roots: bool,
 ) -> Result<Arc<ClientConfig>> {
-    if (ca_cert_paths.is_empty() && ca_certificates.is_empty()) || insecure {
+    if (ca_cert_paths.is_empty() && ca_certificates.is_empty() && !disable_system_roots) || insecure
+    {
         return Ok(build_client_config(insecure, fingerprint, early_data));
     }
     let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if !disable_system_roots {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
     for path in ca_cert_paths {
         for cert in load_certs(path)? {
             roots

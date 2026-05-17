@@ -373,12 +373,18 @@ pub struct XrayTlsSettings {
     pub fingerprint: Option<UtlsFingerprint>,
     #[serde(default)]
     pub alpn: Option<OneOrManyStrings>,
+    #[serde(default, rename = "disableSystemRoot", alias = "disable_system_root")]
+    pub disable_system_root: bool,
     #[serde(default)]
     pub certificates: Vec<XrayCertificate>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct XrayCertificate {
+    #[serde(default)]
+    pub usage: Option<String>,
+    #[serde(default)]
+    pub certificate: Vec<String>,
     #[serde(default, rename = "certificateFile", alias = "certificate_file")]
     pub certificate_file: Option<PathBuf>,
     #[serde(default, rename = "keyFile", alias = "key_file")]
@@ -1202,6 +1208,11 @@ impl XrayOutbound {
         } else {
             None
         };
+        let (ca_cert_paths, ca_certificates) = if tls_enabled {
+            xray_tls_client_roots(tls)?
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let server_host = peer.address.clone();
         Ok(VlessClientConfig {
             listen,
@@ -1217,8 +1228,9 @@ impl XrayOutbound {
             } else {
                 false
             },
-            ca_cert_paths: Vec::new(),
-            ca_certificates: Vec::new(),
+            ca_cert_paths,
+            ca_certificates,
+            disable_system_roots: xray_disable_system_roots(tls, tls_enabled),
             flow: peer
                 .user
                 .flow
@@ -1306,6 +1318,11 @@ impl XrayOutbound {
         } else {
             ensure_no_alpn("xray", self.name(), self.stream_alpn())?;
         }
+        let (ca_cert_paths, ca_certificates) = if tls_enabled {
+            xray_tls_client_roots(tls)?
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let server_host = peer.address.clone();
         Ok(VmessClientConfig {
             listen,
@@ -1332,8 +1349,9 @@ impl XrayOutbound {
             } else {
                 false
             },
-            ca_cert_paths: Vec::new(),
-            ca_certificates: Vec::new(),
+            ca_cert_paths,
+            ca_certificates,
+            disable_system_roots: xray_disable_system_roots(tls, tls_enabled),
             client_fingerprint: if tls_enabled {
                 tls.and_then(|settings| settings.fingerprint)
             } else {
@@ -1354,6 +1372,7 @@ impl XrayOutbound {
         );
         ensure_vless_alpn("xray", self.name(), &transport, self.stream_alpn())?;
         let tls = self.stream_settings.tls_settings.as_ref();
+        let (ca_cert_paths, ca_certificates) = xray_tls_client_roots(tls)?;
         let server_host = server.address.clone();
         Ok(TrojanClientConfig {
             listen,
@@ -1368,8 +1387,9 @@ impl XrayOutbound {
                 self.name(),
             ),
             insecure: tls.map(|settings| settings.allow_insecure).unwrap_or(false),
-            ca_cert_paths: Vec::new(),
-            ca_certificates: Vec::new(),
+            ca_cert_paths,
+            ca_certificates,
+            disable_system_roots: xray_disable_system_roots(tls, true),
             udp: true,
             client_fingerprint: tls.and_then(|settings| settings.fingerprint),
             transport,
@@ -1539,6 +1559,7 @@ impl XrayOutbound {
             .and_then(|finalmask| finalmask.quic_params.as_ref())
             .and_then(|params| params.brutal_down)
             .or_else(|| hysteria.and_then(|settings| settings.down));
+        let (ca_cert_paths, ca_certificates) = xray_tls_client_roots(tls)?;
         Ok(Hysteria2ClientConfig {
             listen,
             server_host: server.address.clone(),
@@ -1559,8 +1580,9 @@ impl XrayOutbound {
             ),
             insecure: tls.map(|settings| settings.allow_insecure).unwrap_or(false),
             certificate_fingerprint: None,
-            ca_cert_paths: Vec::new(),
-            ca_certificates: Vec::new(),
+            ca_cert_paths,
+            ca_certificates,
+            disable_system_roots: xray_disable_system_roots(tls, true),
             obfs,
             obfs_password,
             download_bandwidth,
@@ -1904,6 +1926,40 @@ fn value_has_data(value: &Value) -> bool {
         Value::Array(value) => !value.is_empty(),
         Value::Object(value) => !value.is_empty(),
     }
+}
+
+fn xray_tls_client_roots(tls: Option<&XrayTlsSettings>) -> Result<(Vec<PathBuf>, Vec<String>)> {
+    let Some(tls) = tls else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let mut paths = Vec::new();
+    let mut certificates = Vec::new();
+    for certificate in tls.certificates.iter().filter(|certificate| {
+        certificate
+            .usage
+            .as_deref()
+            .map(|usage| usage.eq_ignore_ascii_case("verify"))
+            .unwrap_or(false)
+    }) {
+        ensure!(
+            certificate.certificate_file.is_some() || !certificate.certificate.is_empty(),
+            "xray TLS verify certificate is missing certificate or certificateFile"
+        );
+        if let Some(path) = &certificate.certificate_file {
+            paths.push(path.clone());
+        }
+        if !certificate.certificate.is_empty() {
+            certificates.push(certificate.certificate.join("\n"));
+        }
+    }
+    Ok((paths, certificates))
+}
+
+fn xray_disable_system_roots(tls: Option<&XrayTlsSettings>, tls_enabled: bool) -> bool {
+    tls_enabled
+        && tls
+            .map(|settings| settings.disable_system_root)
+            .unwrap_or(false)
 }
 
 #[derive(Deserialize)]
@@ -2501,7 +2557,19 @@ mod tests {
         }]
       }]
     },
-    "streamSettings": { "network": "tcp", "security": "tls" }
+    "streamSettings": {
+      "network": "tcp",
+      "security": "tls",
+      "tlsSettings": {
+        "serverName": "vmess.example.com",
+        "disableSystemRoot": true,
+        "certificates": [
+          { "usage": "verify", "certificateFile": "vmess-ca.pem" },
+          { "usage": "verify", "certificate": ["vmess-inline-ca"] },
+          { "usage": "encipherment", "certificateFile": "ignored-ca.pem" }
+        ]
+      }
+    }
   }]
 }
 "#;
@@ -2512,7 +2580,10 @@ mod tests {
             bail!("expected VMess")
         };
         assert!(vmess.tls);
-        assert_eq!(vmess.sni, "example.com");
+        assert_eq!(vmess.sni, "vmess.example.com");
+        assert_eq!(vmess.ca_cert_paths, vec![PathBuf::from("vmess-ca.pem")]);
+        assert_eq!(vmess.ca_certificates, vec!["vmess-inline-ca"]);
+        assert!(vmess.disable_system_roots);
         Ok(())
     }
 
@@ -2615,7 +2686,12 @@ mod tests {
       "tlsSettings": {
         "serverName": "hy2.example.com",
         "allowInsecure": true,
-        "alpn": ["h3"]
+        "disableSystemRoot": true,
+        "alpn": ["h3"],
+        "certificates": [
+          { "usage": "verify", "certificateFile": "hy2-ca.pem" },
+          { "usage": "verify", "certificate": ["hy2-inline-ca"] }
+        ]
       },
       "hysteriaSettings": {
         "version": 2,
@@ -2646,6 +2722,9 @@ mod tests {
         assert_eq!(hysteria2.password, "secret");
         assert_eq!(hysteria2.sni, "hy2.example.com");
         assert!(hysteria2.insecure);
+        assert_eq!(hysteria2.ca_cert_paths, vec![PathBuf::from("hy2-ca.pem")]);
+        assert_eq!(hysteria2.ca_certificates, vec!["hy2-inline-ca"]);
+        assert!(hysteria2.disable_system_roots);
         assert_eq!(hysteria2.obfs.as_deref(), Some("salamander"));
         assert_eq!(hysteria2.obfs_password.as_deref(), Some("obfs-pass"));
         assert_eq!(hysteria2.download_bandwidth, Some(80));

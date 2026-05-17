@@ -82,6 +82,14 @@ pub struct ClientFileConfig {
         alias = "certificate"
     )]
     pub ca_certificates: Vec<String>,
+    #[serde(
+        default,
+        alias = "disable-system-root",
+        alias = "disable_system_root",
+        alias = "disable-system-roots",
+        alias = "disableSystemRoot"
+    )]
+    pub disable_system_roots: bool,
     #[serde(default)]
     pub tls: Option<bool>,
     #[serde(default, alias = "cipher")]
