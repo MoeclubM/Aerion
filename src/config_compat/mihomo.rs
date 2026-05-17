@@ -763,6 +763,7 @@ impl MihomoVlessProxy {
             } else {
                 false
             },
+            ca_cert_paths: Vec::new(),
             flow: self.flow.clone(),
             packet_encoding: self.packet_encoding.clone(),
             mux: self.mux,
@@ -829,6 +830,7 @@ impl MihomoVmessProxy {
             } else {
                 false
             },
+            ca_cert_paths: Vec::new(),
             client_fingerprint: if self.tls {
                 self.client_fingerprint
             } else {
@@ -874,6 +876,7 @@ impl MihomoTrojanProxy {
             password: self.password.clone(),
             sni: sni_or_server(self.sni.as_deref(), &self.server),
             insecure: self.skip_cert_verify,
+            ca_cert_paths: Vec::new(),
             udp: self.udp,
             client_fingerprint: self.client_fingerprint,
             transport,
@@ -989,6 +992,7 @@ impl MihomoAnyTlsProxy {
             password: self.password.clone(),
             sni: sni_or_server(self.servername.as_deref(), &self.server),
             insecure: self.skip_cert_verify,
+            ca_cert_paths: Vec::new(),
             padding_scheme: if self.padding_scheme.is_empty() {
                 PaddingScheme::default_lines()
             } else {
@@ -1113,6 +1117,7 @@ impl MihomoTuicProxy {
                 .with_context(|| format!("mihomo TUIC proxy {} is missing password", self.name))?,
             sni: sni_or_server(self.servername.as_deref(), &self.server),
             insecure: self.skip_cert_verify,
+            ca_cert_paths: Vec::new(),
             udp: self.udp,
             udp_relay_mode: self.udp_relay_mode.clone(),
             congestion_control: self.congestion_control.clone(),

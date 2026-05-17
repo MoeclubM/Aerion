@@ -186,8 +186,32 @@ pub fn client_config_with_custom_roots(
     insecure: bool,
     ca_cert_paths: &[PathBuf],
 ) -> Result<Arc<ClientConfig>> {
+    client_config_with_fingerprint_and_custom_roots(insecure, None, ca_cert_paths)
+}
+
+pub fn client_config_with_custom_roots_early_data(
+    insecure: bool,
+    ca_cert_paths: &[PathBuf],
+) -> Result<Arc<ClientConfig>> {
+    build_client_config_with_custom_roots(insecure, None, true, ca_cert_paths)
+}
+
+pub fn client_config_with_fingerprint_and_custom_roots(
+    insecure: bool,
+    fingerprint: Option<UtlsFingerprint>,
+    ca_cert_paths: &[PathBuf],
+) -> Result<Arc<ClientConfig>> {
+    build_client_config_with_custom_roots(insecure, fingerprint, false, ca_cert_paths)
+}
+
+fn build_client_config_with_custom_roots(
+    insecure: bool,
+    fingerprint: Option<UtlsFingerprint>,
+    early_data: bool,
+    ca_cert_paths: &[PathBuf],
+) -> Result<Arc<ClientConfig>> {
     if ca_cert_paths.is_empty() || insecure {
-        return Ok(client_config(insecure));
+        return Ok(build_client_config(insecure, fingerprint, early_data));
     }
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -198,11 +222,21 @@ pub fn client_config_with_custom_roots(
                 .with_context(|| format!("add custom root certificate {}", path.display()))?;
         }
     }
-    Ok(Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    ))
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = fingerprint
+        .map(UtlsFingerprint::rustls_alpn_protocols)
+        .unwrap_or_default();
+    config.enable_early_data = early_data;
+    if let Some(fingerprint) = fingerprint {
+        tracing::debug!(
+            fingerprint = %fingerprint,
+            profile = fingerprint.rustls_profile_note(),
+            "applied uTLS-like rustls client profile"
+        );
+    }
+    Ok(Arc::new(config))
 }
 
 fn build_client_config(

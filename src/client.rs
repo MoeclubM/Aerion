@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use rustls::pki_types::ServerName;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split};
@@ -29,6 +30,7 @@ pub struct ClientConfig {
     pub password: String,
     pub sni: String,
     pub insecure: bool,
+    pub ca_cert_paths: Vec<PathBuf>,
     pub padding_scheme: Vec<String>,
     pub heartbeat_interval_secs: u64,
 }
@@ -41,7 +43,8 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
 }
 
 pub async fn run_client_listener(listener: TcpListener, config: ClientConfig) -> Result<()> {
-    let tls_config = tls::client_config_early_data(config.insecure);
+    let tls_config =
+        tls::client_config_with_custom_roots_early_data(config.insecure, &config.ca_cert_paths)?;
     let session = ClientSession::connect(&config, tls_config).await?;
     tracing::info!("client listening on socks5://{}", listener.local_addr()?);
     loop {

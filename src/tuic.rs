@@ -5,7 +5,6 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use bytes::Bytes;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{Endpoint, IdleTimeout, VarInt};
-use rustls::RootCertStore;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -50,6 +49,7 @@ pub struct TuicClientConfig {
     pub password: String,
     pub sni: String,
     pub insecure: bool,
+    pub ca_cert_paths: Vec<PathBuf>,
     pub udp: bool,
     pub udp_relay_mode: String,
     pub congestion_control: String,
@@ -1565,18 +1565,10 @@ async fn resolve_host_addr(host: &str, port: u16) -> Result<SocketAddr> {
 }
 
 fn build_client_endpoint(config: &TuicClientConfig, bind_ipv6: bool) -> Result<Endpoint> {
-    let mut tls = if config.insecure {
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(tls::InsecureVerifier))
-            .with_no_client_auth()
-    } else {
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
-    };
+    let mut tls = Arc::unwrap_or_clone(tls::client_config_with_custom_roots(
+        config.insecure,
+        &config.ca_cert_paths,
+    )?);
     tls.alpn_protocols = alpn_protocols(&config.alpn_protocols);
     let quic_tls =
         QuicClientConfig::try_from(Arc::new(tls)).context("build TUIC QUIC TLS client config")?;

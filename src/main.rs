@@ -235,6 +235,7 @@ async fn main() -> Result<()> {
                 password,
                 sni,
                 insecure,
+                ca_cert_paths: Vec::new(),
                 padding_scheme: if padding_scheme.is_empty() {
                     PaddingScheme::default_lines()
                 } else {
@@ -397,6 +398,7 @@ async fn main() -> Result<()> {
                 password,
                 sni,
                 insecure,
+                ca_cert_paths: Vec::new(),
                 udp,
                 udp_relay_mode,
                 congestion_control,
@@ -619,6 +621,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             password: client.password,
             sni,
             insecure: client.insecure,
+            ca_cert_paths: client.ca_cert_paths,
             udp: client.udp,
             udp_relay_mode: client.udp_relay_mode,
             congestion_control: client.congestion_control,
@@ -667,6 +670,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             password: client.password,
             sni,
             insecure: client.insecure,
+            ca_cert_paths: client.ca_cert_paths,
             udp: client.udp,
             client_fingerprint: client.client_fingerprint,
             transport: native_vless_transport(
@@ -699,6 +703,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             tls,
             sni,
             insecure: client.insecure,
+            ca_cert_paths: client.ca_cert_paths,
             flow: client.flow,
             packet_encoding: client.packet_encoding,
             mux: client.mux,
@@ -726,6 +731,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             tls: client.tls.unwrap_or(false),
             sni,
             insecure: client.insecure,
+            ca_cert_paths: client.ca_cert_paths,
             client_fingerprint: client.client_fingerprint,
             transport: native_vless_transport(
                 client.network.as_deref(),
@@ -744,6 +750,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
         password: client.password,
         sni,
         insecure: client.insecure,
+        ca_cert_paths: client.ca_cert_paths,
         padding_scheme: client.padding_scheme,
         heartbeat_interval_secs: client.heartbeat_interval_secs,
     })

@@ -1290,7 +1290,7 @@ impl SingBoxVlessOutbound {
             None
         };
         if let Some(tls) = &self.tls {
-            tls.ensure_supported_client_options("VLESS", name, false)?;
+            tls.ensure_supported_client_options("VLESS", name, true)?;
             if tls_enabled || reality.is_some() {
                 ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
             } else {
@@ -1314,6 +1314,11 @@ impl SingBoxVlessOutbound {
             } else {
                 false
             },
+            ca_cert_paths: value_paths(
+                self.tls
+                    .as_ref()
+                    .and_then(|tls| tls.certificate_path.as_ref()),
+            )?,
             flow: self.flow.clone(),
             packet_encoding: self
                 .packet_encoding
@@ -1351,7 +1356,7 @@ impl SingBoxVmessOutbound {
         ensure_vmess_packet_encoding(&packet_encoding)
             .with_context(|| format!("sing-box VMess outbound {name} packet_encoding"))?;
         if let Some(tls) = &self.tls {
-            tls.ensure_supported_client_options("VMess", name, false)?;
+            tls.ensure_supported_client_options("VMess", name, true)?;
             if tls.enabled {
                 ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
             } else {
@@ -1376,6 +1381,11 @@ impl SingBoxVmessOutbound {
             } else {
                 false
             },
+            ca_cert_paths: value_paths(
+                self.tls
+                    .as_ref()
+                    .and_then(|tls| tls.certificate_path.as_ref()),
+            )?,
             client_fingerprint: if tls_enabled {
                 self.tls
                     .as_ref()
@@ -1407,7 +1417,7 @@ impl SingBoxTrojanOutbound {
             tls.enabled,
             "sing-box Trojan outbound {name} disables TLS; Trojan requires TLS in Aerion"
         );
-        tls.ensure_supported_client_options("Trojan", name, false)?;
+        tls.ensure_supported_client_options("Trojan", name, true)?;
         ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
         Ok(TrojanClientConfig {
             listen,
@@ -1416,6 +1426,7 @@ impl SingBoxTrojanOutbound {
             password: self.password.clone(),
             sni: sni_or_server(tls.server_name.as_deref(), &self.server),
             insecure: tls.insecure,
+            ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
             udp: network_allows_udp(self.network.as_deref()),
             client_fingerprint: tls.utls_fingerprint(name)?,
             transport,
@@ -1517,7 +1528,7 @@ impl SingBoxAnyTlsOutbound {
             tls.enabled,
             "sing-box AnyTLS outbound {name} disables TLS; AnyTLS requires TLS"
         );
-        tls.ensure_supported_client_options("AnyTLS", name, false)?;
+        tls.ensure_supported_client_options("AnyTLS", name, true)?;
         Ok(ClientConfig {
             listen,
             server_host: self.server.clone(),
@@ -1525,6 +1536,7 @@ impl SingBoxAnyTlsOutbound {
             password: self.password.clone(),
             sni: sni_or_server(tls.server_name.as_deref(), &self.server),
             insecure: tls.insecure,
+            ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
             padding_scheme: PaddingScheme::default_lines(),
             heartbeat_interval_secs: 30,
         })
@@ -1601,7 +1613,7 @@ impl SingBoxTuicOutbound {
             tls.enabled,
             "sing-box TUIC outbound {name} disables TLS; TUIC requires QUIC TLS"
         );
-        tls.ensure_supported_client_options("TUIC", name, false)?;
+        tls.ensure_supported_client_options("TUIC", name, true)?;
         ensure_tuic_alpn("sing-box", name, tls.alpn.as_ref())?;
         Ok(TuicClientConfig {
             listen,
@@ -1611,6 +1623,7 @@ impl SingBoxTuicOutbound {
             password: self.password.clone(),
             sni: sni_or_server(tls.server_name.as_deref(), &self.server),
             insecure: tls.insecure,
+            ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
             udp: network_allows_udp(self.network.as_deref()),
             udp_relay_mode: self
                 .udp_relay_mode
@@ -1650,7 +1663,7 @@ impl SingBoxTlsOptions {
                     .as_ref()
                     .map(json_value_non_empty)
                     .unwrap_or(false),
-            "sing-box {protocol} outbound {name} sets custom TLS certificate roots; Aerion client does not expose custom trust roots"
+            "sing-box {protocol} outbound {name} sets inline TLS certificate or private key material; Aerion client expects certificate_path for custom trust roots"
         );
         ensure!(
             allow_certificate_path
@@ -1659,7 +1672,7 @@ impl SingBoxTlsOptions {
                     .as_ref()
                     .map(json_value_non_empty)
                     .unwrap_or(false),
-            "sing-box {protocol} outbound {name} sets custom TLS certificate roots; Aerion client does not expose custom trust roots"
+            "sing-box {protocol} outbound {name} sets custom TLS certificate roots; Aerion client expects certificate_path support to be wired explicitly"
         );
         ensure!(
             !singbox_enabled_option(protocol, name, "tls.ech", self.ech.as_ref())?,
@@ -2969,6 +2982,94 @@ mod tests {
         assert_eq!(hysteria2.obfs.as_deref(), Some("salamander"));
         assert_eq!(hysteria2.obfs_password.as_deref(), Some("obfs-pass"));
         assert_eq!(hysteria2.download_bandwidth, Some(80));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_client_custom_tls_roots() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-tls",
+      "server": "vless.example.com",
+      "server_port": 443,
+      "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+      "tls": { "enabled": true, "certificate_path": ["vless-ca.pem"] }
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-tls",
+      "server": "vmess.example.com",
+      "server_port": 443,
+      "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+      "alter_id": 0,
+      "tls": { "enabled": true, "certificate_path": "vmess-ca.pem" }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-tls",
+      "server": "trojan.example.com",
+      "server_port": 443,
+      "password": "secret",
+      "tls": { "enabled": true, "certificate_path": "trojan-ca.pem" }
+    },
+    {
+      "type": "anytls",
+      "tag": "anytls",
+      "server": "anytls.example.com",
+      "server_port": 443,
+      "password": "secret",
+      "tls": { "enabled": true, "certificate_path": "anytls-ca.pem" }
+    },
+    {
+      "type": "tuic",
+      "tag": "tuic-v5",
+      "server": "tuic.example.com",
+      "server_port": 443,
+      "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+      "password": "secret",
+      "tls": { "enabled": true, "certificate_path": "tuic-ca.pem" }
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxClientConfig::Vless(vless) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected VLESS")
+        };
+        assert_eq!(vless.ca_cert_paths, vec![PathBuf::from("vless-ca.pem")]);
+
+        let SingBoxClientConfig::Vmess(vmess) =
+            config.outbounds[1].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected VMess")
+        };
+        assert_eq!(vmess.ca_cert_paths, vec![PathBuf::from("vmess-ca.pem")]);
+
+        let SingBoxClientConfig::Trojan(trojan) =
+            config.outbounds[2].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Trojan")
+        };
+        assert_eq!(trojan.ca_cert_paths, vec![PathBuf::from("trojan-ca.pem")]);
+
+        let SingBoxClientConfig::AnyTls(anytls) =
+            config.outbounds[3].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected AnyTLS")
+        };
+        assert_eq!(anytls.ca_cert_paths, vec![PathBuf::from("anytls-ca.pem")]);
+
+        let SingBoxClientConfig::Tuic(tuic) =
+            config.outbounds[4].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected TUIC")
+        };
+        assert_eq!(tuic.ca_cert_paths, vec![PathBuf::from("tuic-ca.pem")]);
         Ok(())
     }
 
