@@ -1643,7 +1643,7 @@ fn ensure_multiplex_disabled(
         !multiplex
             .map(|multiplex| multiplex.enabled)
             .unwrap_or(false),
-        "{format} profile {name} enables multiplex; Aerion does not implement sing-box multiplex"
+        "{format} profile {name} enables multiplex; Aerion does not implement sing-box multiplex because it is not wire-compatible with Aerion mux.cool"
     );
     Ok(())
 }

@@ -120,7 +120,7 @@ impl VlessTransportConfig {
             "" | "tcp" | "raw" => Ok(Self::tcp()),
             "ws" | "websocket" => Ok(Self::websocket(path, host, headers)),
             "httpupgrade" => Ok(Self::http_upgrade(path, host, headers)),
-            "h2" | "http2" => Ok(Self::http2(path, host, headers)),
+            "h2" | "http" | "http2" => Ok(Self::http2(path, host, headers)),
             "grpc" => Ok(Self::grpc(path, host, headers)),
             "xhttp" | "splithttp" => Self::xhttp(path, host, headers, None),
             other => bail!("unsupported VLESS transport network {other}"),
