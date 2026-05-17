@@ -2,11 +2,17 @@ use crate::protocol::ProxyTarget;
 use anyhow::{Context, Result, bail, ensure};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 
 pub enum SocksRequest {
     Connect(ProxyTarget),
     UdpAssociate,
+}
+
+pub struct SocksUdpAssociation {
+    pub control: TcpStream,
+    pub udp: UdpSocket,
+    pub bind: SocketAddr,
 }
 
 pub async fn read_request(stream: &mut TcpStream) -> Result<SocksRequest> {
@@ -87,6 +93,32 @@ pub async fn write_reply(stream: &mut TcpStream, code: u8) -> Result<()> {
 }
 
 pub async fn connect_tcp(upstream: SocketAddr, target: &ProxyTarget) -> Result<TcpStream> {
+    let mut stream = connect_no_auth(upstream).await?;
+    write_proxy_request(&mut stream, 0x01, target).await?;
+    read_proxy_reply(&mut stream, upstream).await?;
+    Ok(stream)
+}
+
+pub async fn udp_associate(upstream: SocketAddr) -> Result<SocksUdpAssociation> {
+    let mut control = connect_no_auth(upstream).await?;
+    let local_ip = control.local_addr()?.ip();
+    let bind_request = if upstream.is_ipv4() {
+        ProxyTarget::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+    } else {
+        ProxyTarget::Ip(SocketAddr::new(
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            0,
+        ))
+    };
+    write_proxy_request(&mut control, 0x03, &bind_request).await?;
+    let bind = read_proxy_reply(&mut control, upstream).await?;
+    let udp = UdpSocket::bind(SocketAddr::new(local_ip, 0))
+        .await
+        .with_context(|| format!("bind SOCKS UDP client socket for {upstream}"))?;
+    Ok(SocksUdpAssociation { control, udp, bind })
+}
+
+async fn connect_no_auth(upstream: SocketAddr) -> Result<TcpStream> {
     let mut stream = TcpStream::connect(upstream)
         .await
         .with_context(|| format!("connect SOCKS upstream {upstream}"))?;
@@ -103,13 +135,15 @@ pub async fn connect_tcp(upstream: SocketAddr, target: &ProxyTarget) -> Result<T
         method == [0x05, 0x00],
         "SOCKS upstream {upstream} rejected no-auth method"
     );
-    write_connect_request(&mut stream, target).await?;
-    read_connect_reply(&mut stream, upstream).await?;
     Ok(stream)
 }
 
-async fn write_connect_request(stream: &mut TcpStream, target: &ProxyTarget) -> Result<()> {
-    let mut request = vec![0x05, 0x01, 0x00];
+async fn write_proxy_request(
+    stream: &mut TcpStream,
+    command: u8,
+    target: &ProxyTarget,
+) -> Result<()> {
+    let mut request = vec![0x05, command, 0x00];
     match target {
         ProxyTarget::Ip(addr) => match addr.ip() {
             IpAddr::V4(ip) => {
@@ -135,28 +169,29 @@ async fn write_connect_request(stream: &mut TcpStream, target: &ProxyTarget) -> 
     stream
         .write_all(&request)
         .await
-        .context("write SOCKS connect request")
+        .context("write SOCKS request")
 }
 
-async fn read_connect_reply(stream: &mut TcpStream, upstream: SocketAddr) -> Result<()> {
+async fn read_proxy_reply(stream: &mut TcpStream, upstream: SocketAddr) -> Result<SocketAddr> {
     let mut header = [0u8; 4];
     stream
         .read_exact(&mut header)
         .await
-        .context("read SOCKS connect reply")?;
+        .context("read SOCKS reply")?;
     ensure!(header[0] == 0x05, "invalid SOCKS reply version");
     ensure!(
         header[1] == 0x00,
         "SOCKS upstream {upstream} connect failed with code {}",
         header[1]
     );
-    match header[3] {
+    let ip = match header[3] {
         0x01 => {
             let mut bound = [0u8; 4];
             stream
                 .read_exact(&mut bound)
                 .await
                 .context("read SOCKS IPv4 bind address")?;
+            IpAddr::V4(Ipv4Addr::from(bound))
         }
         0x03 => {
             let mut length = [0u8; 1];
@@ -169,6 +204,7 @@ async fn read_connect_reply(stream: &mut TcpStream, upstream: SocketAddr) -> Res
                 .read_exact(&mut bound)
                 .await
                 .context("read SOCKS domain bind address")?;
+            bail!("SOCKS upstream {upstream} returned domain bind address")
         }
         0x04 => {
             let mut bound = [0u8; 16];
@@ -176,15 +212,16 @@ async fn read_connect_reply(stream: &mut TcpStream, upstream: SocketAddr) -> Res
                 .read_exact(&mut bound)
                 .await
                 .context("read SOCKS IPv6 bind address")?;
+            IpAddr::V6(bound.into())
         }
         other => bail!("unsupported SOCKS bind address type: {other}"),
-    }
+    };
     let mut port = [0u8; 2];
     stream
         .read_exact(&mut port)
         .await
         .context("read SOCKS bind port")?;
-    Ok(())
+    Ok(SocketAddr::new(ip, u16::from_be_bytes(port)))
 }
 
 pub async fn write_reply_with_bind(
