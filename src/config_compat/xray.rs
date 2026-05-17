@@ -1,12 +1,12 @@
 use crate::config_compat::mihomo::OneOrManyStrings;
 use crate::hysteria2::Hysteria2ClientConfig;
 use crate::reality::{RealityClientConfig, RealityServerConfig};
-use crate::shadowsocks::ShadowsocksClientConfig;
-use crate::trojan::TrojanClientConfig;
+use crate::shadowsocks::{ShadowsocksClientConfig, ShadowsocksServerConfig};
+use crate::trojan::{TrojanClientConfig, TrojanServerConfig};
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::{VlessClientConfig, VlessServerConfig};
 use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
-use crate::vmess::{VmessClientConfig, ensure_vmess_packet_encoding};
+use crate::vmess::{VmessClientConfig, VmessServerConfig, ensure_vmess_packet_encoding};
 use anyhow::{Context, Result, bail, ensure};
 use serde::de;
 use serde::{Deserialize, Deserializer};
@@ -425,7 +425,10 @@ pub enum XrayClientConfig {
 }
 
 pub enum XrayServerConfig {
+    Shadowsocks(ShadowsocksServerConfig),
+    Trojan(TrojanServerConfig),
     Vless(VlessServerConfig),
+    Vmess(VmessServerConfig),
 }
 
 struct XrayServerUser {
@@ -462,9 +465,21 @@ impl XrayInbound {
 
     pub fn to_server_config(&self) -> Result<XrayServerConfig> {
         match self.protocol.trim().to_ascii_lowercase().as_str() {
+            "shadowsocks" | "ss" => Ok(XrayServerConfig::Shadowsocks(
+                self.to_shadowsocks_server_config()
+                    .with_context(|| format!("convert xray Shadowsocks inbound {}", self.name()))?,
+            )),
+            "trojan" => Ok(XrayServerConfig::Trojan(
+                self.to_trojan_server_config()
+                    .with_context(|| format!("convert xray Trojan inbound {}", self.name()))?,
+            )),
             "vless" => Ok(XrayServerConfig::Vless(
                 self.to_vless_server_config()
                     .with_context(|| format!("convert xray VLESS inbound {}", self.name()))?,
+            )),
+            "vmess" => Ok(XrayServerConfig::Vmess(
+                self.to_vmess_server_config()
+                    .with_context(|| format!("convert xray VMess inbound {}", self.name()))?,
             )),
             other => bail!(
                 "unsupported xray inbound {} protocol {}; Aerion cannot run this inbound protocol as a server",
@@ -472,6 +487,129 @@ impl XrayInbound {
                 other
             ),
         }
+    }
+
+    fn to_shadowsocks_server_config(&self) -> Result<ShadowsocksServerConfig> {
+        ensure_tcp_network("xray", self.name(), &self.stream_settings.network)?;
+        let stream_security = self.stream_settings.security.trim();
+        ensure!(
+            stream_security.is_empty() || stream_security.eq_ignore_ascii_case("none"),
+            "xray Shadowsocks inbound {} uses stream security {}; Aerion Shadowsocks expects raw Shadowsocks transport",
+            self.name(),
+            stream_security
+        );
+        let primary = self.settings.clients.first();
+        let method = primary
+            .and_then(|user| user.security.clone())
+            .or(self.settings.method.clone())
+            .or(self.settings.security.clone())
+            .with_context(|| {
+                format!("xray Shadowsocks inbound {} is missing method", self.name())
+            })?;
+        let password = primary
+            .and_then(|user| user.password.clone())
+            .or(self.settings.password.clone())
+            .with_context(|| {
+                format!(
+                    "xray Shadowsocks inbound {} is missing password",
+                    self.name()
+                )
+            })?;
+        Ok(ShadowsocksServerConfig {
+            listen: SocketAddr::new(
+                parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
+                self.port.with_context(|| {
+                    format!("xray Shadowsocks inbound {} is missing port", self.name())
+                })?,
+            ),
+            method,
+            password,
+            users: self
+                .settings
+                .clients
+                .iter()
+                .skip(1)
+                .map(|user| {
+                    user.password.clone().with_context(|| {
+                        format!(
+                            "xray Shadowsocks inbound {} extra client is missing password",
+                            self.name()
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            tcp: true,
+            udp: true,
+            udp_over_tcp: false,
+        })
+    }
+
+    fn to_trojan_server_config(&self) -> Result<TrojanServerConfig> {
+        ensure!(
+            self.settings.fallbacks.is_empty(),
+            "xray Trojan inbound {} sets fallbacks; Aerion Trojan server does not expose fallback routing",
+            self.name()
+        );
+        let stream_security = self.stream_settings.security.trim();
+        ensure!(
+            stream_security.eq_ignore_ascii_case("tls"),
+            "xray Trojan inbound {} uses stream security {}; Aerion Trojan server requires TLS",
+            self.name(),
+            stream_security
+        );
+        let transport = XrayOutbound {
+            tag: self.tag.clone(),
+            protocol: self.protocol.clone(),
+            settings: XrayOutboundSettings::default(),
+            stream_settings: self.stream_settings.clone(),
+            mux: None,
+            decode_error: None,
+        }
+        .vless_transport_config()?;
+        ensure_vless_alpn("xray", self.name(), &transport, self.stream_alpn())?;
+        let certificate = self
+            .stream_settings
+            .tls_settings
+            .as_ref()
+            .and_then(|tls| tls.certificates.first())
+            .context("xray Trojan inbound TLS is missing certificates")?;
+        let primary = self
+            .settings
+            .clients
+            .first()
+            .context("xray Trojan inbound is missing settings.clients")?;
+        Ok(TrojanServerConfig {
+            listen: SocketAddr::new(
+                parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
+                self.port.with_context(|| {
+                    format!("xray Trojan inbound {} is missing port", self.name())
+                })?,
+            ),
+            password: primary
+                .password
+                .clone()
+                .context("xray Trojan inbound primary client is missing password")?,
+            users: self
+                .settings
+                .clients
+                .iter()
+                .skip(1)
+                .map(|user| {
+                    user.password
+                        .clone()
+                        .context("xray Trojan inbound extra client is missing password")
+                })
+                .collect::<Result<Vec<_>>>()?,
+            cert_path: certificate
+                .certificate_file
+                .clone()
+                .context("xray Trojan inbound TLS certificate is missing certificateFile")?,
+            key_path: certificate
+                .key_file
+                .clone()
+                .context("xray Trojan inbound TLS certificate is missing keyFile")?,
+            transport,
+        })
     }
 
     fn to_vless_server_config(&self) -> Result<VlessServerConfig> {
@@ -607,6 +745,103 @@ impl XrayInbound {
             key_path,
             flow,
             reality,
+            transport,
+        })
+    }
+
+    fn to_vmess_server_config(&self) -> Result<VmessServerConfig> {
+        ensure_raw_or_tls_stream_security(
+            "xray VMess",
+            self.name(),
+            &self.stream_settings.security,
+        )?;
+        let transport = XrayOutbound {
+            tag: self.tag.clone(),
+            protocol: self.protocol.clone(),
+            settings: XrayOutboundSettings::default(),
+            stream_settings: self.stream_settings.clone(),
+            mux: None,
+            decode_error: None,
+        }
+        .vless_transport_config()?;
+        let tls_enabled = self
+            .stream_settings
+            .security
+            .trim()
+            .eq_ignore_ascii_case("tls");
+        if tls_enabled {
+            ensure_vless_alpn("xray", self.name(), &transport, self.stream_alpn())?;
+        } else {
+            ensure_no_alpn("xray", self.name(), self.stream_alpn())?;
+        }
+        let primary = self
+            .settings
+            .clients
+            .first()
+            .context("xray VMess inbound is missing settings.clients")?;
+        let alter_id = primary.alter_id.or(self.settings.alter_id).unwrap_or(0);
+        ensure!(
+            alter_id == 0,
+            "xray VMess inbound {} primary client uses legacy alterId {}; Aerion implements AEAD VMess only",
+            self.name(),
+            alter_id
+        );
+        let user_id = primary
+            .id
+            .clone()
+            .context("xray VMess inbound primary client is missing id")?;
+        let users = self
+            .settings
+            .clients
+            .iter()
+            .skip(1)
+            .map(|user| {
+                let alter_id = user.alter_id.or(self.settings.alter_id).unwrap_or(0);
+                ensure!(
+                    alter_id == 0,
+                    "xray VMess inbound {} extra client uses legacy alterId {}; Aerion implements AEAD VMess only",
+                    self.name(),
+                    alter_id
+                );
+                user.id
+                    .clone()
+                    .context("xray VMess inbound extra client is missing id")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (cert_path, key_path) =
+            if tls_enabled {
+                let certificate = self
+                    .stream_settings
+                    .tls_settings
+                    .as_ref()
+                    .and_then(|tls| tls.certificates.first())
+                    .context("xray VMess inbound TLS is missing certificates")?;
+                (
+                    Some(certificate.certificate_file.clone().context(
+                        "xray VMess inbound TLS certificate is missing certificateFile",
+                    )?),
+                    Some(
+                        certificate
+                            .key_file
+                            .clone()
+                            .context("xray VMess inbound TLS certificate is missing keyFile")?,
+                    ),
+                )
+            } else {
+                (None, None)
+            };
+        Ok(VmessServerConfig {
+            listen: SocketAddr::new(
+                parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
+                self.port.with_context(|| {
+                    format!("xray VMess inbound {} is missing port", self.name())
+                })?,
+            ),
+            user_id,
+            users,
+            tls: tls_enabled,
+            cert_path,
+            key_path,
             transport,
         })
     }
@@ -1681,7 +1916,9 @@ mod tests {
 }
 "#;
         let config: XrayConfig = serde_json::from_str(json)?;
-        let XrayServerConfig::Vless(vless) = config.inbounds[0].to_server_config()?;
+        let XrayServerConfig::Vless(vless) = config.inbounds[0].to_server_config()? else {
+            bail!("expected VLESS")
+        };
         assert_eq!(vless.listen, "127.0.0.1:8443".parse()?);
         assert_eq!(vless.user_id, "a3482e88-686a-4a58-8126-99c9df64b7bf");
         assert_eq!(
@@ -1732,7 +1969,9 @@ mod tests {
 }
 "#;
         let config: XrayConfig = serde_json::from_str(json)?;
-        let XrayServerConfig::Vless(vless) = config.inbounds[0].to_server_config()?;
+        let XrayServerConfig::Vless(vless) = config.inbounds[0].to_server_config()? else {
+            bail!("expected VLESS")
+        };
         let reality = vless.reality.context("REALITY config")?;
         assert!(!vless.tls);
         assert_eq!(reality.server_name, "www.example.com");
@@ -1742,6 +1981,119 @@ mod tests {
         assert_eq!(reality.alpn_protocols, vec![b"h2".to_vec()]);
         assert_eq!(vless.transport.kind, VlessTransportKind::Grpc);
         assert_eq!(vless.transport.path, "/TunService/Tun");
+        Ok(())
+    }
+
+    #[test]
+    fn converts_vmess_tls_inbound_to_server_config() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [{
+    "tag": "vmess-tls",
+    "protocol": "vmess",
+    "listen": "127.0.0.1",
+    "port": 9443,
+    "settings": {
+      "clients": [
+        { "id": "a3482e88-686a-4a58-8126-99c9df64b7bf", "alterId": 0 },
+        { "id": "433722e1-0f8c-4724-9089-d5bc6d0c51ef" }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws",
+      "security": "tls",
+      "tlsSettings": {
+        "certificates": [{ "certificateFile": "server.crt", "keyFile": "server.key" }]
+      },
+      "wsSettings": { "path": "/vmess" }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let XrayServerConfig::Vmess(vmess) = config.inbounds[0].to_server_config()? else {
+            bail!("expected VMess")
+        };
+        assert_eq!(vmess.listen, "127.0.0.1:9443".parse()?);
+        assert!(vmess.tls);
+        assert_eq!(vmess.cert_path, Some(PathBuf::from("server.crt")));
+        assert_eq!(vmess.key_path, Some(PathBuf::from("server.key")));
+        assert_eq!(vmess.user_id, "a3482e88-686a-4a58-8126-99c9df64b7bf");
+        assert_eq!(
+            vmess.users,
+            vec!["433722e1-0f8c-4724-9089-d5bc6d0c51ef".to_string()]
+        );
+        assert_eq!(vmess.transport.kind, VlessTransportKind::WebSocket);
+        assert_eq!(vmess.transport.path, "/vmess");
+        Ok(())
+    }
+
+    #[test]
+    fn converts_trojan_tls_inbound_to_server_config() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [{
+    "tag": "trojan-tls",
+    "protocol": "trojan",
+    "listen": "127.0.0.1",
+    "port": 9444,
+    "settings": {
+      "clients": [
+        { "password": "primary-pass" },
+        { "password": "alice-pass" }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws",
+      "security": "tls",
+      "tlsSettings": {
+        "certificates": [{ "certificateFile": "server.crt", "keyFile": "server.key" }]
+      },
+      "wsSettings": { "path": "/trojan" }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let XrayServerConfig::Trojan(trojan) = config.inbounds[0].to_server_config()? else {
+            bail!("expected Trojan")
+        };
+        assert_eq!(trojan.listen, "127.0.0.1:9444".parse()?);
+        assert_eq!(trojan.password, "primary-pass");
+        assert_eq!(trojan.users, vec!["alice-pass".to_string()]);
+        assert_eq!(trojan.cert_path, PathBuf::from("server.crt"));
+        assert_eq!(trojan.key_path, PathBuf::from("server.key"));
+        assert_eq!(trojan.transport.kind, VlessTransportKind::WebSocket);
+        assert_eq!(trojan.transport.path, "/trojan");
+        Ok(())
+    }
+
+    #[test]
+    fn converts_shadowsocks_inbound_to_server_config() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [{
+    "tag": "ss",
+    "protocol": "shadowsocks",
+    "listen": "127.0.0.1",
+    "port": 8388,
+    "settings": {
+      "method": "aes-128-gcm",
+      "password": "secret"
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let XrayServerConfig::Shadowsocks(shadowsocks) = config.inbounds[0].to_server_config()?
+        else {
+            bail!("expected Shadowsocks")
+        };
+        assert_eq!(shadowsocks.listen, "127.0.0.1:8388".parse()?);
+        assert_eq!(shadowsocks.method, "aes-128-gcm");
+        assert_eq!(shadowsocks.password, "secret");
+        assert!(shadowsocks.tcp);
+        assert!(shadowsocks.udp);
         Ok(())
     }
 
