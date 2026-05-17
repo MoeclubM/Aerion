@@ -1932,6 +1932,9 @@ fn xray_tls_client_roots(tls: Option<&XrayTlsSettings>) -> Result<(Vec<PathBuf>,
     let Some(tls) = tls else {
         return Ok((Vec::new(), Vec::new()));
     };
+    if !tls.disable_system_root {
+        return Ok((Vec::new(), Vec::new()));
+    }
     let mut paths = Vec::new();
     let mut certificates = Vec::new();
     for certificate in tls.certificates.iter().filter(|certificate| {
