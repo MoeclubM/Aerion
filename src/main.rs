@@ -9,6 +9,9 @@ use aerion::mieru::{
 use aerion::naive::{NaiveClientConfig, NaiveServerConfig};
 use aerion::padding::PaddingScheme;
 use aerion::tuic::{TuicClientConfig, TuicServerConfig, parse_tuic_user};
+use aerion::tun::{
+    DEFAULT_TUN_MTU, TunCancellationToken, TunConfig, TunDnsStrategy, TunVerbosity, run_tun,
+};
 use aerion::vless_transport::VlessTransportConfig;
 use aerion::{
     ClientConfig, MihomoClientConfig, MihomoProxy, RealityClientConfig, RealityServerConfig,
@@ -24,7 +27,7 @@ use aerion::{
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -45,6 +48,42 @@ enum Command {
         profile: Option<String>,
         #[arg(long)]
         listen: Option<SocketAddr>,
+    },
+    Tun {
+        #[arg(long)]
+        proxy: String,
+        #[arg(long)]
+        tun: Option<String>,
+        #[arg(long = "tun-fd")]
+        tun_fd: Option<i32>,
+        #[arg(long = "close-fd-on-drop")]
+        close_fd_on_drop: bool,
+        #[arg(long)]
+        setup: bool,
+        #[arg(long, default_value_t = DEFAULT_TUN_MTU)]
+        mtu: u16,
+        #[arg(long, default_value_t = TunDnsStrategy::Direct)]
+        dns: TunDnsStrategy,
+        #[arg(long = "dns-addr", default_value = "8.8.8.8")]
+        dns_addr: IpAddr,
+        #[arg(long = "virtual-dns-pool", default_value = "198.18.0.0/15")]
+        virtual_dns_pool: String,
+        #[arg(long = "bypass")]
+        bypass: Vec<String>,
+        #[arg(long)]
+        ipv6: bool,
+        #[arg(long, default_value_t = TunVerbosity::Info)]
+        verbosity: TunVerbosity,
+        #[arg(long = "tcp-timeout", default_value_t = 600)]
+        tcp_timeout_secs: u64,
+        #[arg(long = "udp-timeout", default_value_t = 10)]
+        udp_timeout_secs: u64,
+        #[arg(long = "max-sessions", default_value_t = 200)]
+        max_sessions: usize,
+        #[arg(long = "exit-on-fatal-error")]
+        exit_on_fatal_error: bool,
+        #[arg(long = "packet-information")]
+        packet_information: bool,
     },
     Client {
         #[arg(long, default_value = "127.0.0.1:1080")]
@@ -221,6 +260,46 @@ async fn main() -> Result<()> {
             profile,
             listen,
         } => run_file_config(load_config(&config)?, profile.as_deref(), listen).await,
+        Command::Tun {
+            proxy,
+            tun,
+            tun_fd,
+            close_fd_on_drop,
+            setup,
+            mtu,
+            dns,
+            dns_addr,
+            virtual_dns_pool,
+            bypass,
+            ipv6,
+            verbosity,
+            tcp_timeout_secs,
+            udp_timeout_secs,
+            max_sessions,
+            exit_on_fatal_error,
+            packet_information,
+        } => {
+            let mut config = TunConfig::new(proxy);
+            config.tun_name = tun;
+            config.tun_fd = tun_fd;
+            config.close_fd_on_drop = close_fd_on_drop;
+            config.setup = setup;
+            config.mtu = mtu;
+            config.packet_information = packet_information;
+            config.dns = dns;
+            config.dns_addr = dns_addr;
+            config.virtual_dns_pool = virtual_dns_pool;
+            config.bypass = bypass;
+            config.ipv6 = ipv6;
+            config.verbosity = verbosity;
+            config.tcp_timeout_secs = tcp_timeout_secs;
+            config.udp_timeout_secs = udp_timeout_secs;
+            config.max_sessions = max_sessions;
+            config.exit_on_fatal_error = exit_on_fatal_error;
+            run_tun(config, TunCancellationToken::new())
+                .await
+                .map(|_| ())
+        }
         Command::Client {
             listen,
             server,

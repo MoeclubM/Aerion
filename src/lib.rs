@@ -17,6 +17,7 @@ pub mod socks;
 pub mod tls;
 pub mod trojan;
 pub mod tuic;
+pub mod tun;
 pub mod uot;
 pub mod utls;
 pub mod vless;
@@ -67,6 +68,10 @@ pub use trojan::{
 pub use tuic::{
     TuicClientConfig, TuicServerConfig, TuicUdpRelayMode, TuicUser, parse_tuic_user,
     run_tuic_client, run_tuic_client_listener, run_tuic_server, run_tuic_server_with_core,
+};
+pub use tun::{
+    DEFAULT_TUN_MTU, TunCancellationToken, TunConfig, TunDnsStrategy, TunRuntime, TunVerbosity,
+    run_tun, socks_proxy_url, spawn_tun,
 };
 pub use utls::UtlsFingerprint;
 pub use vless::{
