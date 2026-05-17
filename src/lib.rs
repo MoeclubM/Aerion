@@ -10,6 +10,7 @@ pub mod padding;
 pub mod protocol;
 pub mod reality;
 pub mod reality_tls_client;
+pub mod routing;
 pub mod server;
 pub mod shadowsocks;
 pub mod socket_protect;
@@ -55,6 +56,9 @@ pub use naive::{
 pub use reality::{
     BuiltRealityClientHello, RealityClientConfig, RealityServerConfig, build_reality_client_hello,
     build_reality_client_hello_with_alpn,
+};
+pub use routing::{
+    DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
 };
 pub use server::{ServerConfig, run_server, run_server_listener, run_server_listener_with_core};
 pub use shadowsocks::{

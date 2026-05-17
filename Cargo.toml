@@ -42,6 +42,7 @@ webpki-roots = "1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 tun2proxy = { version = "0.7.21", default-features = false }
 tproxy-config = { version = "^7.0.7", default-features = false }
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3"
