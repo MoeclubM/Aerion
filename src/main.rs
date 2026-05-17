@@ -956,6 +956,7 @@ async fn run_client_config(config: RunnableClientConfig) -> Result<()> {
 async fn run_singbox_server_config(config: SingBoxServerConfig) -> Result<()> {
     match config {
         SingBoxServerConfig::Naive(config) => run_naive_server(config).await,
+        SingBoxServerConfig::Vless(config) => run_vless_server(config).await,
     }
 }
 
