@@ -10,7 +10,7 @@ use crate::vmess::{VmessClientConfig, ensure_vmess_packet_encoding};
 use anyhow::{Context, Result, bail, ensure};
 use serde::de;
 use serde::{Deserialize, Deserializer};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -34,17 +34,69 @@ pub struct XrayInbound {
     pub protocol: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct XrayOutbound {
-    #[serde(default)]
     pub tag: Option<String>,
     pub protocol: String,
-    #[serde(default)]
     pub settings: XrayOutboundSettings,
-    #[serde(default, rename = "streamSettings")]
     pub stream_settings: XrayStreamSettings,
-    #[serde(default)]
     pub mux: Option<XrayMuxOptions>,
+    pub decode_error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct XrayOutboundDecoded {
+    #[serde(default)]
+    tag: Option<String>,
+    protocol: String,
+    #[serde(default)]
+    settings: XrayOutboundSettings,
+    #[serde(default, rename = "streamSettings")]
+    stream_settings: XrayStreamSettings,
+    #[serde(default)]
+    mux: Option<XrayMuxOptions>,
+}
+
+impl<'de> Deserialize<'de> for XrayOutbound {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let fields = Map::<String, Value>::deserialize(deserializer)?;
+        let tag = fields
+            .get("tag")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let protocol = fields
+            .get("protocol")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let decoded = serde_json::from_value::<XrayOutboundDecoded>(Value::Object(fields));
+        match decoded {
+            Ok(decoded) => Ok(Self {
+                tag: decoded.tag,
+                protocol: decoded.protocol,
+                settings: decoded.settings,
+                stream_settings: decoded.stream_settings,
+                mux: decoded.mux,
+                decode_error: None,
+            }),
+            Err(error) => {
+                if protocol.trim().is_empty() {
+                    return Err(de::Error::custom(error));
+                }
+                Ok(Self {
+                    tag,
+                    protocol,
+                    settings: XrayOutboundSettings::default(),
+                    stream_settings: XrayStreamSettings::default(),
+                    mux: None,
+                    decode_error: Some(error.to_string()),
+                })
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -376,6 +428,12 @@ impl XrayOutbound {
     }
 
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<XrayClientConfig> {
+        ensure!(
+            self.decode_error.is_none(),
+            "parse xray outbound {} failed: {}",
+            self.name(),
+            self.decode_error.as_deref().unwrap_or_default()
+        );
         match self.protocol.trim().to_ascii_lowercase().as_str() {
             "shadowsocks" | "ss" => Ok(XrayClientConfig::Shadowsocks(
                 self.to_shadowsocks_client_config(listen)?,
@@ -1252,6 +1310,64 @@ mod tests {
         assert_eq!(vless.sni, "www.example.com");
         assert_eq!(vless.client_fingerprint, Some(UtlsFingerprint::Chrome));
         assert!(vless.reality.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn defers_xray_outbound_decode_errors_until_selected() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "tag": "broken-vless",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [{
+          "address": "example.com",
+          "port": 443,
+          "users": [{ "id": "a3482e88-686a-4a58-8126-99c9df64b7bf" }]
+        }]
+      },
+      "streamSettings": {
+        "security": "tls",
+        "tlsSettings": { "fingerprint": 123 }
+      }
+    },
+    {
+      "tag": "ss-ok",
+      "protocol": "shadowsocks",
+      "settings": {
+        "servers": [{
+          "address": "ss.example.com",
+          "port": 8388,
+          "method": "aes-128-gcm",
+          "password": "secret"
+        }]
+      }
+    }
+  ]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let XrayClientConfig::Shadowsocks(shadowsocks) = config
+            .outbound("ss-ok")
+            .context("ss outbound")?
+            .to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Shadowsocks")
+        };
+        assert_eq!(shadowsocks.server_host, "ss.example.com");
+
+        let error = config
+            .outbound("broken-vless")
+            .context("broken outbound")?
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("broken outbound parse must be deferred");
+        assert!(
+            error
+                .to_string()
+                .contains("parse xray outbound broken-vless failed")
+        );
         Ok(())
     }
 
