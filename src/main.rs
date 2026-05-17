@@ -914,6 +914,12 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
         .await;
     }
     if is_vless(&server.protocol) {
+        let tls = server.reality_private_key.is_none() && server.tls.unwrap_or(true);
+        let (cert_path, key_path) = if !tls {
+            (PathBuf::new(), PathBuf::new())
+        } else {
+            native_tls_paths(&server, "VLESS")?
+        };
         let transport = native_vless_transport(
             server.network.as_deref(),
             server.path,
@@ -937,12 +943,6 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
                 )
             })
             .transpose()?;
-        let tls = reality.is_none() && server.tls.unwrap_or(true);
-        let (cert_path, key_path) = if !tls {
-            (PathBuf::new(), PathBuf::new())
-        } else {
-            native_tls_paths(&server, "VLESS")?
-        };
         let certificates = if tls { server.certificates } else { Vec::new() };
         let key = if tls { server.key_pem } else { None };
         return run_vless_server(VlessServerConfig {
