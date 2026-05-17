@@ -357,13 +357,25 @@ fn detect_json_proxy_format(value: &Value) -> Result<JsonProxyFormat> {
     let outbounds = value
         .get("outbounds")
         .and_then(Value::as_array)
-        .context("JSON proxy config is missing outbounds array")?;
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let inbounds = value
+        .get("inbounds")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    ensure!(
+        !outbounds.is_empty() || !inbounds.is_empty(),
+        "JSON proxy config is missing inbounds/outbounds arrays"
+    );
     let has_sing_box = outbounds
         .iter()
-        .any(|outbound| outbound.get("type").is_some());
+        .chain(inbounds.iter())
+        .any(|entry| entry.get("type").is_some());
     let has_xray = outbounds
         .iter()
-        .any(|outbound| outbound.get("protocol").is_some());
+        .chain(inbounds.iter())
+        .any(|entry| entry.get("protocol").is_some());
     match (has_xray, has_sing_box) {
         (true, false) => Ok(JsonProxyFormat::Xray),
         (false, true) => Ok(JsonProxyFormat::SingBox),
@@ -482,6 +494,26 @@ mod tests {
             load_config(&path).expect("sing-box config"),
             FileConfig::SingBox(config) if config.outbounds.len() == 8
         ));
+    }
+
+    #[test]
+    fn detects_json_proxy_format_from_inbounds() -> Result<()> {
+        let sing_box = load_jsonc_value(
+            r#"{ "inbounds": [{ "type": "naive", "listen": "127.0.0.1", "listen_port": 443 }] }"#,
+        )?;
+        assert!(matches!(
+            detect_json_proxy_format(&sing_box)?,
+            JsonProxyFormat::SingBox
+        ));
+
+        let xray = load_jsonc_value(
+            r#"{ "inbounds": [{ "protocol": "vless", "listen": "127.0.0.1", "port": 443 }] }"#,
+        )?;
+        assert!(matches!(
+            detect_json_proxy_format(&xray)?,
+            JsonProxyFormat::Xray
+        ));
+        Ok(())
     }
 
     #[test]
