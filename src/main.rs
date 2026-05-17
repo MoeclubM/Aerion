@@ -62,7 +62,7 @@ enum Command {
         setup: bool,
         #[arg(long, default_value_t = DEFAULT_TUN_MTU)]
         mtu: u16,
-        #[arg(long, default_value_t = TunDnsStrategy::Direct)]
+        #[arg(long, default_value = "direct")]
         dns: TunDnsStrategy,
         #[arg(long = "dns-addr", default_value = "8.8.8.8")]
         dns_addr: IpAddr,
@@ -72,7 +72,7 @@ enum Command {
         bypass: Vec<String>,
         #[arg(long)]
         ipv6: bool,
-        #[arg(long, default_value_t = TunVerbosity::Info)]
+        #[arg(long, default_value = "info")]
         verbosity: TunVerbosity,
         #[arg(long = "tcp-timeout", default_value_t = 600)]
         tcp_timeout_secs: u64,
