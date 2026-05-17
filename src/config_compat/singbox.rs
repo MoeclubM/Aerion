@@ -1547,7 +1547,9 @@ mod tests {
 }
 "#;
         let config: SingBoxConfig = serde_json::from_str(json)?;
-        let SingBoxServerConfig::Naive(naive) = config.inbounds[0].to_server_config()?;
+        let SingBoxServerConfig::Naive(naive) = config.inbounds[0].to_server_config()? else {
+            bail!("expected Naive")
+        };
         assert_eq!(naive.listen, "127.0.0.1:8443".parse()?);
         assert_eq!(naive.username, "user");
         assert_eq!(naive.password, "pass");
