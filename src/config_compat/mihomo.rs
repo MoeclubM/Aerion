@@ -910,11 +910,6 @@ impl MihomoHysteria2Proxy {
             self.name
         );
         ensure!(
-            self.up.is_none(),
-            "mihomo Hysteria2 proxy {} sets up bandwidth; Aerion Hysteria2 client does not expose upload bandwidth",
-            self.name
-        );
-        ensure!(
             self.bbr_profile
                 .as_deref()
                 .map(str::trim)
@@ -988,6 +983,7 @@ impl MihomoHysteria2Proxy {
             pinned_cert_sha256: Vec::new(),
             obfs: self.obfs.clone(),
             obfs_password: self.obfs_password.clone(),
+            upload_bandwidth: self.up,
             download_bandwidth: self.down,
             udp: self.udp,
             congestion_control: self.congestion_control.clone(),
@@ -1763,6 +1759,7 @@ proxies:
     fingerprint: sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
     obfs: salamander
     obfs-password: obfs-pass
+    up: 10 Mbps
     down: 80 Mbps
     congestion-control: reno
     udp: true
@@ -1786,6 +1783,7 @@ proxies:
         );
         assert_eq!(hysteria2.obfs.as_deref(), Some("salamander"));
         assert_eq!(hysteria2.obfs_password.as_deref(), Some("obfs-pass"));
+        assert_eq!(hysteria2.upload_bandwidth, Some(10));
         assert_eq!(hysteria2.download_bandwidth, Some(80));
         assert_eq!(hysteria2.congestion_control, "reno");
         Ok(())
@@ -1795,12 +1793,6 @@ proxies:
     fn rejects_hysteria2_unsupported_fields() -> Result<()> {
         let yaml = r#"
 proxies:
-  - name: hy2-up
-    type: hysteria2
-    server: example.com
-    port: 443
-    password: secret
-    up: 10 Mbps
   - name: hy2-hop
     type: hysteria2
     server: example.com
@@ -1822,19 +1814,15 @@ proxies:
     max-stream-receive-window: 8388608
 "#;
         let config: MihomoConfig = serde_yaml::from_str(yaml)?;
-        let up_error = config.proxies[0]
-            .to_client_config("127.0.0.1:1080".parse()?)
-            .expect_err("up bandwidth must be explicit");
-        assert!(up_error.to_string().contains("up bandwidth"));
-        let hop_error = config.proxies[1]
+        let hop_error = config.proxies[0]
             .to_client_config("127.0.0.1:1080".parse()?)
             .expect_err("port hopping must be explicit");
         assert!(hop_error.to_string().contains("port hopping"));
-        let realm_error = config.proxies[2]
+        let realm_error = config.proxies[1]
             .to_client_config("127.0.0.1:1080".parse()?)
             .expect_err("realm opts must be explicit");
         assert!(realm_error.to_string().contains("realm-opts"));
-        let window_error = config.proxies[3]
+        let window_error = config.proxies[2]
             .to_client_config("127.0.0.1:1080".parse()?)
             .expect_err("receive window override must be explicit");
         assert!(window_error.to_string().contains("receive window"));

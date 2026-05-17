@@ -860,10 +860,6 @@ impl SingBoxHysteria2Inbound {
         ensure_supported_network("sing-box Hysteria2", name, self.network.as_deref())?;
         ensure_hy2_alpn("sing-box", name, self.tls.alpn.as_ref())?;
         ensure!(
-            self.up_mbps.unwrap_or(0) == 0,
-            "sing-box Hysteria2 inbound {name} sets up_mbps; Aerion Hysteria2 server does not expose upload bandwidth limiting"
-        );
-        ensure!(
             !json_value_non_empty_option(self.masquerade.as_ref()),
             "sing-box Hysteria2 inbound {name} sets masquerade; Aerion Hysteria2 server does not expose HTTP masquerade"
         );
@@ -923,6 +919,7 @@ impl SingBoxHysteria2Inbound {
             key,
             obfs: obfs.0,
             obfs_password: obfs.1,
+            upload_bandwidth: self.up_mbps,
             udp: network_allows_udp(self.network.as_deref()),
             cc_rx: self
                 .down_mbps
@@ -1472,10 +1469,6 @@ impl SingBoxHysteria2Outbound {
             "sing-box Hysteria2 outbound {name} enables port hopping; Aerion Hysteria2 client expects one fixed port"
         );
         ensure!(
-            self.up_mbps.unwrap_or(0) == 0,
-            "sing-box Hysteria2 outbound {name} sets up_mbps; Aerion Hysteria2 client does not expose upload bandwidth"
-        );
-        ensure!(
             !self.realm.as_ref().map(value_has_data).unwrap_or(false),
             "sing-box Hysteria2 outbound {name} sets realm; Aerion Hysteria2 client does not expose realm override"
         );
@@ -1534,6 +1527,7 @@ impl SingBoxHysteria2Outbound {
             pinned_cert_sha256: Vec::new(),
             obfs,
             obfs_password,
+            upload_bandwidth: self.up_mbps,
             download_bandwidth: self.down_mbps.or(self.down),
             udp: network_allows_udp(self.network.as_deref()),
             congestion_control: "bbr".to_string(),
@@ -2483,6 +2477,7 @@ mod tests {
         "type": "salamander",
         "password": "obfs-pass"
       },
+      "up_mbps": 5,
       "down_mbps": 10
     }
   ]
@@ -2499,6 +2494,7 @@ mod tests {
         assert_eq!(hy2.key_path, PathBuf::from("server.key"));
         assert_eq!(hy2.obfs, Some("salamander".to_string()));
         assert_eq!(hy2.obfs_password, Some("obfs-pass".to_string()));
+        assert_eq!(hy2.upload_bandwidth, Some(5));
         assert_eq!(hy2.cc_rx, "1250000");
         assert!(hy2.udp);
         Ok(())
@@ -3059,6 +3055,7 @@ mod tests {
     "server_port": 443,
     "password": "secret",
     "network": "udp",
+    "up_mbps": 10,
     "down_mbps": 80,
     "tls": {
       "enabled": true,
@@ -3096,6 +3093,7 @@ mod tests {
         assert!(hysteria2.udp);
         assert_eq!(hysteria2.obfs.as_deref(), Some("salamander"));
         assert_eq!(hysteria2.obfs_password.as_deref(), Some("obfs-pass"));
+        assert_eq!(hysteria2.upload_bandwidth, Some(10));
         assert_eq!(hysteria2.download_bandwidth, Some(80));
         Ok(())
     }
@@ -3239,7 +3237,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_hysteria2_upload_bandwidth() -> Result<()> {
+    fn parses_hysteria2_upload_bandwidth() -> Result<()> {
         let json = r#"
 {
   "outbounds": [{
@@ -3254,10 +3252,12 @@ mod tests {
 }
 "#;
         let config: SingBoxConfig = serde_json::from_str(json)?;
-        let error = config.outbounds[0]
-            .to_client_config("127.0.0.1:1080".parse()?)
-            .expect_err("up_mbps must be explicit");
-        assert!(error.to_string().contains("up_mbps"));
+        let SingBoxClientConfig::Hysteria2(hysteria2) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Hysteria2")
+        };
+        assert_eq!(hysteria2.upload_bandwidth, Some(10));
         Ok(())
     }
 

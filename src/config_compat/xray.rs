@@ -629,11 +629,6 @@ impl XrayInbound {
             self.name()
         );
         ensure!(
-            hysteria.and_then(|settings| settings.up).is_none(),
-            "xray Hysteria inbound {} sets upload bandwidth; Aerion Hysteria2 server does not expose upload bandwidth limiting",
-            self.name()
-        );
-        ensure!(
             !hysteria
                 .and_then(|settings| settings.masquerade.as_ref())
                 .map(value_has_data)
@@ -668,15 +663,6 @@ impl XrayInbound {
                     .map(value_has_data)
                     .unwrap_or(false),
                 "xray Hysteria inbound {} enables finalmask UDP port hopping; Aerion Hysteria2 server expects one fixed port",
-                self.name()
-            );
-            ensure!(
-                finalmask
-                    .quic_params
-                    .as_ref()
-                    .and_then(|params| params.brutal_up)
-                    .is_none(),
-                "xray Hysteria inbound {} sets finalmask brutalUp; Aerion Hysteria2 server does not expose upload bandwidth limiting",
                 self.name()
             );
             ensure!(
@@ -775,6 +761,10 @@ impl XrayInbound {
             .unwrap_or_else(|| "0".to_string());
         let (cert_path, key_path, certificates, key) =
             xray_tls_server_identity(certificate, "Hysteria", self.name())?;
+        let upload_bandwidth = finalmask
+            .and_then(|finalmask| finalmask.quic_params.as_ref())
+            .and_then(|params| params.brutal_up)
+            .or_else(|| hysteria.and_then(|settings| settings.up));
         Ok(Hysteria2ServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
@@ -790,6 +780,7 @@ impl XrayInbound {
             key,
             obfs,
             obfs_password,
+            upload_bandwidth,
             udp: true,
             cc_rx,
             congestion_control,
@@ -1430,11 +1421,6 @@ impl XrayOutbound {
             self.name()
         );
         ensure!(
-            hysteria.and_then(|settings| settings.up).is_none(),
-            "xray Hysteria outbound {} sets upload bandwidth; Aerion Hysteria2 client does not expose upload bandwidth",
-            self.name()
-        );
-        ensure!(
             !hysteria
                 .and_then(|settings| settings.masquerade.as_ref())
                 .map(value_has_data)
@@ -1462,15 +1448,6 @@ impl XrayOutbound {
                     .map(value_has_data)
                     .unwrap_or(false),
                 "xray Hysteria outbound {} enables finalmask UDP port hopping; Aerion Hysteria2 client expects one fixed port",
-                self.name()
-            );
-            ensure!(
-                finalmask
-                    .quic_params
-                    .as_ref()
-                    .and_then(|params| params.brutal_up)
-                    .is_none(),
-                "xray Hysteria outbound {} sets finalmask brutalUp; Aerion Hysteria2 client does not expose upload bandwidth",
                 self.name()
             );
             ensure!(
@@ -1539,6 +1516,10 @@ impl XrayOutbound {
             .and_then(|finalmask| finalmask.quic_params.as_ref())
             .and_then(|params| params.brutal_down)
             .or_else(|| hysteria.and_then(|settings| settings.down));
+        let upload_bandwidth = finalmask
+            .and_then(|finalmask| finalmask.quic_params.as_ref())
+            .and_then(|params| params.brutal_up)
+            .or_else(|| hysteria.and_then(|settings| settings.up));
         let (ca_cert_paths, ca_certificates) = xray_tls_client_roots(tls)?;
         Ok(Hysteria2ClientConfig {
             listen,
@@ -1566,6 +1547,7 @@ impl XrayOutbound {
             pinned_cert_sha256: xray_pinned_cert_sha256(tls, true),
             obfs,
             obfs_password,
+            upload_bandwidth,
             download_bandwidth,
             udp: true,
             congestion_control,
@@ -2565,6 +2547,7 @@ mod tests {
         }],
         "quicParams": {
           "congestion": "reno",
+          "brutalUp": "20mbps",
           "brutalDown": "80mbps"
         }
       }
@@ -2583,6 +2566,7 @@ mod tests {
         assert_eq!(hy2.key_path, PathBuf::from("server.key"));
         assert_eq!(hy2.obfs.as_deref(), Some("salamander"));
         assert_eq!(hy2.obfs_password.as_deref(), Some("obfs-pass"));
+        assert_eq!(hy2.upload_bandwidth, Some(20));
         assert_eq!(hy2.cc_rx, "10000000");
         assert_eq!(hy2.congestion_control, "reno");
         assert!(hy2.udp);
@@ -2789,6 +2773,7 @@ mod tests {
         }],
         "quicParams": {
           "congestion": "reno",
+          "brutalUp": "10mbps",
           "brutalDown": "80mbps"
         }
       }
@@ -2812,13 +2797,14 @@ mod tests {
         assert!(hysteria2.disable_system_roots);
         assert_eq!(hysteria2.obfs.as_deref(), Some("salamander"));
         assert_eq!(hysteria2.obfs_password.as_deref(), Some("obfs-pass"));
+        assert_eq!(hysteria2.upload_bandwidth, Some(10));
         assert_eq!(hysteria2.download_bandwidth, Some(80));
         assert_eq!(hysteria2.congestion_control, "reno");
         Ok(())
     }
 
     #[test]
-    fn rejects_hysteria2_unmapped_quic_options() -> Result<()> {
+    fn parses_hysteria2_upload_bandwidth_and_rejects_unmapped_quic_options() -> Result<()> {
         let json = r#"
 {
   "outbounds": [
@@ -2888,14 +2874,18 @@ mod tests {
 }
 "#;
         let config: XrayConfig = serde_json::from_str(json)?;
-        let up_error = config.outbounds[0]
-            .to_client_config("127.0.0.1:1080".parse()?)
-            .expect_err("upload bandwidth must be explicit");
-        assert!(up_error.to_string().contains("upload bandwidth"));
-        let brutal_up_error = config.outbounds[1]
-            .to_client_config("127.0.0.1:1080".parse()?)
-            .expect_err("brutalUp must be explicit");
-        assert!(brutal_up_error.to_string().contains("brutalUp"));
+        let XrayClientConfig::Hysteria2(up) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Hysteria2")
+        };
+        assert_eq!(up.upload_bandwidth, Some(10));
+        let XrayClientConfig::Hysteria2(brutal_up) =
+            config.outbounds[1].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected Hysteria2")
+        };
+        assert_eq!(brutal_up.upload_bandwidth, Some(10));
         let bbr_profile_error = config.outbounds[2]
             .to_client_config("127.0.0.1:1080".parse()?)
             .expect_err("bbrProfile must be explicit");

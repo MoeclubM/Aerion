@@ -1,4 +1,4 @@
-use crate::core::{CoreSession, ProxyCore};
+use crate::core::{CoreSession, CoreUserLimits, ProxyCore};
 use crate::protocol::{ProxyTarget, target_name};
 use crate::{socket_protect, socks, tls, uot};
 use anyhow::{Context, Result, bail, ensure};
@@ -59,6 +59,7 @@ pub struct Hysteria2ClientConfig {
     pub pinned_cert_sha256: Vec<String>,
     pub obfs: Option<String>,
     pub obfs_password: Option<String>,
+    pub upload_bandwidth: Option<u64>,
     pub download_bandwidth: Option<u64>,
     pub udp: bool,
     pub congestion_control: String,
@@ -75,6 +76,7 @@ pub struct Hysteria2ServerConfig {
     pub key: Option<String>,
     pub obfs: Option<String>,
     pub obfs_password: Option<String>,
+    pub upload_bandwidth: Option<u64>,
     pub udp: bool,
     pub cc_rx: String,
     pub congestion_control: String,
@@ -91,6 +93,7 @@ struct Hysteria2ClientInner {
     h3_driver: JoinHandle<()>,
     h3_sender: Mutex<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>>,
     udp_enabled: bool,
+    upload_limiter: Hy2ByteRateLimiter,
     udp_sessions: Mutex<HashMap<u32, mpsc::Sender<UdpMessage>>>,
     udp_fragments: Mutex<HashMap<(u32, u16), UdpFragmentBuffer>>,
     next_udp_session_id: AtomicU32,
@@ -100,12 +103,45 @@ struct Hysteria2ClientInner {
 pub struct Hysteria2TcpStream {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
+    client: Hysteria2Client,
 }
 
 pub struct Hysteria2UdpSession {
     client: Hysteria2Client,
     session_id: u32,
     incoming: mpsc::Receiver<UdpMessage>,
+}
+
+#[derive(Debug)]
+struct Hy2ByteRateLimiter {
+    bytes_per_second: Option<u64>,
+    next: StdMutex<Instant>,
+}
+
+impl Hy2ByteRateLimiter {
+    fn new(mbps: Option<u64>) -> Self {
+        Self {
+            bytes_per_second: mbps.map(|mbps| mbps.saturating_mul(125_000)),
+            next: StdMutex::new(Instant::now()),
+        }
+    }
+
+    async fn wait(&self, bytes: usize) {
+        let Some(bytes_per_second) = self.bytes_per_second.filter(|rate| *rate > 0) else {
+            return;
+        };
+        let delay = {
+            let mut next = self.next.lock().expect("HY2 upload limiter poisoned");
+            let now = Instant::now();
+            let start = if *next > now { *next } else { now };
+            let duration = Duration::from_secs_f64(bytes as f64 / bytes_per_second as f64);
+            *next = start + duration;
+            start.saturating_duration_since(now)
+        };
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +359,7 @@ impl Hysteria2Client {
                 h3_driver,
                 h3_sender: Mutex::new(h3_sender),
                 udp_enabled: udp_enabled && config.udp,
+                upload_limiter: Hy2ByteRateLimiter::new(config.upload_bandwidth),
                 udp_sessions: Mutex::new(HashMap::new()),
                 udp_fragments: Mutex::new(HashMap::new()),
                 next_udp_session_id: AtomicU32::new(1),
@@ -347,13 +384,18 @@ impl Hysteria2Client {
         encode_varint(address.len() as u64, &mut request)?;
         request.extend_from_slice(address.as_bytes());
         encode_varint(0, &mut request)?;
+        self.wait_upload(request.len()).await;
         send.write_all(&request)
             .await
             .context("write Hysteria2 TCP request")?;
         read_tcp_response(&mut recv)
             .await
             .with_context(|| format!("open Hysteria2 destination {address}"))?;
-        Ok(Hysteria2TcpStream { send, recv })
+        Ok(Hysteria2TcpStream {
+            send,
+            recv,
+            client: self.clone(),
+        })
     }
 
     pub async fn open_udp_session(&self) -> Result<Hysteria2UdpSession> {
@@ -396,7 +438,12 @@ impl Hysteria2Client {
         self.inner.udp_sessions.lock().await.remove(&session_id);
     }
 
-    fn send_udp(&self, session_id: u32, target: &ProxyTarget, payload: &[u8]) -> Result<()> {
+    async fn wait_upload(&self, bytes: usize) {
+        self.inner.upload_limiter.wait(bytes).await;
+    }
+
+    async fn send_udp(&self, session_id: u32, target: &ProxyTarget, payload: &[u8]) -> Result<()> {
+        self.wait_upload(payload.len()).await;
         let packet_id = self
             .inner
             .next_udp_packet_id
@@ -473,6 +520,7 @@ impl Hysteria2TcpStream {
     }
 
     pub async fn write_payload(&mut self, payload: &[u8]) -> Result<()> {
+        self.client.wait_upload(payload.len()).await;
         self.send
             .write_all(payload)
             .await
@@ -484,13 +532,14 @@ impl Hysteria2TcpStream {
     }
 
     pub fn into_parts(self) -> (quinn::SendStream, quinn::RecvStream) {
-        (self.send, self.recv)
+        let Hysteria2TcpStream { send, recv, .. } = self;
+        (send, recv)
     }
 }
 
 impl Hysteria2UdpSession {
-    pub fn send_to(&self, target: &ProxyTarget, payload: &[u8]) -> Result<()> {
-        self.client.send_udp(self.session_id, target, payload)
+    pub async fn send_to(&self, target: &ProxyTarget, payload: &[u8]) -> Result<()> {
+        self.client.send_udp(self.session_id, target, payload).await
     }
 
     pub async fn recv_from(&mut self) -> Result<Option<(ProxyTarget, Vec<u8>)>> {
@@ -549,7 +598,16 @@ pub async fn run_hysteria2_client_listener(
 }
 
 pub async fn run_hysteria2_server(config: Hysteria2ServerConfig) -> Result<()> {
-    let core = ProxyCore::from_credentials(&config.password, &config.users);
+    let core = ProxyCore::from_credentials_with_limits(
+        &config.password,
+        &config.users,
+        CoreUserLimits {
+            upload_limit_bps: config
+                .upload_bandwidth
+                .map(|mbps| mbps.saturating_mul(125_000)),
+            ..CoreUserLimits::default()
+        },
+    );
     run_hysteria2_server_with_core(config, core).await
 }
 
@@ -592,16 +650,23 @@ async fn handle_hy2_socks_client(mut local: TcpStream, session: Hysteria2Client)
             };
             socks::write_reply(&mut local, 0x00).await?;
             tracing::info!("Hysteria2 proxying {}", target_name(&target));
-            relay_hy2_tcp(local, stream).await
+            relay_hy2_tcp(local, stream, session).await
         }
         socks::SocksRequest::UdpAssociate => handle_hy2_udp_associate(local, session).await,
     }
 }
 
-async fn relay_hy2_tcp(local: TcpStream, stream: Hysteria2TcpStream) -> Result<()> {
+async fn relay_hy2_tcp(
+    local: TcpStream,
+    stream: Hysteria2TcpStream,
+    session: Hysteria2Client,
+) -> Result<()> {
     let (mut local_reader, local_writer) = local.into_split();
-    let mut send = stream.send;
-    let mut recv = stream.recv;
+    let Hysteria2TcpStream {
+        send: mut send,
+        recv: mut recv,
+        ..
+    } = stream;
     let uplink = async {
         let mut buffer = vec![0u8; 32 * 1024];
         loop {
@@ -613,6 +678,7 @@ async fn relay_hy2_tcp(local: TcpStream, stream: Hysteria2TcpStream) -> Result<(
                 send.finish().context("finish Hysteria2 send stream")?;
                 return Ok::<(), anyhow::Error>(());
             }
+            session.wait_upload(read).await;
             send.write_all(&buffer[..read])
                 .await
                 .context("write Hysteria2 TCP payload")?;
@@ -684,7 +750,7 @@ async fn handle_hy2_udp_associate(mut control: TcpStream, session: Hysteria2Clie
                     .context("receive SOCKS UDP packet")?;
                 let _ = client_tx.try_send(peer);
                 let (target, payload) = uot::parse_socks_udp_packet(&buffer[..read])?;
-                session.send_udp(session_id, &target, payload)?;
+                session.send_udp(session_id, &target, payload).await?;
             }
         }
     };
@@ -1749,6 +1815,15 @@ mod tests {
         };
         let encoded = encode_udp_message(&message).unwrap();
         assert_eq!(decode_udp_message(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn upload_limiter_maps_mbps_to_bytes_per_second() {
+        assert_eq!(
+            Hy2ByteRateLimiter::new(Some(8)).bytes_per_second,
+            Some(1_000_000)
+        );
+        assert_eq!(Hy2ByteRateLimiter::new(None).bytes_per_second, None);
     }
 
     #[test]

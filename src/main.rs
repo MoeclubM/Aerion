@@ -97,6 +97,8 @@ enum Command {
         obfs: Option<String>,
         #[arg(long = "obfs-password")]
         obfs_password: Option<String>,
+        #[arg(long = "upload-bandwidth")]
+        upload_bandwidth: Option<u64>,
         #[arg(long = "download-bandwidth")]
         download_bandwidth: Option<u64>,
         #[arg(long, default_value_t = true)]
@@ -119,6 +121,8 @@ enum Command {
         obfs: Option<String>,
         #[arg(long = "obfs-password")]
         obfs_password: Option<String>,
+        #[arg(long = "upload-bandwidth")]
+        upload_bandwidth: Option<u64>,
         #[arg(long, default_value_t = true)]
         udp: bool,
         #[arg(long, default_value = "0")]
@@ -284,6 +288,7 @@ async fn main() -> Result<()> {
             ca_cert_paths,
             obfs,
             obfs_password,
+            upload_bandwidth,
             download_bandwidth,
             udp,
             congestion_control,
@@ -304,6 +309,7 @@ async fn main() -> Result<()> {
                 pinned_cert_sha256: Vec::new(),
                 obfs,
                 obfs_password,
+                upload_bandwidth,
                 download_bandwidth,
                 udp,
                 congestion_control,
@@ -318,6 +324,7 @@ async fn main() -> Result<()> {
             users,
             obfs,
             obfs_password,
+            upload_bandwidth,
             udp,
             cc_rx,
             congestion_control,
@@ -332,6 +339,7 @@ async fn main() -> Result<()> {
                 key: None,
                 obfs,
                 obfs_password,
+                upload_bandwidth,
                 udp,
                 cc_rx,
                 congestion_control,
@@ -607,6 +615,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             pinned_cert_sha256: client.pinned_cert_sha256,
             obfs: client.obfs,
             obfs_password: client.obfs_password,
+            upload_bandwidth: client.upload_bandwidth,
             download_bandwidth: client.download_bandwidth,
             udp: client.udp,
             congestion_control: client.congestion_control,
@@ -809,6 +818,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             key: server.key_pem,
             obfs: server.obfs,
             obfs_password: server.obfs_password,
+            upload_bandwidth: server.upload_bandwidth,
             udp: server.udp,
             cc_rx: server.cc_rx,
             congestion_control: server.congestion_control,

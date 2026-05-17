@@ -144,6 +144,16 @@ pub struct ClientFileConfig {
     pub obfs: Option<String>,
     #[serde(default, alias = "obfs-password", alias = "obfsPassword")]
     pub obfs_password: Option<String>,
+    #[serde(
+        default,
+        alias = "upload",
+        alias = "upload-bandwidth",
+        alias = "uploadBandwidth",
+        alias = "up-mbps",
+        alias = "up_mbps",
+        alias = "up"
+    )]
+    pub upload_bandwidth: Option<u64>,
     #[serde(default, alias = "down", alias = "download", alias = "down-mbps")]
     pub download_bandwidth: Option<u64>,
     #[serde(default = "default_udp")]
@@ -236,6 +246,16 @@ pub struct ServerFileConfig {
     pub obfs: Option<String>,
     #[serde(default, alias = "obfs-password", alias = "obfsPassword")]
     pub obfs_password: Option<String>,
+    #[serde(
+        default,
+        alias = "upload",
+        alias = "upload-bandwidth",
+        alias = "uploadBandwidth",
+        alias = "up-mbps",
+        alias = "up_mbps",
+        alias = "up"
+    )]
+    pub upload_bandwidth: Option<u64>,
     #[serde(default = "default_udp")]
     pub udp: bool,
     #[serde(default, alias = "udp-over-tcp", alias = "udpOverTcp", alias = "uot")]

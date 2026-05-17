@@ -129,18 +129,38 @@ impl ProxyCore {
     }
 
     pub fn from_credentials(password: &str, users: &[String]) -> Self {
+        Self::from_credentials_with_limits(password, users, CoreUserLimits::default())
+    }
+
+    pub fn from_credentials_with_limits(
+        password: &str,
+        users: &[String],
+        limits: CoreUserLimits,
+    ) -> Self {
         let mut seen = HashSet::new();
         let mut entries = Vec::new();
         let password = password.trim();
         if !password.is_empty() && seen.insert(password.to_string()) {
-            entries.push(CoreUser::password("default", password));
+            let mut user = CoreUser::password("default", password);
+            user.upload_limit_bps = limits.upload_limit_bps;
+            user.download_limit_bps = limits.download_limit_bps;
+            user.quota_bytes = limits.quota_bytes;
+            user.max_online_sessions = limits.max_online_sessions;
+            user.max_online_ips = limits.max_online_ips;
+            entries.push(user);
         }
         for user in users {
             let credential = user.trim();
             if credential.is_empty() || !seen.insert(credential.to_string()) {
                 continue;
             }
-            entries.push(CoreUser::password(credential, credential));
+            let mut entry = CoreUser::password(credential, credential);
+            entry.upload_limit_bps = limits.upload_limit_bps;
+            entry.download_limit_bps = limits.download_limit_bps;
+            entry.quota_bytes = limits.quota_bytes;
+            entry.max_online_sessions = limits.max_online_sessions;
+            entry.max_online_ips = limits.max_online_ips;
+            entries.push(entry);
         }
         Self::new(entries).expect("deduplicated core credentials must be valid")
     }
