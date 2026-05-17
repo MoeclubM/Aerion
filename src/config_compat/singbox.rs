@@ -1,7 +1,7 @@
 use crate::client::ClientConfig;
 use crate::config_compat::mihomo::OneOrManyStrings;
 use crate::hysteria2::Hysteria2ClientConfig;
-use crate::naive::{NaiveClientConfig, default_naive_quic_congestion_control};
+use crate::naive::{NaiveClientConfig, NaiveServerConfig, default_naive_quic_congestion_control};
 use crate::padding::PaddingScheme;
 use crate::reality::RealityClientConfig;
 use crate::shadowsocks::ShadowsocksClientConfig;
@@ -17,6 +17,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct SingBoxConfig {
@@ -40,6 +41,29 @@ pub struct SingBoxInbound {
         deserialize_with = "deserialize_optional_u16"
     )]
     pub listen_port: Option<u16>,
+    #[serde(flatten)]
+    pub fields: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxNaiveInbound {
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub users: Vec<SingBoxNaiveUser>,
+    pub tls: SingBoxTlsOptions,
+    #[serde(default, rename = "quic_congestion_control")]
+    pub quic_congestion_control: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxNaiveUser {
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -238,6 +262,8 @@ pub struct SingBoxTlsOptions {
     pub certificate: Option<Value>,
     #[serde(default, rename = "certificate_path")]
     pub certificate_path: Option<Value>,
+    #[serde(default, rename = "key_path")]
+    pub key_path: Option<Value>,
     #[serde(default)]
     pub ech: Option<Value>,
 }
@@ -307,6 +333,10 @@ pub enum SingBoxClientConfig {
     Tuic(TuicClientConfig),
 }
 
+pub enum SingBoxServerConfig {
+    Naive(NaiveServerConfig),
+}
+
 impl SingBoxConfig {
     pub fn outbound(&self, tag: &str) -> Option<&SingBoxOutbound> {
         self.outbounds
@@ -334,6 +364,99 @@ impl SingBoxConfig {
 impl SingBoxInbound {
     pub fn name(&self) -> &str {
         self.tag.as_deref().unwrap_or(&self.kind)
+    }
+
+    pub fn to_server_config(&self) -> Result<SingBoxServerConfig> {
+        match self.kind.trim().to_ascii_lowercase().as_str() {
+            "naive" => Ok(SingBoxServerConfig::Naive(
+                self.decode::<SingBoxNaiveInbound>()?.to_server_config(
+                    self.name(),
+                    self.listen.as_deref(),
+                    self.listen_port,
+                )?,
+            )),
+            other => bail!(
+                "unsupported sing-box inbound {} type {}; Aerion cannot run this inbound protocol as a server",
+                self.name(),
+                other
+            ),
+        }
+    }
+
+    fn decode<T: DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_value(Value::Object(self.fields.clone()))
+            .with_context(|| format!("parse sing-box inbound {}", self.name()))
+    }
+}
+
+impl SingBoxNaiveInbound {
+    pub fn to_server_config(
+        &self,
+        name: &str,
+        listen: Option<&str>,
+        listen_port: Option<u16>,
+    ) -> Result<NaiveServerConfig> {
+        ensure!(
+            self.tls.enabled,
+            "sing-box Naive inbound {name} disables TLS; Naive requires HTTPS/TLS"
+        );
+        ensure_disabled_utls(name, &self.tls)?;
+        ensure_disabled_reality(name, &self.tls)?;
+        let (tcp, quic) = naive_inbound_network(name, self.network.as_deref())?;
+        ensure_naive_inbound_alpn(name, self.tls.alpn.as_ref(), tcp, quic)?;
+        ensure!(
+            !json_value_non_empty_option(self.tls.certificate.as_ref()),
+            "sing-box Naive inbound {name} embeds certificate data; Aerion Naive server expects certificate_path"
+        );
+        ensure!(
+            !json_value_non_empty_option(self.tls.ech.as_ref()),
+            "sing-box Naive inbound {name} sets ECH; Aerion Naive server does not expose ECH"
+        );
+        let (username, password, users) = self.credentials();
+        let cert_path = value_path(self.tls.certificate_path.as_ref()).with_context(|| {
+            format!("sing-box Naive inbound {name} is missing certificate_path")
+        })?;
+        let key_path = value_path(self.tls.key_path.as_ref())
+            .with_context(|| format!("sing-box Naive inbound {name} is missing key_path"))?;
+        Ok(NaiveServerConfig {
+            listen: SocketAddr::new(
+                parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
+                listen_port.with_context(|| {
+                    format!("sing-box Naive inbound {name} is missing listen_port")
+                })?,
+            ),
+            username,
+            password,
+            users,
+            cert_path,
+            key_path,
+            udp_over_tcp: false,
+            tcp,
+            quic,
+            quic_congestion_control: self
+                .quic_congestion_control
+                .clone()
+                .unwrap_or_else(default_naive_quic_congestion_control),
+        })
+    }
+
+    fn credentials(&self) -> (String, String, Vec<String>) {
+        if let Some(primary) = self.users.first() {
+            return (
+                primary.username.clone(),
+                primary.password.clone(),
+                self.users
+                    .iter()
+                    .skip(1)
+                    .map(|user| format!("{}:{}", user.username, user.password))
+                    .collect(),
+            );
+        }
+        (
+            self.username.clone().unwrap_or_default(),
+            self.password.clone().unwrap_or_default(),
+            Vec::new(),
+        )
     }
 }
 
@@ -783,6 +906,11 @@ impl SingBoxTlsOptions {
                     .certificate_path
                     .as_ref()
                     .map(json_value_non_empty)
+                    .unwrap_or(false)
+                && !self
+                    .key_path
+                    .as_ref()
+                    .map(json_value_non_empty)
                     .unwrap_or(false),
             "sing-box {protocol} outbound {name} sets custom TLS certificate roots; Aerion client does not expose custom trust roots"
         );
@@ -874,6 +1002,22 @@ fn network_allows_udp(network: Option<&str>) -> bool {
         .unwrap_or_default()
         .trim()
         .eq_ignore_ascii_case("tcp")
+}
+
+fn naive_inbound_network(name: &str, network: Option<&str>) -> Result<(bool, bool)> {
+    match network
+        .unwrap_or("tcp")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "tcp" | "raw" | "http" | "https" | "h2" => Ok((true, false)),
+        "udp" | "quic" | "h3" | "http3" => Ok((false, true)),
+        "both" | "tcp+udp" | "tcp,udp" | "tcp_and_udp" => Ok((true, true)),
+        other => bail!(
+            "sing-box Naive inbound {name} uses network {other}; Aerion supports tcp or udp Naive inbound networks"
+        ),
+    }
 }
 
 fn vless_transport_config(
@@ -1002,6 +1146,22 @@ fn ensure_tuic_alpn(format: &str, name: &str, alpn: Option<&OneOrManyStrings>) -
     Ok(())
 }
 
+fn ensure_naive_inbound_alpn(
+    name: &str,
+    alpn: Option<&OneOrManyStrings>,
+    tcp: bool,
+    quic: bool,
+) -> Result<()> {
+    for value in alpn_values(alpn) {
+        let lower = value.to_ascii_lowercase();
+        ensure!(
+            (tcp && matches!(lower.as_str(), "h2" | "http/1.1")) || (quic && lower == "h3"),
+            "sing-box Naive inbound {name} sets ALPN {value}; Aerion Naive server exposes h2/http/1.1 on TCP and h3 on QUIC"
+        );
+    }
+    Ok(())
+}
+
 fn alpn_values(alpn: Option<&OneOrManyStrings>) -> Vec<String> {
     alpn.map(OneOrManyStrings::to_vec)
         .unwrap_or_default()
@@ -1065,6 +1225,17 @@ fn json_value_non_empty(value: &Value) -> bool {
         Value::Array(value) => !value.is_empty(),
         Value::Object(value) => !value.is_empty(),
         _ => true,
+    }
+}
+
+fn json_value_non_empty_option(value: Option<&Value>) -> bool {
+    value.map(json_value_non_empty).unwrap_or(false)
+}
+
+fn value_path(value: Option<&Value>) -> Option<PathBuf> {
+    match value {
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(PathBuf::from(value)),
+        _ => None,
     }
 }
 
@@ -1158,6 +1329,46 @@ mod tests {
             config.local_socks_listen()?,
             Some("127.0.0.1:7890".parse()?)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_naive_inbound_to_server_config() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [
+    {
+      "type": "naive",
+      "tag": "naive-h3",
+      "listen": "127.0.0.1",
+      "listen_port": 8443,
+      "network": "udp",
+      "users": [
+        { "username": "user", "password": "pass" },
+        { "username": "alice", "password": "alice-pass" }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "server.crt",
+        "key_path": "server.key",
+        "alpn": ["h3"]
+      },
+      "quic_congestion_control": "reno"
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxServerConfig::Naive(naive) = config.inbounds[0].to_server_config()?;
+        assert_eq!(naive.listen, "127.0.0.1:8443".parse()?);
+        assert_eq!(naive.username, "user");
+        assert_eq!(naive.password, "pass");
+        assert_eq!(naive.users, vec!["alice:alice-pass".to_string()]);
+        assert_eq!(naive.cert_path, PathBuf::from("server.crt"));
+        assert_eq!(naive.key_path, PathBuf::from("server.key"));
+        assert!(!naive.tcp);
+        assert!(naive.quic);
+        assert_eq!(naive.quic_congestion_control, "reno");
         Ok(())
     }
 

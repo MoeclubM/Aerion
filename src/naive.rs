@@ -49,6 +49,7 @@ pub struct NaiveServerConfig {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
     pub udp_over_tcp: bool,
+    pub tcp: bool,
     pub quic: bool,
     pub quic_congestion_control: String,
 }
@@ -130,7 +131,14 @@ pub async fn run_naive_server(config: NaiveServerConfig) -> Result<()> {
 }
 
 pub async fn run_naive_server_with_core(config: NaiveServerConfig, core: ProxyCore) -> Result<()> {
+    ensure!(
+        config.tcp || config.quic,
+        "Naive server config disables both TCP and QUIC listeners"
+    );
     let runtime = NaiveServerRuntime::from_config(&config, core)?;
+    if !config.tcp {
+        return run_naive_h3_server(config, runtime).await;
+    }
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind Naive HTTPS listener on {}", config.listen))?;

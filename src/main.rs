@@ -13,12 +13,12 @@ use aerion::vless_transport::VlessTransportConfig;
 use aerion::{
     ClientConfig, MihomoClientConfig, MihomoProxy, RealityClientConfig, RealityServerConfig,
     ServerConfig, ShadowsocksClientConfig, ShadowsocksServerConfig, SingBoxClientConfig,
-    SingBoxOutbound, TrojanClientConfig, TrojanServerConfig, VlessClientConfig, VlessServerConfig,
-    VmessClientConfig, VmessServerConfig, XrayClientConfig, XrayOutbound, run_client,
-    run_hysteria2_client, run_hysteria2_server, run_mieru_client, run_mieru_server,
-    run_naive_client, run_naive_server, run_server, run_shadowsocks_client, run_shadowsocks_server,
-    run_trojan_client, run_trojan_server, run_tuic_client, run_tuic_server, run_vless_client,
-    run_vless_server, run_vmess_client, run_vmess_server, tls,
+    SingBoxOutbound, SingBoxServerConfig, TrojanClientConfig, TrojanServerConfig,
+    VlessClientConfig, VlessServerConfig, VmessClientConfig, VmessServerConfig, XrayClientConfig,
+    XrayOutbound, run_client, run_hysteria2_client, run_hysteria2_server, run_mieru_client,
+    run_mieru_server, run_naive_client, run_naive_server, run_server, run_shadowsocks_client,
+    run_shadowsocks_server, run_trojan_client, run_trojan_server, run_tuic_client, run_tuic_server,
+    run_vless_client, run_vless_server, run_vmess_client, run_vmess_server, tls,
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
@@ -510,6 +510,10 @@ async fn run_file_config(
             run_client_config(outbound.to_client_config(listen)?.into()).await
         }
         FileConfig::SingBox(config) => {
+            if config.outbounds.is_empty() {
+                let inbound = select_singbox_inbound(&config.inbounds, profile)?;
+                return run_singbox_server_config(inbound.to_server_config()?).await;
+            }
             let listen = listen
                 .or(config.local_socks_listen()?)
                 .context("sing-box config has no mixed/socks inbound; pass --listen")?;
@@ -816,6 +820,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             cert_path: server.cert.context("server cert is required for Naive")?,
             key_path: server.key.context("server key is required for Naive")?,
             udp_over_tcp: server.udp_over_tcp,
+            tcp: true,
             quic: server.transport.eq_ignore_ascii_case("quic")
                 || server.protocol.eq_ignore_ascii_case("naive+quic"),
             quic_congestion_control: server.quic_congestion_control,
@@ -943,6 +948,12 @@ async fn run_client_config(config: RunnableClientConfig) -> Result<()> {
     }
 }
 
+async fn run_singbox_server_config(config: SingBoxServerConfig) -> Result<()> {
+    match config {
+        SingBoxServerConfig::Naive(config) => run_naive_server(config).await,
+    }
+}
+
 fn select_mihomo_proxy<'a>(
     proxies: &'a [MihomoProxy],
     profile: Option<&str>,
@@ -1009,6 +1020,30 @@ fn select_singbox_outbound<'a>(
             outbounds
                 .iter()
                 .map(SingBoxOutbound::name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn select_singbox_inbound<'a>(
+    inbounds: &'a [aerion::config_compat::singbox::SingBoxInbound],
+    profile: Option<&str>,
+) -> Result<&'a aerion::config_compat::singbox::SingBoxInbound> {
+    if let Some(profile) = profile {
+        return inbounds
+            .iter()
+            .find(|inbound| inbound.name() == profile)
+            .with_context(|| format!("sing-box config has no inbound profile {profile}"));
+    }
+    match inbounds {
+        [] => bail!("sing-box server config has no inbounds"),
+        [inbound] => Ok(inbound),
+        _ => bail!(
+            "sing-box config has multiple inbound profiles [{}]; pass --profile",
+            inbounds
+                .iter()
+                .map(|inbound| inbound.name())
                 .collect::<Vec<_>>()
                 .join(", ")
         ),

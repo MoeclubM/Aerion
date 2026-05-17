@@ -34,7 +34,9 @@ mod vmess_body;
 pub use client::{ClientConfig, run_client, run_client_listener};
 pub use client_hello::{BuiltClientHello, ClientHelloParams, build_client_hello};
 pub use config_compat::mihomo::{MihomoClientConfig, MihomoConfig, MihomoProxy};
-pub use config_compat::singbox::{SingBoxClientConfig, SingBoxConfig, SingBoxOutbound};
+pub use config_compat::singbox::{
+    SingBoxClientConfig, SingBoxConfig, SingBoxOutbound, SingBoxServerConfig,
+};
 pub use config_compat::xray::{XrayClientConfig, XrayConfig, XrayOutbound};
 pub use hysteria2::{
     Hysteria2ClientConfig, Hysteria2ServerConfig, run_hysteria2_client,

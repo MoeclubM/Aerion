@@ -222,6 +222,8 @@ The CLI can run mihomo YAML, Xray JSON/JSONC, and sing-box JSON/JSONC client
 profiles directly. If those files contain multiple proxies/outbounds, select one
 with `--profile`; unsupported transports still fail explicitly instead of being
 silently downgraded.
+Inbound-only sing-box JSON can also run Naive server profiles, including
+TCP-only and HTTP/3-only listener networks.
 
 ## Run Hysteria2
 
