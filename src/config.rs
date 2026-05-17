@@ -57,6 +57,13 @@ pub struct ClientFileConfig {
     pub sni: Option<String>,
     #[serde(default)]
     pub insecure: bool,
+    #[serde(
+        default,
+        alias = "certificate-fingerprint",
+        alias = "certificateFingerprint",
+        alias = "fingerprint"
+    )]
+    pub certificate_fingerprint: Option<String>,
     #[serde(default)]
     pub tls: Option<bool>,
     #[serde(default, alias = "cipher")]

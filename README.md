@@ -165,7 +165,8 @@ cargo run -- client `
   --heartbeat-interval-secs 30
 ```
 
-For a self-signed server certificate, add `--insecure` on the client.
+For a self-signed Hysteria2 server certificate, either add `--insecure` on the
+client or pin the leaf SHA-256 with `--certificate-fingerprint`.
 
 ## Config file
 

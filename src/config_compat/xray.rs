@@ -1552,6 +1552,7 @@ impl XrayOutbound {
                 self.name(),
             ),
             insecure: tls.map(|settings| settings.allow_insecure).unwrap_or(false),
+            certificate_fingerprint: None,
             obfs,
             obfs_password,
             download_bandwidth,

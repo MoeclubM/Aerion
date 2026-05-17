@@ -15,6 +15,7 @@ use aerion::{
     run_vmess_server, tls,
 };
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -322,6 +323,7 @@ async fn socks_client_reaches_tcp_target_through_hysteria2_server() -> Result<()
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     let cert_path = temp.path().join("hy2.crt");
     let key_path = temp.path().join("hy2.key");
+    let certificate_fingerprint = hex::encode(Sha256::digest(certified.cert.der().as_ref()));
     std::fs::write(&cert_path, certified.cert.pem())?;
     std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
 
@@ -349,7 +351,8 @@ async fn socks_client_reaches_tcp_target_through_hysteria2_server() -> Result<()
             server_port: server_addr.port(),
             password: "test-password".to_string(),
             sni: "localhost".to_string(),
-            insecure: true,
+            insecure: false,
+            certificate_fingerprint: Some(certificate_fingerprint),
             obfs: None,
             obfs_password: None,
             download_bandwidth: None,
@@ -435,6 +438,7 @@ async fn socks_udp_associate_reaches_udp_target_through_hysteria2_datagrams() ->
             password: "test-password".to_string(),
             sni: "localhost".to_string(),
             insecure: true,
+            certificate_fingerprint: None,
             obfs: None,
             obfs_password: None,
             download_bandwidth: None,

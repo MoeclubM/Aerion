@@ -52,6 +52,7 @@ pub struct Hysteria2ClientConfig {
     pub password: String,
     pub sni: String,
     pub insecure: bool,
+    pub certificate_fingerprint: Option<String>,
     pub obfs: Option<String>,
     pub obfs_password: Option<String>,
     pub download_bandwidth: Option<u64>,
@@ -1093,7 +1094,19 @@ fn client_cc_rx(config: &Hysteria2ClientConfig) -> String {
 fn build_client_endpoint(config: &Hysteria2ClientConfig, bind_ipv6: bool) -> Result<Endpoint> {
     let mut transport_config = hy2_transport_config(&config.congestion_control)?;
     transport_config.max_concurrent_bidi_streams(VarInt::from_u32(HY2_MAX_INCOMING_STREAMS));
-    let mut tls = if config.insecure {
+    let mut tls = if let Some(fingerprint) = config
+        .certificate_fingerprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(
+                tls::CertificateFingerprintVerifier::from_sha256(fingerprint)?,
+            ))
+            .with_no_client_auth()
+    } else if config.insecure {
         rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(tls::InsecureVerifier))

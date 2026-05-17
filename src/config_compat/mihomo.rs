@@ -903,15 +903,6 @@ impl MihomoHysteria2Proxy {
             self.name
         );
         ensure!(
-            self.fingerprint
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_none(),
-            "mihomo Hysteria2 proxy {} sets certificate fingerprint pinning; Aerion Hysteria2 client does not expose fingerprint pinning",
-            self.name
-        );
-        ensure!(
             self.bbr_profile
                 .as_deref()
                 .map(str::trim)
@@ -978,6 +969,7 @@ impl MihomoHysteria2Proxy {
             password: self.password.clone(),
             sni: sni_or_server(self.sni.as_deref(), &self.server),
             insecure: self.skip_cert_verify,
+            certificate_fingerprint: self.fingerprint.clone(),
             obfs: self.obfs.clone(),
             obfs_password: self.obfs_password.clone(),
             download_bandwidth: self.down,
@@ -1740,6 +1732,7 @@ proxies:
     password: secret
     servername: hy2.example.com
     skip-cert-verify: true
+    fingerprint: sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
     obfs: salamander
     obfs-password: obfs-pass
     down: 80 Mbps
@@ -1759,6 +1752,10 @@ proxies:
         assert_eq!(hysteria2.password, "secret");
         assert_eq!(hysteria2.sni, "hy2.example.com");
         assert!(hysteria2.insecure);
+        assert_eq!(
+            hysteria2.certificate_fingerprint.as_deref(),
+            Some("sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+        );
         assert_eq!(hysteria2.obfs.as_deref(), Some("salamander"));
         assert_eq!(hysteria2.obfs_password.as_deref(), Some("obfs-pass"));
         assert_eq!(hysteria2.download_bandwidth, Some(80));

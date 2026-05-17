@@ -1,11 +1,12 @@
 use crate::utls::UtlsFingerprint;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{
     ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, ServerConfig,
     SignatureScheme,
 };
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::File;
 use std::io::BufReader;
@@ -48,18 +49,111 @@ impl ServerCertVerifier for InsecureVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ED25519,
-        ]
+        supported_signature_schemes()
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct CertificateFingerprintVerifier {
+    fingerprint: [u8; 32],
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl CertificateFingerprintVerifier {
+    pub(crate) fn from_sha256(value: &str) -> Result<Self> {
+        let value = value.trim();
+        let value = if value
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sha256:"))
+        {
+            &value[7..]
+        } else {
+            value
+        };
+        let value = value
+            .chars()
+            .filter(|ch| !ch.is_ascii_whitespace() && *ch != ':')
+            .collect::<String>();
+        ensure!(
+            value.len() == 64,
+            "Hysteria2 certificate fingerprint must be a SHA-256 hex digest"
+        );
+        let bytes = hex::decode(&value).context("decode Hysteria2 certificate fingerprint")?;
+        Ok(Self {
+            fingerprint: bytes.as_slice().try_into().map_err(|_| {
+                anyhow::anyhow!("Hysteria2 certificate fingerprint length is invalid")
+            })?,
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+        })
+    }
+}
+
+impl ServerCertVerifier for CertificateFingerprintVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, RustlsError> {
+        let digest = Sha256::digest(end_entity.as_ref());
+        if digest.as_slice() == self.fingerprint.as_slice() {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(RustlsError::General(
+                "Hysteria2 server certificate SHA-256 fingerprint mismatch".to_string(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn supported_signature_schemes() -> Vec<SignatureScheme> {
+    vec![
+        SignatureScheme::ECDSA_NISTP256_SHA256,
+        SignatureScheme::ECDSA_NISTP384_SHA384,
+        SignatureScheme::RSA_PSS_SHA256,
+        SignatureScheme::RSA_PSS_SHA384,
+        SignatureScheme::RSA_PSS_SHA512,
+        SignatureScheme::RSA_PKCS1_SHA256,
+        SignatureScheme::RSA_PKCS1_SHA384,
+        SignatureScheme::RSA_PKCS1_SHA512,
+        SignatureScheme::ED25519,
+    ]
 }
 
 pub fn init_crypto() {

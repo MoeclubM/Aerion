@@ -1496,6 +1496,7 @@ impl SingBoxHysteria2Outbound {
             password: self.password.clone(),
             sni: sni_or_server(tls.server_name.as_deref(), server),
             insecure: tls.insecure,
+            certificate_fingerprint: None,
             obfs,
             obfs_password,
             download_bandwidth: self.down_mbps.or(self.down),
