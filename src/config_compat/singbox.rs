@@ -1,13 +1,13 @@
 use crate::client::ClientConfig;
 use crate::config_compat::mihomo::OneOrManyStrings;
-use crate::hysteria2::Hysteria2ClientConfig;
+use crate::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
 use crate::naive::{NaiveClientConfig, NaiveServerConfig, default_naive_quic_congestion_control};
 use crate::padding::PaddingScheme;
 use crate::reality::{RealityClientConfig, RealityServerConfig};
 use crate::server::ServerConfig;
 use crate::shadowsocks::{ShadowsocksClientConfig, ShadowsocksServerConfig};
 use crate::trojan::{TrojanClientConfig, TrojanServerConfig};
-use crate::tuic::TuicClientConfig;
+use crate::tuic::{TuicClientConfig, TuicServerConfig};
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::{VlessClientConfig, VlessServerConfig};
 use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
@@ -165,6 +165,59 @@ pub struct SingBoxAnyTlsInbound {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct SingBoxAnyTlsUser {
+    pub password: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxHysteria2Inbound {
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub users: Vec<SingBoxHysteria2User>,
+    pub tls: SingBoxTlsOptions,
+    #[serde(default)]
+    pub obfs: Option<SingBoxHysteria2Obfs>,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default, rename = "down_mbps")]
+    pub down_mbps: Option<u64>,
+    #[serde(default, rename = "down")]
+    pub down: Option<u64>,
+    #[serde(default, rename = "up_mbps")]
+    pub up_mbps: Option<u64>,
+    #[serde(default)]
+    pub masquerade: Option<Value>,
+    #[serde(default, rename = "bbr_profile")]
+    pub bbr_profile: Option<String>,
+    #[serde(default, rename = "brutal_debug")]
+    pub brutal_debug: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxHysteria2User {
+    pub password: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxTuicInbound {
+    #[serde(default)]
+    pub users: Vec<SingBoxTuicUser>,
+    pub tls: SingBoxTlsOptions,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default, rename = "congestion_control")]
+    pub congestion_control: Option<String>,
+    #[serde(default, rename = "zero_rtt_handshake")]
+    pub zero_rtt_handshake: bool,
+    #[serde(default)]
+    pub heartbeat: Option<String>,
+    #[serde(default, rename = "udp_relay_mode")]
+    pub udp_relay_mode: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxTuicUser {
+    pub uuid: String,
     pub password: String,
 }
 
@@ -450,9 +503,11 @@ pub enum SingBoxClientConfig {
 
 pub enum SingBoxServerConfig {
     AnyTls(ServerConfig),
+    Hysteria2(Hysteria2ServerConfig),
     Naive(NaiveServerConfig),
     Shadowsocks(ShadowsocksServerConfig),
     Trojan(TrojanServerConfig),
+    Tuic(TuicServerConfig),
     Vless(VlessServerConfig),
     Vmess(VmessServerConfig),
 }
@@ -502,12 +557,26 @@ impl SingBoxInbound {
                     self.listen_port,
                 )?,
             )),
+            "hysteria2" | "hy2" => Ok(SingBoxServerConfig::Hysteria2(
+                self.decode::<SingBoxHysteria2Inbound>()?.to_server_config(
+                    self.name(),
+                    self.listen.as_deref(),
+                    self.listen_port,
+                )?,
+            )),
             "shadowsocks" | "ss" => Ok(SingBoxServerConfig::Shadowsocks(
                 self.decode::<SingBoxShadowsocksInbound>()?
                     .to_server_config(self.name(), self.listen.as_deref(), self.listen_port)?,
             )),
             "trojan" => Ok(SingBoxServerConfig::Trojan(
                 self.decode::<SingBoxTrojanInbound>()?.to_server_config(
+                    self.name(),
+                    self.listen.as_deref(),
+                    self.listen_port,
+                )?,
+            )),
+            "tuic" => Ok(SingBoxServerConfig::Tuic(
+                self.decode::<SingBoxTuicInbound>()?.to_server_config(
                     self.name(),
                     self.listen.as_deref(),
                     self.listen_port,
@@ -778,6 +847,163 @@ impl SingBoxAnyTlsInbound {
                 self.padding_scheme.clone()
             },
             heartbeat_interval_secs: 30,
+        })
+    }
+}
+
+impl SingBoxHysteria2Inbound {
+    pub fn to_server_config(
+        &self,
+        name: &str,
+        listen: Option<&str>,
+        listen_port: Option<u16>,
+    ) -> Result<Hysteria2ServerConfig> {
+        ensure!(
+            self.tls.enabled,
+            "sing-box Hysteria2 inbound {name} disables TLS; Hysteria2 requires TLS"
+        );
+        self.tls
+            .ensure_supported_server_options("Hysteria2", name, false)?;
+        ensure_supported_network("sing-box Hysteria2", name, self.network.as_deref())?;
+        ensure_hy2_alpn("sing-box", name, self.tls.alpn.as_ref())?;
+        ensure!(
+            self.up_mbps.unwrap_or(0) == 0,
+            "sing-box Hysteria2 inbound {name} sets up_mbps; Aerion Hysteria2 server does not expose upload bandwidth limiting"
+        );
+        ensure!(
+            !json_value_non_empty_option(self.masquerade.as_ref()),
+            "sing-box Hysteria2 inbound {name} sets masquerade; Aerion Hysteria2 server does not expose HTTP masquerade"
+        );
+        ensure!(
+            self.bbr_profile
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none_or(|value| value.eq_ignore_ascii_case("standard")),
+            "sing-box Hysteria2 inbound {name} sets bbr_profile {:?}; Aerion Hysteria2 uses the default BBR profile",
+            self.bbr_profile
+        );
+        ensure!(
+            !self.brutal_debug,
+            "sing-box Hysteria2 inbound {name} enables brutal_debug; Aerion Hysteria2 server does not expose brutal debug"
+        );
+        let password = self
+            .users
+            .first()
+            .map(|user| user.password.clone())
+            .or_else(|| self.password.clone())
+            .with_context(|| format!("sing-box Hysteria2 inbound {name} is missing password"))?;
+        let users = if self.users.is_empty() {
+            Vec::new()
+        } else {
+            self.users
+                .iter()
+                .skip(1)
+                .map(|user| user.password.clone())
+                .collect()
+        };
+        let obfs = match &self.obfs {
+            Some(obfs) => {
+                ensure!(
+                    obfs.kind.eq_ignore_ascii_case("salamander"),
+                    "sing-box Hysteria2 inbound {name} uses obfs {}; Aerion supports salamander",
+                    obfs.kind
+                );
+                (Some(obfs.kind.clone()), Some(obfs.password.clone()))
+            }
+            None => (None, None),
+        };
+        Ok(Hysteria2ServerConfig {
+            listen: SocketAddr::new(
+                parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
+                listen_port.with_context(|| {
+                    format!("sing-box Hysteria2 inbound {name} is missing listen_port")
+                })?,
+            ),
+            password,
+            users,
+            cert_path: value_path(self.tls.certificate_path.as_ref()).with_context(|| {
+                format!("sing-box Hysteria2 inbound {name} is missing certificate_path")
+            })?,
+            key_path: value_path(self.tls.key_path.as_ref()).with_context(|| {
+                format!("sing-box Hysteria2 inbound {name} is missing key_path")
+            })?,
+            obfs: obfs.0,
+            obfs_password: obfs.1,
+            udp: network_allows_udp(self.network.as_deref()),
+            cc_rx: self
+                .down_mbps
+                .or(self.down)
+                .map(|mbps| mbps.saturating_mul(125_000).to_string())
+                .unwrap_or_else(|| "0".to_string()),
+            congestion_control: "bbr".to_string(),
+        })
+    }
+}
+
+impl SingBoxTuicInbound {
+    pub fn to_server_config(
+        &self,
+        name: &str,
+        listen: Option<&str>,
+        listen_port: Option<u16>,
+    ) -> Result<TuicServerConfig> {
+        ensure!(
+            self.tls.enabled,
+            "sing-box TUIC inbound {name} disables TLS; TUIC requires TLS"
+        );
+        self.tls
+            .ensure_supported_server_options("TUIC", name, false)?;
+        ensure_supported_network("sing-box TUIC", name, self.network.as_deref())?;
+        ensure_tuic_alpn("sing-box", name, self.tls.alpn.as_ref())?;
+        ensure!(
+            !self.zero_rtt_handshake,
+            "sing-box TUIC inbound {name} enables zero_rtt_handshake; Aerion TUIC server does not expose 0-RTT handshakes"
+        );
+        if let Some(mode) = self.udp_relay_mode.as_deref().map(str::trim) {
+            ensure!(
+                mode.is_empty()
+                    || mode.eq_ignore_ascii_case("native")
+                    || mode.eq_ignore_ascii_case("quic"),
+                "sing-box TUIC inbound {name} sets udp_relay_mode {mode}; Aerion supports native and quic TUIC UDP relay commands"
+            );
+        }
+        let primary = self
+            .users
+            .first()
+            .with_context(|| format!("sing-box TUIC inbound {name} is missing users"))?;
+        Ok(TuicServerConfig {
+            listen: SocketAddr::new(
+                parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
+                listen_port.with_context(|| {
+                    format!("sing-box TUIC inbound {name} is missing listen_port")
+                })?,
+            ),
+            uuid: primary.uuid.clone(),
+            password: primary.password.clone(),
+            users: self
+                .users
+                .iter()
+                .skip(1)
+                .map(|user| format!("{}:{}", user.uuid, user.password))
+                .collect(),
+            cert_path: value_path(self.tls.certificate_path.as_ref()).with_context(|| {
+                format!("sing-box TUIC inbound {name} is missing certificate_path")
+            })?,
+            key_path: value_path(self.tls.key_path.as_ref())
+                .with_context(|| format!("sing-box TUIC inbound {name} is missing key_path"))?,
+            udp: network_allows_udp(self.network.as_deref()),
+            congestion_control: self
+                .congestion_control
+                .clone()
+                .unwrap_or_else(|| "cubic".to_string()),
+            alpn_protocols: alpn_values(self.tls.alpn.as_ref()),
+            heartbeat_interval_secs: self
+                .heartbeat
+                .as_deref()
+                .map(parse_duration_secs)
+                .transpose()?
+                .unwrap_or(10),
         })
     }
 }
@@ -1529,7 +1755,7 @@ fn ensure_supported_network(format: &str, name: &str, network: Option<&str>) -> 
         network.is_empty()
             || network.eq_ignore_ascii_case("tcp")
             || network.eq_ignore_ascii_case("udp"),
-        "{format} outbound {name} uses network {network}; Aerion supports sing-box tcp or udp network selection"
+        "{format} profile {name} uses network {network}; Aerion supports sing-box tcp or udp network selection"
     );
     Ok(())
 }
@@ -2075,6 +2301,96 @@ mod tests {
         assert_eq!(anytls.cert_path, PathBuf::from("server.crt"));
         assert_eq!(anytls.key_path, PathBuf::from("server.key"));
         assert_eq!(anytls.padding_scheme, vec!["stop=8".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn converts_hysteria2_inbound_to_server_config() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "hy2",
+      "listen": "127.0.0.1",
+      "listen_port": 8445,
+      "users": [
+        { "password": "primary-pass" },
+        { "password": "alice-pass" }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "server.crt",
+        "key_path": "server.key",
+        "alpn": ["h3"]
+      },
+      "obfs": {
+        "type": "salamander",
+        "password": "obfs-pass"
+      },
+      "down_mbps": 10
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxServerConfig::Hysteria2(hy2) = config.inbounds[0].to_server_config()? else {
+            bail!("expected Hysteria2")
+        };
+        assert_eq!(hy2.listen, "127.0.0.1:8445".parse()?);
+        assert_eq!(hy2.password, "primary-pass");
+        assert_eq!(hy2.users, vec!["alice-pass".to_string()]);
+        assert_eq!(hy2.cert_path, PathBuf::from("server.crt"));
+        assert_eq!(hy2.key_path, PathBuf::from("server.key"));
+        assert_eq!(hy2.obfs, Some("salamander".to_string()));
+        assert_eq!(hy2.obfs_password, Some("obfs-pass".to_string()));
+        assert_eq!(hy2.cc_rx, "1250000");
+        assert!(hy2.udp);
+        Ok(())
+    }
+
+    #[test]
+    fn converts_tuic_inbound_to_server_config() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [
+    {
+      "type": "tuic",
+      "tag": "tuic",
+      "listen": "127.0.0.1",
+      "listen_port": 9445,
+      "users": [
+        { "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf", "password": "primary-pass" },
+        { "uuid": "433722e1-0f8c-4724-9089-d5bc6d0c51ef", "password": "alice-pass" }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "server.crt",
+        "key_path": "server.key",
+        "alpn": ["h3"]
+      },
+      "congestion_control": "bbr",
+      "heartbeat": "15s"
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxServerConfig::Tuic(tuic) = config.inbounds[0].to_server_config()? else {
+            bail!("expected TUIC")
+        };
+        assert_eq!(tuic.listen, "127.0.0.1:9445".parse()?);
+        assert_eq!(tuic.uuid, "a3482e88-686a-4a58-8126-99c9df64b7bf");
+        assert_eq!(tuic.password, "primary-pass");
+        assert_eq!(
+            tuic.users,
+            vec!["433722e1-0f8c-4724-9089-d5bc6d0c51ef:alice-pass".to_string()]
+        );
+        assert_eq!(tuic.cert_path, PathBuf::from("server.crt"));
+        assert_eq!(tuic.key_path, PathBuf::from("server.key"));
+        assert_eq!(tuic.congestion_control, "bbr");
+        assert_eq!(tuic.alpn_protocols, vec!["h3".to_string()]);
+        assert_eq!(tuic.heartbeat_interval_secs, 15);
         Ok(())
     }
 

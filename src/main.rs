@@ -957,9 +957,11 @@ async fn run_client_config(config: RunnableClientConfig) -> Result<()> {
 async fn run_singbox_server_config(config: SingBoxServerConfig) -> Result<()> {
     match config {
         SingBoxServerConfig::AnyTls(config) => run_server(config).await,
+        SingBoxServerConfig::Hysteria2(config) => run_hysteria2_server(config).await,
         SingBoxServerConfig::Naive(config) => run_naive_server(config).await,
         SingBoxServerConfig::Shadowsocks(config) => run_shadowsocks_server(config).await,
         SingBoxServerConfig::Trojan(config) => run_trojan_server(config).await,
+        SingBoxServerConfig::Tuic(config) => run_tuic_server(config).await,
         SingBoxServerConfig::Vless(config) => run_vless_server(config).await,
         SingBoxServerConfig::Vmess(config) => run_vmess_server(config).await,
     }
