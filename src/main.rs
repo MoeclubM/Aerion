@@ -621,6 +621,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             udp_over_tcp: client.udp_over_tcp,
             quic: client.transport.eq_ignore_ascii_case("quic")
                 || client.protocol.eq_ignore_ascii_case("naive+quic"),
+            quic_congestion_control: client.quic_congestion_control,
         })
         .await;
     }
@@ -817,6 +818,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             udp_over_tcp: server.udp_over_tcp,
             quic: server.transport.eq_ignore_ascii_case("quic")
                 || server.protocol.eq_ignore_ascii_case("naive+quic"),
+            quic_congestion_control: server.quic_congestion_control,
         })
         .await;
     }

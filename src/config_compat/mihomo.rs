@@ -1,7 +1,7 @@
 use crate::client::ClientConfig;
 use crate::hysteria2::Hysteria2ClientConfig;
 use crate::mieru::{MieruClientConfig, MieruTrafficPattern, MieruTransport};
-use crate::naive::NaiveClientConfig;
+use crate::naive::{NaiveClientConfig, default_naive_quic_congestion_control};
 use crate::padding::PaddingScheme;
 use crate::reality::RealityClientConfig;
 use crate::shadowsocks::ShadowsocksClientConfig;
@@ -1047,6 +1047,7 @@ impl MihomoNaiveProxy {
                 .transpose()?
                 .unwrap_or(false),
             quic: self.quic,
+            quic_congestion_control: default_naive_quic_congestion_control(),
         })
     }
 }

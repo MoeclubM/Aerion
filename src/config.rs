@@ -1,6 +1,7 @@
 use crate::config_compat::mihomo::MihomoConfig;
 use crate::config_compat::singbox::SingBoxConfig;
 use crate::config_compat::xray::XrayConfig;
+use crate::naive::default_naive_quic_congestion_control;
 use crate::padding::PaddingScheme;
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use anyhow::{Context, Result, bail, ensure};
@@ -110,6 +111,12 @@ pub struct ClientFileConfig {
     #[serde(default = "default_hy2_congestion_control")]
     pub congestion_control: String,
     #[serde(
+        default = "default_naive_quic_congestion_control",
+        alias = "quic-congestion-control",
+        alias = "quicCongestionControl"
+    )]
+    pub quic_congestion_control: String,
+    #[serde(
         default = "default_tuic_udp_relay_mode",
         alias = "udp-relay-mode",
         alias = "udpRelayMode"
@@ -185,6 +192,12 @@ pub struct ServerFileConfig {
     pub cc_rx: String,
     #[serde(default = "default_hy2_congestion_control")]
     pub congestion_control: String,
+    #[serde(
+        default = "default_naive_quic_congestion_control",
+        alias = "quic-congestion-control",
+        alias = "quicCongestionControl"
+    )]
+    pub quic_congestion_control: String,
     #[serde(
         default = "default_tuic_udp_relay_mode",
         alias = "udp-relay-mode",

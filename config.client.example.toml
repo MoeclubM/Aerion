@@ -54,6 +54,7 @@ insecure = false
 udp_over_tcp = false
 # Set transport = "quic" or protocol = "naive+quic" for HTTP/3.
 transport = "tcp"
+# quic_congestion_control = "bbr"
 
 [[clients]]
 name = "tuic"

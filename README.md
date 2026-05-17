@@ -213,6 +213,8 @@ use the native packet underlay. Use `protocol = "tuic"` with `username` as the
 TUIC UUID and `password` as the TUIC password; extra server users use
 `uuid:password` entries. Use `protocol = "naive"` for an HTTPS Naive client or
 server; set `transport = "quic"` or `protocol = "naive+quic"` for HTTP/3.
+For Naive HTTP/3, `quic_congestion_control` accepts `bbr`, `cubic`, `reno`,
+`newreno`, or `new_reno` and defaults to `bbr`.
 Aerion-native TOML also runs Shadowsocks, Trojan, VLESS, and VMess client and
 server profiles.
 

@@ -21,6 +21,10 @@ const NAIVE_HTTP11_ALPN: &[u8] = b"http/1.1";
 const NAIVE_QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const NAIVE_UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 
+pub fn default_naive_quic_congestion_control() -> String {
+    "bbr".to_string()
+}
+
 #[derive(Clone, Debug)]
 pub struct NaiveClientConfig {
     pub listen: SocketAddr,
@@ -33,6 +37,7 @@ pub struct NaiveClientConfig {
     pub extra_headers: Vec<(String, String)>,
     pub udp_over_tcp: bool,
     pub quic: bool,
+    pub quic_congestion_control: String,
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +50,7 @@ pub struct NaiveServerConfig {
     pub key_path: PathBuf,
     pub udp_over_tcp: bool,
     pub quic: bool,
+    pub quic_congestion_control: String,
 }
 
 #[derive(Clone)]
@@ -789,11 +795,9 @@ fn build_naive_quic_endpoint(
     let quic_tls =
         QuicClientConfig::try_from(Arc::new(tls)).context("build Naive QUIC TLS client config")?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
-    let mut transport_config = quinn::TransportConfig::default();
-    let idle_timeout = quinn::IdleTimeout::try_from(NAIVE_QUIC_IDLE_TIMEOUT)
-        .context("build Naive QUIC idle timeout")?;
-    transport_config.max_idle_timeout(Some(idle_timeout));
-    client_config.transport_config(Arc::new(transport_config));
+    client_config.transport_config(Arc::new(naive_quic_transport_config(
+        &config.quic_congestion_control,
+    )?));
     let bind_addr = if bind_ipv6 { "[::]:0" } else { "0.0.0.0:0" }
         .parse()
         .context("build Naive QUIC bind address")?;
@@ -827,11 +831,9 @@ fn build_naive_server_endpoint(config: &NaiveServerConfig) -> Result<quinn::Endp
     let crypto =
         QuicServerConfig::try_from(tls_config).context("build Naive QUIC TLS server config")?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    let idle_timeout = quinn::IdleTimeout::try_from(NAIVE_QUIC_IDLE_TIMEOUT)
-        .context("build Naive H3 idle timeout")?;
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(idle_timeout));
-    server_config.transport_config(Arc::new(transport));
+    server_config.transport_config(Arc::new(naive_quic_transport_config(
+        &config.quic_congestion_control,
+    )?));
     let socket = socket_protect::bind_udp_std(config.listen)?;
     quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
@@ -840,6 +842,24 @@ fn build_naive_server_endpoint(config: &NaiveServerConfig) -> Result<quinn::Endp
         Arc::new(quinn::TokioRuntime),
     )
     .context("bind Naive HTTP/3 server endpoint")
+}
+
+fn naive_quic_transport_config(congestion_control: &str) -> Result<quinn::TransportConfig> {
+    let idle_timeout = quinn::IdleTimeout::try_from(NAIVE_QUIC_IDLE_TIMEOUT)
+        .context("build Naive H3 idle timeout")?;
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(idle_timeout));
+    transport.congestion_controller_factory(
+        match congestion_control.trim().to_ascii_lowercase().as_str() {
+            "" | "bbr" => Arc::new(quinn::congestion::BbrConfig::default()),
+            "cubic" => Arc::new(quinn::congestion::CubicConfig::default()),
+            "reno" | "newreno" | "new_reno" => {
+                Arc::new(quinn::congestion::NewRenoConfig::default())
+            }
+            other => bail!("unsupported Naive quic_congestion_control {other}"),
+        },
+    );
+    Ok(transport)
 }
 
 async fn relay_naive_http1_server_tcp(
@@ -2331,4 +2351,24 @@ fn base64_standard(input: &[u8]) -> String {
         output.push('=');
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_naive_quic_congestion_controls() -> Result<()> {
+        for value in ["", "bbr", "cubic", "reno", "newreno", "new_reno"] {
+            naive_quic_transport_config(value)
+                .with_context(|| format!("accept Naive QUIC congestion control {value:?}"))?;
+        }
+        let error = naive_quic_transport_config("bbr2").expect_err("bbr2 is not wired in quinn");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Naive quic_congestion_control bbr2")
+        );
+        Ok(())
+    }
 }

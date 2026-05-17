@@ -81,6 +81,7 @@ cert = "server.crt"
 key = "server.key"
 udp_over_tcp = true
 # Set transport = "quic" or protocol = "naive+quic" to also bind HTTP/3.
+# quic_congestion_control = "bbr"
 
 [[servers]]
 name = "trojan"

@@ -1,7 +1,7 @@
 use crate::client::ClientConfig;
 use crate::config_compat::mihomo::OneOrManyStrings;
 use crate::hysteria2::Hysteria2ClientConfig;
-use crate::naive::NaiveClientConfig;
+use crate::naive::{NaiveClientConfig, default_naive_quic_congestion_control};
 use crate::padding::PaddingScheme;
 use crate::reality::RealityClientConfig;
 use crate::shadowsocks::ShadowsocksClientConfig;
@@ -687,14 +687,6 @@ impl SingBoxNaiveOutbound {
             self.insecure_concurrency.unwrap_or(0) == 0,
             "sing-box Naive outbound {name} sets insecure_concurrency; Aerion Naive client does not implement speculative parallel connections"
         );
-        ensure!(
-            self.quic_congestion_control
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or_default()
-                .is_empty(),
-            "sing-box Naive outbound {name} sets quic_congestion_control; Aerion Naive client does not expose configurable QUIC congestion control"
-        );
         let udp_over_tcp = singbox_uot_enabled("Naive", name, self.udp_over_tcp.as_ref())?;
         Ok(NaiveClientConfig {
             listen,
@@ -717,6 +709,10 @@ impl SingBoxNaiveOutbound {
                         )
                     })
                     .unwrap_or(false),
+            quic_congestion_control: self
+                .quic_congestion_control
+                .clone()
+                .unwrap_or_else(default_naive_quic_congestion_control),
         })
     }
 }
@@ -1644,6 +1640,7 @@ mod tests {
       "username": "user",
       "password": "pass",
       "quic": true,
+      "quic_congestion_control": "reno",
       "udp_over_tcp": { "enabled": true, "version": 2 },
       "tls": {
         "enabled": true,
@@ -1682,6 +1679,7 @@ mod tests {
         assert!(naive.insecure);
         assert!(naive.quic);
         assert!(naive.udp_over_tcp);
+        assert_eq!(naive.quic_congestion_control, "reno");
 
         let SingBoxClientConfig::Tuic(tuic) =
             config.outbounds[1].to_client_config("127.0.0.1:1080".parse()?)?
@@ -1717,15 +1715,6 @@ mod tests {
       "server": "naive.example.com",
       "server_port": 443,
       "insecure_concurrency": 2,
-      "tls": { "enabled": true }
-    },
-    {
-      "type": "naive",
-      "tag": "naive-quic-cc",
-      "server": "naive.example.com",
-      "server_port": 443,
-      "quic": true,
-      "quic_congestion_control": "bbr",
       "tls": { "enabled": true }
     },
     {
@@ -1766,21 +1755,12 @@ mod tests {
                 .contains("insecure_concurrency")
         );
 
-        let congestion_error = config.outbounds[2]
-            .to_client_config("127.0.0.1:1080".parse()?)
-            .expect_err("quic_congestion_control must be explicit");
-        assert!(
-            congestion_error
-                .to_string()
-                .contains("quic_congestion_control")
-        );
-
-        let cert_error = config.outbounds[3]
+        let cert_error = config.outbounds[2]
             .to_client_config("127.0.0.1:1080".parse()?)
             .expect_err("custom certificate roots must be explicit");
         assert!(cert_error.to_string().contains("certificate roots"));
 
-        let ech_error = config.outbounds[4]
+        let ech_error = config.outbounds[3]
             .to_client_config("127.0.0.1:1080".parse()?)
             .expect_err("ECH must be explicit");
         assert!(ech_error.to_string().contains("ECH"));
