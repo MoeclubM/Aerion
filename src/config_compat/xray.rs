@@ -28,7 +28,7 @@ pub struct XrayInbound {
     pub tag: Option<String>,
     #[serde(default)]
     pub listen: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_u16")]
     pub port: Option<u16>,
     #[serde(default)]
     pub protocol: String,
@@ -1236,6 +1236,21 @@ where
     }
 }
 
+fn deserialize_optional_u16<'de, D>(deserializer: D) -> std::result::Result<Option<u16>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value {
+        Value::Number(number) => Ok(number.as_u64().and_then(|value| u16::try_from(value).ok())),
+        Value::String(text) => Ok(text.trim().parse::<u16>().ok()),
+        _ => Ok(None),
+    }
+}
+
 fn sni_or_server(value: Option<&str>, server: &str, name: &str) -> String {
     value
         .map(str::trim)
@@ -1367,6 +1382,26 @@ mod tests {
             error
                 .to_string()
                 .contains("parse xray outbound broken-vless failed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_xray_inbound_string_and_range_ports() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [
+    { "tag": "range", "protocol": "vless", "listen": "0.0.0.0", "port": "10000-10100" },
+    { "tag": "socks", "protocol": "socks", "listen": "127.0.0.1", "port": "1080" }
+  ],
+  "outbounds": []
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        assert_eq!(config.inbounds[0].port, None);
+        assert_eq!(
+            config.local_socks_listen()?,
+            Some("127.0.0.1:1080".parse()?)
         );
         Ok(())
     }

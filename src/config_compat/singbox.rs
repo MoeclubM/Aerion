@@ -34,7 +34,11 @@ pub struct SingBoxInbound {
     pub tag: Option<String>,
     #[serde(default)]
     pub listen: Option<String>,
-    #[serde(default, rename = "listen_port")]
+    #[serde(
+        default,
+        rename = "listen_port",
+        deserialize_with = "deserialize_optional_u16"
+    )]
     pub listen_port: Option<u16>,
 }
 
@@ -1123,9 +1127,43 @@ where
     }
 }
 
+fn deserialize_optional_u16<'de, D>(deserializer: D) -> std::result::Result<Option<u16>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value {
+        Value::Number(number) => Ok(number.as_u64().and_then(|value| u16::try_from(value).ok())),
+        Value::String(text) => Ok(text.trim().parse::<u16>().ok()),
+        _ => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_singbox_inbound_string_ports() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [
+    { "type": "naive", "listen": "0.0.0.0", "listen_port": "8443" },
+    { "type": "mixed", "listen": "127.0.0.1", "listen_port": "7890" }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        assert_eq!(config.inbounds[0].listen_port, Some(8443));
+        assert_eq!(
+            config.local_socks_listen()?,
+            Some("127.0.0.1:7890".parse()?)
+        );
+        Ok(())
+    }
 
     #[test]
     fn parses_shadowsocks_udp_over_tcp_outbound() -> Result<()> {
