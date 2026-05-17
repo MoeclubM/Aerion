@@ -970,6 +970,7 @@ impl MihomoHysteria2Proxy {
             sni: sni_or_server(self.sni.as_deref(), &self.server),
             insecure: self.skip_cert_verify,
             certificate_fingerprint: self.fingerprint.clone(),
+            ca_cert_paths: Vec::new(),
             obfs: self.obfs.clone(),
             obfs_password: self.obfs_password.clone(),
             download_bandwidth: self.down,

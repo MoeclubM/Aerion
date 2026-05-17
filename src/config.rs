@@ -64,6 +64,15 @@ pub struct ClientFileConfig {
         alias = "fingerprint"
     )]
     pub certificate_fingerprint: Option<String>,
+    #[serde(
+        default,
+        alias = "ca-cert",
+        alias = "ca_cert",
+        alias = "ca-cert-path",
+        alias = "ca_cert_path",
+        alias = "certificate_path"
+    )]
+    pub ca_cert_paths: Vec<PathBuf>,
     #[serde(default)]
     pub tls: Option<bool>,
     #[serde(default, alias = "cipher")]

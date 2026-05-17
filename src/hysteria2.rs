@@ -53,6 +53,7 @@ pub struct Hysteria2ClientConfig {
     pub sni: String,
     pub insecure: bool,
     pub certificate_fingerprint: Option<String>,
+    pub ca_cert_paths: Vec<PathBuf>,
     pub obfs: Option<String>,
     pub obfs_password: Option<String>,
     pub download_bandwidth: Option<u64>,
@@ -1114,6 +1115,13 @@ fn build_client_endpoint(config: &Hysteria2ClientConfig, bind_ipv6: bool) -> Res
     } else {
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        for path in &config.ca_cert_paths {
+            for cert in tls::load_certs(path)? {
+                roots.add(cert).with_context(|| {
+                    format!("add Hysteria2 custom root certificate {}", path.display())
+                })?;
+            }
+        }
         rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth()

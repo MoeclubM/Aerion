@@ -26,6 +26,7 @@ congestion_control = "bbr"
 # download_bandwidth is Mbps and is sent as Hysteria-CC-RX.
 # download_bandwidth = 100
 # certificate_fingerprint = "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+# ca_cert_paths = ["ca.pem"]
 # obfs = "salamander"
 # obfs_password = "change-me-obfs"
 

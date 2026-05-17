@@ -353,6 +353,7 @@ async fn socks_client_reaches_tcp_target_through_hysteria2_server() -> Result<()
             sni: "localhost".to_string(),
             insecure: false,
             certificate_fingerprint: Some(certificate_fingerprint),
+            ca_cert_paths: Vec::new(),
             obfs: None,
             obfs_password: None,
             download_bandwidth: None,
@@ -410,6 +411,7 @@ async fn socks_udp_associate_reaches_udp_target_through_hysteria2_datagrams() ->
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     let cert_path = temp.path().join("hy2-udp.crt");
     let key_path = temp.path().join("hy2-udp.key");
+    let ca_cert_path = cert_path.clone();
     std::fs::write(&cert_path, certified.cert.pem())?;
     std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
 
@@ -437,8 +439,9 @@ async fn socks_udp_associate_reaches_udp_target_through_hysteria2_datagrams() ->
             server_port: server_addr.port(),
             password: "test-password".to_string(),
             sni: "localhost".to_string(),
-            insecure: true,
+            insecure: false,
             certificate_fingerprint: None,
+            ca_cert_paths: vec![ca_cert_path],
             obfs: None,
             obfs_password: None,
             download_bandwidth: None,

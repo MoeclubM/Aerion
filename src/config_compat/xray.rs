@@ -1553,6 +1553,7 @@ impl XrayOutbound {
             ),
             insecure: tls.map(|settings| settings.allow_insecure).unwrap_or(false),
             certificate_fingerprint: None,
+            ca_cert_paths: Vec::new(),
             obfs,
             obfs_password,
             download_bandwidth,

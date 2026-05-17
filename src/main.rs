@@ -91,6 +91,8 @@ enum Command {
         insecure: bool,
         #[arg(long = "certificate-fingerprint")]
         certificate_fingerprint: Option<String>,
+        #[arg(long = "ca-cert")]
+        ca_cert_paths: Vec<PathBuf>,
         #[arg(long)]
         obfs: Option<String>,
         #[arg(long = "obfs-password")]
@@ -273,6 +275,7 @@ async fn main() -> Result<()> {
             sni,
             insecure,
             certificate_fingerprint,
+            ca_cert_paths,
             obfs,
             obfs_password,
             download_bandwidth,
@@ -289,6 +292,7 @@ async fn main() -> Result<()> {
                 sni,
                 insecure,
                 certificate_fingerprint,
+                ca_cert_paths,
                 obfs,
                 obfs_password,
                 download_bandwidth,
@@ -580,6 +584,7 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             sni,
             insecure: client.insecure,
             certificate_fingerprint: client.certificate_fingerprint,
+            ca_cert_paths: client.ca_cert_paths,
             obfs: client.obfs,
             obfs_password: client.obfs_password,
             download_bandwidth: client.download_bandwidth,

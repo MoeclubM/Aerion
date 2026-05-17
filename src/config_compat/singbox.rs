@@ -1290,7 +1290,7 @@ impl SingBoxVlessOutbound {
             None
         };
         if let Some(tls) = &self.tls {
-            tls.ensure_supported_client_options("VLESS", name)?;
+            tls.ensure_supported_client_options("VLESS", name, false)?;
             if tls_enabled || reality.is_some() {
                 ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
             } else {
@@ -1351,7 +1351,7 @@ impl SingBoxVmessOutbound {
         ensure_vmess_packet_encoding(&packet_encoding)
             .with_context(|| format!("sing-box VMess outbound {name} packet_encoding"))?;
         if let Some(tls) = &self.tls {
-            tls.ensure_supported_client_options("VMess", name)?;
+            tls.ensure_supported_client_options("VMess", name, false)?;
             if tls.enabled {
                 ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
             } else {
@@ -1407,7 +1407,7 @@ impl SingBoxTrojanOutbound {
             tls.enabled,
             "sing-box Trojan outbound {name} disables TLS; Trojan requires TLS in Aerion"
         );
-        tls.ensure_supported_client_options("Trojan", name)?;
+        tls.ensure_supported_client_options("Trojan", name, false)?;
         ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
         Ok(TrojanClientConfig {
             listen,
@@ -1476,7 +1476,7 @@ impl SingBoxHysteria2Outbound {
             tls.enabled,
             "sing-box Hysteria2 outbound {name} disables TLS; Hysteria2 requires TLS in Aerion"
         );
-        tls.ensure_supported_client_options("Hysteria2", name)?;
+        tls.ensure_supported_client_options("Hysteria2", name, true)?;
         ensure_hy2_alpn("sing-box", name, tls.alpn.as_ref())?;
         let (obfs, obfs_password) = match &self.obfs {
             Some(obfs) => {
@@ -1497,6 +1497,7 @@ impl SingBoxHysteria2Outbound {
             sni: sni_or_server(tls.server_name.as_deref(), server),
             insecure: tls.insecure,
             certificate_fingerprint: None,
+            ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
             obfs,
             obfs_password,
             download_bandwidth: self.down_mbps.or(self.down),
@@ -1516,7 +1517,7 @@ impl SingBoxAnyTlsOutbound {
             tls.enabled,
             "sing-box AnyTLS outbound {name} disables TLS; AnyTLS requires TLS"
         );
-        tls.ensure_supported_client_options("AnyTLS", name)?;
+        tls.ensure_supported_client_options("AnyTLS", name, false)?;
         Ok(ClientConfig {
             listen,
             server_host: self.server.clone(),
@@ -1540,7 +1541,7 @@ impl SingBoxNaiveOutbound {
             tls.enabled,
             "sing-box Naive outbound {name} disables TLS; Naive requires HTTPS/TLS"
         );
-        tls.ensure_supported_client_options("Naive", name)?;
+        tls.ensure_supported_client_options("Naive", name, false)?;
         ensure!(
             self.insecure_concurrency.unwrap_or(0) == 0,
             "sing-box Naive outbound {name} sets insecure_concurrency; Aerion Naive client does not implement speculative parallel connections"
@@ -1599,7 +1600,7 @@ impl SingBoxTuicOutbound {
             tls.enabled,
             "sing-box TUIC outbound {name} disables TLS; TUIC requires QUIC TLS"
         );
-        tls.ensure_supported_client_options("TUIC", name)?;
+        tls.ensure_supported_client_options("TUIC", name, false)?;
         ensure_tuic_alpn("sing-box", name, tls.alpn.as_ref())?;
         Ok(TuicClientConfig {
             listen,
@@ -1630,21 +1631,30 @@ impl SingBoxTuicOutbound {
 }
 
 impl SingBoxTlsOptions {
-    fn ensure_supported_client_options(&self, protocol: &str, name: &str) -> Result<()> {
+    fn ensure_supported_client_options(
+        &self,
+        protocol: &str,
+        name: &str,
+        allow_certificate_path: bool,
+    ) -> Result<()> {
         ensure!(
             !self
                 .certificate
                 .as_ref()
                 .map(json_value_non_empty)
                 .unwrap_or(false)
-                && !self
-                    .certificate_path
-                    .as_ref()
-                    .map(json_value_non_empty)
-                    .unwrap_or(false)
                 && !self.key.as_ref().map(json_value_non_empty).unwrap_or(false)
                 && !self
                     .key_path
+                    .as_ref()
+                    .map(json_value_non_empty)
+                    .unwrap_or(false),
+            "sing-box {protocol} outbound {name} sets custom TLS certificate roots; Aerion client does not expose custom trust roots"
+        );
+        ensure!(
+            allow_certificate_path
+                || !self
+                    .certificate_path
                     .as_ref()
                     .map(json_value_non_empty)
                     .unwrap_or(false),
@@ -2031,6 +2041,25 @@ fn value_path(value: Option<&Value>) -> Option<PathBuf> {
         Some(Value::String(value)) if !value.trim().is_empty() => Some(PathBuf::from(value)),
         Some(Value::Array(values)) if values.len() == 1 => value_path(values.first()),
         _ => None,
+    }
+}
+
+fn value_paths(value: Option<&Value>) -> Result<Vec<PathBuf>> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(vec![PathBuf::from(value)]),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+                    .context("sing-box TLS certificate_path array contains a non-string path")
+            })
+            .collect(),
+        Some(_) => bail!("sing-box TLS certificate_path must be a string or string array"),
     }
 }
 
@@ -2910,7 +2939,8 @@ mod tests {
       "enabled": true,
       "server_name": "hy2.example.com",
       "insecure": true,
-      "alpn": ["h3"]
+      "alpn": ["h3"],
+      "certificate_path": ["ca.pem", "backup-ca.pem"]
     },
     "obfs": {
       "type": "salamander",
@@ -2930,6 +2960,10 @@ mod tests {
         assert_eq!(hysteria2.password, "secret");
         assert_eq!(hysteria2.sni, "hy2.example.com");
         assert!(hysteria2.insecure);
+        assert_eq!(
+            hysteria2.ca_cert_paths,
+            vec![PathBuf::from("ca.pem"), PathBuf::from("backup-ca.pem")]
+        );
         assert!(hysteria2.udp);
         assert_eq!(hysteria2.obfs.as_deref(), Some("salamander"));
         assert_eq!(hysteria2.obfs_password.as_deref(), Some("obfs-pass"));

@@ -103,8 +103,8 @@ Aerion now provides these server/client protocol stacks:
     and TUIC selection helpers
   - protocol modules expose the bottom-level connection capability; profile
     selection and service/app policy stay in the integrating client or server
-  - unsupported transport mismatches such as mihomo `smux` or
-    REALITY client outbound fail with explicit errors instead of falling back silently
+  - unsupported transport mismatches such as mihomo `smux` fail with explicit
+    errors instead of falling back silently
 - VMess:
   - AEAD request/response header
   - raw TCP/TLS plus TCP / WebSocket / HTTPUpgrade / HTTP/2 / gRPC / XHTTP transports for client/server
@@ -165,8 +165,9 @@ cargo run -- client `
   --heartbeat-interval-secs 30
 ```
 
-For a self-signed Hysteria2 server certificate, either add `--insecure` on the
-client or pin the leaf SHA-256 with `--certificate-fingerprint`.
+For a self-signed Hysteria2 server certificate, either add `--insecure`, pin the
+leaf SHA-256 with `--certificate-fingerprint`, or pass a CA PEM with
+`--ca-cert`.
 
 ## Config file
 
