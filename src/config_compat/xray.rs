@@ -1,5 +1,5 @@
 use crate::config_compat::mihomo::OneOrManyStrings;
-use crate::hysteria2::Hysteria2ClientConfig;
+use crate::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
 use crate::reality::{RealityClientConfig, RealityServerConfig};
 use crate::shadowsocks::{ShadowsocksClientConfig, ShadowsocksServerConfig};
 use crate::trojan::{TrojanClientConfig, TrojanServerConfig};
@@ -117,6 +117,8 @@ pub struct XrayOutboundSettings {
     #[serde(default)]
     pub password: Option<String>,
     #[serde(default)]
+    pub auth: Option<String>,
+    #[serde(default)]
     pub network: Option<String>,
     #[serde(default)]
     pub flow: Option<String>,
@@ -154,6 +156,8 @@ pub struct XrayUser {
     pub id: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+    #[serde(default)]
+    pub auth: Option<String>,
     #[serde(default)]
     pub method: Option<String>,
     #[serde(default)]
@@ -430,6 +434,7 @@ pub enum XrayClientConfig {
 
 pub enum XrayServerConfig {
     Shadowsocks(ShadowsocksServerConfig),
+    Hysteria2(Hysteria2ServerConfig),
     Trojan(TrojanServerConfig),
     Vless(VlessServerConfig),
     Vmess(VmessServerConfig),
@@ -472,6 +477,10 @@ impl XrayInbound {
             "shadowsocks" | "ss" => Ok(XrayServerConfig::Shadowsocks(
                 self.to_shadowsocks_server_config()
                     .with_context(|| format!("convert xray Shadowsocks inbound {}", self.name()))?,
+            )),
+            "hysteria" | "hysteria2" | "hy2" => Ok(XrayServerConfig::Hysteria2(
+                self.to_hysteria2_server_config()
+                    .with_context(|| format!("convert xray Hysteria2 inbound {}", self.name()))?,
             )),
             "trojan" => Ok(XrayServerConfig::Trojan(
                 self.to_trojan_server_config()
@@ -557,6 +566,231 @@ impl XrayInbound {
             tcp,
             udp,
             udp_over_tcp: false,
+        })
+    }
+
+    fn to_hysteria2_server_config(&self) -> Result<Hysteria2ServerConfig> {
+        let hysteria = self.stream_settings.hysteria_settings.as_ref();
+        let version = self
+            .settings
+            .version
+            .or_else(|| hysteria.and_then(|settings| settings.version));
+        ensure!(
+            !self.protocol.eq_ignore_ascii_case("hysteria") || version == Some(2),
+            "xray Hysteria inbound {} uses version {:?}; Aerion supports Hysteria2 version 2",
+            self.name(),
+            version
+        );
+        if let Some(version) = version {
+            ensure!(
+                version == 2,
+                "xray Hysteria inbound {} uses version {}; Aerion supports Hysteria2 version 2",
+                self.name(),
+                version
+            );
+        }
+        let network = self.stream_settings.network.trim();
+        ensure!(
+            network.eq_ignore_ascii_case("hysteria"),
+            "xray Hysteria inbound {} uses network {}; Aerion Hysteria2 expects hysteria transport",
+            self.name(),
+            network
+        );
+        let stream_security = self.stream_settings.security.trim();
+        ensure!(
+            stream_security.is_empty()
+                || stream_security.eq_ignore_ascii_case("none")
+                || stream_security.eq_ignore_ascii_case("tls"),
+            "xray Hysteria inbound {} uses stream security {}; Aerion Hysteria2 expects TLS-backed hysteria transport",
+            self.name(),
+            stream_security
+        );
+        ensure!(
+            !hysteria
+                .and_then(|settings| settings.udp_hop.as_ref())
+                .map(value_has_data)
+                .unwrap_or(false),
+            "xray Hysteria inbound {} enables UDP port hopping; Aerion Hysteria2 server expects one fixed port",
+            self.name()
+        );
+        ensure!(
+            hysteria.and_then(|settings| settings.up).is_none(),
+            "xray Hysteria inbound {} sets upload bandwidth; Aerion Hysteria2 server does not expose upload bandwidth limiting",
+            self.name()
+        );
+        ensure!(
+            !hysteria
+                .and_then(|settings| settings.masquerade.as_ref())
+                .map(value_has_data)
+                .unwrap_or(false),
+            "xray Hysteria inbound {} sets masquerade; Aerion Hysteria2 server does not expose HTTP masquerade",
+            self.name()
+        );
+        let tls = self.stream_settings.tls_settings.as_ref();
+        ensure_hysteria_alpn(
+            "xray",
+            self.name(),
+            tls.and_then(|settings| settings.alpn.as_ref()),
+        )?;
+        let certificate = tls
+            .and_then(|tls| tls.certificates.first())
+            .with_context(|| {
+                format!(
+                    "xray Hysteria inbound {} TLS is missing certificates",
+                    self.name()
+                )
+            })?;
+        let finalmask = self.stream_settings.finalmask.as_ref();
+        if let Some(finalmask) = finalmask {
+            ensure!(
+                finalmask.tcp.is_empty(),
+                "xray Hysteria inbound {} sets finalmask TCP masks; Aerion Hysteria2 only maps salamander UDP obfs",
+                self.name()
+            );
+            ensure!(
+                finalmask.udp.len() <= 1,
+                "xray Hysteria inbound {} sets multiple finalmask UDP masks; Aerion Hysteria2 exposes one obfs layer",
+                self.name()
+            );
+            ensure!(
+                !finalmask
+                    .quic_params
+                    .as_ref()
+                    .and_then(|params| params.udp_hop.as_ref())
+                    .map(value_has_data)
+                    .unwrap_or(false),
+                "xray Hysteria inbound {} enables finalmask UDP port hopping; Aerion Hysteria2 server expects one fixed port",
+                self.name()
+            );
+            ensure!(
+                finalmask
+                    .quic_params
+                    .as_ref()
+                    .and_then(|params| params.brutal_up)
+                    .is_none(),
+                "xray Hysteria inbound {} sets finalmask brutalUp; Aerion Hysteria2 server does not expose upload bandwidth limiting",
+                self.name()
+            );
+            ensure!(
+                finalmask
+                    .quic_params
+                    .as_ref()
+                    .and_then(|params| params.bbr_profile.as_deref())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none_or(|value| value.eq_ignore_ascii_case("standard")),
+                "xray Hysteria inbound {} sets finalmask bbrProfile {:?}; Aerion Hysteria2 uses the default BBR profile",
+                self.name(),
+                finalmask
+                    .quic_params
+                    .as_ref()
+                    .and_then(|params| params.bbr_profile.as_ref())
+            );
+            ensure!(
+                !finalmask
+                    .quic_params
+                    .as_ref()
+                    .map(|params| params.debug)
+                    .unwrap_or(false),
+                "xray Hysteria inbound {} enables finalmask quicParams debug; Aerion Hysteria2 server does not expose QUIC debug toggles",
+                self.name()
+            );
+        }
+        let (obfs, obfs_password) = match finalmask.and_then(|finalmask| finalmask.udp.first()) {
+            Some(mask) => {
+                ensure!(
+                    mask.kind.eq_ignore_ascii_case("salamander"),
+                    "xray Hysteria inbound {} uses finalmask UDP mask {}; Aerion supports salamander",
+                    self.name(),
+                    mask.kind
+                );
+                let password = mask
+                    .settings
+                    .as_ref()
+                    .and_then(|settings| settings.get("password"))
+                    .and_then(Value::as_str)
+                    .with_context(|| {
+                        format!(
+                            "xray Hysteria inbound {} salamander mask is missing password",
+                            self.name()
+                        )
+                    })?
+                    .to_string();
+                (Some("salamander".to_string()), Some(password))
+            }
+            None => (None, None),
+        };
+        let congestion_control = finalmask
+            .and_then(|finalmask| finalmask.quic_params.as_ref())
+            .and_then(|params| params.congestion.clone())
+            .or_else(|| hysteria.and_then(|settings| settings.congestion.clone()))
+            .unwrap_or_else(|| "bbr".to_string());
+        ensure!(
+            congestion_control.trim().is_empty()
+                || congestion_control.eq_ignore_ascii_case("bbr")
+                || congestion_control.eq_ignore_ascii_case("reno"),
+            "xray Hysteria inbound {} uses congestion {}; Aerion Hysteria2 supports bbr or reno",
+            self.name(),
+            congestion_control
+        );
+        let password = self
+            .settings
+            .clients
+            .first()
+            .and_then(|user| user.auth.clone().or(user.password.clone()))
+            .or_else(|| hysteria.and_then(|settings| settings.auth.clone()))
+            .or(self.settings.auth.clone())
+            .or(self.settings.password.clone())
+            .with_context(|| format!("xray Hysteria inbound {} is missing auth", self.name()))?;
+        let users = self
+            .settings
+            .clients
+            .iter()
+            .skip(1)
+            .map(|user| {
+                user.auth
+                    .clone()
+                    .or(user.password.clone())
+                    .with_context(|| {
+                        format!(
+                            "xray Hysteria inbound {} extra client is missing auth",
+                            self.name()
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let cc_rx = finalmask
+            .and_then(|finalmask| finalmask.quic_params.as_ref())
+            .and_then(|params| params.brutal_down)
+            .or_else(|| hysteria.and_then(|settings| settings.down))
+            .map(|mbps| mbps.saturating_mul(125_000).to_string())
+            .unwrap_or_else(|| "0".to_string());
+        Ok(Hysteria2ServerConfig {
+            listen: SocketAddr::new(
+                parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
+                self.port.with_context(|| {
+                    format!("xray Hysteria inbound {} is missing port", self.name())
+                })?,
+            ),
+            password,
+            users,
+            cert_path: certificate.certificate_file.clone().with_context(|| {
+                format!(
+                    "xray Hysteria inbound {} TLS certificate is missing certificateFile",
+                    self.name()
+                )
+            })?,
+            key_path: certificate.key_file.clone().with_context(|| {
+                format!(
+                    "xray Hysteria inbound {} TLS certificate is missing keyFile",
+                    self.name()
+                )
+            })?,
+            obfs,
+            obfs_password,
+            udp: true,
+            cc_rx,
+            congestion_control,
         })
     }
 
@@ -1352,6 +1586,7 @@ impl XrayOutbound {
             user: XrayUser {
                 id: self.settings.id.clone(),
                 password: self.settings.password.clone(),
+                auth: self.settings.auth.clone(),
                 method: self.settings.method.clone(),
                 encryption: None,
                 flow: self.settings.flow.clone(),
@@ -2149,6 +2384,63 @@ mod tests {
         assert_eq!(shadowsocks.password, "secret");
         assert!(shadowsocks.tcp);
         assert!(shadowsocks.udp);
+        Ok(())
+    }
+
+    #[test]
+    fn converts_hysteria2_inbound_to_server_config() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [{
+    "tag": "hy2",
+    "protocol": "hysteria",
+    "listen": "127.0.0.1",
+    "port": 8445,
+    "settings": {
+      "version": 2,
+      "users": [
+        { "auth": "primary-pass" },
+        { "auth": "alice-pass" }
+      ]
+    },
+    "streamSettings": {
+      "network": "hysteria",
+      "security": "tls",
+      "tlsSettings": {
+        "alpn": ["h3"],
+        "certificates": [{ "certificateFile": "server.crt", "keyFile": "server.key" }]
+      },
+      "hysteriaSettings": {
+        "version": 2
+      },
+      "finalmask": {
+        "udp": [{
+          "type": "salamander",
+          "settings": { "password": "obfs-pass" }
+        }],
+        "quicParams": {
+          "congestion": "reno",
+          "brutalDown": "80mbps"
+        }
+      }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let XrayServerConfig::Hysteria2(hy2) = config.inbounds[0].to_server_config()? else {
+            bail!("expected Hysteria2")
+        };
+        assert_eq!(hy2.listen, "127.0.0.1:8445".parse()?);
+        assert_eq!(hy2.password, "primary-pass");
+        assert_eq!(hy2.users, vec!["alice-pass".to_string()]);
+        assert_eq!(hy2.cert_path, PathBuf::from("server.crt"));
+        assert_eq!(hy2.key_path, PathBuf::from("server.key"));
+        assert_eq!(hy2.obfs.as_deref(), Some("salamander"));
+        assert_eq!(hy2.obfs_password.as_deref(), Some("obfs-pass"));
+        assert_eq!(hy2.cc_rx, "10000000");
+        assert_eq!(hy2.congestion_control, "reno");
+        assert!(hy2.udp);
         Ok(())
     }
 

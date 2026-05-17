@@ -226,8 +226,8 @@ Inbound-only sing-box JSON can also run AnyTLS, Shadowsocks, Trojan, VMess,
 Hysteria2, TUIC, Naive, and VLESS server profiles, including Naive TCP-only /
 HTTP/3-only listener networks and VLESS raw, TLS, or REALITY inbound TLS
 settings.
-Inbound-only Xray JSON can run Shadowsocks, Trojan, VLESS, and VMess server
-profiles, with VLESS raw, TLS, or REALITY stream security.
+Inbound-only Xray JSON can run Shadowsocks, Hysteria2, Trojan, VLESS, and VMess
+server profiles, with VLESS raw, TLS, or REALITY stream security.
 
 ## Run Hysteria2
 

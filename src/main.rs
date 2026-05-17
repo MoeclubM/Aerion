@@ -970,6 +970,7 @@ async fn run_singbox_server_config(config: SingBoxServerConfig) -> Result<()> {
 async fn run_xray_server_config(config: XrayServerConfig) -> Result<()> {
     match config {
         XrayServerConfig::Shadowsocks(config) => run_shadowsocks_server(config).await,
+        XrayServerConfig::Hysteria2(config) => run_hysteria2_server(config).await,
         XrayServerConfig::Trojan(config) => run_trojan_server(config).await,
         XrayServerConfig::Vless(config) => run_vless_server(config).await,
         XrayServerConfig::Vmess(config) => run_vmess_server(config).await,
