@@ -67,6 +67,14 @@ jobs:
         with:
           targets: aarch64-linux-android
 
+      - name: Configure Android NDK clang
+        shell: bash
+        run: |
+          ndk="${ANDROID_NDK_ROOT:-$ANDROID_NDK_LATEST_HOME}"
+          clang="$(find "$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin" -name 'aarch64-linux-android*-clang' | sort -V | tail -n 1)"
+          echo "CC_aarch64_linux_android=$clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" >> "$GITHUB_ENV"
+
       - name: Check Android arm64 target
         run: cargo check --locked --target aarch64-linux-android
 
