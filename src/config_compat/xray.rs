@@ -1,6 +1,6 @@
 use crate::config_compat::mihomo::OneOrManyStrings;
 use crate::hysteria2::Hysteria2ClientConfig;
-use crate::reality::RealityClientConfig;
+use crate::reality::{RealityClientConfig, RealityServerConfig};
 use crate::shadowsocks::ShadowsocksClientConfig;
 use crate::trojan::TrojanClientConfig;
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
@@ -379,8 +379,12 @@ pub struct XrayCertificate {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct XrayRealitySettings {
+    #[serde(default)]
+    pub dest: Option<String>,
     #[serde(default, rename = "serverName", alias = "server_name")]
     pub server_name: Option<String>,
+    #[serde(default, rename = "serverNames", alias = "server_names")]
+    pub server_names: Vec<String>,
     #[serde(
         default,
         deserialize_with = "deserialize_optional_fingerprint",
@@ -395,8 +399,12 @@ pub struct XrayRealitySettings {
         alias = "password"
     )]
     pub public_key: Option<String>,
+    #[serde(default, rename = "privateKey", alias = "private_key")]
+    pub private_key: Option<String>,
     #[serde(default, rename = "shortId", alias = "short_id")]
     pub short_id: Option<String>,
+    #[serde(default, rename = "shortIds", alias = "short_ids")]
+    pub short_ids: Vec<String>,
     #[serde(default)]
     pub alpn: Option<OneOrManyStrings>,
 }
@@ -483,12 +491,14 @@ impl XrayInbound {
         ensure!(
             stream_security.is_empty()
                 || stream_security.eq_ignore_ascii_case("none")
-                || stream_security.eq_ignore_ascii_case("tls"),
-            "xray VLESS inbound {} uses stream security {}; Aerion maps raw TCP or TLS VLESS server configs",
+                || stream_security.eq_ignore_ascii_case("tls")
+                || stream_security.eq_ignore_ascii_case("reality"),
+            "xray VLESS inbound {} uses stream security {}; Aerion maps raw TCP, TLS, or REALITY VLESS server configs",
             self.name(),
             stream_security
         );
         let tls = self.stream_settings.tls_settings.as_ref();
+        let reality_settings = self.stream_settings.reality_settings.as_ref();
         let transport = XrayOutbound {
             tag: self.tag.clone(),
             protocol: self.protocol.clone(),
@@ -498,12 +508,18 @@ impl XrayInbound {
             decode_error: None,
         }
         .vless_transport_config()?;
-        if stream_security.eq_ignore_ascii_case("tls") {
+        if stream_security.eq_ignore_ascii_case("tls")
+            || stream_security.eq_ignore_ascii_case("reality")
+        {
             ensure_vless_alpn(
                 "xray",
                 self.name(),
                 &transport,
-                tls.and_then(|tls| tls.alpn.as_ref()),
+                if stream_security.eq_ignore_ascii_case("reality") {
+                    reality_settings.and_then(|settings| settings.alpn.as_ref())
+                } else {
+                    tls.and_then(|settings| settings.alpn.as_ref())
+                },
             )?;
         } else {
             ensure_no_alpn("xray", self.name(), tls.and_then(|tls| tls.alpn.as_ref()))?;
@@ -562,6 +578,21 @@ impl XrayInbound {
         } else {
             (PathBuf::new(), PathBuf::new())
         };
+        let reality = if stream_security.eq_ignore_ascii_case("reality") {
+            let settings = reality_settings.with_context(|| {
+                format!(
+                    "xray VLESS inbound {} is missing realitySettings",
+                    self.name()
+                )
+            })?;
+            Some(xray_reality_server_config(
+                self.name(),
+                settings,
+                &transport,
+            )?)
+        } else {
+            None
+        };
         Ok(VlessServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
@@ -575,7 +606,7 @@ impl XrayInbound {
             cert_path,
             key_path,
             flow,
-            reality: None,
+            reality,
             transport,
         })
     }
@@ -1418,6 +1449,57 @@ fn sni_or_server(value: Option<&str>, server: &str, name: &str) -> String {
         .to_string()
 }
 
+fn xray_reality_server_config(
+    name: &str,
+    settings: &XrayRealitySettings,
+    transport: &VlessTransportConfig,
+) -> Result<RealityServerConfig> {
+    let dest = settings
+        .dest
+        .as_deref()
+        .with_context(|| format!("xray REALITY inbound {name} is missing realitySettings.dest"))?;
+    let (server_name, server_port) =
+        parse_host_port(dest).with_context(|| format!("parse xray REALITY inbound {name} dest"))?;
+    let private_key = settings.private_key.as_deref().with_context(|| {
+        format!("xray REALITY inbound {name} is missing realitySettings.privateKey")
+    })?;
+    let mut short_ids = settings.short_ids.clone();
+    if short_ids.is_empty() {
+        if let Some(short_id) = &settings.short_id {
+            short_ids.push(short_id.clone());
+        }
+    }
+    let alpn_protocols = settings
+        .alpn
+        .as_ref()
+        .map(|alpn| {
+            alpn.to_vec()
+                .into_iter()
+                .map(String::into_bytes)
+                .collect::<Vec<_>>()
+        })
+        .filter(|alpn| !alpn.is_empty())
+        .unwrap_or_else(|| transport.alpn_protocols());
+    RealityServerConfig::from_strings(
+        server_name,
+        server_port,
+        settings.server_names.clone(),
+        private_key,
+        &short_ids,
+        alpn_protocols,
+    )
+}
+
+fn parse_host_port(value: &str) -> Result<(String, u16)> {
+    let (host, port) = value
+        .rsplit_once(':')
+        .with_context(|| format!("address must be host:port: {value}"))?;
+    let port = port
+        .parse::<u16>()
+        .with_context(|| format!("parse port in {value}"))?;
+    Ok((host.trim_matches(&['[', ']'][..]).to_string(), port))
+}
+
 fn parse_listen_ip(format: &str, value: &str) -> Result<IpAddr> {
     let value = value.trim();
     match value {
@@ -1616,6 +1698,50 @@ mod tests {
             vless.transport.request_host("example.com"),
             "edge.example.com"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_vless_reality_inbound_to_server_config() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [{
+    "tag": "vless-reality",
+    "protocol": "vless",
+    "listen": "127.0.0.1",
+    "port": 8443,
+    "settings": {
+      "decryption": "none",
+      "clients": [{ "id": "a3482e88-686a-4a58-8126-99c9df64b7bf" }]
+    },
+    "streamSettings": {
+      "network": "grpc",
+      "security": "reality",
+      "realitySettings": {
+        "dest": "www.example.com:443",
+        "serverNames": ["front.example.com"],
+        "privateKey": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "shortIds": ["a1b2"],
+        "alpn": ["h2"]
+      },
+      "grpcSettings": {
+        "serviceName": "TunService"
+      }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let XrayServerConfig::Vless(vless) = config.inbounds[0].to_server_config()?;
+        let reality = vless.reality.context("REALITY config")?;
+        assert!(!vless.tls);
+        assert_eq!(reality.server_name, "www.example.com");
+        assert_eq!(reality.server_port, 443);
+        assert_eq!(reality.server_names, vec!["front.example.com".to_string()]);
+        assert_eq!(reality.short_ids[0], [0xa1, 0xb2, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(reality.alpn_protocols, vec![b"h2".to_vec()]);
+        assert_eq!(vless.transport.kind, VlessTransportKind::Grpc);
+        assert_eq!(vless.transport.path, "/TunService/Tun");
         Ok(())
     }
 
