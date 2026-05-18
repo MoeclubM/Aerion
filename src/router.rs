@@ -1,12 +1,13 @@
+use crate::listener::ListenerStopToken;
 use crate::protocol::{ProxyTarget, target_name};
-use crate::routing::{RouteDecision, RouteNetwork, RouteTable};
+use crate::routing::{RouteDecision, RouteNetwork, RouteTable, SharedRouteTable};
 use crate::socket_protect;
 use crate::socks::{self, SocksRequest};
 use crate::uot;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncReadExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
@@ -17,6 +18,12 @@ pub struct RouteProxyConfig {
     pub upstreams: BTreeMap<String, SocketAddr>,
 }
 
+#[derive(Clone, Debug)]
+pub struct RouteProxyState {
+    routes: SharedRouteTable,
+    upstreams: Arc<RwLock<BTreeMap<String, SocketAddr>>>,
+}
+
 struct UdpCommand {
     target: ProxyTarget,
     payload: Vec<u8>,
@@ -24,32 +31,116 @@ struct UdpCommand {
 }
 
 pub async fn run_route_proxy(listener: TcpListener, config: RouteProxyConfig) -> Result<()> {
-    let routes = Arc::new(config.routes);
-    let upstreams = Arc::new(config.upstreams);
+    run_route_proxy_with_state(listener, RouteProxyState::from_config(config)).await
+}
+
+pub async fn run_route_proxy_until(
+    listener: TcpListener,
+    config: RouteProxyConfig,
+    stop: ListenerStopToken,
+) -> Result<()> {
+    run_route_proxy_with_state_until(listener, RouteProxyState::from_config(config), stop).await
+}
+
+pub async fn run_route_proxy_with_state(
+    listener: TcpListener,
+    state: RouteProxyState,
+) -> Result<()> {
+    run_route_proxy_with_state_until(listener, state, ListenerStopToken::new()).await
+}
+
+pub async fn run_route_proxy_with_state_until(
+    listener: TcpListener,
+    state: RouteProxyState,
+    stop: ListenerStopToken,
+) -> Result<()> {
     tracing::info!(
         "route proxy listening on socks5://{}",
         listener.local_addr()?
     );
     loop {
-        let (stream, peer) = listener.accept().await.context("accept route client")?;
-        let routes = routes.clone();
-        let upstreams = upstreams.clone();
+        let (stream, peer) = tokio::select! {
+            _ = stop.stopped() => return Ok(()),
+            accepted = listener.accept() => accepted.context("accept route client")?,
+        };
+        let state = state.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_route_client(stream, routes, upstreams).await {
+            if let Err(error) = handle_route_client(stream, state).await {
                 tracing::warn!("route client {peer} failed: {error:?}");
             }
         });
     }
 }
 
-async fn handle_route_client(
-    mut local: TcpStream,
-    routes: Arc<RouteTable>,
-    upstreams: Arc<BTreeMap<String, SocketAddr>>,
-) -> Result<()> {
+impl RouteProxyState {
+    pub fn new(routes: RouteTable, upstreams: BTreeMap<String, SocketAddr>) -> Self {
+        Self {
+            routes: SharedRouteTable::new(routes),
+            upstreams: Arc::new(RwLock::new(upstreams)),
+        }
+    }
+
+    pub fn from_config(config: RouteProxyConfig) -> Self {
+        Self::new(config.routes, config.upstreams)
+    }
+
+    pub fn route_table(&self) -> SharedRouteTable {
+        self.routes.clone()
+    }
+
+    pub fn replace_routes(&self, routes: RouteTable) {
+        self.routes.replace(routes);
+    }
+
+    pub fn replace_upstreams(&self, upstreams: BTreeMap<String, SocketAddr>) {
+        *self
+            .upstreams
+            .write()
+            .expect("route upstreams lock poisoned") = upstreams;
+    }
+
+    pub fn set_upstream(&self, tag: impl Into<String>, upstream: SocketAddr) {
+        self.upstreams
+            .write()
+            .expect("route upstreams lock poisoned")
+            .insert(tag.into(), upstream);
+    }
+
+    pub fn remove_upstream(&self, tag: &str) -> Option<SocketAddr> {
+        self.upstreams
+            .write()
+            .expect("route upstreams lock poisoned")
+            .remove(tag)
+    }
+
+    pub fn upstream(&self, tag: &str) -> Option<SocketAddr> {
+        self.upstreams
+            .read()
+            .expect("route upstreams lock poisoned")
+            .get(tag)
+            .copied()
+    }
+
+    pub fn upstreams_snapshot(&self) -> BTreeMap<String, SocketAddr> {
+        self.upstreams
+            .read()
+            .expect("route upstreams lock poisoned")
+            .clone()
+    }
+
+    pub fn decide(&self, target: &ProxyTarget, network: RouteNetwork) -> RouteDecision {
+        self.routes.decide(target, network)
+    }
+
+    pub fn try_decide(&self, target: &ProxyTarget, network: RouteNetwork) -> Result<RouteDecision> {
+        self.routes.try_decide(target, network)
+    }
+}
+
+async fn handle_route_client(mut local: TcpStream, state: RouteProxyState) -> Result<()> {
     match socks::read_request(&mut local).await? {
         SocksRequest::Connect(target) => {
-            let decision = routes.decide(&target, RouteNetwork::Tcp);
+            let decision = state.try_decide(&target, RouteNetwork::Tcp)?;
             match decision {
                 RouteDecision::Direct => {
                     let mut remote = match connect_direct(&target).await {
@@ -71,8 +162,8 @@ async fn handle_route_client(
                     bail!("route blocked {}", target_name(&target))
                 }
                 RouteDecision::Proxy(tag) => {
-                    let upstream = *upstreams
-                        .get(&tag)
+                    let upstream = state
+                        .upstream(&tag)
                         .with_context(|| format!("route outbound {tag} was not started"))?;
                     let mut remote = match socks::connect_tcp(upstream, &target).await {
                         Ok(remote) => remote,
@@ -90,7 +181,7 @@ async fn handle_route_client(
                 }
             }
         }
-        SocksRequest::UdpAssociate => handle_udp_associate(local, routes, upstreams).await,
+        SocksRequest::UdpAssociate => handle_udp_associate(local, state).await,
     }
 }
 
@@ -101,11 +192,7 @@ async fn connect_direct(target: &ProxyTarget) -> Result<TcpStream> {
     }
 }
 
-async fn handle_udp_associate(
-    mut control: TcpStream,
-    routes: Arc<RouteTable>,
-    upstreams: Arc<BTreeMap<String, SocketAddr>>,
-) -> Result<()> {
+async fn handle_udp_associate(mut control: TcpStream, state: RouteProxyState) -> Result<()> {
     let bind_ip = match control.local_addr()?.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         ip => ip,
@@ -126,7 +213,7 @@ async fn handle_udp_associate(
             received = udp.recv_from(&mut packet) => {
                 let (read, peer) = received.context("receive route UDP packet")?;
                 let (target, payload) = uot::parse_socks_udp_packet(&packet[..read])?;
-                match routes.decide(&target, RouteNetwork::Udp) {
+                match state.try_decide(&target, RouteNetwork::Udp)? {
                     RouteDecision::Direct => {
                         let key = format!("direct:{}", target_name(&target));
                         let tx = sessions.entry(key).or_insert_with(|| {
@@ -142,12 +229,15 @@ async fn handle_udp_associate(
                         tracing::info!("blocking UDP {}", target_name(&target));
                     }
                     RouteDecision::Proxy(tag) => {
-                        let upstream = *upstreams
-                            .get(&tag)
+                        let upstream = state
+                            .upstream(&tag)
                             .with_context(|| format!("route UDP outbound {tag} was not started"))?;
-                        let tx = sessions.entry(format!("proxy:{tag}")).or_insert_with(|| {
-                            spawn_proxy_udp_session(tag.clone(), upstream, udp.clone())
-                        }).clone();
+                        let tx = sessions
+                            .entry(format!("proxy:{tag}@{upstream}"))
+                            .or_insert_with(|| {
+                                spawn_proxy_udp_session(tag.clone(), upstream, udp.clone())
+                            })
+                            .clone();
                         tx.send(UdpCommand {
                             target,
                             payload: payload.to_vec(),
@@ -277,5 +367,40 @@ async fn resolve_udp_target(target: &ProxyTarget) -> Result<SocketAddr> {
             .with_context(|| format!("resolve UDP target {host}:{port}"))?
             .next()
             .with_context(|| format!("UDP target resolved to no addresses: {host}:{port}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routing::RouteRule;
+
+    #[test]
+    fn route_proxy_state_hot_updates_routes_and_upstreams() {
+        let target = ProxyTarget::Domain("example.com".to_string(), 443);
+        let state = RouteProxyState::new(RouteTable::default(), BTreeMap::new());
+        assert_eq!(
+            state.decide(&target, RouteNetwork::Tcp),
+            RouteDecision::Direct
+        );
+
+        state.replace_routes(RouteTable {
+            rules: vec![RouteRule::new(RouteDecision::Proxy("node-a".to_string()))],
+            default: RouteDecision::Block,
+            ..RouteTable::default()
+        });
+        assert_eq!(
+            state.decide(&target, RouteNetwork::Tcp),
+            RouteDecision::Proxy("node-a".to_string())
+        );
+
+        let first = "127.0.0.1:10001".parse().expect("valid socket addr");
+        let second = "127.0.0.1:10002".parse().expect("valid socket addr");
+        state.set_upstream("node-a", first);
+        assert_eq!(state.upstream("node-a"), Some(first));
+        state.set_upstream("node-a", second);
+        assert_eq!(state.upstream("node-a"), Some(second));
+        assert_eq!(state.remove_upstream("node-a"), Some(second));
+        assert_eq!(state.upstream("node-a"), None);
     }
 }

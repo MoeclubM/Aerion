@@ -111,7 +111,7 @@ pub async fn udp_associate(upstream: SocketAddr) -> Result<SocksUdpAssociation> 
         ))
     };
     write_proxy_request(&mut control, 0x03, &bind_request).await?;
-    let bind = read_proxy_reply(&mut control, upstream).await?;
+    let bind = normalize_udp_bind(read_proxy_reply(&mut control, upstream).await?, upstream);
     let udp = UdpSocket::bind(SocketAddr::new(local_ip, 0))
         .await
         .with_context(|| format!("bind SOCKS UDP client socket for {upstream}"))?;
@@ -261,5 +261,35 @@ fn target_port(target: &ProxyTarget) -> u16 {
     match target {
         ProxyTarget::Ip(addr) => addr.port(),
         ProxyTarget::Domain(_, port) => *port,
+    }
+}
+
+fn normalize_udp_bind(bind: SocketAddr, upstream: SocketAddr) -> SocketAddr {
+    if bind.ip().is_unspecified() {
+        SocketAddr::new(upstream.ip(), bind.port())
+    } else {
+        bind
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_associate_uses_upstream_ip_for_unspecified_bind() -> Result<()> {
+        assert_eq!(
+            normalize_udp_bind("0.0.0.0:5300".parse()?, "192.0.2.10:1080".parse()?),
+            "192.0.2.10:5300".parse::<SocketAddr>()?
+        );
+        assert_eq!(
+            normalize_udp_bind("[::]:5300".parse()?, "[2001:db8::1]:1080".parse()?),
+            "[2001:db8::1]:5300".parse::<SocketAddr>()?
+        );
+        assert_eq!(
+            normalize_udp_bind("198.51.100.5:5300".parse()?, "192.0.2.10:1080".parse()?),
+            "198.51.100.5:5300".parse::<SocketAddr>()?
+        );
+        Ok(())
     }
 }

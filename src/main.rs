@@ -2,6 +2,7 @@ use aerion::config::{
     AerionFileConfig, ClientFileConfig, FileConfig, ServerFileConfig,
     default_heartbeat_interval_secs, load_config,
 };
+use aerion::http_connect::{HttpConnectInboundConfig, run_http_connect_listener};
 use aerion::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
 use aerion::mieru::{
     MieruClientConfig, MieruServerConfig, MieruTrafficPattern, MieruTransport, parse_mieru_user,
@@ -89,6 +90,12 @@ enum Command {
         exit_on_fatal_error: bool,
         #[arg(long = "packet-information")]
         packet_information: bool,
+    },
+    HttpConnect {
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: SocketAddr,
+        #[arg(long = "upstream-socks")]
+        upstream_socks: SocketAddr,
     },
     Client {
         #[arg(long, default_value = "127.0.0.1:1080")]
@@ -304,6 +311,15 @@ async fn main() -> Result<()> {
             run_tun(config, TunCancellationToken::new())
                 .await
                 .map(|_| ())
+        }
+        Command::HttpConnect {
+            listen,
+            upstream_socks,
+        } => {
+            let listener = TcpListener::bind(listen)
+                .await
+                .with_context(|| format!("bind HTTP CONNECT inbound on {listen}"))?;
+            run_http_connect_listener(listener, HttpConnectInboundConfig { upstream_socks }).await
         }
         Command::Client {
             listen,

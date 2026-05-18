@@ -545,13 +545,17 @@ impl XrayRoutingRule {
         );
         let mut rule = RouteRule::new(RouteDecision::from_outbound(&self.outbound_tag)?);
         for domain in &self.domain {
-            if let Some(matcher) = DomainMatcher::from_prefixed(domain)? {
+            if let Some(name) = DomainMatcher::geosite_name(domain) {
+                rule.add_geosite_set(name);
+            } else if let Some(matcher) = DomainMatcher::from_prefixed(domain)? {
                 rule.domains.push(matcher);
             }
         }
         for ip in &self.ip {
             if ip.eq_ignore_ascii_case("geoip:private") {
                 rule.ip_is_private = true;
+            } else if let Some(name) = IpCidr::geoip_name(ip) {
+                rule.add_geoip_set(name);
             } else {
                 rule.ip_cidrs.push(IpCidr::parse(ip)?);
             }

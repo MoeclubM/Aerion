@@ -60,8 +60,12 @@ pub struct SingBoxRouteRule {
     pub domain_keyword: Option<Value>,
     #[serde(default, rename = "domain_regex")]
     pub domain_regex: Option<Value>,
+    #[serde(default)]
+    pub geosite: Option<Value>,
     #[serde(default, rename = "ip_cidr")]
     pub ip_cidr: Option<Value>,
+    #[serde(default)]
+    pub geoip: Option<Value>,
     #[serde(default, rename = "ip_is_private")]
     pub ip_is_private: bool,
     #[serde(default)]
@@ -663,6 +667,7 @@ impl SingBoxRouteConfig {
                 .map(RouteDecision::from_outbound)
                 .transpose()?
                 .unwrap_or(RouteDecision::Direct),
+            ..RouteTable::default()
         };
         for (index, rule) in self.rules.iter().enumerate() {
             table.rules.push(rule.to_route_rule(index)?);
@@ -710,10 +715,20 @@ impl SingBoxRouteRule {
         for value in route_value_strings(self.domain_regex.as_ref())? {
             rule.domains.push(DomainMatcher::regex(&value)?);
         }
+        for value in route_value_strings(self.geosite.as_ref())? {
+            rule.add_geosite_set(value);
+        }
         for value in route_value_strings(self.ip_cidr.as_ref())? {
             rule.ip_cidrs.push(IpCidr::parse(&value)?);
         }
-        rule.ip_is_private = self.ip_is_private;
+        for value in route_value_strings(self.geoip.as_ref())? {
+            if value.eq_ignore_ascii_case("private") {
+                rule.ip_is_private = true;
+            } else {
+                rule.add_geoip_set(value);
+            }
+        }
+        rule.ip_is_private |= self.ip_is_private;
         for value in route_value_strings(self.port.as_ref())? {
             rule.ports.push(PortRange::parse(&value)?);
         }

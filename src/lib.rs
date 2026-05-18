@@ -3,7 +3,11 @@ pub mod client_hello;
 pub mod config;
 pub mod config_compat;
 pub mod core;
+pub mod http_connect;
 pub mod hysteria2;
+pub mod ios_packet_flow;
+pub mod listener;
+pub mod log_bridge;
 pub mod mieru;
 pub mod naive;
 pub mod padding;
@@ -41,10 +45,24 @@ pub use config_compat::singbox::{
     SingBoxClientConfig, SingBoxConfig, SingBoxOutbound, SingBoxServerConfig,
 };
 pub use config_compat::xray::{XrayClientConfig, XrayConfig, XrayOutbound, XrayServerConfig};
+pub use core::{
+    CoreEvent, CoreSession, CoreUser, CoreUserLimits, ProxyCore, TrafficDirection, TrafficSnapshot,
+};
+pub use http_connect::{
+    HttpConnectInboundConfig, handle_http_connect, run_http_connect_listener,
+    run_http_connect_listener_until,
+};
 pub use hysteria2::{
     Hysteria2ClientConfig, Hysteria2ServerConfig, run_hysteria2_client,
     run_hysteria2_client_listener, run_hysteria2_server, run_hysteria2_server_with_core,
 };
+pub use ios_packet_flow::{
+    IOS_PACKET_FLOW_IPV4_PROTOCOL, IOS_PACKET_FLOW_IPV6_PROTOCOL, IosPacketFlowPacket,
+    IosPacketFlowProtocol, packet_flow_address_families, packet_flow_packets_from_ip_packets,
+    packet_flow_packets_from_parts, packet_flow_payloads,
+};
+pub use listener::ListenerStopToken;
+pub use log_bridge::{LogBridge, LogBridgeLayer, LogEntry};
 pub use mieru::{
     MieruClientConfig, MieruNoncePattern, MieruNonceType, MieruServerConfig, MieruTcpFragment,
     MieruTrafficPattern, MieruTransport, MieruUser, parse_mieru_user, run_mieru_client,
@@ -58,9 +76,13 @@ pub use reality::{
     BuiltRealityClientHello, RealityClientConfig, RealityServerConfig, build_reality_client_hello,
     build_reality_client_hello_with_alpn,
 };
-pub use router::{RouteProxyConfig, run_route_proxy};
+pub use router::{
+    RouteProxyConfig, RouteProxyState, run_route_proxy, run_route_proxy_until,
+    run_route_proxy_with_state, run_route_proxy_with_state_until,
+};
 pub use routing::{
     DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
+    SharedRouteTable,
 };
 pub use server::{ServerConfig, run_server, run_server_listener, run_server_listener_with_core};
 pub use shadowsocks::{

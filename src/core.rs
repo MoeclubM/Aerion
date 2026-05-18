@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 use tokio::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,16 +40,53 @@ pub struct TrafficSnapshot {
     pub max_online_ips: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrafficDirection {
+    Upload,
+    Download,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoreEvent {
+    UsersReplaced {
+        user_ids: Vec<String>,
+    },
+    SessionOpened {
+        user_id: String,
+        session_id: u64,
+        source_ip: Option<String>,
+    },
+    SessionClosed {
+        user_id: String,
+        session_id: u64,
+        source_ip: Option<String>,
+    },
+    SessionCancelled {
+        user_id: String,
+        session_id: u64,
+        source_ip: Option<String>,
+    },
+    TrafficRecorded {
+        user_id: String,
+        session_id: u64,
+        direction: TrafficDirection,
+        bytes: u64,
+        upload_bytes: u64,
+        download_bytes: u64,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct ProxyCore {
     inner: Arc<CoreInner>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CoreInner {
     users: RwLock<HashMap<String, Arc<UserState>>>,
     credentials: RwLock<HashMap<String, String>>,
     session_seq: AtomicU64,
+    events: Arc<CoreEventBus>,
 }
 
 #[derive(Debug)]
@@ -64,6 +101,7 @@ struct UserState {
     upload_limiter: ByteRateLimiter,
     download_limiter: ByteRateLimiter,
     sessions: Mutex<HashMap<u64, SessionSlot>>,
+    events: Arc<CoreEventBus>,
 }
 
 #[derive(Debug)]
@@ -84,6 +122,11 @@ struct ByteRateLimiter {
     next: Mutex<Instant>,
 }
 
+#[derive(Default)]
+struct CoreEventBus {
+    subscribers: Mutex<Vec<mpsc::UnboundedSender<CoreEvent>>>,
+}
+
 struct SessionControl {
     cancelled: AtomicBool,
     notify: Notify,
@@ -93,6 +136,49 @@ struct SessionControl {
 struct SessionSlot {
     control: Arc<SessionControl>,
     source_ip: Option<String>,
+}
+
+impl Default for CoreInner {
+    fn default() -> Self {
+        Self {
+            users: RwLock::new(HashMap::new()),
+            credentials: RwLock::new(HashMap::new()),
+            session_seq: AtomicU64::new(0),
+            events: Arc::new(CoreEventBus::default()),
+        }
+    }
+}
+
+impl CoreEventBus {
+    fn subscribe(&self) -> mpsc::UnboundedReceiver<CoreEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.subscribers
+            .lock()
+            .expect("core event subscribers lock poisoned")
+            .push(tx);
+        rx
+    }
+
+    fn send(&self, event: CoreEvent) {
+        self.subscribers
+            .lock()
+            .expect("core event subscribers lock poisoned")
+            .retain(|subscriber| subscriber.send(event.clone()).is_ok());
+    }
+}
+
+impl std::fmt::Debug for CoreEventBus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let subscribers = self
+            .subscribers
+            .lock()
+            .expect("core event subscribers lock poisoned")
+            .len();
+        formatter
+            .debug_struct("CoreEventBus")
+            .field("subscribers", &subscribers)
+            .finish()
+    }
 }
 
 impl CoreUser {
@@ -195,14 +281,18 @@ impl ProxyCore {
         let mut user_map = HashMap::new();
         let mut credential_map = HashMap::new();
         let mut active_ids = HashSet::new();
+        let mut event_user_ids = Vec::new();
         for user in users {
             active_ids.insert(user.id.clone());
+            if !event_user_ids.contains(&user.id) {
+                event_user_ids.push(user.id.clone());
+            }
             credential_map.insert(user.credential.clone(), user.id.clone());
             let state = if let Some(existing) = current_users.get(&user.id) {
                 existing.apply_user_update(&user);
                 existing.clone()
             } else {
-                Arc::new(UserState::new(&user))
+                Arc::new(UserState::new(&user, self.inner.events.clone()))
             };
             user_map.insert(user.id.clone(), state);
         }
@@ -218,6 +308,9 @@ impl ProxyCore {
             .credentials
             .write()
             .expect("core credentials lock poisoned") = credential_map;
+        self.inner.events.send(CoreEvent::UsersReplaced {
+            user_ids: event_user_ids,
+        });
         Ok(())
     }
 
@@ -346,11 +439,19 @@ impl ProxyCore {
         snapshots.sort_by(|left, right| left.user_id.cmp(&right.user_id));
         snapshots
     }
+
+    pub fn subscribe_events(&self) -> mpsc::UnboundedReceiver<CoreEvent> {
+        self.inner.events.subscribe()
+    }
 }
 
 impl CoreSession {
     pub fn user_id(&self) -> &str {
         &self.inner.user.id
+    }
+
+    pub fn session_id(&self) -> u64 {
+        self.inner.session_id
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -364,14 +465,14 @@ impl CoreSession {
     pub async fn record_upload(&self, bytes: usize) -> Result<()> {
         self.inner
             .user
-            .record_upload(bytes, &self.inner.control)
+            .record_upload(bytes, self.inner.session_id, &self.inner.control)
             .await
     }
 
     pub async fn record_download(&self, bytes: usize) -> Result<()> {
         self.inner
             .user
-            .record_download(bytes, &self.inner.control)
+            .record_download(bytes, self.inner.session_id, &self.inner.control)
             .await
     }
 }
@@ -383,7 +484,7 @@ impl Drop for ActiveSession {
 }
 
 impl UserState {
-    fn new(user: &CoreUser) -> Self {
+    fn new(user: &CoreUser, events: Arc<CoreEventBus>) -> Self {
         Self {
             id: user.id.clone(),
             credential: RwLock::new(user.credential.clone()),
@@ -395,6 +496,7 @@ impl UserState {
             upload_limiter: ByteRateLimiter::new(user.upload_limit_bps),
             download_limiter: ByteRateLimiter::new(user.download_limit_bps),
             sessions: Mutex::new(HashMap::new()),
+            events,
         }
     }
 
@@ -453,33 +555,50 @@ impl UserState {
             session_id,
             SessionSlot {
                 control: control.clone(),
-                source_ip,
+                source_ip: source_ip.clone(),
             },
         );
         self.update_online_counts(&sessions);
+        self.events.send(CoreEvent::SessionOpened {
+            user_id: self.id.clone(),
+            session_id,
+            source_ip,
+        });
         Ok(control)
     }
 
     fn close_session(&self, session_id: u64) {
         let mut sessions = self.sessions.lock().expect("core sessions lock poisoned");
-        sessions.remove(&session_id);
+        let slot = sessions.remove(&session_id);
         self.update_online_counts(&sessions);
+        if let Some(slot) = slot {
+            self.events.send(CoreEvent::SessionClosed {
+                user_id: self.id.clone(),
+                session_id,
+                source_ip: slot.source_ip,
+            });
+        }
     }
 
     fn cancel_sessions(&self) {
         let sessions = {
             let mut guard = self.sessions.lock().expect("core sessions lock poisoned");
             let sessions = guard
-                .values()
-                .map(|slot| slot.control.clone())
+                .iter()
+                .map(|(session_id, slot)| (*session_id, slot.clone()))
                 .collect::<Vec<_>>();
             guard.clear();
             self.online.store(0, Ordering::SeqCst);
             self.online_ips.store(0, Ordering::SeqCst);
             sessions
         };
-        for session in sessions {
-            session.cancel();
+        for (session_id, slot) in sessions {
+            self.events.send(CoreEvent::SessionCancelled {
+                user_id: self.id.clone(),
+                session_id,
+                source_ip: slot.source_ip,
+            });
+            slot.control.cancel();
         }
     }
 
@@ -495,7 +614,12 @@ impl UserState {
         );
     }
 
-    async fn record_upload(&self, bytes: usize, control: &SessionControl) -> Result<()> {
+    async fn record_upload(
+        &self,
+        bytes: usize,
+        session_id: u64,
+        control: &SessionControl,
+    ) -> Result<()> {
         if bytes == 0 {
             return Ok(());
         }
@@ -503,11 +627,25 @@ impl UserState {
         self.ensure_quota(bytes as u64)?;
         self.upload_limiter.wait(bytes as u64, control).await?;
         control.ensure_active()?;
-        self.upload.fetch_add(bytes as u64, Ordering::Relaxed);
+        let upload = self.upload.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
+        let download = self.download.load(Ordering::Relaxed);
+        self.events.send(CoreEvent::TrafficRecorded {
+            user_id: self.id.clone(),
+            session_id,
+            direction: TrafficDirection::Upload,
+            bytes: bytes as u64,
+            upload_bytes: upload,
+            download_bytes: download,
+        });
         Ok(())
     }
 
-    async fn record_download(&self, bytes: usize, control: &SessionControl) -> Result<()> {
+    async fn record_download(
+        &self,
+        bytes: usize,
+        session_id: u64,
+        control: &SessionControl,
+    ) -> Result<()> {
         if bytes == 0 {
             return Ok(());
         }
@@ -515,7 +653,16 @@ impl UserState {
         self.ensure_quota(bytes as u64)?;
         self.download_limiter.wait(bytes as u64, control).await?;
         control.ensure_active()?;
-        self.download.fetch_add(bytes as u64, Ordering::Relaxed);
+        let download = self.download.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
+        let upload = self.upload.load(Ordering::Relaxed);
+        self.events.send(CoreEvent::TrafficRecorded {
+            user_id: self.id.clone(),
+            session_id,
+            direction: TrafficDirection::Download,
+            bytes: bytes as u64,
+            upload_bytes: upload,
+            download_bytes: download,
+        });
         Ok(())
     }
 
@@ -671,6 +818,48 @@ mod tests {
         assert_eq!(stats[0].online_ips, 0);
         drop(session);
         assert_eq!(core.snapshot().await[0].online_sessions, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn emits_session_and_traffic_events() -> Result<()> {
+        let core = ProxyCore::new(vec![CoreUser::password("u1", "secret")])?;
+        let mut events = core.subscribe_events();
+        let session = core
+            .authenticate_from("secret", "1.2.3.4:1234".parse()?)
+            .await?;
+        let session_id = session.session_id();
+        assert_eq!(
+            events.recv().await,
+            Some(CoreEvent::SessionOpened {
+                user_id: "u1".to_string(),
+                session_id,
+                source_ip: Some("1.2.3.4".to_string()),
+            })
+        );
+
+        session.record_upload(7).await?;
+        assert_eq!(
+            events.recv().await,
+            Some(CoreEvent::TrafficRecorded {
+                user_id: "u1".to_string(),
+                session_id,
+                direction: TrafficDirection::Upload,
+                bytes: 7,
+                upload_bytes: 7,
+                download_bytes: 0,
+            })
+        );
+
+        drop(session);
+        assert_eq!(
+            events.recv().await,
+            Some(CoreEvent::SessionClosed {
+                user_id: "u1".to_string(),
+                session_id,
+                source_ip: Some("1.2.3.4".to_string()),
+            })
+        );
         Ok(())
     }
 

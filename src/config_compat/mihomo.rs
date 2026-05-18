@@ -1408,9 +1408,10 @@ fn parse_mihomo_route_rule(raw: &str, index: usize) -> Result<RouteRule> {
         "DOMAIN-SUFFIX" => rule.domains.push(DomainMatcher::suffix(parts[1])),
         "DOMAIN-KEYWORD" => rule.domains.push(DomainMatcher::keyword(parts[1])),
         "DOMAIN-REGEX" => rule.domains.push(DomainMatcher::regex(parts[1])?),
+        "GEOSITE" => rule.add_geosite_set(parts[1]),
         "IP-CIDR" | "IP-CIDR6" => rule.ip_cidrs.push(IpCidr::parse(parts[1])?),
         "GEOIP" if parts[1].eq_ignore_ascii_case("private") => rule.ip_is_private = true,
-        "GEOIP" => bail!("mihomo rules[{index}] GEOIP requires geoip data"),
+        "GEOIP" => rule.add_geoip_set(parts[1]),
         "DST-PORT" => rule.ports.push(PortRange::parse(parts[1])?),
         "NETWORK" => rule.networks.push(RouteNetwork::parse(parts[1])?),
         "MATCH" | "FINAL" => {}

@@ -47,7 +47,7 @@ impl TunConfig {
             close_fd_on_drop: false,
             setup: cfg!(not(target_os = "linux")),
             mtu: DEFAULT_TUN_MTU,
-            packet_information: cfg!(target_os = "macos"),
+            packet_information: cfg!(any(target_os = "macos", target_os = "ios")),
             dns: TunDnsStrategy::Direct,
             dns_addr: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             virtual_dns_pool: "198.18.0.0/15".to_string(),
@@ -59,6 +59,19 @@ impl TunConfig {
             max_sessions: 200,
             exit_on_fatal_error: false,
         }
+    }
+
+    pub fn ios_packet_flow_socket_fd(
+        proxy_url: impl Into<String>,
+        tun_fd: i32,
+        close_fd_on_drop: bool,
+    ) -> Self {
+        let mut config = Self::new(proxy_url);
+        config.tun_fd = Some(tun_fd);
+        config.close_fd_on_drop = close_fd_on_drop;
+        config.packet_information = true;
+        config.setup = false;
+        config
     }
 
     fn to_tun2proxy_args(&self) -> Result<Args> {
@@ -179,5 +192,14 @@ mod tests {
             .to_tun2proxy_args()
             .expect_err("tun name and fd must be exclusive");
         assert!(error.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn builds_ios_packet_flow_socket_fd_config() {
+        let config = TunConfig::ios_packet_flow_socket_fd("socks5://127.0.0.1:1080", 7, false);
+        assert_eq!(config.tun_fd, Some(7));
+        assert!(!config.close_fd_on_drop);
+        assert!(config.packet_information);
+        assert!(!config.setup);
     }
 }

@@ -1,7 +1,10 @@
 use crate::protocol::ProxyTarget;
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
+use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RouteDecision {
@@ -21,6 +24,13 @@ pub enum RouteNetwork {
 pub struct RouteTable {
     pub rules: Vec<RouteRule>,
     pub default: RouteDecision,
+    pub geoip_sets: BTreeMap<String, Vec<IpCidr>>,
+    pub geosite_sets: BTreeMap<String, Vec<DomainMatcher>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedRouteTable {
+    inner: Arc<RwLock<RouteTable>>,
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +39,8 @@ pub struct RouteRule {
     pub networks: Vec<RouteNetwork>,
     pub domains: Vec<DomainMatcher>,
     pub ip_cidrs: Vec<IpCidr>,
+    pub geoip_sets: Vec<String>,
+    pub geosite_sets: Vec<String>,
     pub ip_is_private: bool,
     pub ports: Vec<PortRange>,
 }
@@ -58,17 +70,119 @@ impl Default for RouteTable {
         Self {
             rules: Vec::new(),
             default: RouteDecision::Direct,
+            geoip_sets: BTreeMap::new(),
+            geosite_sets: BTreeMap::new(),
         }
     }
 }
 
 impl RouteTable {
     pub fn decide(&self, target: &ProxyTarget, network: RouteNetwork) -> RouteDecision {
+        self.try_decide(target, network)
+            .expect("route table decision failed")
+    }
+
+    pub fn try_decide(&self, target: &ProxyTarget, network: RouteNetwork) -> Result<RouteDecision> {
         self.rules
             .iter()
-            .find(|rule| rule.matches(target, network))
-            .map(|rule| rule.action.clone())
-            .unwrap_or_else(|| self.default.clone())
+            .find_map(|rule| match rule.try_matches(self, target, network) {
+                Ok(true) => Some(Ok(rule.action.clone())),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .unwrap_or_else(|| Ok(self.default.clone()))
+    }
+
+    pub fn add_geoip_set(&mut self, name: impl AsRef<str>, cidrs: Vec<IpCidr>) {
+        self.geoip_sets.insert(route_set_name(name.as_ref()), cidrs);
+    }
+
+    pub fn add_geosite_set(&mut self, name: impl AsRef<str>, domains: Vec<DomainMatcher>) {
+        self.geosite_sets
+            .insert(route_set_name(name.as_ref()), domains);
+    }
+
+    pub fn add_geoip_lines<I, S>(&mut self, name: impl AsRef<str>, lines: I) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut cidrs = Vec::new();
+        for line in lines {
+            if let Some(line) = route_set_line(line.as_ref()) {
+                cidrs.push(IpCidr::parse(line)?);
+            }
+        }
+        self.add_geoip_set(name, cidrs);
+        Ok(())
+    }
+
+    pub fn add_geosite_lines<I, S>(&mut self, name: impl AsRef<str>, lines: I) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut domains = Vec::new();
+        for line in lines {
+            if let Some(line) = route_set_line(line.as_ref()) {
+                if let Some(matcher) = DomainMatcher::from_prefixed(line)? {
+                    domains.push(matcher);
+                }
+            }
+        }
+        self.add_geosite_set(name, domains);
+        Ok(())
+    }
+
+    pub fn load_geoip_set_file(
+        &mut self,
+        name: impl AsRef<str>,
+        path: impl AsRef<Path>,
+    ) -> Result<()> {
+        let text = std::fs::read_to_string(path.as_ref())
+            .with_context(|| format!("read geoip route set {}", path.as_ref().display()))?;
+        self.add_geoip_lines(name, text.lines())
+    }
+
+    pub fn load_geosite_set_file(
+        &mut self,
+        name: impl AsRef<str>,
+        path: impl AsRef<Path>,
+    ) -> Result<()> {
+        let text = std::fs::read_to_string(path.as_ref())
+            .with_context(|| format!("read geosite route set {}", path.as_ref().display()))?;
+        self.add_geosite_lines(name, text.lines())
+    }
+}
+
+impl SharedRouteTable {
+    pub fn new(routes: RouteTable) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(routes)),
+        }
+    }
+
+    pub fn replace(&self, routes: RouteTable) {
+        *self.inner.write().expect("route table lock poisoned") = routes;
+    }
+
+    pub fn snapshot(&self) -> RouteTable {
+        self.inner
+            .read()
+            .expect("route table lock poisoned")
+            .clone()
+    }
+
+    pub fn decide(&self, target: &ProxyTarget, network: RouteNetwork) -> RouteDecision {
+        self.try_decide(target, network)
+            .expect("route table decision failed")
+    }
+
+    pub fn try_decide(&self, target: &ProxyTarget, network: RouteNetwork) -> Result<RouteDecision> {
+        self.inner
+            .read()
+            .expect("route table lock poisoned")
+            .try_decide(target, network)
     }
 }
 
@@ -79,14 +193,26 @@ impl RouteRule {
             networks: Vec::new(),
             domains: Vec::new(),
             ip_cidrs: Vec::new(),
+            geoip_sets: Vec::new(),
+            geosite_sets: Vec::new(),
             ip_is_private: false,
             ports: Vec::new(),
         }
     }
 
     pub fn matches(&self, target: &ProxyTarget, network: RouteNetwork) -> bool {
+        self.try_matches(&RouteTable::default(), target, network)
+            .expect("route rule match failed")
+    }
+
+    fn try_matches(
+        &self,
+        table: &RouteTable,
+        target: &ProxyTarget,
+        network: RouteNetwork,
+    ) -> Result<bool> {
         if !self.networks.is_empty() && !self.networks.contains(&network) {
-            return false;
+            return Ok(false);
         }
 
         if !self.ports.is_empty()
@@ -95,33 +221,62 @@ impl RouteRule {
                 .iter()
                 .any(|range| range.contains(target_port(target)))
         {
-            return false;
+            return Ok(false);
         }
 
-        if !self.domains.is_empty() {
+        if !self.domains.is_empty() || !self.geosite_sets.is_empty() {
             let ProxyTarget::Domain(host, _) = target else {
-                return false;
+                return Ok(false);
             };
             let host = normalize_domain(host);
-            if !self.domains.iter().any(|matcher| matcher.matches(&host)) {
-                return false;
+            let mut matched = self.domains.iter().any(|matcher| matcher.matches(&host));
+            for name in &self.geosite_sets {
+                let domains = table
+                    .geosite_sets
+                    .get(name)
+                    .with_context(|| format!("route geosite set {name} is missing"))?;
+                matched |= domains.iter().any(|matcher| matcher.matches(&host));
+            }
+            if !matched {
+                return Ok(false);
             }
         }
 
-        if self.ip_is_private || !self.ip_cidrs.is_empty() {
+        if self.ip_is_private || !self.ip_cidrs.is_empty() || !self.geoip_sets.is_empty() {
             let ProxyTarget::Ip(addr) = target else {
-                return false;
+                return Ok(false);
             };
             let ip = addr.ip();
             if self.ip_is_private && !is_private_ip(ip) {
-                return false;
+                return Ok(false);
             }
             if !self.ip_cidrs.is_empty() && !self.ip_cidrs.iter().any(|cidr| cidr.contains(ip)) {
-                return false;
+                return Ok(false);
+            }
+            if !self.geoip_sets.is_empty() {
+                let mut matched = false;
+                for name in &self.geoip_sets {
+                    let cidrs = table
+                        .geoip_sets
+                        .get(name)
+                        .with_context(|| format!("route geoip set {name} is missing"))?;
+                    matched |= cidrs.iter().any(|cidr| cidr.contains(ip));
+                }
+                if !matched {
+                    return Ok(false);
+                }
             }
         }
 
-        true
+        Ok(true)
+    }
+
+    pub fn add_geoip_set(&mut self, name: impl AsRef<str>) {
+        self.geoip_sets.push(route_set_name(name.as_ref()));
+    }
+
+    pub fn add_geosite_set(&mut self, name: impl AsRef<str>) {
+        self.geosite_sets.push(route_set_name(name.as_ref()));
     }
 }
 
@@ -196,10 +351,18 @@ impl DomainMatcher {
         if let Some(domain) = value.strip_prefix("*.") {
             return Ok(Some(Self::suffix(domain)));
         }
-        if value.starts_with("geosite:") {
+        if Self::geosite_name(value).is_some() {
             bail!("geosite route rules require rule-set data");
         }
         Ok(Some(Self::exact(value)))
+    }
+
+    pub fn geosite_name(value: &str) -> Option<String> {
+        let value = value.trim();
+        value
+            .get(..8)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("geosite:"))
+            .map(|_| route_set_name(&value[8..]))
     }
 
     pub fn matches(&self, domain: &str) -> bool {
@@ -219,7 +382,7 @@ impl IpCidr {
         if value.eq_ignore_ascii_case("geoip:private") {
             bail!("geoip:private must be represented as ip_is_private");
         }
-        if value.to_ascii_lowercase().starts_with("geoip:") {
+        if Self::geoip_name(value).is_some() {
             bail!("geoip route rules require geoip data");
         }
         let (network, prefix) = match value.split_once('/') {
@@ -253,6 +416,14 @@ impl IpCidr {
             _ => false,
         }
     }
+
+    pub fn geoip_name(value: &str) -> Option<String> {
+        let value = value.trim();
+        value
+            .get(..6)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("geoip:"))
+            .map(|_| route_set_name(&value[6..]))
+    }
 }
 
 impl PortRange {
@@ -282,6 +453,15 @@ impl PortRange {
 
 pub fn normalize_domain(domain: &str) -> String {
     domain.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+pub fn route_set_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+fn route_set_line(line: &str) -> Option<&str> {
+    let line = line.split('#').next().unwrap_or_default().trim();
+    (!line.is_empty()).then_some(line)
 }
 
 pub fn is_private_ip(ip: IpAddr) -> bool {
@@ -334,6 +514,7 @@ mod tests {
         let table = RouteTable {
             rules: vec![suffix, keyword],
             default: RouteDecision::Block,
+            ..RouteTable::default()
         };
         assert_eq!(
             table.decide(
@@ -367,6 +548,7 @@ mod tests {
         let table = RouteTable {
             rules: vec![rule],
             default: RouteDecision::Proxy("proxy".to_string()),
+            ..RouteTable::default()
         };
         assert_eq!(
             table.decide(
@@ -395,5 +577,112 @@ mod tests {
         assert!(suffix.matches("static.example.org"));
         assert!(regex.matches("cdn12.example.net"));
         Ok(())
+    }
+
+    #[test]
+    fn routes_by_geoip_and_geosite_sets() -> Result<()> {
+        let mut domain_rule = RouteRule::new(RouteDecision::Proxy("site".to_string()));
+        domain_rule.add_geosite_set("category-test");
+        let mut ip_rule = RouteRule::new(RouteDecision::Proxy("ip".to_string()));
+        ip_rule.add_geoip_set("test");
+        let mut table = RouteTable {
+            rules: vec![domain_rule, ip_rule],
+            default: RouteDecision::Direct,
+            ..RouteTable::default()
+        };
+        table.add_geosite_set("category-test", vec![DomainMatcher::suffix("example.com")]);
+        table.add_geoip_set("test", vec![IpCidr::parse("203.0.113.0/24")?]);
+
+        assert_eq!(
+            table.try_decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Tcp
+            )?,
+            RouteDecision::Proxy("site".to_string())
+        );
+        assert_eq!(
+            table.try_decide(
+                &ProxyTarget::Ip("203.0.113.10:443".parse::<SocketAddr>()?),
+                RouteNetwork::Tcp
+            )?,
+            RouteDecision::Proxy("ip".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn loads_geo_sets_from_text_lines() -> Result<()> {
+        let mut table = RouteTable::default();
+        table.add_geosite_lines(
+            "ads",
+            [
+                "# comment",
+                "domain:example.com",
+                "full:api.example.net # inline comment",
+                "keyword:tracker",
+            ],
+        )?;
+        table.add_geoip_lines("lab", ["203.0.113.0/24", "", "2001:db8::/32"])?;
+
+        assert!(
+            table
+                .geosite_sets
+                .get("ads")
+                .expect("geosite set")
+                .iter()
+                .any(|matcher| matcher.matches("cdn.example.com"))
+        );
+        let ipv6_sample = "2001:db8::1".parse()?;
+        assert!(
+            table
+                .geoip_sets
+                .get("lab")
+                .expect("geoip set")
+                .iter()
+                .any(|cidr| cidr.contains(ipv6_sample))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_geo_set_is_explicit_error() {
+        let mut rule = RouteRule::new(RouteDecision::Direct);
+        rule.add_geosite_set("missing");
+        let table = RouteTable {
+            rules: vec![rule],
+            default: RouteDecision::Block,
+            ..RouteTable::default()
+        };
+        let error = table
+            .try_decide(
+                &ProxyTarget::Domain("example.com".to_string(), 443),
+                RouteNetwork::Tcp,
+            )
+            .expect_err("missing geosite set must fail explicitly");
+        assert!(error.to_string().contains("geosite set missing"));
+    }
+
+    #[test]
+    fn shared_route_table_reflects_replacement() {
+        let target = ProxyTarget::Domain("example.com".to_string(), 443);
+        let shared = SharedRouteTable::new(RouteTable {
+            rules: Vec::new(),
+            default: RouteDecision::Direct,
+            ..RouteTable::default()
+        });
+        assert_eq!(
+            shared.decide(&target, RouteNetwork::Tcp),
+            RouteDecision::Direct
+        );
+
+        shared.replace(RouteTable {
+            rules: Vec::new(),
+            default: RouteDecision::Block,
+            ..RouteTable::default()
+        });
+        assert_eq!(
+            shared.decide(&target, RouteNetwork::Tcp),
+            RouteDecision::Block
+        );
     }
 }
