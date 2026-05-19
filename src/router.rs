@@ -22,6 +22,7 @@ pub struct RouteProxyConfig {
 pub struct RouteProxyState {
     routes: SharedRouteTable,
     upstreams: Arc<RwLock<BTreeMap<String, SocketAddr>>>,
+    core: Option<ProxyCore>,
 }
 
 struct UdpCommand {
@@ -73,15 +74,25 @@ pub async fn run_route_proxy_with_state_until(
 }
 
 impl RouteProxyState {
-    pub fn new(routes: RouteTable, upstreams: BTreeMap<String, SocketAddr>) -> Self {
+    pub fn new(
+        routes: RouteTable,
+        upstreams: BTreeMap<String, SocketAddr>,
+        core: Option<ProxyCore>,
+    ) -> Self {
         Self {
             routes: SharedRouteTable::new(routes),
             upstreams: Arc::new(RwLock::new(upstreams)),
+            core,
         }
     }
 
     pub fn from_config(config: RouteProxyConfig) -> Self {
-        Self::new(config.routes, config.upstreams)
+        Self::new(config.routes, config.upstreams, None)
+    }
+
+    pub fn with_core(mut self, core: ProxyCore) -> Self {
+        self.core = Some(core);
+        self
     }
 
     pub fn route_table(&self) -> SharedRouteTable {
@@ -135,9 +146,19 @@ impl RouteProxyState {
     pub fn try_decide(&self, target: &ProxyTarget, network: RouteNetwork) -> Result<RouteDecision> {
         self.routes.try_decide(target, network)
     }
+
+    pub fn core(&self) -> Option<&ProxyCore> {
+        self.core.as_ref()
+    }
 }
 
 async fn handle_route_client(mut local: TcpStream, state: RouteProxyState) -> Result<()> {
+    let peer = local.peer_addr()?;
+    let session = if let Some(core) = state.core() {
+        Some(core.open_session_from("default", peer).await?)
+    } else {
+        None
+    };
     match socks::read_request(&mut local).await? {
         SocksRequest::Connect(target) => {
             let decision = state.try_decide(&target, RouteNetwork::Tcp)?;
@@ -152,9 +173,15 @@ async fn handle_route_client(mut local: TcpStream, state: RouteProxyState) -> Re
                     };
                     socks::write_reply(&mut local, 0x00).await?;
                     tracing::info!("routing {} direct", target_name(&target));
-                    copy_bidirectional(&mut local, &mut remote)
-                        .await
-                        .context("relay direct route")?;
+                    if let Some(session) = session {
+                        copy_bidirectional_recorded(&mut local, &mut remote, session)
+                            .await
+                            .context("relay direct recorded route")?;
+                    } else {
+                        copy_bidirectional(&mut local, &mut remote)
+                            .await
+                            .context("relay direct route")?;
+                    }
                     Ok(())
                 }
                 RouteDecision::Block => {
@@ -174,15 +201,62 @@ async fn handle_route_client(mut local: TcpStream, state: RouteProxyState) -> Re
                     };
                     socks::write_reply(&mut local, 0x00).await?;
                     tracing::info!("routing {} via {tag}", target_name(&target));
-                    copy_bidirectional(&mut local, &mut remote)
-                        .await
-                        .with_context(|| format!("relay route via {tag}"))?;
+                    if let Some(session) = session {
+                        copy_bidirectional_recorded(&mut local, &mut remote, session)
+                            .await
+                            .with_context(|| format!("relay recorded route via {tag}"))?;
+                    } else {
+                        copy_bidirectional(&mut local, &mut remote)
+                            .await
+                            .with_context(|| format!("relay route via {tag}"))?;
+                    }
                     Ok(())
                 }
             }
         }
         SocksRequest::UdpAssociate => handle_udp_associate(local, state).await,
     }
+}
+
+async fn copy_bidirectional_recorded(
+    local: &mut TcpStream,
+    remote: &mut TcpStream,
+    session: crate::core::CoreSession,
+) -> Result<()> {
+    let (mut local_read, mut local_write) = local.split();
+    let (mut remote_read, mut remote_write) = remote.split();
+
+    let upload = async {
+        let mut buffer = vec![0u8; 16384];
+        loop {
+            let read = local_read.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            session.record_upload(read).await?;
+            remote_write.write_all(&buffer[..read]).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let download = async {
+        let mut buffer = vec![0u8; 16384];
+        loop {
+            let read = remote_read.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            session.record_download(read).await?;
+            local_write.write_all(&buffer[..read]).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    tokio::select! {
+        result = upload => result?,
+        result = download => result?,
+    }
+    Ok(())
 }
 
 async fn connect_direct(target: &ProxyTarget) -> Result<TcpStream> {
@@ -208,6 +282,14 @@ async fn handle_udp_associate(mut control: TcpStream, state: RouteProxyState) ->
     let mut sessions = BTreeMap::<String, mpsc::Sender<UdpCommand>>::new();
     let mut packet = vec![0u8; u16::MAX as usize + 512];
     let mut control_probe = [0u8; 1];
+
+    let peer = control.peer_addr()?;
+    let session = if let Some(core) = state.core() {
+        Some(core.open_session_from("default", peer).await?)
+    } else {
+        None
+    };
+
     loop {
         tokio::select! {
             received = udp.recv_from(&mut packet) => {
@@ -217,7 +299,7 @@ async fn handle_udp_associate(mut control: TcpStream, state: RouteProxyState) ->
                     RouteDecision::Direct => {
                         let key = format!("direct:{}", target_name(&target));
                         let tx = sessions.entry(key).or_insert_with(|| {
-                            spawn_direct_udp_session(target.clone(), udp.clone())
+                            spawn_direct_udp_session(target.clone(), udp.clone(), session.clone())
                         }).clone();
                         tx.send(UdpCommand {
                             target,
@@ -235,7 +317,7 @@ async fn handle_udp_associate(mut control: TcpStream, state: RouteProxyState) ->
                         let tx = sessions
                             .entry(format!("proxy:{tag}@{upstream}"))
                             .or_insert_with(|| {
-                                spawn_proxy_udp_session(tag.clone(), upstream, udp.clone())
+                                spawn_proxy_udp_session(tag.clone(), upstream, udp.clone(), session.clone())
                             })
                             .clone();
                         tx.send(UdpCommand {
@@ -258,10 +340,11 @@ async fn handle_udp_associate(mut control: TcpStream, state: RouteProxyState) ->
 fn spawn_direct_udp_session(
     target: ProxyTarget,
     client_udp: Arc<UdpSocket>,
+    session: Option<crate::core::CoreSession>,
 ) -> mpsc::Sender<UdpCommand> {
     let (tx, rx) = mpsc::channel(32);
     tokio::spawn(async move {
-        if let Err(error) = run_direct_udp_session(target, rx, client_udp).await {
+        if let Err(error) = run_direct_udp_session(target, rx, client_udp, session).await {
             tracing::warn!("direct UDP route session failed: {error:?}");
         }
     });
@@ -272,10 +355,11 @@ fn spawn_proxy_udp_session(
     tag: String,
     upstream: SocketAddr,
     client_udp: Arc<UdpSocket>,
+    session: Option<crate::core::CoreSession>,
 ) -> mpsc::Sender<UdpCommand> {
     let (tx, rx) = mpsc::channel(32);
     tokio::spawn(async move {
-        if let Err(error) = run_proxy_udp_session(&tag, upstream, rx, client_udp).await {
+        if let Err(error) = run_proxy_udp_session(&tag, upstream, rx, client_udp, session).await {
             tracing::warn!("proxy UDP route session {tag} failed: {error:?}");
         }
     });
@@ -286,6 +370,7 @@ async fn run_direct_udp_session(
     target: ProxyTarget,
     mut rx: mpsc::Receiver<UdpCommand>,
     client_udp: Arc<UdpSocket>,
+    session: Option<crate::core::CoreSession>,
 ) -> Result<()> {
     let remote = resolve_udp_target(&target).await?;
     let bind = if remote.is_ipv4() {
@@ -303,12 +388,18 @@ async fn run_direct_udp_session(
                     return Ok(());
                 };
                 peer = Some(command.peer);
+                if let Some(session) = &session {
+                    session.record_upload(command.payload.len()).await?;
+                }
                 socket.send_to(&command.payload, remote)
                     .await
                     .with_context(|| format!("send direct UDP {}", target_name(&command.target)))?;
             }
             received = socket.recv_from(&mut buffer) => {
                 let (read, source) = received.context("receive direct UDP response")?;
+                if let Some(session) = &session {
+                    session.record_download(read).await?;
+                }
                 let response = uot::encode_socks_udp_packet(
                     &ProxyTarget::Ip(source),
                     &buffer[..read],
@@ -327,6 +418,7 @@ async fn run_proxy_udp_session(
     upstream: SocketAddr,
     mut rx: mpsc::Receiver<UdpCommand>,
     client_udp: Arc<UdpSocket>,
+    session: Option<crate::core::CoreSession>,
 ) -> Result<()> {
     let association = socks::udp_associate(upstream).await?;
     let _control = association.control;
@@ -341,6 +433,9 @@ async fn run_proxy_udp_session(
                     return Ok(());
                 };
                 peer = Some(command.peer);
+                if let Some(session) = &session {
+                    session.record_upload(command.payload.len()).await?;
+                }
                 let packet = uot::encode_socks_udp_packet(&command.target, &command.payload)?;
                 socket.send_to(&packet, bind)
                     .await
@@ -348,6 +443,9 @@ async fn run_proxy_udp_session(
             }
             received = socket.recv_from(&mut buffer) => {
                 let (read, _) = received.with_context(|| format!("receive UDP route via {tag}"))?;
+                if let Some(session) = &session {
+                    session.record_download(read).await?;
+                }
                 let (source, payload) = uot::parse_socks_udp_packet(&buffer[..read])?;
                 let response = uot::encode_socks_udp_packet(&source, payload)?;
                 let peer = peer.context("route UDP client peer is not known yet")?;
