@@ -1754,6 +1754,7 @@ impl SingBoxAnyTlsOutbound {
             password: self.password.clone(),
             sni: sni_or_server(tls.server_name.as_deref(), &self.server),
             insecure: tls.insecure,
+            client_fingerprint: tls.utls_fingerprint(name)?,
             ca_cert_paths: value_paths(tls.certificate_path.as_ref())?,
             ca_certificates: value_strings(tls.certificate.as_ref())?,
             disable_system_roots: tls.disable_system_root,
@@ -3467,7 +3468,11 @@ mod tests {
         "enabled": true,
         "certificate_path": "anytls-ca.pem",
         "disable_system_root": true,
-        "certificate": ["anytls-inline-ca"]
+        "certificate": ["anytls-inline-ca"],
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
       }
     },
     {
@@ -3519,6 +3524,7 @@ mod tests {
         assert_eq!(anytls.ca_cert_paths, vec![PathBuf::from("anytls-ca.pem")]);
         assert_eq!(anytls.ca_certificates, vec!["anytls-inline-ca"]);
         assert!(anytls.disable_system_roots);
+        assert_eq!(anytls.client_fingerprint, Some(UtlsFingerprint::Chrome));
 
         let SingBoxClientConfig::Tuic(tuic) =
             config.outbounds[4].to_client_config("127.0.0.1:1080".parse()?)?

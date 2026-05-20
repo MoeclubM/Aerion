@@ -9,6 +9,7 @@ use crate::socket_protect;
 use crate::socks::{self, SocksRequest};
 use crate::tls;
 use crate::uot;
+use crate::utls::UtlsFingerprint;
 use anyhow::{Context, Result, bail};
 use rustls::pki_types::ServerName;
 use std::collections::HashMap;
@@ -31,6 +32,7 @@ pub struct ClientConfig {
     pub password: String,
     pub sni: String,
     pub insecure: bool,
+    pub client_fingerprint: Option<UtlsFingerprint>,
     pub ca_cert_paths: Vec<PathBuf>,
     pub ca_certificates: Vec<String>,
     pub disable_system_roots: bool,
@@ -55,13 +57,15 @@ pub async fn run_client_listener(
     config: ClientConfig,
     core: Option<ProxyCore>,
 ) -> Result<()> {
-    let tls_config = tls::client_config_with_custom_root_material_early_data_options(
-        config.insecure,
-        &config.ca_cert_paths,
-        &config.ca_certificates,
-        config.disable_system_roots,
-        &config.pinned_cert_sha256,
-    )?;
+    let tls_config =
+        tls::client_config_with_fingerprint_and_custom_root_material_early_data_options(
+            config.insecure,
+            config.client_fingerprint,
+            &config.ca_cert_paths,
+            &config.ca_certificates,
+            config.disable_system_roots,
+            &config.pinned_cert_sha256,
+        )?;
     let session = ClientSession::connect(&config, tls_config).await?;
     let core = core.unwrap_or_else(ProxyCore::empty);
     tracing::info!("client listening on socks5://{}", listener.local_addr()?);

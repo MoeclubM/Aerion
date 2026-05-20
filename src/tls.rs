@@ -459,6 +459,25 @@ pub fn client_config_with_fingerprint_and_custom_root_material_options(
     )
 }
 
+pub fn client_config_with_fingerprint_and_custom_root_material_early_data_options(
+    insecure: bool,
+    fingerprint: Option<UtlsFingerprint>,
+    ca_cert_paths: &[PathBuf],
+    ca_certificates: &[String],
+    disable_system_roots: bool,
+    pinned_cert_sha256: &[String],
+) -> Result<Arc<ClientConfig>> {
+    build_client_config_with_custom_roots(
+        insecure,
+        fingerprint,
+        true,
+        ca_cert_paths,
+        ca_certificates,
+        disable_system_roots,
+        pinned_cert_sha256,
+    )
+}
+
 fn build_client_config_with_custom_roots(
     insecure: bool,
     fingerprint: Option<UtlsFingerprint>,

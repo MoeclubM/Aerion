@@ -398,6 +398,13 @@ pub struct MihomoAnyTlsProxy {
     pub servername: Option<String>,
     #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
     pub skip_cert_verify: bool,
+    #[serde(
+        default,
+        rename = "client-fingerprint",
+        alias = "client_fingerprint",
+        deserialize_with = "deserialize_optional_fingerprint"
+    )]
+    pub client_fingerprint: Option<UtlsFingerprint>,
     #[serde(default, rename = "padding-scheme", alias = "padding_scheme")]
     pub padding_scheme: Vec<String>,
 }
@@ -1105,6 +1112,7 @@ impl MihomoAnyTlsProxy {
             password: self.password.clone(),
             sni: sni_or_server(self.servername.as_deref(), &self.server),
             insecure: self.skip_cert_verify,
+            client_fingerprint: self.client_fingerprint,
             ca_cert_paths: Vec::new(),
             ca_certificates: Vec::new(),
             disable_system_roots: false,
@@ -1668,6 +1676,29 @@ proxies:
         };
         assert!(shadowsocks.udp);
         assert!(shadowsocks.udp_over_tcp);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_anytls_client_fingerprint() -> Result<()> {
+        let yaml = r#"
+proxies:
+  - name: anytls-chrome
+    type: anytls
+    server: anytls.example.com
+    port: 443
+    password: secret
+    servername: edge.example.com
+    client-fingerprint: chrome
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let MihomoClientConfig::AnyTls(anytls) =
+            config.proxies[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected AnyTLS")
+        };
+        assert_eq!(anytls.sni, "edge.example.com");
+        assert_eq!(anytls.client_fingerprint, Some(UtlsFingerprint::Chrome));
         Ok(())
     }
 
