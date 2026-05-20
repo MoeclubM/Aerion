@@ -79,15 +79,23 @@ struct RealityServerState {
 }
 
 pub async fn run_vless_client(config: VlessClientConfig) -> Result<()> {
+    run_vless_client_with_core(config, None).await
+}
+
+pub async fn run_vless_client_with_core(
+    config: VlessClientConfig,
+    core: Option<ProxyCore>,
+) -> Result<()> {
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind VLESS SOCKS listener on {}", config.listen))?;
-    run_vless_client_listener(listener, config).await
+    run_vless_client_listener(listener, config, core).await
 }
 
 pub async fn run_vless_client_listener(
     listener: TcpListener,
     config: VlessClientConfig,
+    core: Option<ProxyCore>,
 ) -> Result<()> {
     tracing::info!(
         "VLESS client listening on socks5://{}",
@@ -96,8 +104,9 @@ pub async fn run_vless_client_listener(
     loop {
         let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
         let config = config.clone();
+        let core = core.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_vless_socks(stream, config).await {
+            if let Err(error) = handle_vless_socks(stream, config, core).await {
                 tracing::warn!("VLESS SOCKS client {peer} failed: {error:?}");
             }
         });
@@ -124,87 +133,6 @@ pub async fn run_vless_server_with_core(config: VlessServerConfig, core: ProxyCo
         server_config.alpn_protocols = config.transport.alpn_protocols();
         Some(TlsAcceptor::from(Arc::new(server_config)))
     } else {
-        None
-    };
-    let transport_alpn = config.transport.alpn_protocols();
-    let reality = config
-        .reality
-        .clone()
-        .map(|mut config| {
-            if config.alpn_protocols.is_empty() {
-                config.alpn_protocols = transport_alpn.clone();
-            }
-            Ok::<_, anyhow::Error>(RealityServerState {
-                config,
-                cert_state: Arc::new(reality::RealityCertificateState::build()?),
-            })
-        })
-        .transpose()?;
-    let users = vless_users(&config.user_id, &config.users)?;
-    let flow = config.flow.clone();
-    let transport = config.transport.clone();
-    tracing::info!("VLESS server listening on {}", listener.local_addr()?);
-    loop {
-        let (stream, peer) = listener.accept().await.context("accept VLESS client")?;
-        let acceptor = acceptor.clone();
-        let reality = reality.clone();
-        let users = users.clone();
-        let core = core.clone();
-        let flow = flow.clone();
-        let transport = transport.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_vless_client(
-                stream, acceptor, reality, users, core, flow, transport, peer,
-            )
-            .await
-            {
-                tracing::warn!("VLESS client {peer} failed: {error:?}");
-            }
-        });
-    }
-}
-
-async fn handle_vless_socks(mut local: TcpStream, config: VlessClientConfig) -> Result<()> {
-    match socks::read_request(&mut local).await? {
-        socks::SocksRequest::Connect(target) => {
-            let mut server = connect_vless_server(&config).await?;
-            let user = parse_uuid(&config.user_id)?;
-            if config.mux {
-                write_vless_request(&mut server, &user, CMD_MUX, &vless_xudp::mux_target(), "")
-                    .await?;
-                read_vless_response_header(&mut server).await?;
-                socks::write_reply(&mut local, 0x00).await?;
-                return vless_mux::relay_single_tcp_client(server, local, target).await;
-            }
-            write_vless_request(&mut server, &user, CMD_TCP, &target, &config.flow).await?;
-            read_vless_response_header(&mut server).await?;
-            socks::write_reply(&mut local, 0x00).await?;
-            tracing::info!("VLESS proxying {}", target_name(&target));
-            if is_vision_flow(&config.flow) {
-                relay_vision_client(local, server, user).await
-            } else {
-                tokio::io::copy_bidirectional(&mut local, &mut server)
-                    .await
-                    .context("relay VLESS TCP")?;
-                Ok(())
-            }
-        }
-        socks::SocksRequest::UdpAssociate => {
-            ensure!(config.udp, "VLESS UDP is disabled by client config");
-            handle_vless_udp_associate(local, config).await
-        }
-    }
-}
-
-async fn handle_vless_udp_associate(
-    mut control: TcpStream,
-    config: VlessClientConfig,
-) -> Result<()> {
-    let bind_ip = match control.local_addr()?.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        ip => ip,
-    };
-    let udp = Arc::new(
         UdpSocket::bind(SocketAddr::new(bind_ip, 0))
             .await
             .with_context(|| format!("bind VLESS SOCKS UDP associate socket on {bind_ip}:0"))?,
@@ -475,28 +403,6 @@ async fn handle_vless_client(
             write_vless_response_header(&mut stream).await?;
             tracing::info!("VLESS opened {}", target_name(&request.target));
             if is_vision_flow(&request.flow) {
-                relay_vision_server(stream, remote, session, request.user).await
-            } else {
-                relay_counted(&mut stream, &mut remote, session).await
-            }
-        }
-        CMD_UDP => {
-            write_vless_response_header(&mut stream).await?;
-            if vless_xudp::is_mux_target(&request.target) {
-                vless_xudp::relay_server(stream, session).await
-            } else {
-                relay_vless_udp(stream, request.target, session).await
-            }
-        }
-        CMD_MUX => {
-            write_vless_response_header(&mut stream).await?;
-            vless_mux::relay_server(stream, session).await
-        }
-        other => bail!("unsupported VLESS command {other:#x}"),
-    }
-}
-
-async fn apply_server_transport<S>(
     mut stream: S,
     transport: &VlessTransportConfig,
 ) -> Result<BoxedVlessStream>

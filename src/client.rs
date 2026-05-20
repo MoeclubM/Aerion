@@ -1,3 +1,4 @@
+use crate::core::ProxyCore;
 use crate::padding::PaddingScheme;
 use crate::protocol::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
@@ -39,13 +40,21 @@ pub struct ClientConfig {
 }
 
 pub async fn run_client(config: ClientConfig) -> Result<()> {
+    run_client_with_core(config, None).await
+}
+
+pub async fn run_client_with_core(config: ClientConfig, core: Option<ProxyCore>) -> Result<()> {
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind local SOCKS listener on {}", config.listen))?;
-    run_client_listener(listener, config).await
+    run_client_listener(listener, config, core).await
 }
 
-pub async fn run_client_listener(listener: TcpListener, config: ClientConfig) -> Result<()> {
+pub async fn run_client_listener(
+    listener: TcpListener,
+    config: ClientConfig,
+    core: Option<ProxyCore>,
+) -> Result<()> {
     let tls_config = tls::client_config_with_custom_root_material_early_data_options(
         config.insecure,
         &config.ca_cert_paths,
@@ -58,8 +67,9 @@ pub async fn run_client_listener(listener: TcpListener, config: ClientConfig) ->
     loop {
         let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
         let session = session.clone();
+        let core = core.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_socks_client(stream, session).await {
+            if let Err(error) = handle_socks_client(stream, session, core).await {
                 tracing::warn!("SOCKS client {peer} failed: {error:?}");
             }
         });
@@ -207,7 +217,11 @@ impl ClientStream {
     }
 }
 
-async fn handle_socks_client(mut local: TcpStream, session: ClientSession) -> Result<()> {
+async fn handle_socks_client(
+    mut local: TcpStream,
+    session: ClientSession,
+    core: Option<ProxyCore>,
+) -> Result<()> {
     match socks::read_request(&mut local).await? {
         SocksRequest::Connect(target) => {
             let stream = match session.open_stream(target.clone(), Vec::new()).await {
@@ -219,16 +233,78 @@ async fn handle_socks_client(mut local: TcpStream, session: ClientSession) -> Re
             };
             socks::write_reply(&mut local, 0x00).await?;
             tracing::info!("proxying {}", target_name(&target));
-            relay_tcp(local, stream).await
+
+            if let Some(core) = core {
+                let peer = local.peer_addr().unwrap_or_else(|_| socks_addr_unspecified());
+                let session = core.authenticate_from("local", peer).await?;
+                relay_counted_client(local, stream, session).await
+            } else {
+                relay_tcp(local, stream).await
+            }
         }
-        SocksRequest::UdpAssociate => handle_udp_associate(local, session).await,
+        SocksRequest::UdpAssociate => handle_udp_associate(local, session, core).await,
     }
+}
+
+fn socks_addr_unspecified() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+}
+
+async fn relay_counted_client(
+    local: TcpStream,
+    mut stream: ClientStream,
+    session: crate::core::CoreSession,
+) -> Result<()> {
+    let stream_id = stream.stream_id;
+    let writer = stream.writer.clone();
+    let (mut local_reader, mut local_writer) = local.into_split();
+
+    let uplink = async {
+        let mut buffer = vec![0u8; 32 * 1024];
+        loop {
+            let read = local_reader
+                .read(&mut buffer)
+                .await
+                .context("read local payload")?;
+            if read == 0 {
+                writer
+                    .lock()
+                    .await
+                    .write_frame(CMD_FIN, stream_id, &[])
+                    .await?;
+                return Ok::<(), anyhow::Error>(());
+            }
+            session.record_upload(read).await?;
+            writer
+                .lock()
+                .await
+                .write_payload_chunks(stream_id, &buffer[..read])
+                .await?;
+        }
+    };
+
+    let downlink = async {
+        while let Some(payload) = stream.read_payload().await? {
+            session.record_download(payload.len()).await?;
+            local_writer
+                .write_all(&payload)
+                .await
+                .context("write local payload")?;
+        }
+        local_writer
+            .shutdown()
+            .await
+            .context("shutdown local writer")
+    };
+
+    tokio::try_join!(uplink, downlink)?;
+    Ok(())
 }
 
 async fn relay_tcp(local: TcpStream, mut stream: ClientStream) -> Result<()> {
     let stream_id = stream.stream_id;
     let writer = stream.writer.clone();
-    let (mut local_reader, local_writer) = local.into_split();
+    let (mut local_reader, mut local_writer) = local.into_split();
     let uplink = async {
         let mut buffer = vec![0u8; 32 * 1024];
         loop {
@@ -251,28 +327,31 @@ async fn relay_tcp(local: TcpStream, mut stream: ClientStream) -> Result<()> {
                 .await?;
         }
     };
-    let downlink = write_stream_payloads(&mut stream, local_writer);
+    let downlink = async {
+        while let Some(payload) = stream.read_payload().await? {
+            local_writer
+                .write_all(&payload)
+                .await
+                .context("write local payload")?;
+        }
+        local_writer
+            .shutdown()
+            .await
+            .context("shutdown local writer")
+    };
     tokio::try_join!(uplink, downlink)?;
     Ok(())
 }
 
-async fn write_stream_payloads(
-    stream: &mut ClientStream,
-    mut local_writer: OwnedWriteHalf,
+async fn handle_udp_associate(
+    control: TcpStream,
+    session: ClientSession,
+    _core: Option<ProxyCore>,
 ) -> Result<()> {
-    while let Some(payload) = stream.read_payload().await? {
-        local_writer
-            .write_all(&payload)
-            .await
-            .context("write local payload")?;
-    }
-    local_writer
-        .shutdown()
-        .await
-        .context("shutdown local writer")
+    handle_udp_associate_impl(control, session).await
 }
 
-async fn handle_udp_associate(mut control: TcpStream, session: ClientSession) -> Result<()> {
+async fn handle_udp_associate_impl(mut control: TcpStream, session: ClientSession) -> Result<()> {
     let bind_ip = match control.local_addr()?.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         ip => ip,

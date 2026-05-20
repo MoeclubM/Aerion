@@ -68,15 +68,23 @@ struct TrojanUdpPacket {
 }
 
 pub async fn run_trojan_client(config: TrojanClientConfig) -> Result<()> {
+    run_trojan_client_with_core(config, None).await
+}
+
+pub async fn run_trojan_client_with_core(
+    config: TrojanClientConfig,
+    core: Option<ProxyCore>,
+) -> Result<()> {
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind Trojan SOCKS listener on {}", config.listen))?;
-    run_trojan_client_listener(listener, config).await
+    run_trojan_client_listener(listener, config, core).await
 }
 
 pub async fn run_trojan_client_listener(
     listener: TcpListener,
     config: TrojanClientConfig,
+    core: Option<ProxyCore>,
 ) -> Result<()> {
     tracing::info!(
         "Trojan client listening on socks5://{}",
@@ -85,8 +93,9 @@ pub async fn run_trojan_client_listener(
     loop {
         let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
         let config = config.clone();
+        let core = core.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_trojan_socks(stream, config).await {
+            if let Err(error) = handle_trojan_socks(stream, config, core).await {
                 tracing::warn!("Trojan SOCKS client {peer} failed: {error:?}");
             }
         });
@@ -136,28 +145,83 @@ pub async fn run_trojan_server_with_core(
     }
 }
 
-async fn handle_trojan_socks(mut local: TcpStream, config: TrojanClientConfig) -> Result<()> {
+async fn handle_trojan_socks(
+    mut local: TcpStream,
+    config: TrojanClientConfig,
+    core: Option<ProxyCore>,
+) -> Result<()> {
     match socks::read_request(&mut local).await? {
         socks::SocksRequest::Connect(target) => {
             let mut server = connect_trojan_server(&config).await?;
             write_trojan_request(&mut server, &config.password, CMD_CONNECT, &target).await?;
             socks::write_reply(&mut local, 0x00).await?;
             tracing::info!("Trojan proxying {}", target_name(&target));
-            tokio::io::copy_bidirectional(&mut local, &mut server)
-                .await
-                .context("relay Trojan TCP")?;
-            Ok(())
+            if let Some(core) = core {
+                let peer = local.peer_addr().unwrap_or_else(|_| socks_addr_unspecified());
+                let session = core.authenticate_from("local", peer).await?;
+                relay_counted(&mut local, &mut server, session).await
+            } else {
+                tokio::io::copy_bidirectional(&mut local, &mut server)
+                    .await
+                    .context("relay Trojan TCP")?;
+                Ok(())
+            }
         }
         socks::SocksRequest::UdpAssociate => {
             ensure!(config.udp, "Trojan UDP is disabled by client config");
-            handle_trojan_udp_associate(local, config).await
+            handle_trojan_udp_associate(local, config, core).await
         }
     }
+}
+
+fn socks_addr_unspecified() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+}
+
+async fn relay_counted<A, B>(left: &mut A, right: &mut B, session: CoreSession) -> Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut lr, mut lw) = tokio::io::split(left);
+    let (mut rr, mut rw) = tokio::io::split(right);
+    let uplink_session = session.clone();
+    let uplink = async {
+        let mut buffer = vec![0u8; 32 * 1024];
+        loop {
+            let read = lr.read(&mut buffer).await.context("read Trojan uplink")?;
+            if read == 0 {
+                let _ = rw.shutdown().await;
+                return Ok::<(), anyhow::Error>(());
+            }
+            uplink_session.record_upload(read).await?;
+            rw.write_all(&buffer[..read])
+                .await
+                .context("write Trojan uplink")?;
+        }
+    };
+    let downlink = async {
+        let mut buffer = vec![0u8; 32 * 1024];
+        loop {
+            let read = rr.read(&mut buffer).await.context("read Trojan downlink")?;
+            if read == 0 {
+                let _ = lw.shutdown().await;
+                return Ok::<(), anyhow::Error>(());
+            }
+            session.record_download(read).await?;
+            lw.write_all(&buffer[..read])
+                .await
+                .context("write Trojan downlink")?;
+        }
+    };
+    tokio::try_join!(uplink, downlink)?;
+    Ok(())
 }
 
 async fn handle_trojan_udp_associate(
     mut control: TcpStream,
     config: TrojanClientConfig,
+    _core: Option<ProxyCore>,
 ) -> Result<()> {
     let bind_ip = match control.local_addr()?.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
