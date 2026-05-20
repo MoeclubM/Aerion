@@ -63,13 +63,15 @@ pub async fn run_client_listener(
         &config.pinned_cert_sha256,
     )?;
     let session = ClientSession::connect(&config, tls_config).await?;
+    let core = core.unwrap_or_else(ProxyCore::empty);
     tracing::info!("client listening on socks5://{}", listener.local_addr()?);
     loop {
         let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
         let session = session.clone();
+        let config = config.clone();
         let core = core.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_socks_client(stream, session, core).await {
+            if let Err(error) = handle_socks_client(stream, session, config, core, peer).await {
                 tracing::warn!("SOCKS client {peer} failed: {error:?}");
             }
         });
@@ -220,7 +222,9 @@ impl ClientStream {
 async fn handle_socks_client(
     mut local: TcpStream,
     session: ClientSession,
-    core: Option<ProxyCore>,
+    config: ClientConfig,
+    core: ProxyCore,
+    peer: SocketAddr,
 ) -> Result<()> {
     match socks::read_request(&mut local).await? {
         SocksRequest::Connect(target) => {
@@ -231,34 +235,24 @@ async fn handle_socks_client(
                     return Err(error);
                 }
             };
+            let core_session = core.authenticate_from(&config.password, peer).await?;
             socks::write_reply(&mut local, 0x00).await?;
             tracing::info!("proxying {}", target_name(&target));
-
-            if let Some(core) = core {
-                let peer = local.peer_addr().unwrap_or_else(|_| socks_addr_unspecified());
-                let session = core.authenticate_from("local", peer).await?;
-                relay_counted_client(local, stream, session).await
-            } else {
-                relay_tcp(local, stream).await
-            }
+            relay_tcp_counted(local, stream, core_session).await
         }
-        SocksRequest::UdpAssociate => handle_udp_associate(local, session, core).await,
+        SocksRequest::UdpAssociate => handle_udp_associate_counted(local, session, config, core, peer).await,
     }
 }
 
-fn socks_addr_unspecified() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-}
-
-async fn relay_counted_client(
+async fn relay_tcp_counted(
     local: TcpStream,
     mut stream: ClientStream,
     session: crate::core::CoreSession,
 ) -> Result<()> {
     let stream_id = stream.stream_id;
     let writer = stream.writer.clone();
-    let (mut local_reader, mut local_writer) = local.into_split();
-
+    let (mut local_reader, local_writer) = local.into_split();
+    let uplink_session = session.clone();
     let uplink = async {
         let mut buffer = vec![0u8; 32 * 1024];
         loop {
@@ -274,7 +268,7 @@ async fn relay_counted_client(
                     .await?;
                 return Ok::<(), anyhow::Error>(());
             }
-            session.record_upload(read).await?;
+            uplink_session.record_upload(read).await?;
             writer
                 .lock()
                 .await
@@ -282,76 +276,36 @@ async fn relay_counted_client(
                 .await?;
         }
     };
-
-    let downlink = async {
-        while let Some(payload) = stream.read_payload().await? {
-            session.record_download(payload.len()).await?;
-            local_writer
-                .write_all(&payload)
-                .await
-                .context("write local payload")?;
-        }
-        local_writer
-            .shutdown()
-            .await
-            .context("shutdown local writer")
-    };
-
+    let downlink = write_stream_payloads_counted(&mut stream, local_writer, session);
     tokio::try_join!(uplink, downlink)?;
     Ok(())
 }
 
-async fn relay_tcp(local: TcpStream, mut stream: ClientStream) -> Result<()> {
-    let stream_id = stream.stream_id;
-    let writer = stream.writer.clone();
-    let (mut local_reader, mut local_writer) = local.into_split();
-    let uplink = async {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            let read = local_reader
-                .read(&mut buffer)
-                .await
-                .context("read local payload")?;
-            if read == 0 {
-                writer
-                    .lock()
-                    .await
-                    .write_frame(CMD_FIN, stream_id, &[])
-                    .await?;
-                return Ok::<(), anyhow::Error>(());
-            }
-            writer
-                .lock()
-                .await
-                .write_payload_chunks(stream_id, &buffer[..read])
-                .await?;
-        }
-    };
-    let downlink = async {
-        while let Some(payload) = stream.read_payload().await? {
-            local_writer
-                .write_all(&payload)
-                .await
-                .context("write local payload")?;
-        }
-        local_writer
-            .shutdown()
-            .await
-            .context("shutdown local writer")
-    };
-    tokio::try_join!(uplink, downlink)?;
-    Ok(())
-}
-
-async fn handle_udp_associate(
-    control: TcpStream,
-    session: ClientSession,
-    _core: Option<ProxyCore>,
+async fn write_stream_payloads_counted(
+    stream: &mut ClientStream,
+    mut local_writer: OwnedWriteHalf,
+    session: crate::core::CoreSession,
 ) -> Result<()> {
-    handle_udp_associate_impl(control, session).await
+    while let Some(payload) = stream.read_payload().await? {
+        session.record_download(payload.len()).await?;
+        local_writer
+            .write_all(&payload)
+            .await
+            .context("write local payload")?;
+    }
+    local_writer
+        .shutdown()
+        .await
+        .context("shutdown local writer")
 }
 
-async fn handle_udp_associate_impl(mut control: TcpStream, session: ClientSession) -> Result<()> {
+async fn handle_udp_associate_counted(
+    mut control: TcpStream,
+    session: ClientSession,
+    config: ClientConfig,
+    core: ProxyCore,
+    peer: SocketAddr,
+) -> Result<()> {
     let bind_ip = match control.local_addr()?.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         ip => ip,
@@ -362,6 +316,7 @@ async fn handle_udp_associate_impl(mut control: TcpStream, session: ClientSessio
     let udp_addr = udp.local_addr()?;
     socks::write_reply_with_bind(&mut control, 0x00, udp_addr).await?;
 
+    let core_session = core.authenticate_from(&config.password, peer).await?;
     let stream = session
         .open_stream(uot::magic_target(), uot::encode_v2_associate_request()?)
         .await?;
@@ -372,6 +327,7 @@ async fn handle_udp_associate_impl(mut control: TcpStream, session: ClientSessio
         let udp = udp.clone();
         let stream_id = stream.stream_id;
         let writer = stream.writer.clone();
+        let core_session = core_session.clone();
         async move {
             let mut buffer = vec![0u8; u16::MAX as usize + 32];
             loop {
@@ -381,6 +337,7 @@ async fn handle_udp_associate_impl(mut control: TcpStream, session: ClientSessio
                     .context("receive SOCKS UDP packet")?;
                 let _ = client_tx.try_send(peer);
                 let (target, payload) = uot::parse_socks_udp_packet(&buffer[..read])?;
+                core_session.record_upload(payload.len()).await?;
                 let packet = uot::encode_associate_packet(&target, payload)?;
                 writer
                     .lock()
@@ -394,6 +351,7 @@ async fn handle_udp_associate_impl(mut control: TcpStream, session: ClientSessio
     let stream_to_udp = {
         let udp = udp.clone();
         let mut stream = stream;
+        let core_session = core_session.clone();
         async move {
             let mut peer = None;
             loop {
@@ -408,6 +366,7 @@ async fn handle_udp_associate_impl(mut control: TcpStream, session: ClientSessio
                             return Ok::<(), anyhow::Error>(());
                         };
                         let (source, packet) = uot::decode_associate_packet(&payload)?;
+                        core_session.record_download(packet.len()).await?;
                         let response = uot::encode_socks_udp_packet(&source, packet)?;
                         let peer = peer.context("SOCKS UDP peer is not known yet")?;
                         udp.send_to(&response, peer)
