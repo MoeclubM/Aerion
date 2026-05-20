@@ -83,6 +83,7 @@ async fn socks_client_reaches_tcp_target_through_aerion_server() -> Result<()> {
             padding_scheme: PaddingScheme::default_lines(),
             heartbeat_interval_secs: 30,
         },
+        None,
     ));
 
     let result = timeout(Duration::from_secs(5), async {
@@ -216,6 +217,7 @@ async fn socks_udp_associate_reaches_udp_target_through_uot() -> Result<()> {
             padding_scheme: PaddingScheme::default_lines(),
             heartbeat_interval_secs: 30,
         },
+        None,
     ));
 
     let result = timeout(Duration::from_secs(5), async {
@@ -925,6 +927,7 @@ async fn socks_client_reaches_tcp_target_through_trojan_server() -> Result<()> {
             client_fingerprint: None,
             transport: VlessTransportConfig::tcp(),
         },
+        None,
     ));
 
     let result = timeout(
@@ -998,6 +1001,7 @@ async fn socks_client_reaches_tcp_target_through_trojan_websocket_server() -> Re
             client_fingerprint: None,
             transport,
         },
+        None,
     ));
 
     let result = timeout(
@@ -1079,6 +1083,7 @@ async fn socks_client_reaches_tcp_target_through_vless_server() -> Result<()> {
             reality: None,
             transport: VlessTransportConfig::tcp(),
         },
+        None,
     ));
 
     let result = timeout(
@@ -1161,6 +1166,7 @@ async fn socks_client_reaches_tcp_target_through_vless_websocket() -> Result<()>
             reality: None,
             transport,
         },
+        None,
     ));
 
     let result = timeout(
@@ -1244,6 +1250,7 @@ async fn socks_client_reaches_tcp_target_through_vless_httpupgrade() -> Result<(
             reality: None,
             transport,
         },
+        None,
     ));
 
     let result = timeout(
@@ -1326,6 +1333,7 @@ async fn socks_client_reaches_tcp_target_through_vless_http2() -> Result<()> {
             reality: None,
             transport,
         },
+        None,
     ));
 
     let result = timeout(
@@ -1408,6 +1416,7 @@ async fn socks_client_reaches_tcp_target_through_vless_grpc() -> Result<()> {
             reality: None,
             transport,
         },
+        None,
     ));
 
     let result = timeout(
@@ -1495,6 +1504,7 @@ async fn socks_client_reaches_tcp_target_through_vless_xhttp() -> Result<()> {
             reality: None,
             transport,
         },
+        None,
     ));
 
     let result = timeout(
@@ -1586,6 +1596,7 @@ async fn socks_client_reaches_tcp_target_through_vless_reality() -> Result<()> {
             }),
             transport: VlessTransportConfig::tcp(),
         },
+        None,
     ));
 
     let result = timeout(
@@ -1667,6 +1678,7 @@ async fn socks_client_reaches_tcp_target_through_vless_vision() -> Result<()> {
             reality: None,
             transport: VlessTransportConfig::tcp(),
         },
+        None,
     ));
 
     let result = timeout(
@@ -1748,6 +1760,7 @@ async fn socks_client_reaches_tcp_target_through_vless_mux() -> Result<()> {
             reality: None,
             transport: VlessTransportConfig::tcp(),
         },
+        None,
     ));
 
     let result = timeout(
@@ -1828,6 +1841,7 @@ async fn socks_udp_associate_reaches_udp_target_through_vless_xudp() -> Result<(
             reality: None,
             transport: VlessTransportConfig::tcp(),
         },
+        None,
     ));
 
     let result = timeout(Duration::from_secs(5), async {
