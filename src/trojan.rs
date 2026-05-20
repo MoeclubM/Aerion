@@ -91,7 +91,6 @@ pub async fn run_trojan_client_listener(
         "Trojan client listening on socks5://{}",
         listener.local_addr()?
     );
-    let core = core.unwrap_or_else(ProxyCore::empty);
     loop {
         let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
         let config = config.clone();
@@ -150,11 +149,15 @@ pub async fn run_trojan_server_with_core(
 async fn handle_trojan_socks_with_core(
     mut stream: TcpStream,
     config: TrojanClientConfig,
-    core: ProxyCore,
+    core: Option<ProxyCore>,
     peer: SocketAddr,
 ) -> Result<()> {
     let (target, mut stream) = socks::handle_socks_greeting(stream).await?;
-    let session = core.authenticate_from(&config.password, peer).await?;
+    let session = if let Some(core) = core.as_ref() {
+        core.authenticate_from(&config.password, peer).await?
+    } else {
+        CoreSession::disabled()
+    };
     match target {
         socks::SocksRequest::Connect(target) => {
             let mut server = connect_trojan_server(&config).await?;

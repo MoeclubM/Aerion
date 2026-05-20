@@ -101,7 +101,6 @@ pub async fn run_vless_client_listener(
         "VLESS client listening on socks5://{}",
         listener.local_addr()?
     );
-    let core = core.unwrap_or_else(ProxyCore::empty);
     loop {
         let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
         let config = config.clone();
@@ -177,11 +176,15 @@ pub async fn run_vless_server_with_core(config: VlessServerConfig, core: ProxyCo
 async fn handle_vless_socks_with_core(
     mut stream: TcpStream,
     config: VlessClientConfig,
-    core: ProxyCore,
+    core: Option<ProxyCore>,
     peer: SocketAddr,
 ) -> Result<()> {
     let (request, mut stream) = socks::handle_socks_greeting(stream).await?;
-    let session = core.authenticate_from(&config.user_id, peer).await?;
+    let session = if let Some(core) = core.as_ref() {
+        core.authenticate_from(&config.user_id, peer).await?
+    } else {
+        CoreSession::disabled()
+    };
     match request {
         socks::SocksRequest::Connect(target) => {
             let mut server = connect_vless_server(&config).await?;

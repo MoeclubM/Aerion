@@ -1,4 +1,4 @@
-use crate::core::ProxyCore;
+use crate::core::{CoreSession, ProxyCore};
 use crate::padding::PaddingScheme;
 use crate::protocol::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
@@ -67,7 +67,6 @@ pub async fn run_client_listener(
             &config.pinned_cert_sha256,
         )?;
     let session = ClientSession::connect(&config, tls_config).await?;
-    let core = core.unwrap_or_else(ProxyCore::empty);
     tracing::info!("client listening on socks5://{}", listener.local_addr()?);
     loop {
         let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
@@ -227,7 +226,7 @@ async fn handle_socks_client(
     mut local: TcpStream,
     session: ClientSession,
     config: ClientConfig,
-    core: ProxyCore,
+    core: Option<ProxyCore>,
     peer: SocketAddr,
 ) -> Result<()> {
     match socks::read_request(&mut local).await? {
@@ -239,7 +238,11 @@ async fn handle_socks_client(
                     return Err(error);
                 }
             };
-            let core_session = core.authenticate_from(&config.password, peer).await?;
+            let core_session = if let Some(core) = core.as_ref() {
+                core.authenticate_from(&config.password, peer).await?
+            } else {
+                CoreSession::disabled()
+            };
             socks::write_reply(&mut local, 0x00).await?;
             tracing::info!("proxying {}", target_name(&target));
             relay_tcp_counted(local, stream, core_session).await
@@ -309,7 +312,7 @@ async fn handle_udp_associate_counted(
     mut control: TcpStream,
     session: ClientSession,
     config: ClientConfig,
-    core: ProxyCore,
+    core: Option<ProxyCore>,
     peer: SocketAddr,
 ) -> Result<()> {
     let bind_ip = match control.local_addr()?.ip() {
@@ -322,7 +325,11 @@ async fn handle_udp_associate_counted(
     let udp_addr = udp.local_addr()?;
     socks::write_reply_with_bind(&mut control, 0x00, udp_addr).await?;
 
-    let core_session = core.authenticate_from(&config.password, peer).await?;
+    let core_session = if let Some(core) = core.as_ref() {
+        core.authenticate_from(&config.password, peer).await?
+    } else {
+        CoreSession::disabled()
+    };
     let stream = session
         .open_stream(uot::magic_target(), uot::encode_v2_associate_request()?)
         .await?;
