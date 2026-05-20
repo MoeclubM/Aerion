@@ -1344,7 +1344,7 @@ async fn run_client_config_with_listener(
     config: RunnableClientConfig,
 ) -> Result<()> {
     match config {
-        RunnableClientConfig::AnyTls(config) => run_client_listener(listener, config).await,
+        RunnableClientConfig::AnyTls(config) => run_client_listener(listener, config, None).await,
         RunnableClientConfig::Hysteria2(config) => {
             run_hysteria2_client_listener(listener, config).await
         }
@@ -1353,9 +1353,13 @@ async fn run_client_config_with_listener(
         RunnableClientConfig::Shadowsocks(config) => {
             run_shadowsocks_client_listener(listener, config).await
         }
-        RunnableClientConfig::Trojan(config) => run_trojan_client_listener(listener, config).await,
+        RunnableClientConfig::Trojan(config) => {
+            run_trojan_client_listener(listener, config, None).await
+        }
         RunnableClientConfig::Tuic(config) => run_tuic_client_listener(listener, config).await,
-        RunnableClientConfig::Vless(config) => run_vless_client_listener(listener, config).await,
+        RunnableClientConfig::Vless(config) => {
+            run_vless_client_listener(listener, config, None).await
+        }
         RunnableClientConfig::Vmess(config) => run_vmess_client_listener(listener, config).await,
     }
 }
