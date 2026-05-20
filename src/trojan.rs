@@ -163,7 +163,11 @@ async fn handle_trojan_socks_with_core(
             tracing::info!("Trojan proxying {}", target_name(&target));
             relay_counted(&mut stream, &mut server, session).await
         }
-        socks::SocksRequest::UdpAssociate(bind_ip) => {
+        socks::SocksRequest::UdpAssociate => {
+            let bind_ip = match stream.local_addr()?.ip() {
+                IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                ip => ip,
+            };
             ensure!(config.udp, "Trojan UDP is disabled by client config");
             handle_trojan_udp_associate_counted(stream, config, session).await
         }

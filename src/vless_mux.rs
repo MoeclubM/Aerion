@@ -94,9 +94,22 @@ where
 }
 
 pub async fn relay_single_tcp_client<S, L>(
+    mux_stream: S,
+    local: L,
+    target: ProxyTarget,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    L: AsyncRead + AsyncWrite + Unpin,
+{
+    relay_single_tcp_client_counted(mux_stream, local, target, CoreSession::disabled()).await
+}
+
+pub async fn relay_single_tcp_client_counted<S, L>(
     mut mux_stream: S,
     local: L,
     target: ProxyTarget,
+    session: CoreSession,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -133,6 +146,7 @@ where
                     .context("write VLESS mux end frame")?;
                 return Ok::<(), anyhow::Error>(());
             }
+            session.record_upload(read).await?;
             mux_writer
                 .write_all(&encode_frame(
                     session_id,
@@ -158,6 +172,7 @@ where
                 return Ok::<(), anyhow::Error>(());
             }
             if frame.has_data {
+                session.record_download(frame.payload.len()).await?;
                 local_writer
                     .write_all(&frame.payload)
                     .await

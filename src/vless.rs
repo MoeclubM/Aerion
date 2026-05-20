@@ -200,7 +200,7 @@ async fn handle_vless_socks_with_core(
                 relay_counted(&mut stream, &mut server, session).await
             }
         }
-        socks::SocksRequest::UdpAssociate(_) => {
+        socks::SocksRequest::UdpAssociate => {
             ensure!(config.udp, "VLESS UDP is disabled by client config");
             handle_vless_udp_associate_counted(stream, config, session).await
         }
