@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn route_proxy_state_hot_updates_routes_and_upstreams() {
         let target = ProxyTarget::Domain("example.com".to_string(), 443);
-        let state = RouteProxyState::new(RouteTable::default(), BTreeMap::new());
+        let state = RouteProxyState::new(RouteTable::default(), BTreeMap::new(), None);
         assert_eq!(
             state.decide(&target, RouteNetwork::Tcp),
             RouteDecision::Direct
