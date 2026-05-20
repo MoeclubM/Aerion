@@ -153,7 +153,7 @@ async fn handle_trojan_socks_with_core(
     core: ProxyCore,
     peer: SocketAddr,
 ) -> Result<()> {
-    let (target, mut control) = socks::handle_socks_greeting(&mut stream).await?;
+    let (target, mut stream) = socks::handle_socks_greeting(stream).await?;
     let session = core.authenticate_from(&config.password, peer).await?;
     match target {
         socks::SocksRequest::Connect(target) => {

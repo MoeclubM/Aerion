@@ -240,7 +240,9 @@ async fn handle_socks_client(
             tracing::info!("proxying {}", target_name(&target));
             relay_tcp_counted(local, stream, core_session).await
         }
-        SocksRequest::UdpAssociate => handle_udp_associate_counted(local, session, config, core, peer).await,
+        SocksRequest::UdpAssociate => {
+            handle_udp_associate_counted(local, session, config, core, peer).await
+        }
     }
 }
 

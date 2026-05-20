@@ -9,9 +9,9 @@ pub enum SocksRequest {
     UdpAssociate,
 }
 
-pub async fn handle_socks_greeting(stream: &mut TcpStream) -> Result<(SocksRequest, TcpStream)> {
-    let request = read_request(stream).await?;
-    Ok((request, stream.try_clone()?))
+pub async fn handle_socks_greeting(mut stream: TcpStream) -> Result<(SocksRequest, TcpStream)> {
+    let request = read_request(&mut stream).await?;
+    Ok((request, stream))
 }
 
 pub struct SocksUdpAssociation {

@@ -113,7 +113,7 @@ struct ActiveSession {
 
 #[derive(Clone, Debug)]
 pub struct CoreSession {
-    inner: Arc<ActiveSession>,
+    inner: Option<Arc<ActiveSession>>,
 }
 
 #[derive(Debug)]
@@ -373,11 +373,11 @@ impl ProxyCore {
         let session_id = self.inner.session_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let control = user.open_session(session_id, source_ip)?;
         Ok(CoreSession {
-            inner: Arc::new(ActiveSession {
+            inner: Some(Arc::new(ActiveSession {
                 user,
                 session_id,
                 control,
-            }),
+            })),
         })
     }
 
@@ -446,34 +446,60 @@ impl ProxyCore {
 }
 
 impl CoreSession {
+    pub fn disabled() -> Self {
+        Self { inner: None }
+    }
+
     pub fn user_id(&self) -> &str {
-        &self.inner.user.id
+        match &self.inner {
+            Some(inner) => &inner.user.id,
+            None => "disabled",
+        }
     }
 
     pub fn session_id(&self) -> u64 {
-        self.inner.session_id
+        match &self.inner {
+            Some(inner) => inner.session_id,
+            None => 0,
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.inner.control.is_cancelled()
+        match &self.inner {
+            Some(inner) => inner.control.is_cancelled(),
+            None => false,
+        }
     }
 
     pub async fn cancelled(&self) {
-        self.inner.control.cancelled().await;
+        match &self.inner {
+            Some(inner) => inner.control.cancelled().await,
+            None => std::future::pending().await,
+        }
     }
 
     pub async fn record_upload(&self, bytes: usize) -> Result<()> {
-        self.inner
-            .user
-            .record_upload(bytes, self.inner.session_id, &self.inner.control)
-            .await
+        match &self.inner {
+            Some(inner) => {
+                inner
+                    .user
+                    .record_upload(bytes, inner.session_id, &inner.control)
+                    .await
+            }
+            None => Ok(()),
+        }
     }
 
     pub async fn record_download(&self, bytes: usize) -> Result<()> {
-        self.inner
-            .user
-            .record_download(bytes, self.inner.session_id, &self.inner.control)
-            .await
+        match &self.inner {
+            Some(inner) => {
+                inner
+                    .user
+                    .record_download(bytes, inner.session_id, &inner.control)
+                    .await
+            }
+            None => Ok(()),
+        }
     }
 }
 

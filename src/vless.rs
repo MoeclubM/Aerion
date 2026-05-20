@@ -82,7 +82,10 @@ pub async fn run_vless_client(config: VlessClientConfig) -> Result<()> {
     run_vless_client_with_core(config, None).await
 }
 
-pub async fn run_vless_client_with_core(config: VlessClientConfig, core: Option<ProxyCore>) -> Result<()> {
+pub async fn run_vless_client_with_core(
+    config: VlessClientConfig,
+    core: Option<ProxyCore>,
+) -> Result<()> {
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind VLESS SOCKS listener on {}", config.listen))?;
@@ -177,7 +180,7 @@ async fn handle_vless_socks_with_core(
     core: ProxyCore,
     peer: SocketAddr,
 ) -> Result<()> {
-    let (request, mut local) = socks::handle_socks_greeting(&mut stream).await?;
+    let (request, mut stream) = socks::handle_socks_greeting(stream).await?;
     let session = core.authenticate_from(&config.user_id, peer).await?;
     match request {
         socks::SocksRequest::Connect(target) => {
@@ -188,7 +191,8 @@ async fn handle_vless_socks_with_core(
                     .await?;
                 read_vless_response_header(&mut server).await?;
                 socks::write_reply(&mut stream, 0x00).await?;
-                return vless_mux::relay_single_tcp_client_counted(server, stream, target, session).await;
+                return vless_mux::relay_single_tcp_client_counted(server, stream, target, session)
+                    .await;
             }
             write_vless_request(&mut server, &user, CMD_TCP, &target, &config.flow).await?;
             read_vless_response_header(&mut server).await?;
@@ -239,7 +243,14 @@ async fn handle_vless_udp_associate_counted(
                     .context("receive SOCKS UDP packet")?;
                 let (target, payload) = uot::parse_socks_udp_packet(&buffer[..read])?;
                 session.record_upload(payload.len()).await?;
-                let response = vless_udp_roundtrip_counted(&config, user, target.clone(), payload, session.clone()).await?;
+                let response = vless_udp_roundtrip_counted(
+                    &config,
+                    user,
+                    target.clone(),
+                    payload,
+                    session.clone(),
+                )
+                .await?;
                 session.record_download(response.len()).await?;
                 let packet = uot::encode_socks_udp_packet(&target, &response)?;
                 udp.send_to(&packet, peer)
