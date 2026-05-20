@@ -1,3 +1,4 @@
+use crate::core::ProxyCore;
 use crate::listener::ListenerStopToken;
 use crate::protocol::{ProxyTarget, target_name};
 use crate::routing::{RouteDecision, RouteNetwork, RouteTable, SharedRouteTable};
@@ -8,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
-use tokio::io::{AsyncReadExt, copy_bidirectional};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
