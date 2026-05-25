@@ -24,6 +24,7 @@ use serde::{Deserialize, Deserializer, de};
 use serde_yaml::{Mapping, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct MihomoConfig {
@@ -41,6 +42,8 @@ pub struct MihomoConfig {
     pub proxies: Vec<MihomoProxy>,
     #[serde(default, rename = "proxy-groups", alias = "proxy_groups")]
     pub proxy_groups: Vec<MihomoProxyGroup>,
+    #[serde(default, rename = "rule-providers", alias = "rule_providers")]
+    pub rule_providers: BTreeMap<String, MihomoRuleProvider>,
     #[serde(default)]
     pub rules: Vec<String>,
     #[serde(default)]
@@ -49,6 +52,8 @@ pub struct MihomoConfig {
     pub dns: MihomoDnsConfig,
     #[serde(default)]
     pub tun: Option<MihomoTunConfig>,
+    #[serde(skip)]
+    pub source_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -89,6 +94,21 @@ pub struct MihomoTunConfig {
         alias = "route_exclude_address_set"
     )]
     pub route_exclude_address_set: Option<OneOrManyStrings>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct MihomoRuleProvider {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub behavior: String,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub payload: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -811,9 +831,37 @@ impl MihomoConfig {
     pub fn route_table(&self) -> Result<RouteTable> {
         let mut table = RouteTable::default();
         for (index, rule) in self.rules.iter().enumerate() {
-            table.rules.push(parse_mihomo_route_rule(rule, index)?);
+            table
+                .rules
+                .extend(self.parse_mihomo_route_rules(rule, index)?);
         }
         Ok(table)
+    }
+
+    fn parse_mihomo_route_rules(&self, raw: &str, index: usize) -> Result<Vec<RouteRule>> {
+        let parts = split_mihomo_rule(raw);
+        let location = format!("mihomo rules[{index}]");
+        ensure!(
+            !parts.is_empty() && !parts[0].is_empty(),
+            "{location} is empty"
+        );
+        let kind = parts[0].to_ascii_uppercase();
+        if kind.as_str() != "RULE-SET" {
+            return Ok(vec![parse_mihomo_route_rule_parts(
+                &parts, &location, None,
+            )?]);
+        }
+        ensure!(parts.len() > 2, "{location} RULE-SET is missing outbound");
+        ensure!(
+            !parts[1].is_empty(),
+            "{location} RULE-SET is missing provider"
+        );
+        let action = RouteDecision::from_outbound(parts[2])?;
+        let provider = self
+            .rule_providers
+            .get(parts[1])
+            .with_context(|| format!("{location} RULE-SET provider {} was not found", parts[1]))?;
+        provider.to_route_rules(parts[1], self.source_dir.as_deref(), action)
     }
 
     pub fn tun_enabled(&self) -> bool {
@@ -993,6 +1041,118 @@ impl MihomoProxyGroup {
             unsupported
         );
         Ok(())
+    }
+}
+
+impl MihomoRuleProvider {
+    fn to_route_rules(
+        &self,
+        name: &str,
+        source_dir: Option<&Path>,
+        action: RouteDecision,
+    ) -> Result<Vec<RouteRule>> {
+        let lines = self.rule_lines(name, source_dir)?;
+        let behavior = self.behavior.trim().to_ascii_lowercase();
+        match behavior.as_str() {
+            "domain" => {
+                let mut rule = RouteRule::new(action);
+                for line in lines {
+                    rule.domains.push(mihomo_rule_provider_domain(&line)?);
+                }
+                ensure!(
+                    !rule.domains.is_empty(),
+                    "mihomo rule-provider {name} domain payload is empty"
+                );
+                Ok(vec![rule])
+            }
+            "ipcidr" | "ip-cidr" => {
+                let mut rule = RouteRule::new(action);
+                for line in lines {
+                    rule.ip_cidrs.push(IpCidr::parse(&line)?);
+                }
+                ensure!(
+                    !rule.ip_cidrs.is_empty(),
+                    "mihomo rule-provider {name} ipcidr payload is empty"
+                );
+                Ok(vec![rule])
+            }
+            "classical" => {
+                let mut rules = Vec::new();
+                for (index, line) in lines.iter().enumerate() {
+                    let location = format!("mihomo rule-provider {name} payload[{index}]");
+                    rules.push(parse_mihomo_route_rule_with_action(
+                        line,
+                        &location,
+                        action.clone(),
+                    )?);
+                }
+                ensure!(
+                    !rules.is_empty(),
+                    "mihomo rule-provider {name} classical payload is empty"
+                );
+                Ok(rules)
+            }
+            other => bail!("unsupported mihomo rule-provider {name} behavior {other}"),
+        }
+    }
+
+    fn rule_lines(&self, name: &str, source_dir: Option<&Path>) -> Result<Vec<String>> {
+        let kind = self.kind.trim().to_ascii_lowercase();
+        match kind.as_str() {
+            "inline" => Ok(clean_mihomo_rule_provider_lines(&self.payload)),
+            "file" => {
+                ensure!(
+                    self.payload.is_empty(),
+                    "mihomo file rule-provider {name} embeds inline payload"
+                );
+                let path = self
+                    .path
+                    .as_ref()
+                    .with_context(|| format!("mihomo file rule-provider {name} is missing path"))?;
+                let path = match (path.is_absolute(), source_dir) {
+                    (true, _) | (false, None) => path.clone(),
+                    (false, Some(source_dir)) => source_dir.join(path),
+                };
+                self.load_rule_file(name, &path)
+            }
+            "http" => bail!("mihomo http rule-provider {name} requires downloading rule-set data"),
+            other => bail!("unsupported mihomo rule-provider {name} type {other}"),
+        }
+    }
+
+    fn load_rule_file(&self, name: &str, path: &Path) -> Result<Vec<String>> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read mihomo rule-provider {name} file {}", path.display()))?;
+        match self
+            .format
+            .as_deref()
+            .map(str::trim)
+            .filter(|format| !format.is_empty())
+            .unwrap_or("yaml")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "yaml" | "yml" => {
+                #[derive(Deserialize)]
+                struct RuleProviderFile {
+                    payload: Vec<String>,
+                }
+                let file: RuleProviderFile = serde_yaml::from_str(&text).with_context(|| {
+                    format!(
+                        "parse mihomo rule-provider {name} YAML file {}",
+                        path.display()
+                    )
+                })?;
+                Ok(clean_mihomo_rule_provider_lines(&file.payload))
+            }
+            "text" => Ok(text
+                .lines()
+                .filter_map(mihomo_text_rule_provider_line)
+                .map(str::to_string)
+                .collect()),
+            "mrs" => bail!("mihomo rule-provider {name} MRS format is not supported"),
+            other => bail!("unsupported mihomo rule-provider {name} format {other}"),
+        }
     }
 }
 
@@ -1782,23 +1942,48 @@ fn sni_or_server(value: Option<&str>, server: &str) -> String {
         .to_string()
 }
 
-fn parse_mihomo_route_rule(raw: &str, index: usize) -> Result<RouteRule> {
-    let parts = raw.split(',').map(str::trim).collect::<Vec<_>>();
+fn split_mihomo_rule(raw: &str) -> Vec<&str> {
+    raw.split(',').map(str::trim).collect()
+}
+
+fn parse_mihomo_route_rule_with_action(
+    raw: &str,
+    location: &str,
+    action: RouteDecision,
+) -> Result<RouteRule> {
+    let parts = split_mihomo_rule(raw);
+    parse_mihomo_route_rule_parts(&parts, location, Some(action))
+}
+
+fn parse_mihomo_route_rule_parts(
+    parts: &[&str],
+    location: &str,
+    action: Option<RouteDecision>,
+) -> Result<RouteRule> {
     ensure!(
         !parts.is_empty() && !parts[0].is_empty(),
-        "mihomo rules[{index}] is empty"
+        "{location} is empty"
     );
     let kind = parts[0].to_ascii_uppercase();
-    let action_index = if matches!(kind.as_str(), "MATCH" | "FINAL") {
-        1
-    } else {
-        2
+    let action = match action {
+        Some(action) => action,
+        None => {
+            let action_index = if matches!(kind.as_str(), "MATCH" | "FINAL") {
+                1
+            } else {
+                2
+            };
+            ensure!(parts.len() > action_index, "{location} is missing outbound");
+            RouteDecision::from_outbound(parts[action_index])?
+        }
     };
-    ensure!(
-        parts.len() > action_index,
-        "mihomo rules[{index}] is missing outbound"
-    );
-    let mut rule = RouteRule::new(RouteDecision::from_outbound(parts[action_index])?);
+    if !matches!(kind.as_str(), "MATCH" | "FINAL") {
+        ensure!(
+            parts.len() > 1 && !parts[1].is_empty(),
+            "{location} is missing rule value"
+        );
+    }
+    let mut rule = RouteRule::new(action);
     match kind.as_str() {
         "DOMAIN" => rule.domains.push(DomainMatcher::exact(parts[1])),
         "DOMAIN-SUFFIX" => rule.domains.push(DomainMatcher::suffix(parts[1])),
@@ -1812,13 +1997,32 @@ fn parse_mihomo_route_rule(raw: &str, index: usize) -> Result<RouteRule> {
         "DST-PORT" => rule.ports.push(PortRange::parse(parts[1])?),
         "NETWORK" => rule.networks.push(RouteNetwork::parse(parts[1])?),
         "MATCH" | "FINAL" => {}
-        "RULE-SET" => bail!("mihomo rules[{index}] RULE-SET requires rule-set data"),
+        "RULE-SET" => bail!("{location} nested RULE-SET requires rule-set expansion"),
+        "SRC-IP-CIDR" | "SRC-PORT" => bail!("{location} source rules require source metadata"),
         "PROCESS-NAME" | "PROCESS-PATH" => {
-            bail!("mihomo rules[{index}] process rules require process metadata")
+            bail!("{location} process rules require process metadata")
         }
-        other => bail!("unsupported mihomo route rule type {other}"),
+        other => bail!("{location} unsupported mihomo route rule type {other}"),
     }
     Ok(rule)
+}
+
+fn mihomo_rule_provider_domain(value: &str) -> Result<DomainMatcher> {
+    DomainMatcher::clash_wildcard(value)
+}
+
+fn clean_mihomo_rule_provider_lines(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn mihomo_text_rule_provider_line(line: &str) -> Option<&str> {
+    let line = line.split('#').next().unwrap_or_default().trim();
+    (!line.is_empty()).then_some(line)
 }
 
 fn default_true() -> bool {
@@ -1884,6 +2088,7 @@ where
 #[cfg(test)]
 mod tests {
     use anyhow::bail;
+    use std::fs;
 
     use super::*;
     use crate::protocol::ProxyTarget;
@@ -2092,6 +2297,138 @@ rules:
             ),
             RouteDecision::Proxy("proxy-b".to_string())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn compiles_mihomo_inline_rule_providers() -> Result<()> {
+        let yaml = r#"
+rule-providers:
+  ads:
+    type: inline
+    behavior: domain
+    payload:
+      - .example.com
+      - +.cdn.test
+      - '*.media.example.net'
+  lan:
+    type: inline
+    behavior: ipcidr
+    payload:
+      - 10.0.0.0/8
+  mixed:
+    type: inline
+    behavior: classical
+    payload:
+      - DOMAIN-KEYWORD,video
+      - DST-PORT,53
+rules:
+  - RULE-SET,ads,REJECT
+  - RULE-SET,lan,DIRECT
+  - RULE-SET,mixed,proxy-a
+  - MATCH,proxy-b
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let routes = config.route_table()?;
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Block
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("cdn.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Block
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("sub.media.example.net".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Block
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("deep.sub.media.example.net".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-b".to_string())
+        );
+        assert_eq!(
+            routes.decide(&ProxyTarget::Ip("10.1.2.3:443".parse()?), RouteNetwork::Tcp),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("video.example.net".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-a".to_string())
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("dns.example.net".to_string(), 53),
+                RouteNetwork::Udp
+            ),
+            RouteDecision::Proxy("proxy-a".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compiles_mihomo_file_rule_providers_relative_to_config() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(
+            dir.path().join("ads.yaml"),
+            r#"
+payload:
+  - +.example.com
+"#,
+        )?;
+        let yaml = r#"
+rule-providers:
+  ads:
+    type: file
+    behavior: domain
+    path: ads.yaml
+rules:
+  - RULE-SET,ads,REJECT
+  - MATCH,DIRECT
+"#;
+        let mut config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        config.source_dir = Some(dir.path().to_path_buf());
+        let routes = config.route_table()?;
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Block
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mihomo_http_rule_provider_without_remote_loader() -> Result<()> {
+        let yaml = r#"
+rule-providers:
+  remote:
+    type: http
+    behavior: domain
+    url: https://rules.example.test/ads.yaml
+    path: ./ads.yaml
+rules:
+  - RULE-SET,remote,REJECT
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let error = config
+            .route_table()
+            .expect_err("http rule-provider must fail explicitly");
+        assert!(error.to_string().contains("requires downloading"));
         Ok(())
     }
 

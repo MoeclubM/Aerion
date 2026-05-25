@@ -337,6 +337,31 @@ impl DomainMatcher {
         Self::regex(&regex)
     }
 
+    pub fn clash_wildcard(pattern: &str) -> Result<Self> {
+        let pattern = normalize_domain(pattern);
+        ensure!(!pattern.is_empty(), "empty clash domain wildcard");
+        if let Some(domain) = pattern.strip_prefix("+.") {
+            ensure!(!domain.is_empty(), "empty clash + domain wildcard");
+            return Ok(Self::suffix(domain));
+        }
+        if let Some(domain) = pattern.strip_prefix('.') {
+            ensure!(!domain.is_empty(), "empty clash . domain wildcard");
+            return Self::regex(&format!(r"^.+\.{}$", regex::escape(domain)));
+        }
+        if pattern.contains('*') {
+            let mut regex = String::from("^");
+            for ch in pattern.chars() {
+                match ch {
+                    '*' => regex.push_str("[^.]+"),
+                    _ => regex.push_str(&regex::escape(&ch.to_string())),
+                }
+            }
+            regex.push('$');
+            return Self::regex(&regex);
+        }
+        Ok(Self::exact(&pattern))
+    }
+
     pub fn from_prefixed(value: &str) -> Result<Option<Self>> {
         let value = value.trim();
         if value.is_empty() {
@@ -601,6 +626,25 @@ mod tests {
         assert!(wildcard.matches("static.cdn2.example.com"));
         assert!(!wildcard.matches("cdn1.example.com"));
         assert!(!wildcard.matches("img.cdn12.example.com"));
+        Ok(())
+    }
+
+    #[test]
+    fn clash_domain_wildcards_follow_mihomo_style() -> Result<()> {
+        let plus = DomainMatcher::clash_wildcard("+.baidu.com")?;
+        assert!(plus.matches("baidu.com"));
+        assert!(plus.matches("tieba.baidu.com"));
+        assert!(plus.matches("123.tieba.baidu.com"));
+
+        let dot = DomainMatcher::clash_wildcard(".baidu.com")?;
+        assert!(!dot.matches("baidu.com"));
+        assert!(dot.matches("tieba.baidu.com"));
+        assert!(dot.matches("123.tieba.baidu.com"));
+
+        let star = DomainMatcher::clash_wildcard("*.baidu.com")?;
+        assert!(!star.matches("baidu.com"));
+        assert!(star.matches("tieba.baidu.com"));
+        assert!(!star.matches("123.tieba.baidu.com"));
         Ok(())
     }
 

@@ -298,9 +298,10 @@ pub fn load_config(path: &Path) -> Result<FileConfig> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read config file {}", path.display()))?;
     if is_yaml(path) {
-        return serde_yaml::from_str(&text)
-            .map(FileConfig::Mihomo)
-            .with_context(|| format!("parse mihomo config file {}", path.display()));
+        let mut config: MihomoConfig = serde_yaml::from_str(&text)
+            .with_context(|| format!("parse mihomo config file {}", path.display()))?;
+        config.source_dir = path.parent().map(Path::to_path_buf);
+        return Ok(FileConfig::Mihomo(config));
     }
     if is_json(path) {
         let json = load_jsonc_value(&text)
@@ -323,8 +324,10 @@ pub fn load_config(path: &Path) -> Result<FileConfig> {
 pub fn load_mihomo_config(path: &Path) -> Result<MihomoConfig> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read mihomo config file {}", path.display()))?;
-    serde_yaml::from_str(&text)
-        .with_context(|| format!("parse mihomo config file {}", path.display()))
+    let mut config: MihomoConfig = serde_yaml::from_str(&text)
+        .with_context(|| format!("parse mihomo config file {}", path.display()))?;
+    config.source_dir = path.parent().map(Path::to_path_buf);
+    Ok(config)
 }
 
 pub fn load_xray_config(path: &Path) -> Result<XrayConfig> {
