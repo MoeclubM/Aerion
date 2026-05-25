@@ -266,8 +266,9 @@ policies fail explicitly because Aerion does not implement active runtime
 selection yet. sing-box `selector` outbounds are resolved to their startup
 selection (`default`, or the first listed outbound when `default` is omitted).
 sing-box route rules accept `route` / `reject` actions, logical route rules,
-and inline route rule-sets when they can be represented by Aerion's static
-route table. External binary/source rule-set loading still fails explicitly.
+inline route rule-sets, and local source JSON rule-sets when they can be
+represented by Aerion's static route table. Remote and binary rule-set loading
+still fails explicitly.
 Xray routing `balancerTag` resolves only when its balancer selectors identify
 exactly one outbound and no runtime strategy/fallback state is required.
 Inbound-only sing-box JSON can also run AnyTLS, Shadowsocks, Trojan, VMess,

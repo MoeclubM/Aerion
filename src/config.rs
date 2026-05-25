@@ -310,9 +310,12 @@ pub fn load_config(path: &Path) -> Result<FileConfig> {
             JsonProxyFormat::Xray => serde_json::from_value(json)
                 .map(FileConfig::Xray)
                 .with_context(|| format!("parse xray config file {}", path.display())),
-            JsonProxyFormat::SingBox => serde_json::from_value(json)
-                .map(FileConfig::SingBox)
-                .with_context(|| format!("parse sing-box config file {}", path.display())),
+            JsonProxyFormat::SingBox => {
+                let mut config: SingBoxConfig = serde_json::from_value(json)
+                    .with_context(|| format!("parse sing-box config file {}", path.display()))?;
+                config.source_dir = path.parent().map(Path::to_path_buf);
+                Ok(FileConfig::SingBox(config))
+            }
         };
     }
     toml::from_str::<TomlFileConfig>(&text)
@@ -340,8 +343,10 @@ pub fn load_xray_config(path: &Path) -> Result<XrayConfig> {
 pub fn load_singbox_config(path: &Path) -> Result<SingBoxConfig> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read sing-box config file {}", path.display()))?;
-    serde_json::from_value(load_jsonc_value(&text)?)
-        .with_context(|| format!("parse sing-box config file {}", path.display()))
+    let mut config: SingBoxConfig = serde_json::from_value(load_jsonc_value(&text)?)
+        .with_context(|| format!("parse sing-box config file {}", path.display()))?;
+    config.source_dir = path.parent().map(Path::to_path_buf);
+    Ok(config)
 }
 
 pub fn default_heartbeat_interval_secs() -> u64 {

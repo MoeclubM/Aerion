@@ -25,7 +25,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct SingBoxConfig {
@@ -35,6 +35,8 @@ pub struct SingBoxConfig {
     pub outbounds: Vec<SingBoxOutbound>,
     #[serde(default)]
     pub route: Option<SingBoxRouteConfig>,
+    #[serde(skip)]
+    pub source_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -114,6 +116,14 @@ pub struct SingBoxRuleSet {
     pub update_interval: Option<Value>,
     #[serde(default, rename = "download_detour")]
     pub download_detour: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SingBoxSourceRuleSet {
+    pub version: u64,
+    pub rules: Vec<SingBoxRouteRule>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -743,10 +753,10 @@ impl SingBoxConfig {
     }
 
     pub fn route_table(&self) -> Result<RouteTable> {
-        self.route
-            .as_ref()
-            .map(SingBoxRouteConfig::to_route_table)
-            .unwrap_or_else(|| Ok(RouteTable::default()))
+        match &self.route {
+            Some(route) => route.to_route_table(self.source_dir.as_deref()),
+            None => Ok(RouteTable::default()),
+        }
     }
 
     pub fn tun_enabled(&self) -> bool {
@@ -797,8 +807,8 @@ impl SingBoxConfig {
 }
 
 impl SingBoxRouteConfig {
-    pub fn to_route_table(&self) -> Result<RouteTable> {
-        let rule_sets = self.inline_rule_sets()?;
+    pub fn to_route_table(&self, source_dir: Option<&Path>) -> Result<RouteTable> {
+        let rule_sets = self.static_rule_sets(source_dir)?;
         let mut table = RouteTable {
             rules: Vec::new(),
             default: self
@@ -815,14 +825,17 @@ impl SingBoxRouteConfig {
         Ok(table)
     }
 
-    fn inline_rule_sets(&self) -> Result<BTreeMap<String, Vec<SingBoxRouteRule>>> {
+    fn static_rule_sets(
+        &self,
+        source_dir: Option<&Path>,
+    ) -> Result<BTreeMap<String, Vec<SingBoxRouteRule>>> {
         let mut rule_sets = BTreeMap::new();
         for rule_set in &self.rule_sets {
             let tag = rule_set.tag.trim();
             ensure!(!tag.is_empty(), "sing-box route.rule_set tag is empty");
             ensure!(
                 rule_sets
-                    .insert(tag.to_string(), rule_set.inline_rules()?)
+                    .insert(tag.to_string(), rule_set.static_rules(source_dir)?)
                     .is_none(),
                 "sing-box route.rule_set {tag} is duplicated"
             );
@@ -832,7 +845,7 @@ impl SingBoxRouteConfig {
 }
 
 impl SingBoxRuleSet {
-    fn inline_rules(&self) -> Result<Vec<SingBoxRouteRule>> {
+    fn static_rules(&self, source_dir: Option<&Path>) -> Result<Vec<SingBoxRouteRule>> {
         ensure!(
             self.extra.is_empty(),
             "sing-box route.rule_set {} has unsupported fields {:?}",
@@ -865,10 +878,7 @@ impl SingBoxRuleSet {
                 );
                 Ok(self.rules.clone())
             }
-            "local" => bail!(
-                "sing-box local route.rule_set {} requires loading external rule-set data",
-                self.tag
-            ),
+            "local" => self.local_source_rules(source_dir),
             "remote" => bail!(
                 "sing-box remote route.rule_set {} requires downloading rule-set data",
                 self.tag
@@ -878,6 +888,90 @@ impl SingBoxRuleSet {
                 self.tag
             ),
         }
+    }
+
+    fn local_source_rules(&self, source_dir: Option<&Path>) -> Result<Vec<SingBoxRouteRule>> {
+        ensure!(
+            self.rules.is_empty()
+                && self.url.is_none()
+                && self.http_client.is_none()
+                && self.update_interval.is_none()
+                && self.download_detour.is_none(),
+            "sing-box local route.rule_set {} sets inline/remote rule-set fields",
+            self.tag
+        );
+        let path = value_path(self.path.as_ref()).with_context(|| {
+            format!("sing-box local route.rule_set {} is missing path", self.tag)
+        })?;
+        let format = self.rule_set_format(Some(&path))?;
+        ensure!(
+            format == "source",
+            "sing-box local route.rule_set {} format {format} is not supported",
+            self.tag
+        );
+        let path = match (path.is_absolute(), source_dir) {
+            (true, _) | (false, None) => path,
+            (false, Some(source_dir)) => source_dir.join(path),
+        };
+        let text = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "read sing-box local route.rule_set {} file {}",
+                self.tag,
+                path.display()
+            )
+        })?;
+        let source: SingBoxSourceRuleSet = serde_json::from_str(&text).with_context(|| {
+            format!(
+                "parse sing-box local route.rule_set {} source file {}",
+                self.tag,
+                path.display()
+            )
+        })?;
+        ensure!(
+            source.extra.is_empty(),
+            "sing-box local route.rule_set {} source has unsupported fields {:?}",
+            self.tag,
+            source.extra.keys().collect::<Vec<_>>()
+        );
+        ensure!(
+            source.version > 0,
+            "sing-box local route.rule_set {} source version is invalid",
+            self.tag
+        );
+        ensure!(
+            !source.rules.is_empty(),
+            "sing-box local route.rule_set {} source has no rules",
+            self.tag
+        );
+        Ok(source.rules)
+    }
+
+    fn rule_set_format(&self, path: Option<&Path>) -> Result<String> {
+        if let Some(value) = &self.format {
+            return value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_ascii_lowercase())
+                .with_context(|| {
+                    format!(
+                        "sing-box route.rule_set {} format must be a string",
+                        self.tag
+                    )
+                });
+        }
+        let extension = path
+            .and_then(Path::extension)
+            .and_then(|value| value.to_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        if extension.eq_ignore_ascii_case("json") {
+            return Ok("source".to_string());
+        }
+        if extension.eq_ignore_ascii_case("srs") {
+            return Ok("binary".to_string());
+        }
+        bail!("sing-box route.rule_set {} is missing format", self.tag)
     }
 }
 
@@ -3107,6 +3201,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::protocol::ProxyTarget;
 
@@ -3358,7 +3454,79 @@ mod tests {
     }
 
     #[test]
-    fn rejects_singbox_external_route_rule_set() -> Result<()> {
+    fn compiles_singbox_local_source_route_rule_set() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(
+            dir.path().join("geo.json"),
+            r#"
+{
+  "version": 3,
+  "rules": [
+    { "domain_suffix": ["example.com"] },
+    {
+      "type": "logical",
+      "mode": "or",
+      "rules": [
+        { "ip_cidr": ["10.0.0.0/8"] },
+        { "domain_keyword": "video" }
+      ]
+    }
+  ]
+}
+"#,
+        )?;
+        let json = r#"
+{
+  "route": {
+    "rule_set": [
+      {
+        "type": "local",
+        "tag": "geo",
+        "format": "source",
+        "path": "geo.json"
+      }
+    ],
+    "rules": [
+      { "rule_set": ["geo"], "action": "route", "outbound": "direct" }
+    ],
+    "final": "proxy-b"
+  }
+}
+"#;
+        let mut config: SingBoxConfig = serde_json::from_str(json)?;
+        config.source_dir = Some(dir.path().to_path_buf());
+        let routes = config.route_table()?;
+        assert_eq!(routes.rules.len(), 3);
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(&ProxyTarget::Ip("10.1.2.3:443".parse()?), RouteNetwork::Tcp),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("video.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("unmatched.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-b".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_singbox_binary_route_rule_set() -> Result<()> {
         let json = r#"
 {
   "route": {
@@ -3378,8 +3546,35 @@ mod tests {
         let config: SingBoxConfig = serde_json::from_str(json)?;
         let error = config
             .route_table()
-            .expect_err("external rule-set loading must fail explicitly");
-        assert!(error.to_string().contains("external rule-set"));
+            .expect_err("binary rule-set loading must fail explicitly");
+        assert!(error.to_string().contains("format binary"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_singbox_remote_route_rule_set() -> Result<()> {
+        let json = r#"
+{
+  "route": {
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geo",
+        "format": "source",
+        "url": "https://rules.example.test/geo.json"
+      }
+    ],
+    "rules": [
+      { "rule_set": ["geo"], "outbound": "direct" }
+    ]
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("remote rule-set loading must fail explicitly");
+        assert!(error.to_string().contains("requires downloading"));
         Ok(())
     }
 
