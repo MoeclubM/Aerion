@@ -41,6 +41,8 @@ pub struct SingBoxConfig {
 pub struct SingBoxRouteConfig {
     #[serde(default)]
     pub rules: Vec<SingBoxRouteRule>,
+    #[serde(default, rename = "rule_set")]
+    pub rule_sets: Vec<SingBoxRuleSet>,
     #[serde(default, rename = "final")]
     pub final_outbound: Option<String>,
 }
@@ -81,6 +83,37 @@ pub struct SingBoxRouteRule {
     pub port: Option<Value>,
     #[serde(default, rename = "port_range")]
     pub port_range: Option<Value>,
+    #[serde(default, rename = "rule_set")]
+    pub rule_set: Option<Value>,
+    #[serde(
+        default,
+        rename = "rule_set_ip_cidr_match_source",
+        alias = "rule_set_ipcidr_match_source"
+    )]
+    pub rule_set_ip_cidr_match_source: bool,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct SingBoxRuleSet {
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    pub tag: String,
+    #[serde(default)]
+    pub rules: Vec<SingBoxRouteRule>,
+    #[serde(default)]
+    pub format: Option<Value>,
+    #[serde(default)]
+    pub path: Option<Value>,
+    #[serde(default)]
+    pub url: Option<Value>,
+    #[serde(default, rename = "http_client")]
+    pub http_client: Option<Value>,
+    #[serde(default, rename = "update_interval")]
+    pub update_interval: Option<Value>,
+    #[serde(default, rename = "download_detour")]
+    pub download_detour: Option<Value>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -765,6 +798,7 @@ impl SingBoxConfig {
 
 impl SingBoxRouteConfig {
     pub fn to_route_table(&self) -> Result<RouteTable> {
+        let rule_sets = self.inline_rule_sets()?;
         let mut table = RouteTable {
             rules: Vec::new(),
             default: self
@@ -776,14 +810,83 @@ impl SingBoxRouteConfig {
             ..RouteTable::default()
         };
         for (index, rule) in self.rules.iter().enumerate() {
-            table.rules.extend(rule.to_route_rules(index)?);
+            table.rules.extend(rule.to_route_rules(index, &rule_sets)?);
         }
         Ok(table)
+    }
+
+    fn inline_rule_sets(&self) -> Result<BTreeMap<String, Vec<SingBoxRouteRule>>> {
+        let mut rule_sets = BTreeMap::new();
+        for rule_set in &self.rule_sets {
+            let tag = rule_set.tag.trim();
+            ensure!(!tag.is_empty(), "sing-box route.rule_set tag is empty");
+            ensure!(
+                rule_sets
+                    .insert(tag.to_string(), rule_set.inline_rules()?)
+                    .is_none(),
+                "sing-box route.rule_set {tag} is duplicated"
+            );
+        }
+        Ok(rule_sets)
+    }
+}
+
+impl SingBoxRuleSet {
+    fn inline_rules(&self) -> Result<Vec<SingBoxRouteRule>> {
+        ensure!(
+            self.extra.is_empty(),
+            "sing-box route.rule_set {} has unsupported fields {:?}",
+            self.tag,
+            self.extra.keys().collect::<Vec<_>>()
+        );
+        let kind = self
+            .kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or("inline")
+            .to_ascii_lowercase();
+        match kind.as_str() {
+            "inline" => {
+                ensure!(
+                    self.format.is_none()
+                        && self.path.is_none()
+                        && self.url.is_none()
+                        && self.http_client.is_none()
+                        && self.update_interval.is_none()
+                        && self.download_detour.is_none(),
+                    "sing-box inline route.rule_set {} sets local/remote rule-set fields",
+                    self.tag
+                );
+                ensure!(
+                    !self.rules.is_empty(),
+                    "sing-box inline route.rule_set {} has no rules",
+                    self.tag
+                );
+                Ok(self.rules.clone())
+            }
+            "local" => bail!(
+                "sing-box local route.rule_set {} requires loading external rule-set data",
+                self.tag
+            ),
+            "remote" => bail!(
+                "sing-box remote route.rule_set {} requires downloading rule-set data",
+                self.tag
+            ),
+            other => bail!(
+                "unsupported sing-box route.rule_set {} type {other}",
+                self.tag
+            ),
+        }
     }
 }
 
 impl SingBoxRouteRule {
-    fn to_route_rules(&self, index: usize) -> Result<Vec<RouteRule>> {
+    fn to_route_rules(
+        &self,
+        index: usize,
+        rule_sets: &BTreeMap<String, Vec<SingBoxRouteRule>>,
+    ) -> Result<Vec<RouteRule>> {
         ensure!(
             self.extra.is_empty(),
             "sing-box route.rules[{index}] has unsupported fields {:?}",
@@ -795,7 +898,7 @@ impl SingBoxRouteRule {
             .map(str::trim)
             .filter(|kind| !kind.is_empty());
         if matches!(kind, Some(kind) if kind.eq_ignore_ascii_case("logical")) {
-            return self.to_logical_route_rules(index);
+            return self.to_logical_route_rules(index, None, rule_sets);
         }
         if let Some(kind) = kind {
             ensure!(
@@ -803,7 +906,47 @@ impl SingBoxRouteRule {
                 "unsupported sing-box route.rules[{index}] type {kind}"
             );
         }
-        Ok(vec![self.to_default_route_rule(index, None)?])
+        self.to_default_route_rules(index, None, rule_sets)
+    }
+
+    fn to_default_route_rules(
+        &self,
+        index: usize,
+        action_override: Option<&RouteDecision>,
+        rule_sets: &BTreeMap<String, Vec<SingBoxRouteRule>>,
+    ) -> Result<Vec<RouteRule>> {
+        ensure!(
+            !self.rule_set_ip_cidr_match_source,
+            "sing-box route.rules[{index}] rule_set_ip_cidr_match_source requires source IP matching"
+        );
+        let rule_set_refs = route_value_strings(self.rule_set.as_ref())?;
+        ensure!(
+            action_override.is_none() || rule_set_refs.is_empty(),
+            "sing-box route.rules[{index}] inherited-action rule uses nested rule_set"
+        );
+        let base = self.to_default_route_rule(index, action_override)?;
+        if rule_set_refs.is_empty() {
+            return Ok(vec![base]);
+        }
+        let action = base.action.clone();
+        let mut rules = Vec::new();
+        for tag in rule_set_refs {
+            let set_rules = rule_sets.get(&tag).with_context(|| {
+                format!("sing-box route.rules[{index}] rule_set {tag} is missing")
+            })?;
+            for set_rule in set_rules {
+                for branch in set_rule.to_child_route_rules(index, &action, rule_sets)? {
+                    let mut merged = base.clone();
+                    merge_singbox_and_route_rule(&mut merged, branch, index)?;
+                    rules.push(merged);
+                }
+            }
+        }
+        ensure!(
+            !rules.is_empty(),
+            "sing-box route.rules[{index}] rule_set expanded to no rules"
+        );
+        Ok(rules)
     }
 
     fn to_default_route_rule(
@@ -866,7 +1009,12 @@ impl SingBoxRouteRule {
         Ok(rule)
     }
 
-    fn to_logical_route_rules(&self, index: usize) -> Result<Vec<RouteRule>> {
+    fn to_logical_route_rules(
+        &self,
+        index: usize,
+        action_override: Option<&RouteDecision>,
+        rule_sets: &BTreeMap<String, Vec<SingBoxRouteRule>>,
+    ) -> Result<Vec<RouteRule>> {
         ensure!(
             !self.invert,
             "sing-box route.rules[{index}] logical invert requires negative route matching"
@@ -886,21 +1034,37 @@ impl SingBoxRouteRule {
             !self.has_match_fields(),
             "sing-box route.rules[{index}] logical rule sets parent match fields"
         );
-        let action = self.route_decision(index)?;
+        let action = match action_override {
+            Some(action) => {
+                ensure!(
+                    self.outbound.is_none() && self.action.is_none(),
+                    "sing-box route.rules[{index}] inherited logical child sets its own action"
+                );
+                action.clone()
+            }
+            None => self.route_decision(index)?,
+        };
         match mode.as_str() {
-            "or" => self
-                .rules
-                .iter()
-                .map(|rule| rule.to_child_route_rule(index, &action))
-                .collect(),
+            "or" => {
+                let mut rules = Vec::new();
+                for rule in &self.rules {
+                    rules.extend(rule.to_child_route_rules(index, &action, rule_sets)?);
+                }
+                Ok(rules)
+            }
             "and" => self
-                .to_logical_and_route_rule(index, &action)
+                .to_logical_and_route_rule(index, &action, rule_sets)
                 .map(|rule| vec![rule]),
             other => bail!("unsupported sing-box route.rules[{index}] logical mode {other}"),
         }
     }
 
-    fn to_child_route_rule(&self, index: usize, action: &RouteDecision) -> Result<RouteRule> {
+    fn to_child_route_rules(
+        &self,
+        index: usize,
+        action: &RouteDecision,
+        rule_sets: &BTreeMap<String, Vec<SingBoxRouteRule>>,
+    ) -> Result<Vec<RouteRule>> {
         ensure!(
             self.outbound.is_none() && self.action.is_none(),
             "sing-box route.rules[{index}] logical child sets its own action"
@@ -910,20 +1074,32 @@ impl SingBoxRouteRule {
             .as_deref()
             .map(str::trim)
             .filter(|kind| !kind.is_empty());
+        if matches!(kind, Some(kind) if kind.eq_ignore_ascii_case("logical")) {
+            return self.to_logical_route_rules(index, Some(action), rule_sets);
+        }
         if let Some(kind) = kind {
             ensure!(
                 kind.eq_ignore_ascii_case("default"),
                 "unsupported sing-box route.rules[{index}] logical child type {kind}"
             );
         }
-        self.to_default_route_rule(index, Some(action))
+        self.to_default_route_rules(index, Some(action), rule_sets)
     }
 
-    fn to_logical_and_route_rule(&self, index: usize, action: &RouteDecision) -> Result<RouteRule> {
+    fn to_logical_and_route_rule(
+        &self,
+        index: usize,
+        action: &RouteDecision,
+        rule_sets: &BTreeMap<String, Vec<SingBoxRouteRule>>,
+    ) -> Result<RouteRule> {
         let mut merged = RouteRule::new(action.clone());
         for child in &self.rules {
-            let rule = child.to_child_route_rule(index, action)?;
-            merge_singbox_and_route_rule(&mut merged, rule, index)?;
+            let mut rules = child.to_child_route_rules(index, action, rule_sets)?;
+            ensure!(
+                rules.len() == 1,
+                "sing-box route.rules[{index}] logical and child expands to multiple branches"
+            );
+            merge_singbox_and_route_rule(&mut merged, rules.remove(0), index)?;
         }
         Ok(merged)
     }
@@ -981,6 +1157,8 @@ impl SingBoxRouteRule {
             || self.ip_is_private
             || self.port.is_some()
             || self.port_range.is_some()
+            || self.rule_set.is_some()
+            || self.rule_set_ip_cidr_match_source
     }
 }
 
@@ -3116,6 +3294,92 @@ mod tests {
             ),
             RouteDecision::Proxy("proxy-b".to_string())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn compiles_singbox_inline_route_rule_set() -> Result<()> {
+        let json = r#"
+{
+  "route": {
+    "rule_set": [
+      {
+        "type": "inline",
+        "tag": "static-set",
+        "rules": [
+          { "domain_suffix": ["example.com"] },
+          {
+            "type": "logical",
+            "mode": "or",
+            "rules": [
+              { "ip_cidr": ["10.0.0.0/8"] },
+              { "domain_keyword": "video" }
+            ]
+          }
+        ]
+      }
+    ],
+    "rules": [
+      { "rule_set": ["static-set"], "action": "route", "outbound": "direct" }
+    ],
+    "final": "proxy-b"
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let routes = config.route_table()?;
+        assert_eq!(routes.rules.len(), 3);
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(&ProxyTarget::Ip("10.1.2.3:443".parse()?), RouteNetwork::Tcp),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("video.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("unmatched.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-b".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_singbox_external_route_rule_set() -> Result<()> {
+        let json = r#"
+{
+  "route": {
+    "rule_set": [
+      {
+        "type": "local",
+        "tag": "geo",
+        "path": "geo.srs"
+      }
+    ],
+    "rules": [
+      { "rule_set": ["geo"], "outbound": "direct" }
+    ]
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("external rule-set loading must fail explicitly");
+        assert!(error.to_string().contains("external rule-set"));
         Ok(())
     }
 
