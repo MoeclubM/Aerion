@@ -49,8 +49,9 @@ pub use core::{
     CoreEvent, CoreSession, CoreUser, CoreUserLimits, ProxyCore, TrafficDirection, TrafficSnapshot,
 };
 pub use http_connect::{
-    HttpConnectInboundConfig, handle_http_connect, run_http_connect_listener,
-    run_http_connect_listener_until,
+    HttpConnectInboundConfig, HttpProxyClientConfig, handle_http_connect,
+    run_http_connect_listener, run_http_connect_listener_until, run_http_proxy_client,
+    run_http_proxy_client_listener,
 };
 pub use hysteria2::{
     Hysteria2ClientConfig, Hysteria2ServerConfig, run_hysteria2_client,
@@ -89,6 +90,7 @@ pub use shadowsocks::{
     ShadowsocksClientConfig, ShadowsocksServerConfig, run_shadowsocks_client,
     run_shadowsocks_client_listener, run_shadowsocks_server,
 };
+pub use socks::{SocksProxyClientConfig, run_socks_proxy_client, run_socks_proxy_client_listener};
 pub use trojan::{
     TrojanClientConfig, TrojanServerConfig, run_trojan_client, run_trojan_client_listener,
     run_trojan_server, run_trojan_server_with_core,

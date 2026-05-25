@@ -37,6 +37,15 @@ Aerion now provides these server/client protocol stacks:
   - Basic authentication, TLS SNI verification, optional extra headers
   - UOT-style SOCKS5 UDP ASSOCIATE when UDP-over-TCP is enabled
   - Naive-compatible randomized padding chunks for tunnel payloads
+- HTTP proxy:
+  - local SOCKS5 CONNECT client over upstream HTTP/1.1 CONNECT proxy
+  - plain HTTP and TLS-wrapped HTTPS proxy upstreams
+  - Basic authentication, TLS SNI verification, optional extra headers
+  - mihomo `http`, sing-box `http`, and Xray `http` outbound profile mapping
+- SOCKS proxy:
+  - local SOCKS5 CONNECT and UDP ASSOCIATE client over upstream SOCKS5 proxy
+  - no-auth and username/password upstream authentication
+  - mihomo `socks5`, sing-box `socks`, and Xray `socks` outbound profile mapping
 - Shadowsocks:
   - local SOCKS5 CONNECT and UDP ASSOCIATE client
   - TCP and UDP server relay
@@ -94,13 +103,14 @@ Aerion now provides these server/client protocol stacks:
     built-in handshake transcript
   - config compatibility is stored separately under `src/config_compat/`
   - `MihomoConfig` parses Clash.Meta / mihomo-style `proxies:` YAML for
-    Shadowsocks, VLESS, VMess, Trojan, Hysteria2, AnyTLS, Mieru, Naive, and
-    TUIC core profiles
+    Shadowsocks, HTTP proxy, VLESS, VMess, Trojan, Hysteria2, AnyTLS, Mieru,
+    Naive, and TUIC core profiles
   - `XrayConfig` parses Xray JSON / JSONC `inbounds` and `outbounds`
-    profiles with Shadowsocks, VLESS, VMess, Trojan, and Hysteria2 selection helpers
+    profiles with Shadowsocks, HTTP proxy, VLESS, VMess, Trojan, and Hysteria2
+    selection helpers
   - `SingBoxConfig` parses sing-box JSON / JSONC `inbounds` and `outbounds`
-    profiles with Shadowsocks, VLESS, VMess, Trojan, Hysteria2, AnyTLS, Naive,
-    and TUIC selection helpers
+    profiles with Shadowsocks, HTTP proxy, VLESS, VMess, Trojan, Hysteria2,
+    AnyTLS, Naive, and TUIC selection helpers
   - protocol modules expose the bottom-level connection capability; profile
     selection and service/app policy stay in the integrating client or server
   - unsupported transport mismatches such as mihomo `smux` fail with explicit
@@ -176,6 +186,7 @@ cargo run -- run --config config.client.example.toml --profile anytls
 cargo run -- run --config config.client.example.toml --profile hysteria2
 cargo run -- run --config config.client.example.toml --profile mieru-tcp
 cargo run -- run --config config.client.example.toml --profile naive-h2
+cargo run -- run --config config.client.example.toml --profile http-proxy
 cargo run -- run --config config.client.example.toml --profile tuic
 cargo run -- run --config config.client.example.toml --profile shadowsocks
 cargo run -- run --config config.client.example.toml --profile trojan
@@ -194,12 +205,18 @@ cargo run -- run --config config.mihomo.example.yaml --profile anytls
 cargo run -- run --config config.mihomo.example.yaml --profile shadowsocks
 cargo run -- run --config config.mihomo.example.yaml --profile mieru-tcp
 cargo run -- run --config config.mihomo.example.yaml --profile naive-h2
+cargo run -- run --config config.mihomo.example.yaml --profile http-proxy
+cargo run -- run --config config.mihomo.example.yaml --profile socks-proxy
 cargo run -- run --config config.xray.example.json --profile vless-reality
+cargo run -- run --config config.xray.example.json --profile http-proxy
+cargo run -- run --config config.xray.example.json --profile socks-proxy
 cargo run -- run --config config.xray.example.json --profile shadowsocks
 cargo run -- run --config config.xray.example.json --profile hysteria2
 cargo run -- run --config config.singbox.example.json --profile anytls
 cargo run -- run --config config.singbox.example.json --profile shadowsocks
 cargo run -- run --config config.singbox.example.json --profile naive-h2
+cargo run -- run --config config.singbox.example.json --profile http-proxy
+cargo run -- run --config config.singbox.example.json --profile socks-proxy
 ```
 
 Aerion-native TOML can keep multiple `[[clients]]` or `[[servers]]` profiles in
@@ -218,8 +235,9 @@ server; set `transport = "quic"` or `protocol = "naive+quic"` for HTTP/3.
 For Naive HTTP/3, `quic_congestion_control` accepts `bbr`, `cubic`, `reno`,
 `newreno`, or `new_reno` and defaults to `bbr`. TLS clients accept
 `ca_cert_paths` / sing-box `tls.certificate_path` custom TLS roots.
-Aerion-native TOML also runs Shadowsocks, Trojan, VLESS, and VMess client and
-server profiles.
+Aerion-native TOML also runs HTTP proxy, Shadowsocks, Trojan, VLESS, and VMess
+client profiles, SOCKS proxy client profiles, plus Shadowsocks, Trojan, VLESS,
+and VMess server profiles.
 
 The CLI can run mihomo YAML, Xray JSON/JSONC, and sing-box JSON/JSONC client
 profiles directly. If those files contain multiple proxies/outbounds, select one

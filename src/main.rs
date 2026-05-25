@@ -2,7 +2,10 @@ use aerion::config::{
     AerionFileConfig, ClientFileConfig, FileConfig, ServerFileConfig,
     default_heartbeat_interval_secs, load_config,
 };
-use aerion::http_connect::{HttpConnectInboundConfig, run_http_connect_listener};
+use aerion::http_connect::{
+    HttpConnectInboundConfig, HttpProxyClientConfig, run_http_connect_listener,
+    run_http_proxy_client, run_http_proxy_client_listener,
+};
 use aerion::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
 use aerion::mieru::{
     MieruClientConfig, MieruServerConfig, MieruTrafficPattern, MieruTransport, parse_mieru_user,
@@ -18,15 +21,17 @@ use aerion::{
     ClientConfig, MihomoClientConfig, MihomoProxy, RealityClientConfig, RealityServerConfig,
     RouteDecision, RouteProxyConfig, RouteTable, ServerConfig, ShadowsocksClientConfig,
     ShadowsocksServerConfig, SingBoxClientConfig, SingBoxOutbound, SingBoxServerConfig,
-    TrojanClientConfig, TrojanServerConfig, VlessClientConfig, VlessServerConfig,
-    VmessClientConfig, VmessServerConfig, XrayClientConfig, XrayOutbound, XrayServerConfig,
-    run_client, run_client_listener, run_hysteria2_client, run_hysteria2_client_listener,
-    run_hysteria2_server, run_mieru_client, run_mieru_client_listener, run_mieru_server,
-    run_naive_client, run_naive_client_listener, run_naive_server, run_route_proxy, run_server,
-    run_shadowsocks_client, run_shadowsocks_client_listener, run_shadowsocks_server,
-    run_trojan_client, run_trojan_client_listener, run_trojan_server, run_tuic_client,
-    run_tuic_client_listener, run_tuic_server, run_vless_client, run_vless_client_listener,
-    run_vless_server, run_vmess_client, run_vmess_client_listener, run_vmess_server, tls,
+    SocksProxyClientConfig, TrojanClientConfig, TrojanServerConfig, VlessClientConfig,
+    VlessServerConfig, VmessClientConfig, VmessServerConfig, XrayClientConfig, XrayOutbound,
+    XrayServerConfig, run_client, run_client_listener, run_hysteria2_client,
+    run_hysteria2_client_listener, run_hysteria2_server, run_mieru_client,
+    run_mieru_client_listener, run_mieru_server, run_naive_client, run_naive_client_listener,
+    run_naive_server, run_route_proxy, run_server, run_shadowsocks_client,
+    run_shadowsocks_client_listener, run_shadowsocks_server, run_socks_proxy_client,
+    run_socks_proxy_client_listener, run_trojan_client, run_trojan_client_listener,
+    run_trojan_server, run_tuic_client, run_tuic_client_listener, run_tuic_server,
+    run_vless_client, run_vless_client_listener, run_vless_server, run_vmess_client,
+    run_vmess_client_listener, run_vmess_server, tls,
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
@@ -568,10 +573,12 @@ async fn main() -> Result<()> {
 
 enum RunnableClientConfig {
     AnyTls(ClientConfig),
+    HttpProxy(HttpProxyClientConfig),
     Hysteria2(Hysteria2ClientConfig),
     Mieru(MieruClientConfig),
     Naive(NaiveClientConfig),
     Shadowsocks(ShadowsocksClientConfig),
+    SocksProxy(SocksProxyClientConfig),
     Trojan(TrojanClientConfig),
     Tuic(TuicClientConfig),
     Vless(VlessClientConfig),
@@ -582,10 +589,12 @@ impl From<MihomoClientConfig> for RunnableClientConfig {
     fn from(config: MihomoClientConfig) -> Self {
         match config {
             MihomoClientConfig::AnyTls(config) => Self::AnyTls(config),
+            MihomoClientConfig::HttpProxy(config) => Self::HttpProxy(config),
             MihomoClientConfig::Hysteria2(config) => Self::Hysteria2(config),
             MihomoClientConfig::Mieru(config) => Self::Mieru(config),
             MihomoClientConfig::Naive(config) => Self::Naive(config),
             MihomoClientConfig::Shadowsocks(config) => Self::Shadowsocks(config),
+            MihomoClientConfig::SocksProxy(config) => Self::SocksProxy(config),
             MihomoClientConfig::Trojan(config) => Self::Trojan(config),
             MihomoClientConfig::Tuic(config) => Self::Tuic(config),
             MihomoClientConfig::Vless(config) => Self::Vless(config),
@@ -598,9 +607,11 @@ impl From<SingBoxClientConfig> for RunnableClientConfig {
     fn from(config: SingBoxClientConfig) -> Self {
         match config {
             SingBoxClientConfig::AnyTls(config) => Self::AnyTls(config),
+            SingBoxClientConfig::HttpProxy(config) => Self::HttpProxy(config),
             SingBoxClientConfig::Hysteria2(config) => Self::Hysteria2(config),
             SingBoxClientConfig::Naive(config) => Self::Naive(config),
             SingBoxClientConfig::Shadowsocks(config) => Self::Shadowsocks(config),
+            SingBoxClientConfig::SocksProxy(config) => Self::SocksProxy(config),
             SingBoxClientConfig::Trojan(config) => Self::Trojan(config),
             SingBoxClientConfig::Tuic(config) => Self::Tuic(config),
             SingBoxClientConfig::Vless(config) => Self::Vless(config),
@@ -612,8 +623,10 @@ impl From<SingBoxClientConfig> for RunnableClientConfig {
 impl From<XrayClientConfig> for RunnableClientConfig {
     fn from(config: XrayClientConfig) -> Self {
         match config {
+            XrayClientConfig::HttpProxy(config) => Self::HttpProxy(config),
             XrayClientConfig::Hysteria2(config) => Self::Hysteria2(config),
             XrayClientConfig::Shadowsocks(config) => Self::Shadowsocks(config),
+            XrayClientConfig::SocksProxy(config) => Self::SocksProxy(config),
             XrayClientConfig::Trojan(config) => Self::Trojan(config),
             XrayClientConfig::Vless(config) => Self::Vless(config),
             XrayClientConfig::Vmess(config) => Self::Vmess(config),
@@ -964,6 +977,65 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
             password: client.password,
             udp: client.udp,
             udp_over_tcp: client.udp_over_tcp,
+        })
+        .await;
+    }
+    if is_http_proxy(&client.protocol) {
+        let tls = client.tls.unwrap_or_else(|| {
+            client.protocol.eq_ignore_ascii_case("https")
+                || client.protocol.eq_ignore_ascii_case("https-proxy")
+                || client.protocol.eq_ignore_ascii_case("http+tls")
+        });
+        ensure!(
+            tls || (!client.insecure
+                && client.ca_cert_paths.is_empty()
+                && client.ca_certificates.is_empty()
+                && !client.disable_system_roots
+                && client.pinned_cert_sha256.is_empty()
+                && client.client_fingerprint.is_none()),
+            "HTTP proxy client sets TLS-only options while TLS is disabled"
+        );
+        return run_http_proxy_client(HttpProxyClientConfig {
+            listen: client.listen,
+            server_host,
+            server_port,
+            username: client.username,
+            password: client.password,
+            tls,
+            sni,
+            insecure: client.insecure,
+            ca_cert_paths: client.ca_cert_paths,
+            ca_certificates: client.ca_certificates,
+            disable_system_roots: client.disable_system_roots,
+            pinned_cert_sha256: client.pinned_cert_sha256,
+            client_fingerprint: client.client_fingerprint,
+            extra_headers: client.headers.into_iter().collect(),
+        })
+        .await;
+    }
+    if is_socks_proxy(&client.protocol) {
+        ensure!(
+            !client.tls.unwrap_or(false)
+                && !client.insecure
+                && client.ca_cert_paths.is_empty()
+                && client.ca_certificates.is_empty()
+                && !client.disable_system_roots
+                && client.pinned_cert_sha256.is_empty()
+                && client.client_fingerprint.is_none()
+                && client.alpn_protocols.is_empty(),
+            "SOCKS proxy client sets TLS-only options"
+        );
+        ensure!(
+            client.headers.is_empty(),
+            "SOCKS proxy client sets HTTP headers; SOCKS does not use headers"
+        );
+        return run_socks_proxy_client(SocksProxyClientConfig {
+            listen: client.listen,
+            server_host,
+            server_port,
+            username: client.username,
+            password: client.password,
+            udp: client.udp,
         })
         .await;
     }
@@ -1322,10 +1394,12 @@ fn native_tls_paths(server: &ServerFileConfig, protocol: &str) -> Result<(PathBu
 async fn run_client_config(config: RunnableClientConfig) -> Result<()> {
     match config {
         RunnableClientConfig::AnyTls(config) => run_client(config).await,
+        RunnableClientConfig::HttpProxy(config) => run_http_proxy_client(config).await,
         RunnableClientConfig::Hysteria2(config) => run_hysteria2_client(config).await,
         RunnableClientConfig::Mieru(config) => run_mieru_client(config).await,
         RunnableClientConfig::Naive(config) => run_naive_client(config).await,
         RunnableClientConfig::Shadowsocks(config) => run_shadowsocks_client(config).await,
+        RunnableClientConfig::SocksProxy(config) => run_socks_proxy_client(config).await,
         RunnableClientConfig::Trojan(config) => run_trojan_client(config).await,
         RunnableClientConfig::Tuic(config) => run_tuic_client(config).await,
         RunnableClientConfig::Vless(config) => run_vless_client(config).await,
@@ -1345,6 +1419,9 @@ async fn run_client_config_with_listener(
 ) -> Result<()> {
     match config {
         RunnableClientConfig::AnyTls(config) => run_client_listener(listener, config, None).await,
+        RunnableClientConfig::HttpProxy(config) => {
+            run_http_proxy_client_listener(listener, config).await
+        }
         RunnableClientConfig::Hysteria2(config) => {
             run_hysteria2_client_listener(listener, config).await
         }
@@ -1352,6 +1429,9 @@ async fn run_client_config_with_listener(
         RunnableClientConfig::Naive(config) => run_naive_client_listener(listener, config).await,
         RunnableClientConfig::Shadowsocks(config) => {
             run_shadowsocks_client_listener(listener, config).await
+        }
+        RunnableClientConfig::SocksProxy(config) => {
+            run_socks_proxy_client_listener(listener, config).await
         }
         RunnableClientConfig::Trojan(config) => {
             run_trojan_client_listener(listener, config, None).await
@@ -1650,6 +1730,20 @@ fn is_naive(protocol: &str) -> bool {
 
 fn is_shadowsocks(protocol: &str) -> bool {
     protocol.eq_ignore_ascii_case("shadowsocks") || protocol.eq_ignore_ascii_case("ss")
+}
+
+fn is_socks_proxy(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case("socks")
+        || protocol.eq_ignore_ascii_case("socks5")
+        || protocol.eq_ignore_ascii_case("socks5h")
+}
+
+fn is_http_proxy(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case("http")
+        || protocol.eq_ignore_ascii_case("https")
+        || protocol.eq_ignore_ascii_case("http-proxy")
+        || protocol.eq_ignore_ascii_case("https-proxy")
+        || protocol.eq_ignore_ascii_case("http+tls")
 }
 
 fn is_trojan(protocol: &str) -> bool {

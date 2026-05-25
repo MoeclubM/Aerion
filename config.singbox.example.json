@@ -102,6 +102,26 @@
       }
     },
     {
+      "type": "http",
+      "tag": "http-proxy",
+      "server": "example.com",
+      "server_port": 8080,
+      "username": "user",
+      "password": "secret",
+      "headers": {
+        "X-Aerion": "example"
+      }
+    },
+    {
+      "type": "socks",
+      "tag": "socks-proxy",
+      "server": "example.com",
+      "server_port": 1080,
+      "username": "user",
+      "password": "secret",
+      "network": "tcp+udp"
+    },
+    {
       "type": "tuic",
       "tag": "tuic-v5",
       "server": "example.com",

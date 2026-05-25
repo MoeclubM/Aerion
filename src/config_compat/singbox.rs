@@ -1,5 +1,6 @@
 use crate::client::ClientConfig;
 use crate::config_compat::mihomo::OneOrManyStrings;
+use crate::http_connect::HttpProxyClientConfig;
 use crate::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
 use crate::naive::{NaiveClientConfig, NaiveServerConfig, default_naive_quic_congestion_control};
 use crate::padding::PaddingScheme;
@@ -9,6 +10,7 @@ use crate::routing::{
 };
 use crate::server::ServerConfig;
 use crate::shadowsocks::{ShadowsocksClientConfig, ShadowsocksServerConfig};
+use crate::socks::SocksProxyClientConfig;
 use crate::trojan::{TrojanClientConfig, TrojanServerConfig};
 use crate::tuic::{TuicClientConfig, TuicServerConfig};
 use crate::tun::{TunConfig, socks_proxy_url};
@@ -375,6 +377,34 @@ pub struct SingBoxShadowsocksOutbound {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxSocksOutbound {
+    pub server: String,
+    #[serde(rename = "server_port")]
+    pub server_port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub network: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxHttpOutbound {
+    pub server: String,
+    #[serde(rename = "server_port")]
+    pub server_port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub tls: Option<SingBoxTlsOptions>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct SingBoxHysteria2Outbound {
     #[serde(default)]
     pub server: Option<String>,
@@ -560,6 +590,8 @@ pub struct SingBoxHysteria2Obfs {
 #[derive(Clone, Debug)]
 pub enum SingBoxClientConfig {
     Shadowsocks(ShadowsocksClientConfig),
+    SocksProxy(SocksProxyClientConfig),
+    HttpProxy(HttpProxyClientConfig),
     Vless(VlessClientConfig),
     Vmess(VmessClientConfig),
     Trojan(TrojanClientConfig),
@@ -1400,6 +1432,14 @@ impl SingBoxOutbound {
                 self.decode::<SingBoxShadowsocksOutbound>()?
                     .to_client_config(self.name(), listen)?,
             )),
+            "socks" | "socks5" => Ok(SingBoxClientConfig::SocksProxy(
+                self.decode::<SingBoxSocksOutbound>()?
+                    .to_client_config(self.name(), listen)?,
+            )),
+            "http" => Ok(SingBoxClientConfig::HttpProxy(
+                self.decode::<SingBoxHttpOutbound>()?
+                    .to_client_config(self.name(), listen)?,
+            )),
             "vless" => Ok(SingBoxClientConfig::Vless(
                 self.decode::<SingBoxVlessOutbound>()?
                     .to_client_config(self.name(), listen)?,
@@ -1461,6 +1501,87 @@ impl SingBoxShadowsocksOutbound {
             password: self.password.clone(),
             udp: network_allows_udp(self.network.as_deref()) || udp_over_tcp,
             udp_over_tcp,
+        })
+    }
+}
+
+impl SingBoxSocksOutbound {
+    pub fn to_client_config(
+        &self,
+        name: &str,
+        listen: SocketAddr,
+    ) -> Result<SocksProxyClientConfig> {
+        let (tcp, udp) = tcp_udp_network("sing-box SOCKS outbound", name, self.network.as_deref())?;
+        ensure!(
+            tcp,
+            "sing-box SOCKS outbound {name} uses udp-only network; Aerion SOCKS outbound requires TCP control channel"
+        );
+        Ok(SocksProxyClientConfig {
+            listen,
+            server_host: self.server.clone(),
+            server_port: self.server_port,
+            username: self.username.clone().unwrap_or_default(),
+            password: self.password.clone().unwrap_or_default(),
+            udp,
+        })
+    }
+}
+
+impl SingBoxHttpOutbound {
+    pub fn to_client_config(
+        &self,
+        name: &str,
+        listen: SocketAddr,
+    ) -> Result<HttpProxyClientConfig> {
+        let tls_enabled = self.tls.as_ref().map(|tls| tls.enabled).unwrap_or(false);
+        if let Some(tls) = &self.tls {
+            tls.ensure_supported_client_options("HTTP", name, true)?;
+            if tls_enabled {
+                ensure_http_alpn("sing-box", name, tls.alpn.as_ref())?;
+            } else {
+                ensure_disabled_utls(name, tls)?;
+                ensure_disabled_reality(name, tls)?;
+                ensure!(
+                    alpn_values(tls.alpn.as_ref()).is_empty()
+                        && !tls.insecure
+                        && !tls.disable_system_root
+                        && !json_value_non_empty_option(tls.certificate.as_ref())
+                        && !json_value_non_empty_option(tls.certificate_path.as_ref()),
+                    "sing-box HTTP outbound {name} sets TLS-only options while tls.enabled is false"
+                );
+            }
+        }
+        Ok(HttpProxyClientConfig {
+            listen,
+            server_host: self.server.clone(),
+            server_port: self.server_port,
+            username: self.username.clone().unwrap_or_default(),
+            password: self.password.clone().unwrap_or_default(),
+            tls: tls_enabled,
+            sni: sni_or_server(
+                self.tls.as_ref().and_then(|tls| tls.server_name.as_deref()),
+                &self.server,
+            ),
+            insecure: self.tls.as_ref().map(|tls| tls.insecure).unwrap_or(false),
+            ca_cert_paths: value_paths(
+                self.tls
+                    .as_ref()
+                    .and_then(|tls| tls.certificate_path.as_ref()),
+            )?,
+            ca_certificates: Vec::new(),
+            disable_system_roots: self
+                .tls
+                .as_ref()
+                .map(|tls| tls.disable_system_root)
+                .unwrap_or(false),
+            pinned_cert_sha256: Vec::new(),
+            client_fingerprint: self
+                .tls
+                .as_ref()
+                .map(|tls| tls.utls_fingerprint(name))
+                .transpose()?
+                .flatten(),
+            extra_headers: self.headers.clone().into_iter().collect(),
         })
     }
 }
@@ -2176,6 +2297,16 @@ fn ensure_tuic_alpn(format: &str, name: &str, alpn: Option<&OneOrManyStrings>) -
     ensure!(
         values.is_empty() || values.iter().any(|value| value.eq_ignore_ascii_case("h3")),
         "{format} TUIC outbound {name} sets ALPN {:?}; TUIC over QUIC requires h3-compatible ALPN",
+        values
+    );
+    Ok(())
+}
+
+fn ensure_http_alpn(format: &str, name: &str, alpn: Option<&OneOrManyStrings>) -> Result<()> {
+    let values = alpn_values(alpn);
+    ensure!(
+        values.is_empty() || (values.len() == 1 && values[0].eq_ignore_ascii_case("http/1.1")),
+        "{format} HTTP outbound {name} sets ALPN {:?}; Aerion HTTP proxy outbound uses HTTP/1.1 CONNECT",
         values
     );
     Ok(())
@@ -3758,6 +3889,84 @@ mod tests {
                 .to_string()
                 .contains("udp_over_stream")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_http_outbound_to_client_config() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "type": "http",
+      "tag": "http-proxy",
+      "server": "proxy.example.com",
+      "server_port": 8443,
+      "username": "user",
+      "password": "pass",
+      "headers": {
+        "X-Test": "value"
+      },
+      "tls": {
+        "enabled": true,
+        "server_name": "front.example.com",
+        "insecure": true,
+        "alpn": "http/1.1",
+        "utls": { "enabled": true, "fingerprint": "chrome" }
+      }
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxClientConfig::HttpProxy(http) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected HTTP proxy")
+        };
+        assert_eq!(http.server_host, "proxy.example.com");
+        assert_eq!(http.server_port, 8443);
+        assert_eq!(http.username, "user");
+        assert_eq!(http.password, "pass");
+        assert!(http.tls);
+        assert_eq!(http.sni, "front.example.com");
+        assert!(http.insecure);
+        assert_eq!(http.client_fingerprint, Some(UtlsFingerprint::Chrome));
+        assert_eq!(
+            http.extra_headers,
+            vec![("X-Test".to_string(), "value".to_string())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_socks_outbound_to_client_config() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-proxy",
+      "server": "proxy.example.com",
+      "server_port": 1080,
+      "username": "user",
+      "password": "pass",
+      "network": "tcp+udp"
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxClientConfig::SocksProxy(socks) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected SOCKS proxy")
+        };
+        assert_eq!(socks.server_host, "proxy.example.com");
+        assert_eq!(socks.server_port, 1080);
+        assert_eq!(socks.username, "user");
+        assert_eq!(socks.password, "pass");
+        assert!(socks.udp);
         Ok(())
     }
 }

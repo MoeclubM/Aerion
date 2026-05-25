@@ -1,10 +1,12 @@
 use crate::config_compat::mihomo::OneOrManyStrings;
+use crate::http_connect::HttpProxyClientConfig;
 use crate::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
 use crate::reality::{RealityClientConfig, RealityServerConfig};
 use crate::routing::{
     DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
 };
 use crate::shadowsocks::{ShadowsocksClientConfig, ShadowsocksServerConfig};
+use crate::socks::SocksProxyClientConfig;
 use crate::trojan::{TrojanClientConfig, TrojanServerConfig};
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::{VlessClientConfig, VlessServerConfig};
@@ -150,6 +152,12 @@ pub struct XrayOutboundSettings {
     #[serde(default)]
     pub auth: Option<String>,
     #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default, rename = "pass")]
+    pub pass: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
     pub network: Option<String>,
     #[serde(default)]
     pub flow: Option<String>,
@@ -211,6 +219,16 @@ pub struct XrayServer {
     pub password: Option<String>,
     #[serde(default)]
     pub method: Option<String>,
+    #[serde(default)]
+    pub users: Vec<XrayHttpUser>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct XrayHttpUser {
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default, rename = "pass")]
+    pub pass: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -471,7 +489,9 @@ pub struct XrayMuxOptions {
 
 #[derive(Clone, Debug)]
 pub enum XrayClientConfig {
+    HttpProxy(HttpProxyClientConfig),
     Shadowsocks(ShadowsocksClientConfig),
+    SocksProxy(SocksProxyClientConfig),
     Vless(VlessClientConfig),
     Vmess(VmessClientConfig),
     Trojan(TrojanClientConfig),
@@ -1204,6 +1224,12 @@ impl XrayOutbound {
             "shadowsocks" | "ss" => Ok(XrayClientConfig::Shadowsocks(
                 self.to_shadowsocks_client_config(listen)?,
             )),
+            "socks" | "socks5" => Ok(XrayClientConfig::SocksProxy(
+                self.to_socks_client_config(listen)?,
+            )),
+            "http" => Ok(XrayClientConfig::HttpProxy(
+                self.to_http_client_config(listen)?,
+            )),
             "vless" => Ok(XrayClientConfig::Vless(
                 self.to_vless_client_config(listen)?,
             )),
@@ -1218,6 +1244,161 @@ impl XrayOutbound {
             )),
             other => bail!("unsupported xray outbound protocol {other}"),
         }
+    }
+
+    fn to_http_client_config(&self, listen: SocketAddr) -> Result<HttpProxyClientConfig> {
+        ensure!(
+            !self.mux.as_ref().map(|mux| mux.enabled).unwrap_or(false),
+            "xray HTTP outbound {} enables mux; HTTP CONNECT proxying does not use Xray mux",
+            self.name()
+        );
+        let stream_security = self.stream_settings.security.trim();
+        ensure!(
+            stream_security.is_empty()
+                || stream_security.eq_ignore_ascii_case("none")
+                || stream_security.eq_ignore_ascii_case("tls"),
+            "xray HTTP outbound {} uses stream security {}; Aerion HTTP proxy supports raw TCP or TLS",
+            self.name(),
+            stream_security
+        );
+        let tls_enabled = stream_security.eq_ignore_ascii_case("tls");
+        if tls_enabled {
+            ensure_http_alpn("xray", self.name(), self.stream_alpn())?;
+        } else {
+            ensure_no_alpn("xray", self.name(), self.stream_alpn())?;
+        }
+        let tls = self.stream_settings.tls_settings.as_ref();
+        if !tls_enabled {
+            ensure!(
+                tls.is_none_or(|settings| {
+                    !settings.allow_insecure
+                        && settings.fingerprint.is_none()
+                        && settings
+                            .server_name
+                            .as_deref()
+                            .map(str::trim)
+                            .unwrap_or_default()
+                            .is_empty()
+                        && !settings.disable_system_root
+                        && settings.pinned_peer_cert_sha256.is_none()
+                        && settings.certificates.is_empty()
+                }),
+                "xray HTTP outbound {} sets TLS-only options while stream security is not tls",
+                self.name()
+            );
+        }
+        let (ca_cert_paths, ca_certificates) = if tls_enabled {
+            xray_tls_client_roots(tls)?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let server = self.first_trojan_server()?;
+        let server_user = server.users.first();
+        let server_host = server.address.clone();
+        Ok(HttpProxyClientConfig {
+            listen,
+            server_host: server_host.clone(),
+            server_port: server.port,
+            username: self
+                .settings
+                .user
+                .clone()
+                .or_else(|| server_user.and_then(|user| user.user.clone()))
+                .unwrap_or_default(),
+            password: self
+                .settings
+                .pass
+                .clone()
+                .or_else(|| server_user.and_then(|user| user.pass.clone()))
+                .unwrap_or_default(),
+            tls: tls_enabled,
+            sni: sni_or_server(
+                tls.and_then(|settings| settings.server_name.as_deref()),
+                &server_host,
+                self.name(),
+            ),
+            insecure: if tls_enabled {
+                tls.map(|settings| settings.allow_insecure).unwrap_or(false)
+            } else {
+                false
+            },
+            ca_cert_paths,
+            ca_certificates,
+            disable_system_roots: xray_disable_system_roots(tls, tls_enabled),
+            pinned_cert_sha256: xray_pinned_cert_sha256(tls, tls_enabled),
+            client_fingerprint: if tls_enabled {
+                tls.and_then(|settings| settings.fingerprint)
+            } else {
+                None
+            },
+            extra_headers: self.settings.headers.clone().into_iter().collect(),
+        })
+    }
+
+    fn to_socks_client_config(&self, listen: SocketAddr) -> Result<SocksProxyClientConfig> {
+        ensure!(
+            !self.mux.as_ref().map(|mux| mux.enabled).unwrap_or(false),
+            "xray SOCKS outbound {} enables mux; SOCKS proxying does not use Xray mux",
+            self.name()
+        );
+        ensure_tcp_network("xray SOCKS", self.name(), &self.stream_settings.network)?;
+        let stream_security = self.stream_settings.security.trim();
+        ensure!(
+            stream_security.is_empty() || stream_security.eq_ignore_ascii_case("none"),
+            "xray SOCKS outbound {} uses stream security {}; Aerion SOCKS outbound is plain SOCKS5",
+            self.name(),
+            stream_security
+        );
+        ensure_no_alpn("xray", self.name(), self.stream_alpn())?;
+        let tls = self.stream_settings.tls_settings.as_ref();
+        ensure!(
+            tls.is_none_or(|settings| {
+                !settings.allow_insecure
+                    && settings.fingerprint.is_none()
+                    && settings
+                        .server_name
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .is_empty()
+                    && !settings.disable_system_root
+                    && settings.pinned_peer_cert_sha256.is_none()
+                    && settings.certificates.is_empty()
+            }),
+            "xray SOCKS outbound {} sets TLS-only options",
+            self.name()
+        );
+        ensure!(
+            self.settings.headers.is_empty(),
+            "xray SOCKS outbound {} sets HTTP headers; SOCKS does not use headers",
+            self.name()
+        );
+        let (tcp, udp) = xray_tcp_udp_outbound_network(self.settings.network.as_deref())?;
+        ensure!(
+            tcp,
+            "xray SOCKS outbound {} uses udp-only network; Aerion SOCKS outbound requires TCP control channel",
+            self.name()
+        );
+        let server = self.first_trojan_server()?;
+        let server_user = server.users.first();
+        Ok(SocksProxyClientConfig {
+            listen,
+            server_host: server.address.clone(),
+            server_port: server.port,
+            username: self
+                .settings
+                .user
+                .clone()
+                .or_else(|| server_user.and_then(|user| user.user.clone()))
+                .unwrap_or_default(),
+            password: self
+                .settings
+                .pass
+                .clone()
+                .or_else(|| server_user.and_then(|user| user.pass.clone()))
+                .unwrap_or_default(),
+            udp,
+        })
     }
 
     fn to_vless_client_config(&self, listen: SocketAddr) -> Result<VlessClientConfig> {
@@ -1701,6 +1882,7 @@ impl XrayOutbound {
                 .with_context(|| format!("xray outbound {} is missing port", self.name()))?,
             password: self.settings.password.clone(),
             method: self.settings.method.clone(),
+            users: Vec::new(),
         })
     }
 
@@ -1883,6 +2065,20 @@ fn xray_tcp_udp_network(network: Option<&str>) -> Result<(bool, bool)> {
     }
 }
 
+fn xray_tcp_udp_outbound_network(network: Option<&str>) -> Result<(bool, bool)> {
+    match network
+        .unwrap_or("tcp,udp")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "tcp,udp" | "tcp+udp" | "both" => Ok((true, true)),
+        "tcp" => Ok((true, false)),
+        "udp" => Ok((false, true)),
+        other => bail!("xray SOCKS outbound uses network {other}; Aerion supports tcp or udp"),
+    }
+}
+
 fn ensure_tls_or_reality(format: &str, name: &str, security: &str) -> Result<()> {
     let security = security.trim();
     ensure!(
@@ -1969,6 +2165,21 @@ fn ensure_hysteria_alpn(format: &str, name: &str, alpn: Option<&OneOrManyStrings
     ensure!(
         values.is_empty() || (values.len() == 1 && values[0].eq_ignore_ascii_case("h3")),
         "{format} Hysteria outbound {name} sets ALPN {:?}; Aerion Hysteria2 uses h3",
+        values
+    );
+    Ok(())
+}
+
+fn ensure_http_alpn(format: &str, name: &str, alpn: Option<&OneOrManyStrings>) -> Result<()> {
+    let values = alpn
+        .map(OneOrManyStrings::to_vec)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>();
+    ensure!(
+        values.is_empty() || (values.len() == 1 && values[0].eq_ignore_ascii_case("http/1.1")),
+        "{format} HTTP outbound {name} sets ALPN {:?}; Aerion HTTP proxy outbound uses HTTP/1.1 CONNECT",
         values
     );
     Ok(())
@@ -3256,6 +3467,91 @@ mod tests {
             "edge.example.com"
         );
         assert_eq!(vless.transport.mode, "stream-one");
+        Ok(())
+    }
+
+    #[test]
+    fn converts_http_outbound_to_client_config() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [{
+    "tag": "http-proxy",
+    "protocol": "http",
+    "settings": {
+      "address": "proxy.example.com",
+      "port": 8443,
+      "user": "user",
+      "pass": "pass",
+      "headers": {
+        "X-Test": "value"
+      }
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "tls",
+      "tlsSettings": {
+        "serverName": "front.example.com",
+        "allowInsecure": true,
+        "fingerprint": "chrome",
+        "alpn": ["http/1.1"]
+      }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let XrayClientConfig::HttpProxy(http) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected HTTP proxy")
+        };
+        assert_eq!(http.server_host, "proxy.example.com");
+        assert_eq!(http.server_port, 8443);
+        assert_eq!(http.username, "user");
+        assert_eq!(http.password, "pass");
+        assert!(http.tls);
+        assert_eq!(http.sni, "front.example.com");
+        assert!(http.insecure);
+        assert_eq!(http.client_fingerprint, Some(UtlsFingerprint::Chrome));
+        assert_eq!(
+            http.extra_headers,
+            vec![("X-Test".to_string(), "value".to_string())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_socks_outbound_to_client_config() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [{
+    "tag": "socks-proxy",
+    "protocol": "socks",
+    "settings": {
+      "servers": [{
+        "address": "proxy.example.com",
+        "port": 1080,
+        "users": [{
+          "user": "user",
+          "pass": "pass"
+        }]
+      }],
+      "network": "tcp+udp"
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let XrayClientConfig::SocksProxy(socks) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected SOCKS proxy")
+        };
+        assert_eq!(socks.server_host, "proxy.example.com");
+        assert_eq!(socks.server_port, 1080);
+        assert_eq!(socks.username, "user");
+        assert_eq!(socks.password, "pass");
+        assert!(socks.udp);
         Ok(())
     }
 }

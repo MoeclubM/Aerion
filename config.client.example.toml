@@ -61,6 +61,29 @@ transport = "tcp"
 # quic_congestion_control = "bbr"
 
 [[clients]]
+name = "http-proxy"
+protocol = "http"
+listen = "127.0.0.1:1090"
+server = "example.com:8080"
+username = "user"
+password = "change-me"
+tls = false
+# For HTTPS proxy upstreams:
+# protocol = "https"
+# sni = "example.com"
+# ca_cert_paths = ["ca.pem"]
+# headers = { X-Aerion = "example" }
+
+[[clients]]
+name = "socks-proxy"
+protocol = "socks5"
+listen = "127.0.0.1:1091"
+server = "example.com:1080"
+username = "user"
+password = "change-me"
+udp = true
+
+[[clients]]
 name = "tuic"
 protocol = "tuic"
 listen = "127.0.0.1:1084"

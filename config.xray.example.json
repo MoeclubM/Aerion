@@ -120,6 +120,46 @@
           "allowInsecure": false
         }
       }
+    },
+    {
+      "tag": "http-proxy",
+      "protocol": "http",
+      "settings": {
+        "address": "example.com",
+        "port": 8080,
+        "user": "user",
+        "pass": "secret",
+        "headers": {
+          "X-Aerion": "example"
+        }
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      }
+    },
+    {
+      "tag": "socks-proxy",
+      "protocol": "socks",
+      "settings": {
+        "servers": [
+          {
+            "address": "example.com",
+            "port": 1080,
+            "users": [
+              {
+                "user": "user",
+                "pass": "secret"
+              }
+            ]
+          }
+        ],
+        "network": "tcp+udp"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      }
     }
   ]
 }

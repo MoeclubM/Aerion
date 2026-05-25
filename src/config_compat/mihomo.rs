@@ -1,4 +1,5 @@
 use crate::client::ClientConfig;
+use crate::http_connect::HttpProxyClientConfig;
 use crate::hysteria2::Hysteria2ClientConfig;
 use crate::mieru::{MieruClientConfig, MieruTrafficPattern, MieruTransport};
 use crate::naive::{NaiveClientConfig, default_naive_quic_congestion_control};
@@ -8,6 +9,7 @@ use crate::routing::{
     DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
 };
 use crate::shadowsocks::ShadowsocksClientConfig;
+use crate::socks::SocksProxyClientConfig;
 use crate::trojan::TrojanClientConfig;
 use crate::tuic::TuicClientConfig;
 use crate::tun::{TunConfig, TunDnsStrategy, socks_proxy_url};
@@ -89,6 +91,8 @@ pub struct MihomoTunConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MihomoProxy {
     Shadowsocks(MihomoShadowsocksProxy),
+    Socks(MihomoSocksProxy),
+    Http(MihomoHttpProxy),
     Vless(MihomoVlessProxy),
     Vmess(MihomoVmessProxy),
     Trojan(MihomoTrojanProxy),
@@ -117,6 +121,10 @@ impl<'de> Deserialize<'de> for MihomoProxy {
             "ss" | "shadowsocks" => {
                 decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::Shadowsocks)
             }
+            "socks" | "socks5" | "socks5h" => {
+                decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::Socks)
+            }
+            "http" => decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::Http),
             "vless" => decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::Vless),
             "vmess" => decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::Vmess),
             "trojan" => decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::Trojan),
@@ -189,6 +197,53 @@ pub struct MihomoShadowsocksProxy {
     pub plugin_opts: Option<BTreeMap<String, String>>,
     #[serde(default, rename = "udp-over-tcp", alias = "udp_over_tcp")]
     pub udp_over_tcp: Option<MihomoUdpOverTcpOptions>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct MihomoSocksProxy {
+    pub name: String,
+    pub server: String,
+    pub port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default = "default_true")]
+    pub udp: bool,
+    #[serde(default)]
+    pub tls: bool,
+    #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
+    pub skip_cert_verify: bool,
+    #[serde(default)]
+    pub alpn: Option<OneOrManyStrings>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct MihomoHttpProxy {
+    pub name: String,
+    pub server: String,
+    pub port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub tls: bool,
+    #[serde(default, alias = "servername", alias = "server-name", alias = "sni")]
+    pub servername: Option<String>,
+    #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
+    pub skip_cert_verify: bool,
+    #[serde(
+        default,
+        rename = "client-fingerprint",
+        alias = "client_fingerprint",
+        deserialize_with = "deserialize_optional_fingerprint"
+    )]
+    pub client_fingerprint: Option<UtlsFingerprint>,
+    #[serde(default)]
+    pub alpn: Option<OneOrManyStrings>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -599,6 +654,8 @@ pub enum OneOrManyStrings {
 #[derive(Clone, Debug)]
 pub enum MihomoClientConfig {
     Shadowsocks(ShadowsocksClientConfig),
+    SocksProxy(SocksProxyClientConfig),
+    HttpProxy(HttpProxyClientConfig),
     Vless(VlessClientConfig),
     Vmess(VmessClientConfig),
     Trojan(TrojanClientConfig),
@@ -687,6 +744,8 @@ impl MihomoProxy {
     pub fn name(&self) -> &str {
         match self {
             Self::Shadowsocks(proxy) => &proxy.name,
+            Self::Socks(proxy) => &proxy.name,
+            Self::Http(proxy) => &proxy.name,
             Self::Vless(proxy) => &proxy.name,
             Self::Vmess(proxy) => &proxy.name,
             Self::Trojan(proxy) => &proxy.name,
@@ -704,6 +763,8 @@ impl MihomoProxy {
             Self::Shadowsocks(proxy) => {
                 MihomoClientConfig::Shadowsocks(proxy.to_client_config(listen)?)
             }
+            Self::Socks(proxy) => MihomoClientConfig::SocksProxy(proxy.to_client_config(listen)?),
+            Self::Http(proxy) => MihomoClientConfig::HttpProxy(proxy.to_client_config(listen)?),
             Self::Vless(proxy) => MihomoClientConfig::Vless(proxy.to_client_config(listen)?),
             Self::Vmess(proxy) => MihomoClientConfig::Vmess(proxy.to_client_config(listen)?),
             Self::Trojan(proxy) => MihomoClientConfig::Trojan(proxy.to_client_config(listen)?),
@@ -726,6 +787,16 @@ impl MihomoUnsupportedProxy {
             "ss" | "shadowsocks" => MihomoClientConfig::Shadowsocks(
                 serde_yaml::from_value::<MihomoShadowsocksProxy>(value)
                     .with_context(|| format!("parse mihomo Shadowsocks proxy {}", self.name))?
+                    .to_client_config(listen)?,
+            ),
+            "socks" | "socks5" | "socks5h" => MihomoClientConfig::SocksProxy(
+                serde_yaml::from_value::<MihomoSocksProxy>(value)
+                    .with_context(|| format!("parse mihomo SOCKS proxy {}", self.name))?
+                    .to_client_config(listen)?,
+            ),
+            "http" => MihomoClientConfig::HttpProxy(
+                serde_yaml::from_value::<MihomoHttpProxy>(value)
+                    .with_context(|| format!("parse mihomo HTTP proxy {}", self.name))?
                     .to_client_config(listen)?,
             ),
             "vless" => MihomoClientConfig::Vless(
@@ -811,6 +882,56 @@ impl MihomoShadowsocksProxy {
             password: self.password.clone(),
             udp: self.udp,
             udp_over_tcp,
+        })
+    }
+}
+
+impl MihomoSocksProxy {
+    pub fn to_client_config(&self, listen: SocketAddr) -> Result<SocksProxyClientConfig> {
+        ensure!(
+            !self.tls && !self.skip_cert_verify && alpn_values(self.alpn.as_ref()).is_empty(),
+            "mihomo SOCKS proxy {} sets TLS options; Aerion SOCKS outbound is plain SOCKS5",
+            self.name
+        );
+        Ok(SocksProxyClientConfig {
+            listen,
+            server_host: self.server.clone(),
+            server_port: self.port,
+            username: self.username.clone().unwrap_or_default(),
+            password: self.password.clone().unwrap_or_default(),
+            udp: self.udp,
+        })
+    }
+}
+
+impl MihomoHttpProxy {
+    pub fn to_client_config(&self, listen: SocketAddr) -> Result<HttpProxyClientConfig> {
+        if self.tls {
+            ensure_http_alpn(&self.name, self.alpn.as_ref())?;
+        } else {
+            ensure!(
+                alpn_values(self.alpn.as_ref()).is_empty()
+                    && !self.skip_cert_verify
+                    && self.client_fingerprint.is_none(),
+                "mihomo HTTP proxy {} sets TLS-only options while tls is disabled",
+                self.name
+            );
+        }
+        Ok(HttpProxyClientConfig {
+            listen,
+            server_host: self.server.clone(),
+            server_port: self.port,
+            username: self.username.clone().unwrap_or_default(),
+            password: self.password.clone().unwrap_or_default(),
+            tls: self.tls,
+            sni: sni_or_server(self.servername.as_deref(), &self.server),
+            insecure: self.skip_cert_verify,
+            ca_cert_paths: Vec::new(),
+            ca_certificates: Vec::new(),
+            disable_system_roots: false,
+            pinned_cert_sha256: Vec::new(),
+            client_fingerprint: self.client_fingerprint,
+            extra_headers: self.headers.clone().into_iter().collect(),
         })
     }
 }
@@ -1372,6 +1493,16 @@ fn ensure_tuic_alpn(name: &str, alpn: Option<&OneOrManyStrings>) -> Result<()> {
     ensure!(
         values.is_empty() || values.iter().any(|value| value.eq_ignore_ascii_case("h3")),
         "mihomo TUIC proxy {name} sets ALPN {:?}; TUIC over QUIC requires h3-compatible ALPN",
+        values
+    );
+    Ok(())
+}
+
+fn ensure_http_alpn(name: &str, alpn: Option<&OneOrManyStrings>) -> Result<()> {
+    let values = alpn_values(alpn);
+    ensure!(
+        values.is_empty() || (values.len() == 1 && values[0].eq_ignore_ascii_case("http/1.1")),
+        "mihomo HTTP proxy {name} sets ALPN {:?}; Aerion HTTP proxy outbound uses HTTP/1.1 CONNECT",
         values
     );
     Ok(())
@@ -2179,6 +2310,70 @@ proxies:
             .to_client_config("127.0.0.1:1080".parse()?)
             .expect_err("max-open-streams must be explicit");
         assert!(stream_error.to_string().contains("max-open-streams"));
+        Ok(())
+    }
+
+    #[test]
+    fn converts_http_proxy_to_client_config() -> Result<()> {
+        let yaml = r#"
+proxies:
+  - name: http-proxy
+    type: http
+    server: proxy.example.com
+    port: 8080
+    username: user
+    password: pass
+    tls: true
+    servername: front.example.com
+    skip-cert-verify: true
+    alpn:
+      - http/1.1
+    headers:
+      X-Test: value
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let MihomoClientConfig::HttpProxy(http) =
+            config.proxies[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected HTTP proxy")
+        };
+        assert_eq!(http.server_host, "proxy.example.com");
+        assert_eq!(http.server_port, 8080);
+        assert_eq!(http.username, "user");
+        assert_eq!(http.password, "pass");
+        assert!(http.tls);
+        assert_eq!(http.sni, "front.example.com");
+        assert!(http.insecure);
+        assert_eq!(
+            http.extra_headers,
+            vec![("X-Test".to_string(), "value".to_string())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_socks_proxy_to_client_config() -> Result<()> {
+        let yaml = r#"
+proxies:
+  - name: socks-proxy
+    type: socks5
+    server: proxy.example.com
+    port: 1080
+    username: user
+    password: pass
+    udp: true
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let MihomoClientConfig::SocksProxy(socks) =
+            config.proxies[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected SOCKS proxy")
+        };
+        assert_eq!(socks.server_host, "proxy.example.com");
+        assert_eq!(socks.server_port, 1080);
+        assert_eq!(socks.username, "user");
+        assert_eq!(socks.password, "pass");
+        assert!(socks.udp);
         Ok(())
     }
 

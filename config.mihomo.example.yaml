@@ -83,6 +83,24 @@ proxies:
     extra-headers:
       X-Aerion: example
 
+  - name: http-proxy
+    type: http
+    server: example.com
+    port: 8080
+    username: user
+    password: secret
+    tls: false
+    headers:
+      X-Aerion: example
+
+  - name: socks-proxy
+    type: socks5
+    server: example.com
+    port: 1080
+    username: user
+    password: secret
+    udp: true
+
   - name: tuic-v5
     type: tuic
     server: example.com
