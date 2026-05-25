@@ -839,29 +839,109 @@ impl MihomoConfig {
     }
 
     fn parse_mihomo_route_rules(&self, raw: &str, index: usize) -> Result<Vec<RouteRule>> {
-        let parts = split_mihomo_rule(raw);
         let location = format!("mihomo rules[{index}]");
+        self.parse_mihomo_route_expr(raw, &location, None)
+    }
+
+    fn parse_mihomo_route_expr(
+        &self,
+        raw: &str,
+        location: &str,
+        action: Option<RouteDecision>,
+    ) -> Result<Vec<RouteRule>> {
+        let parts = split_mihomo_rule(raw);
         ensure!(
             !parts.is_empty() && !parts[0].is_empty(),
             "{location} is empty"
         );
         let kind = parts[0].to_ascii_uppercase();
-        if kind.as_str() != "RULE-SET" {
-            return Ok(vec![parse_mihomo_route_rule_parts(
-                &parts, &location, None,
-            )?]);
+        match kind.as_str() {
+            "RULE-SET" => self.parse_mihomo_rule_set_expr(&parts, location, action),
+            "OR" | "AND" | "NOT" => self.parse_mihomo_logical_expr(raw, location, action),
+            _ => Ok(vec![parse_mihomo_route_rule_parts(
+                &parts, location, action,
+            )?]),
         }
-        ensure!(parts.len() > 2, "{location} RULE-SET is missing outbound");
+    }
+
+    fn parse_mihomo_rule_set_expr(
+        &self,
+        parts: &[&str],
+        location: &str,
+        action: Option<RouteDecision>,
+    ) -> Result<Vec<RouteRule>> {
         ensure!(
-            !parts[1].is_empty(),
+            parts.len() > 1 && !parts[1].is_empty(),
             "{location} RULE-SET is missing provider"
         );
-        let action = RouteDecision::from_outbound(parts[2])?;
+        let action = match action {
+            Some(action) => {
+                ensure!(
+                    parts.len() == 2,
+                    "{location} RULE-SET child rule sets its own action"
+                );
+                action
+            }
+            None => {
+                ensure!(parts.len() > 2, "{location} RULE-SET is missing outbound");
+                RouteDecision::from_outbound(parts[2])?
+            }
+        };
         let provider = self
             .rule_providers
             .get(parts[1])
             .with_context(|| format!("{location} RULE-SET provider {} was not found", parts[1]))?;
         provider.to_route_rules(parts[1], self.source_dir.as_deref(), action)
+    }
+
+    fn parse_mihomo_logical_expr(
+        &self,
+        raw: &str,
+        location: &str,
+        action: Option<RouteDecision>,
+    ) -> Result<Vec<RouteRule>> {
+        let (kind, payload, action) = split_mihomo_logical_rule(raw, location, action)?;
+        if kind == "NOT" {
+            bail!("{location} NOT requires negative route matching");
+        }
+        let children = mihomo_logical_children(payload, location)?;
+        ensure!(
+            !children.is_empty(),
+            "{location} {kind} rule has no child rules"
+        );
+        if kind == "OR" {
+            let mut rules = Vec::new();
+            for (child_index, child) in children.iter().enumerate() {
+                let child_location = format!("{location} {kind}[{child_index}]");
+                rules.extend(self.parse_mihomo_route_expr(
+                    child,
+                    &child_location,
+                    Some(action.clone()),
+                )?);
+            }
+            return Ok(rules);
+        }
+
+        let mut branches = vec![RouteRule::new(action.clone())];
+        for (child_index, child) in children.iter().enumerate() {
+            let child_location = format!("{location} {kind}[{child_index}]");
+            let child_rules =
+                self.parse_mihomo_route_expr(child, &child_location, Some(action.clone()))?;
+            ensure!(
+                !child_rules.is_empty(),
+                "{child_location} expands to no route rules"
+            );
+            let mut next = Vec::new();
+            for branch in &branches {
+                for child_rule in &child_rules {
+                    let mut merged = branch.clone();
+                    merge_mihomo_and_route_rule(&mut merged, child_rule.clone(), &child_location)?;
+                    next.push(merged);
+                }
+            }
+            branches = next;
+        }
+        Ok(branches)
     }
 
     pub fn tun_enabled(&self) -> bool {
@@ -1946,6 +2026,119 @@ fn split_mihomo_rule(raw: &str) -> Vec<&str> {
     raw.split(',').map(str::trim).collect()
 }
 
+fn split_mihomo_logical_rule<'a>(
+    raw: &'a str,
+    location: &str,
+    action: Option<RouteDecision>,
+) -> Result<(String, &'a str, RouteDecision)> {
+    let (kind, rest) = raw
+        .split_once(',')
+        .with_context(|| format!("{location} logical rule is missing payload"))?;
+    let kind = kind.trim().to_ascii_uppercase();
+    let rest = rest.trim();
+    ensure!(
+        rest.starts_with('('),
+        "{location} {kind} rule is missing payload"
+    );
+    let mut depth = 0usize;
+    let mut payload_end = None;
+    for (index, ch) in rest.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                ensure!(depth > 0, "{location} {kind} rule has unmatched ')'");
+                depth -= 1;
+                if depth == 0 {
+                    payload_end = Some(index + ch.len_utf8());
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let payload_end =
+        payload_end.with_context(|| format!("{location} {kind} rule has unclosed payload"))?;
+    let payload = &rest[..payload_end];
+    let trailing = rest[payload_end..].trim();
+    let action = match action {
+        Some(action) => {
+            ensure!(
+                trailing.is_empty(),
+                "{location} {kind} child rule sets its own action"
+            );
+            action
+        }
+        None => {
+            let trailing = trailing
+                .strip_prefix(',')
+                .map(str::trim)
+                .with_context(|| format!("{location} {kind} rule is missing outbound"))?;
+            let values = trailing
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            ensure!(
+                !values.is_empty(),
+                "{location} {kind} rule is missing outbound"
+            );
+            ensure!(
+                values.len() == 1,
+                "{location} {kind} rule has unsupported trailing fields {:?}",
+                &values[1..]
+            );
+            RouteDecision::from_outbound(values[0])?
+        }
+    };
+    Ok((kind, payload, action))
+}
+
+fn mihomo_logical_children<'a>(payload: &'a str, location: &str) -> Result<Vec<&'a str>> {
+    let payload = payload.trim();
+    ensure!(
+        payload.starts_with('(') && payload.ends_with(')'),
+        "{location} logical payload must be enclosed in parentheses"
+    );
+    let inner = payload[1..payload.len() - 1].trim();
+    let mut children = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < inner.len() {
+        let tail = inner[cursor..].trim_start();
+        cursor = inner.len() - tail.len();
+        if tail.starts_with(',') {
+            cursor += 1;
+            continue;
+        }
+        ensure!(
+            tail.starts_with('('),
+            "{location} logical payload has non-rule text {}",
+            tail
+        );
+        let start = cursor;
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, ch) in inner[start..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    ensure!(depth > 0, "{location} logical payload has unmatched ')'");
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(start + offset + ch.len_utf8());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end =
+            end.with_context(|| format!("{location} logical payload has unclosed child rule"))?;
+        children.push(inner[start + 1..end - 1].trim());
+        cursor = end;
+    }
+    Ok(children)
+}
+
 fn parse_mihomo_route_rule_with_action(
     raw: &str,
     location: &str,
@@ -2005,6 +2198,55 @@ fn parse_mihomo_route_rule_parts(
         other => bail!("{location} unsupported mihomo route rule type {other}"),
     }
     Ok(rule)
+}
+
+fn merge_mihomo_and_route_rule(
+    target: &mut RouteRule,
+    rule: RouteRule,
+    location: &str,
+) -> Result<()> {
+    ensure!(
+        target.networks.is_empty() || rule.networks.is_empty(),
+        "{location} AND combines multiple network matchers"
+    );
+    let target_has_domain = !target.domains.is_empty() || !target.geosite_sets.is_empty();
+    let rule_has_domain = !rule.domains.is_empty() || !rule.geosite_sets.is_empty();
+    ensure!(
+        !target_has_domain || !rule_has_domain,
+        "{location} AND combines multiple domain matchers"
+    );
+    let target_has_ip =
+        target.ip_is_private || !target.ip_cidrs.is_empty() || !target.geoip_sets.is_empty();
+    let rule_has_ip =
+        rule.ip_is_private || !rule.ip_cidrs.is_empty() || !rule.geoip_sets.is_empty();
+    ensure!(
+        !target_has_domain || !rule_has_ip,
+        "{location} AND combines destination domain and IP matchers, which requires DNS resolution"
+    );
+    ensure!(
+        !target_has_ip || !rule_has_domain,
+        "{location} AND combines destination IP and domain matchers, which requires DNS resolution"
+    );
+    ensure!(
+        target.ip_cidrs.is_empty() || rule.ip_cidrs.is_empty(),
+        "{location} AND combines multiple IP CIDR matchers"
+    );
+    ensure!(
+        target.geoip_sets.is_empty() || rule.geoip_sets.is_empty(),
+        "{location} AND combines multiple geoip matchers"
+    );
+    ensure!(
+        target.ports.is_empty() || rule.ports.is_empty(),
+        "{location} AND combines multiple port matchers"
+    );
+    target.networks.extend(rule.networks);
+    target.domains.extend(rule.domains);
+    target.geosite_sets.extend(rule.geosite_sets);
+    target.ip_cidrs.extend(rule.ip_cidrs);
+    target.geoip_sets.extend(rule.geoip_sets);
+    target.ip_is_private |= rule.ip_is_private;
+    target.ports.extend(rule.ports);
+    Ok(())
 }
 
 fn mihomo_rule_provider_domain(value: &str) -> Result<DomainMatcher> {
@@ -2297,6 +2539,89 @@ rules:
             ),
             RouteDecision::Proxy("proxy-b".to_string())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn compiles_mihomo_logical_route_rules() -> Result<()> {
+        let yaml = r#"
+proxies: []
+rules:
+  - OR,((DOMAIN-SUFFIX,video.example),(DOMAIN-KEYWORD,stream)),proxy-a
+  - AND,((DOMAIN-SUFFIX,api.example),(NETWORK,tcp)),proxy-b
+  - AND,((OR,((DOMAIN-SUFFIX,cdn.example),(DOMAIN-SUFFIX,asset.example))),(DST-PORT,443)),proxy-c
+  - MATCH,DIRECT
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let routes = config.route_table()?;
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("img.video.example".to_string(), 80),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-a".to_string())
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("live.stream.test".to_string(), 80),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-a".to_string())
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("www.api.example".to_string(), 80),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-b".to_string())
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("www.api.example".to_string(), 80),
+                RouteNetwork::Udp
+            ),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("edge.asset.example".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-c".to_string())
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("edge.asset.example".to_string(), 80),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Direct
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mihomo_logical_not_and_unrepresentable_and_rules() -> Result<()> {
+        let not_yaml = r#"
+proxies: []
+rules:
+  - NOT,((DOMAIN-SUFFIX,example.com)),DIRECT
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(not_yaml)?;
+        let error = config
+            .route_table()
+            .expect_err("NOT needs negative matching");
+        assert!(error.to_string().contains("negative route matching"));
+
+        let and_yaml = r#"
+proxies: []
+rules:
+  - AND,((DOMAIN-SUFFIX,example.com),(DOMAIN-KEYWORD,video)),DIRECT
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(and_yaml)?;
+        let error = config
+            .route_table()
+            .expect_err("AND of multiple domain matchers must fail explicitly");
+        assert!(error.to_string().contains("multiple domain matchers"));
         Ok(())
     }
 

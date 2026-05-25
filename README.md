@@ -256,7 +256,8 @@ with `--profile`; unsupported transports still fail explicitly instead of being
 silently downgraded. Built-in direct/block-style outbounds run as local route
 clients and do not start fake upstream proxy processes. Mihomo route rules
 include exact, suffix, keyword, wildcard, regex, geo, IP CIDR, port, network,
-match/final forms, and `RULE-SET` expansion from inline or local YAML/text file
+match/final forms, statically representable `OR` / `AND` logical rules, and
+`RULE-SET` expansion from inline or local YAML/text file
 `rule-providers` with `domain`, `ipcidr`, or `classical` behavior. Remote HTTP
 and binary MRS rule-provider loading still fails explicitly. Mihomo `select`
 proxy-groups resolve to the first listed proxy. Mihomo health-check /
