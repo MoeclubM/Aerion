@@ -261,8 +261,10 @@ statically only when they contain a single explicit candidate; multi-candidate
 policies fail explicitly because Aerion does not implement active runtime
 selection yet. sing-box `selector` outbounds are resolved to their startup
 selection (`default`, or the first listed outbound when `default` is omitted).
-Xray routing `balancerTag` resolves only when its balancer selectors identify
-exactly one outbound and no runtime strategy/fallback state is required.
+sing-box route rules accept `route` / `reject` actions and logical route rules
+when they can be represented by Aerion's static route table. Xray routing
+`balancerTag` resolves only when its balancer selectors identify exactly one
+outbound and no runtime strategy/fallback state is required.
 Inbound-only sing-box JSON can also run AnyTLS, Shadowsocks, Trojan, VMess,
 Hysteria2, TUIC, Naive, and VLESS server profiles, including Naive TCP-only /
 HTTP/3-only listener networks and VLESS raw, TLS, or REALITY inbound TLS

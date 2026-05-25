@@ -54,6 +54,12 @@ pub struct SingBoxRouteRule {
     #[serde(default)]
     pub action: Option<String>,
     #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub invert: bool,
+    #[serde(default)]
+    pub rules: Vec<SingBoxRouteRule>,
+    #[serde(default)]
     pub network: Option<Value>,
     #[serde(default)]
     pub domain: Option<Value>,
@@ -770,36 +776,58 @@ impl SingBoxRouteConfig {
             ..RouteTable::default()
         };
         for (index, rule) in self.rules.iter().enumerate() {
-            table.rules.push(rule.to_route_rule(index)?);
+            table.rules.extend(rule.to_route_rules(index)?);
         }
         Ok(table)
     }
 }
 
 impl SingBoxRouteRule {
-    fn to_route_rule(&self, index: usize) -> Result<RouteRule> {
+    fn to_route_rules(&self, index: usize) -> Result<Vec<RouteRule>> {
         ensure!(
             self.extra.is_empty(),
             "sing-box route.rules[{index}] has unsupported fields {:?}",
             self.extra.keys().collect::<Vec<_>>()
         );
-        if let Some(kind) = self
+        let kind = self
             .kind
             .as_deref()
             .map(str::trim)
-            .filter(|kind| !kind.is_empty())
-        {
+            .filter(|kind| !kind.is_empty());
+        if matches!(kind, Some(kind) if kind.eq_ignore_ascii_case("logical")) {
+            return self.to_logical_route_rules(index);
+        }
+        if let Some(kind) = kind {
             ensure!(
                 kind.eq_ignore_ascii_case("default"),
                 "unsupported sing-box route.rules[{index}] type {kind}"
             );
         }
-        let action = self
-            .outbound
-            .as_deref()
-            .or(self.action.as_deref())
-            .with_context(|| format!("sing-box route.rules[{index}] is missing outbound"))?;
-        let mut rule = RouteRule::new(RouteDecision::from_outbound(action)?);
+        Ok(vec![self.to_default_route_rule(index, None)?])
+    }
+
+    fn to_default_route_rule(
+        &self,
+        index: usize,
+        action_override: Option<&RouteDecision>,
+    ) -> Result<RouteRule> {
+        ensure!(
+            self.extra.is_empty(),
+            "sing-box route.rules[{index}] has unsupported fields {:?}",
+            self.extra.keys().collect::<Vec<_>>()
+        );
+        ensure!(
+            !self.invert,
+            "sing-box route.rules[{index}] invert requires negative route matching"
+        );
+        ensure!(
+            self.mode.is_none() && self.rules.is_empty(),
+            "sing-box route.rules[{index}] sets logical fields on a default rule"
+        );
+        let mut rule = RouteRule::new(match action_override {
+            Some(action) => action.clone(),
+            None => self.route_decision(index)?,
+        });
         for value in route_value_strings(self.network.as_ref())? {
             rule.networks.push(RouteNetwork::parse(&value)?);
         }
@@ -837,6 +865,160 @@ impl SingBoxRouteRule {
         }
         Ok(rule)
     }
+
+    fn to_logical_route_rules(&self, index: usize) -> Result<Vec<RouteRule>> {
+        ensure!(
+            !self.invert,
+            "sing-box route.rules[{index}] logical invert requires negative route matching"
+        );
+        let mode = self
+            .mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|mode| !mode.is_empty())
+            .with_context(|| format!("sing-box route.rules[{index}] logical rule is missing mode"))?
+            .to_ascii_lowercase();
+        ensure!(
+            !self.rules.is_empty(),
+            "sing-box route.rules[{index}] logical rule has no child rules"
+        );
+        ensure!(
+            !self.has_match_fields(),
+            "sing-box route.rules[{index}] logical rule sets parent match fields"
+        );
+        let action = self.route_decision(index)?;
+        match mode.as_str() {
+            "or" => self
+                .rules
+                .iter()
+                .map(|rule| rule.to_child_route_rule(index, &action))
+                .collect(),
+            "and" => self
+                .to_logical_and_route_rule(index, &action)
+                .map(|rule| vec![rule]),
+            other => bail!("unsupported sing-box route.rules[{index}] logical mode {other}"),
+        }
+    }
+
+    fn to_child_route_rule(&self, index: usize, action: &RouteDecision) -> Result<RouteRule> {
+        ensure!(
+            self.outbound.is_none() && self.action.is_none(),
+            "sing-box route.rules[{index}] logical child sets its own action"
+        );
+        let kind = self
+            .kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty());
+        if let Some(kind) = kind {
+            ensure!(
+                kind.eq_ignore_ascii_case("default"),
+                "unsupported sing-box route.rules[{index}] logical child type {kind}"
+            );
+        }
+        self.to_default_route_rule(index, Some(action))
+    }
+
+    fn to_logical_and_route_rule(&self, index: usize, action: &RouteDecision) -> Result<RouteRule> {
+        let mut merged = RouteRule::new(action.clone());
+        for child in &self.rules {
+            let rule = child.to_child_route_rule(index, action)?;
+            merge_singbox_and_route_rule(&mut merged, rule, index)?;
+        }
+        Ok(merged)
+    }
+
+    fn route_decision(&self, index: usize) -> Result<RouteDecision> {
+        let outbound = self
+            .outbound
+            .as_deref()
+            .map(str::trim)
+            .filter(|outbound| !outbound.is_empty());
+        let action = self
+            .action
+            .as_deref()
+            .map(str::trim)
+            .filter(|action| !action.is_empty());
+        let Some(action) = action else {
+            let outbound = outbound
+                .with_context(|| format!("sing-box route.rules[{index}] is missing outbound"))?;
+            return RouteDecision::from_outbound(outbound);
+        };
+        match action.to_ascii_lowercase().as_str() {
+            "route" => {
+                let outbound = outbound.with_context(|| {
+                    format!("sing-box route.rules[{index}] route action is missing outbound")
+                })?;
+                RouteDecision::from_outbound(outbound)
+            }
+            "direct" => {
+                ensure!(
+                    outbound.is_none(),
+                    "sing-box route.rules[{index}] direct action must not set outbound"
+                );
+                Ok(RouteDecision::Direct)
+            }
+            "reject" | "block" => {
+                ensure!(
+                    outbound.is_none(),
+                    "sing-box route.rules[{index}] reject action must not set outbound"
+                );
+                Ok(RouteDecision::Block)
+            }
+            other => bail!("unsupported sing-box route.rules[{index}] action {other}"),
+        }
+    }
+
+    fn has_match_fields(&self) -> bool {
+        self.network.is_some()
+            || self.domain.is_some()
+            || self.domain_suffix.is_some()
+            || self.domain_keyword.is_some()
+            || self.domain_regex.is_some()
+            || self.geosite.is_some()
+            || self.ip_cidr.is_some()
+            || self.geoip.is_some()
+            || self.ip_is_private
+            || self.port.is_some()
+            || self.port_range.is_some()
+    }
+}
+
+fn merge_singbox_and_route_rule(
+    target: &mut RouteRule,
+    rule: RouteRule,
+    index: usize,
+) -> Result<()> {
+    ensure!(
+        target.networks.is_empty() || rule.networks.is_empty(),
+        "sing-box route.rules[{index}] logical and combines multiple network matchers"
+    );
+    let target_has_domain = !target.domains.is_empty() || !target.geosite_sets.is_empty();
+    let rule_has_domain = !rule.domains.is_empty() || !rule.geosite_sets.is_empty();
+    ensure!(
+        !target_has_domain || !rule_has_domain,
+        "sing-box route.rules[{index}] logical and combines multiple domain matchers"
+    );
+    ensure!(
+        target.ip_cidrs.is_empty() || rule.ip_cidrs.is_empty(),
+        "sing-box route.rules[{index}] logical and combines multiple IP CIDR matchers"
+    );
+    ensure!(
+        target.geoip_sets.is_empty() || rule.geoip_sets.is_empty(),
+        "sing-box route.rules[{index}] logical and combines multiple geoip matchers"
+    );
+    ensure!(
+        target.ports.is_empty() || rule.ports.is_empty(),
+        "sing-box route.rules[{index}] logical and combines multiple port matchers"
+    );
+    target.networks.extend(rule.networks);
+    target.domains.extend(rule.domains);
+    target.geosite_sets.extend(rule.geosite_sets);
+    target.ip_cidrs.extend(rule.ip_cidrs);
+    target.geoip_sets.extend(rule.geoip_sets);
+    target.ip_is_private |= rule.ip_is_private;
+    target.ports.extend(rule.ports);
+    Ok(())
 }
 
 impl SingBoxInbound {
@@ -2807,6 +2989,130 @@ mod tests {
             routes.decide(
                 &ProxyTarget::Domain("unmatched.test".to_string(), 443),
                 RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-b".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compiles_singbox_route_actions() -> Result<()> {
+        let json = r#"
+{
+  "route": {
+    "rules": [
+      { "domain_suffix": ["example.com"], "action": "route", "outbound": "direct" },
+      { "domain_suffix": ["blocked.test"], "action": "reject" }
+    ],
+    "final": "proxy-b"
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let routes = config.route_table()?;
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("www.blocked.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Block
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compiles_singbox_logical_or_route_rules() -> Result<()> {
+        let json = r#"
+{
+  "route": {
+    "rules": [
+      {
+        "type": "logical",
+        "mode": "or",
+        "action": "route",
+        "outbound": "direct",
+        "rules": [
+          { "domain_suffix": ["example.com"] },
+          { "ip_cidr": ["10.0.0.0/8"] }
+        ]
+      }
+    ],
+    "final": "proxy-b"
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let routes = config.route_table()?;
+        assert_eq!(routes.rules.len(), 2);
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(&ProxyTarget::Ip("10.1.2.3:443".parse()?), RouteNetwork::Tcp),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("unmatched.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-b".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compiles_singbox_logical_and_route_rules() -> Result<()> {
+        let json = r#"
+{
+  "route": {
+    "rules": [
+      {
+        "type": "logical",
+        "mode": "and",
+        "outbound": "direct",
+        "rules": [
+          { "domain_suffix": ["example.com"] },
+          { "port": [443] },
+          { "network": "tcp" }
+        ]
+      }
+    ],
+    "final": "proxy-b"
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let routes = config.route_table()?;
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 80),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-b".to_string())
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Udp
             ),
             RouteDecision::Proxy("proxy-b".to_string())
         );
