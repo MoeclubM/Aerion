@@ -111,7 +111,8 @@ Aerion now provides these server/client protocol stacks:
     `proxy-groups`
   - `XrayConfig` parses Xray JSON / JSONC `inbounds` and `outbounds`
     profiles with Shadowsocks, HTTP proxy, SOCKS proxy, VLESS, VMess, Trojan,
-    Hysteria2, freedom, and blackhole selection helpers
+    Hysteria2, freedom, blackhole, and statically equivalent single-outbound
+    routing balancer selection helpers
   - `SingBoxConfig` parses sing-box JSON / JSONC `inbounds` and `outbounds`
     profiles with Shadowsocks, HTTP proxy, VLESS, VMess, Trojan, Hysteria2,
     AnyTLS, Naive, TUIC, direct, and block selection helpers
@@ -258,7 +259,9 @@ proxy-groups resolve to the first listed proxy, while health-check /
 load-balancing groups fail explicitly. sing-box `selector` outbounds are
 resolved to their startup selection (`default`, or the first listed outbound
 when `default` is omitted); `urltest` still fails explicitly because Aerion
-does not implement active latency policy selection yet.
+does not implement active latency policy selection yet. Xray routing
+`balancerTag` resolves only when its balancer selectors identify exactly one
+outbound and no runtime strategy/fallback state is required.
 Inbound-only sing-box JSON can also run AnyTLS, Shadowsocks, Trojan, VMess,
 Hysteria2, TUIC, Naive, and VLESS server profiles, including Naive TCP-only /
 HTTP/3-only listener networks and VLESS raw, TLS, or REALITY inbound TLS

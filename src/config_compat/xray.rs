@@ -35,6 +35,8 @@ pub struct XrayConfig {
 pub struct XrayRoutingConfig {
     #[serde(default)]
     pub rules: Vec<XrayRoutingRule>,
+    #[serde(default)]
+    pub balancers: Vec<XrayBalancer>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -53,6 +55,19 @@ pub struct XrayRoutingRule {
     pub port: Option<Value>,
     #[serde(default)]
     pub network: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct XrayBalancer {
+    pub tag: String,
+    #[serde(default)]
+    pub selector: Vec<String>,
+    #[serde(default, rename = "fallbackTag", alias = "fallback_tag")]
+    pub fallback_tag: String,
+    #[serde(default)]
+    pub strategy: Option<Value>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -543,22 +558,29 @@ impl XrayConfig {
     }
 
     pub fn route_table(&self) -> Result<RouteTable> {
-        self.routing.to_route_table()
+        self.routing.to_route_table(&self.outbounds)
     }
 }
 
 impl XrayRoutingConfig {
-    pub fn to_route_table(&self) -> Result<RouteTable> {
+    pub fn to_route_table(&self, outbounds: &[XrayOutbound]) -> Result<RouteTable> {
         let mut table = RouteTable::default();
         for (index, rule) in self.rules.iter().enumerate() {
-            table.rules.push(rule.to_route_rule(index)?);
+            table
+                .rules
+                .push(rule.to_route_rule(index, &self.balancers, outbounds)?);
         }
         Ok(table)
     }
 }
 
 impl XrayRoutingRule {
-    fn to_route_rule(&self, index: usize) -> Result<RouteRule> {
+    fn to_route_rule(
+        &self,
+        index: usize,
+        balancers: &[XrayBalancer],
+        outbounds: &[XrayOutbound],
+    ) -> Result<RouteRule> {
         ensure!(
             self.extra.is_empty(),
             "xray routing.rules[{index}] has unsupported fields {:?}",
@@ -570,10 +592,26 @@ impl XrayRoutingRule {
             self.kind
         );
         ensure!(
-            self.balancer_tag.trim().is_empty(),
-            "xray routing.rules[{index}] balancerTag requires balancer support"
+            self.outbound_tag.trim().is_empty() || self.balancer_tag.trim().is_empty(),
+            "xray routing.rules[{index}] sets both outboundTag and balancerTag"
         );
-        let mut rule = RouteRule::new(RouteDecision::from_outbound(&self.outbound_tag)?);
+        let action = if !self.outbound_tag.trim().is_empty() {
+            RouteDecision::from_outbound(&self.outbound_tag)?
+        } else if !self.balancer_tag.trim().is_empty() {
+            let balancer = balancers
+                .iter()
+                .find(|balancer| balancer.tag == self.balancer_tag)
+                .with_context(|| {
+                    format!(
+                        "xray routing.rules[{index}] balancerTag {} was not found",
+                        self.balancer_tag
+                    )
+                })?;
+            RouteDecision::Proxy(balancer.static_target(outbounds)?)
+        } else {
+            bail!("xray routing.rules[{index}] is missing outboundTag or balancerTag");
+        };
+        let mut rule = RouteRule::new(action);
         for domain in &self.domain {
             if let Some(name) = DomainMatcher::geosite_name(domain) {
                 rule.add_geosite_set(name);
@@ -603,6 +641,59 @@ impl XrayRoutingRule {
             rule.ports.push(PortRange::parse(&value)?);
         }
         Ok(rule)
+    }
+}
+
+impl XrayBalancer {
+    fn static_target(&self, outbounds: &[XrayOutbound]) -> Result<String> {
+        ensure!(
+            self.extra.is_empty(),
+            "xray routing.balancers {} has unsupported fields {:?}",
+            self.tag,
+            self.extra.keys().collect::<Vec<_>>()
+        );
+        ensure!(
+            self.fallback_tag.trim().is_empty(),
+            "xray routing.balancers {} fallbackTag requires active observatory state",
+            self.tag
+        );
+        ensure!(
+            self.strategy
+                .as_ref()
+                .map(value_is_empty_object)
+                .unwrap_or(true),
+            "xray routing.balancers {} strategy requires active load balancing policy",
+            self.tag
+        );
+        let selectors = self
+            .selector
+            .iter()
+            .map(|selector| selector.trim())
+            .filter(|selector| !selector.is_empty())
+            .collect::<Vec<_>>();
+        ensure!(
+            !selectors.is_empty(),
+            "xray routing.balancers {} has no selector",
+            self.tag
+        );
+        let mut matches = Vec::new();
+        for outbound in outbounds {
+            let tag = outbound.tag.as_deref().unwrap_or_default();
+            if !tag.is_empty()
+                && selectors.iter().any(|selector| tag.starts_with(selector))
+                && !matches.iter().any(|matched| matched == tag)
+            {
+                matches.push(tag.to_string());
+            }
+        }
+        ensure!(
+            matches.len() == 1,
+            "xray routing.balancers {} matches {} outbounds [{}]; Aerion only supports statically equivalent single-outbound balancers",
+            self.tag,
+            matches.len(),
+            matches.join(", ")
+        );
+        Ok(matches.remove(0))
     }
 }
 
@@ -2209,6 +2300,10 @@ fn option_text_has_data(value: &Option<String>) -> bool {
         .is_some_and(|value| !value.is_empty())
 }
 
+fn value_is_empty_object(value: &Value) -> bool {
+    matches!(value, Value::Object(object) if object.is_empty())
+}
+
 fn xray_tcp_udp_network(network: Option<&str>) -> Result<(bool, bool)> {
     match network
         .unwrap_or("tcp")
@@ -2709,6 +2804,87 @@ mod tests {
             routes.decide(&ProxyTarget::Ip("10.1.2.3:53".parse()?), RouteNetwork::Udp),
             RouteDecision::Direct
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_static_xray_balancer_rule() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    { "tag": "proxy-a", "protocol": "freedom" },
+    { "tag": "direct-out", "protocol": "freedom" }
+  ],
+  "routing": {
+    "balancers": [
+      { "tag": "single", "selector": ["proxy-a"], "strategy": {} }
+    ],
+    "rules": [
+      { "type": "field", "domain": ["domain:example.com"], "balancerTag": "single" }
+    ]
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let routes = config.route_table()?;
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-a".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_dynamic_xray_balancer_rule() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    { "tag": "proxy-a", "protocol": "freedom" },
+    { "tag": "proxy-b", "protocol": "freedom" }
+  ],
+  "routing": {
+    "balancers": [
+      { "tag": "multi", "selector": ["proxy-"] }
+    ],
+    "rules": [
+      { "type": "field", "domain": ["domain:example.com"], "balancerTag": "multi" }
+    ]
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("multi-outbound balancer needs a real policy");
+        assert!(error.to_string().contains("single-outbound"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_xray_balancer_runtime_policy_fields() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    { "tag": "proxy-a", "protocol": "freedom" }
+  ],
+  "routing": {
+    "balancers": [
+      { "tag": "runtime", "selector": ["proxy-a"], "fallbackTag": "direct", "strategy": { "type": "leastPing" } }
+    ],
+    "rules": [
+      { "type": "field", "domain": ["domain:example.com"], "balancerTag": "runtime" }
+    ]
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("fallbackTag requires observatory state");
+        assert!(error.to_string().contains("fallbackTag"));
         Ok(())
     }
 
