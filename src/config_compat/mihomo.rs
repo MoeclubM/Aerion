@@ -190,6 +190,10 @@ pub struct MihomoProxyGroup {
     #[serde(default)]
     pub interval: Option<Value>,
     #[serde(default)]
+    pub tolerance: Option<Value>,
+    #[serde(default)]
+    pub strategy: Option<Value>,
+    #[serde(default)]
     pub lazy: Option<Value>,
     #[serde(default)]
     pub timeout: Option<Value>,
@@ -900,9 +904,10 @@ impl MihomoProxy {
 
 impl MihomoProxyGroup {
     fn static_target(&self) -> Result<String> {
-        match self.kind.trim().to_ascii_lowercase().as_str() {
+        let kind = self.kind.trim().to_ascii_lowercase();
+        match kind.as_str() {
             "select" => {
-                self.ensure_static_select_supported()?;
+                self.ensure_static_group_supported("select")?;
                 let target = self
                     .proxies
                     .first()
@@ -913,30 +918,43 @@ impl MihomoProxyGroup {
                     })?;
                 Ok(target.to_string())
             }
-            "url-test" => bail!(
-                "mihomo url-test proxy-group {} requires active latency selection; Aerion does not implement url-test policy yet",
-                self.name
-            ),
-            "fallback" => bail!(
-                "mihomo fallback proxy-group {} requires active health-check selection; Aerion does not implement fallback policy yet",
-                self.name
-            ),
-            "load-balance" => bail!(
-                "mihomo load-balance proxy-group {} requires per-connection policy selection; Aerion does not implement load-balance policy yet",
-                self.name
-            ),
-            "relay" => bail!(
-                "mihomo relay proxy-group {} requires proxy chaining; Aerion does not implement relay groups yet",
-                self.name
-            ),
+            "url-test" | "fallback" | "load-balance" | "relay" => {
+                self.ensure_static_group_supported(&kind)?;
+                let targets = self
+                    .proxies
+                    .iter()
+                    .map(|proxy| proxy.trim())
+                    .filter(|proxy| !proxy.is_empty())
+                    .collect::<Vec<_>>();
+                match targets.as_slice() {
+                    [target] => Ok((*target).to_string()),
+                    [] => bail!("mihomo {kind} proxy-group {} has no proxies", self.name),
+                    _ if kind == "url-test" => bail!(
+                        "mihomo url-test proxy-group {} requires active latency selection; Aerion only resolves single-proxy url-test groups statically",
+                        self.name
+                    ),
+                    _ if kind == "fallback" => bail!(
+                        "mihomo fallback proxy-group {} requires active health-check selection; Aerion only resolves single-proxy fallback groups statically",
+                        self.name
+                    ),
+                    _ if kind == "load-balance" => bail!(
+                        "mihomo load-balance proxy-group {} requires per-connection policy selection; Aerion only resolves single-proxy load-balance groups statically",
+                        self.name
+                    ),
+                    _ => bail!(
+                        "mihomo relay proxy-group {} requires proxy chaining; Aerion only resolves single-proxy relay groups statically",
+                        self.name
+                    ),
+                }
+            }
             other => bail!("unsupported mihomo proxy-group {} type {other}", self.name),
         }
     }
 
-    fn ensure_static_select_supported(&self) -> Result<()> {
+    fn ensure_static_group_supported(&self, kind: &str) -> Result<()> {
         ensure!(
             !self.disable_udp,
-            "mihomo select proxy-group {} disables UDP; Aerion route clients expose TCP and UDP together",
+            "mihomo {kind} proxy-group {} disables UDP; Aerion route clients expose TCP and UDP together",
             self.name
         );
         let mut unsupported = Vec::new();
@@ -970,7 +988,7 @@ impl MihomoProxyGroup {
         unsupported.extend(self.fields.keys().cloned());
         ensure!(
             unsupported.is_empty(),
-            "mihomo select proxy-group {} has unsupported fields {:?}",
+            "mihomo {kind} proxy-group {} has unsupported fields {:?}",
             self.name,
             unsupported
         );
@@ -1989,6 +2007,27 @@ proxy-groups:
     }
 
     #[test]
+    fn resolves_single_mihomo_policy_group_to_target() -> Result<()> {
+        let yaml = r#"
+proxy-groups:
+  - name: auto
+    type: url-test
+    proxies: [DIRECT]
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let MihomoClientConfig::Route(route) =
+            config.resolved_proxy_config("auto", "127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected static url-test direct route client")
+        };
+        assert_eq!(route.default, RouteDecision::Direct);
+        Ok(())
+    }
+
+    #[test]
     fn rejects_mihomo_policy_proxy_groups_without_static_equivalence() -> Result<()> {
         let yaml = r#"
 proxy-groups:
@@ -2002,7 +2041,7 @@ proxy-groups:
         let error = config
             .resolved_proxy_config("auto", "127.0.0.1:1080".parse()?)
             .expect_err("url-test requires active selection");
-        assert!(error.to_string().contains("url-test"));
+        assert!(error.to_string().contains("single-proxy"));
         Ok(())
     }
 

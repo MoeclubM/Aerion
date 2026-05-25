@@ -509,6 +509,24 @@ pub struct SingBoxSelectorOutbound {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct SingBoxUrlTestOutbound {
+    #[serde(default)]
+    pub outbounds: Vec<String>,
+    #[serde(default)]
+    pub url: Option<Value>,
+    #[serde(default)]
+    pub interval: Option<Value>,
+    #[serde(default)]
+    pub tolerance: Option<Value>,
+    #[serde(default, rename = "idle_timeout")]
+    pub idle_timeout: Option<Value>,
+    #[serde(default, rename = "interrupt_exist_connections")]
+    pub interrupt_exist_connections: Option<bool>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct SingBoxTlsOptions {
     #[serde(default)]
     pub enabled: bool,
@@ -1482,10 +1500,10 @@ impl SingBoxOutbound {
                 self.decode::<SingBoxSelectorOutbound>()?
                     .selected_target(self.name())?,
             )),
-            "urltest" => bail!(
-                "sing-box urltest outbound {} requires active latency selection; Aerion does not implement urltest policy yet",
-                self.name()
-            ),
+            "urltest" => Ok(Some(
+                self.decode::<SingBoxUrlTestOutbound>()?
+                    .static_target(self.name())?,
+            )),
             _ => Ok(None),
         }
     }
@@ -1561,7 +1579,7 @@ impl SingBoxOutbound {
                 self.name()
             ),
             "urltest" => bail!(
-                "sing-box urltest outbound {} requires active latency selection; Aerion does not implement urltest policy yet",
+                "sing-box urltest outbound {} must be resolved through its statically selected outbound before conversion",
                 self.name()
             ),
             other => bail!("unsupported sing-box outbound type {other}"),
@@ -1599,6 +1617,29 @@ impl SingBoxSelectorOutbound {
             "sing-box selector outbound {name} default {target} is not listed in outbounds"
         );
         Ok(target.to_string())
+    }
+}
+
+impl SingBoxUrlTestOutbound {
+    fn static_target(&self, name: &str) -> Result<String> {
+        ensure!(
+            self.extra.is_empty(),
+            "sing-box urltest outbound {name} has unsupported fields {:?}",
+            self.extra.keys().collect::<Vec<_>>()
+        );
+        let outbounds = self
+            .outbounds
+            .iter()
+            .map(|outbound| outbound.trim())
+            .filter(|outbound| !outbound.is_empty())
+            .collect::<Vec<_>>();
+        match outbounds.as_slice() {
+            [target] => Ok((*target).to_string()),
+            [] => bail!("sing-box urltest outbound {name} has no outbounds"),
+            _ => bail!(
+                "sing-box urltest outbound {name} requires active latency selection; Aerion only resolves single-outbound urltest policies statically"
+            ),
+        }
     }
 }
 
@@ -4194,6 +4235,35 @@ mod tests {
     }
 
     #[test]
+    fn resolves_single_urltest_policy_outbound() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "type": "urltest",
+      "tag": "auto",
+      "outbounds": ["direct-out"],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m",
+      "tolerance": 50
+    },
+    { "type": "direct", "tag": "direct-out" }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        assert_eq!(config.resolved_outbound("auto")?.name(), "direct-out");
+        let SingBoxClientConfig::Route(route) = config
+            .resolved_outbound_profile("auto")?
+            .to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected static urltest direct route client")
+        };
+        assert_eq!(route.default, RouteDecision::Direct);
+        Ok(())
+    }
+
+    #[test]
     fn rejects_urltest_policy_outbound() -> Result<()> {
         let json = r#"
 {
@@ -4214,7 +4284,7 @@ mod tests {
         let error = config
             .resolved_outbound("auto")
             .expect_err("urltest requires active latency selection");
-        assert!(error.to_string().contains("urltest"));
+        assert!(error.to_string().contains("single-outbound"));
         Ok(())
     }
 }
