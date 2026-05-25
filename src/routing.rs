@@ -322,6 +322,21 @@ impl DomainMatcher {
         Ok(Self::Regex(Regex::new(pattern)?))
     }
 
+    pub fn wildcard(pattern: &str) -> Result<Self> {
+        let pattern = normalize_domain(pattern);
+        ensure!(!pattern.is_empty(), "empty route domain wildcard");
+        let mut regex = String::from("^");
+        for ch in pattern.chars() {
+            match ch {
+                '*' => regex.push_str(".*"),
+                '?' => regex.push('.'),
+                _ => regex.push_str(&regex::escape(&ch.to_string())),
+            }
+        }
+        regex.push('$');
+        Self::regex(&regex)
+    }
+
     pub fn from_prefixed(value: &str) -> Result<Option<Self>> {
         let value = value.trim();
         if value.is_empty() {
@@ -576,6 +591,16 @@ mod tests {
         assert!(!exact.matches("www.api.example.com"));
         assert!(suffix.matches("static.example.org"));
         assert!(regex.matches("cdn12.example.net"));
+        Ok(())
+    }
+
+    #[test]
+    fn wildcard_domain_matchers_follow_glob_style() -> Result<()> {
+        let wildcard = DomainMatcher::wildcard("*.cdn?.example.com")?;
+        assert!(wildcard.matches("img.cdn1.example.com"));
+        assert!(wildcard.matches("static.cdn2.example.com"));
+        assert!(!wildcard.matches("cdn1.example.com"));
+        assert!(!wildcard.matches("img.cdn12.example.com"));
         Ok(())
     }
 

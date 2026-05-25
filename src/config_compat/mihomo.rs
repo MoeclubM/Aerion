@@ -1803,6 +1803,7 @@ fn parse_mihomo_route_rule(raw: &str, index: usize) -> Result<RouteRule> {
         "DOMAIN" => rule.domains.push(DomainMatcher::exact(parts[1])),
         "DOMAIN-SUFFIX" => rule.domains.push(DomainMatcher::suffix(parts[1])),
         "DOMAIN-KEYWORD" => rule.domains.push(DomainMatcher::keyword(parts[1])),
+        "DOMAIN-WILDCARD" => rule.domains.push(DomainMatcher::wildcard(parts[1])?),
         "DOMAIN-REGEX" => rule.domains.push(DomainMatcher::regex(parts[1])?),
         "GEOSITE" => rule.add_geosite_set(parts[1]),
         "IP-CIDR" | "IP-CIDR6" => rule.ip_cidrs.push(IpCidr::parse(parts[1])?),
@@ -2052,6 +2053,7 @@ proxies: []
 rules:
   - DOMAIN-SUFFIX,example.com,DIRECT
   - DOMAIN-KEYWORD,video,proxy-a
+  - DOMAIN-WILDCARD,*.cdn?.example.org,proxy-c
   - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
   - DST-PORT,53,DIRECT
   - MATCH,proxy-b
@@ -2071,6 +2073,13 @@ rules:
                 RouteNetwork::Tcp
             ),
             RouteDecision::Proxy("proxy-a".to_string())
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("img.cdn1.example.org".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-c".to_string())
         );
         assert_eq!(
             routes.decide(&ProxyTarget::Ip("10.1.2.3:443".parse()?), RouteNetwork::Tcp),

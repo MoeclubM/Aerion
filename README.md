@@ -254,8 +254,10 @@ The CLI can run mihomo YAML, Xray JSON/JSONC, and sing-box JSON/JSONC client
 profiles directly. If those files contain multiple proxies/outbounds, select one
 with `--profile`; unsupported transports still fail explicitly instead of being
 silently downgraded. Built-in direct/block-style outbounds run as local route
-clients and do not start fake upstream proxy processes. Mihomo `select`
-proxy-groups resolve to the first listed proxy. Mihomo health-check /
+clients and do not start fake upstream proxy processes. Mihomo route rules
+include exact, suffix, keyword, wildcard, regex, geo, IP CIDR, port, network,
+and match/final forms. Mihomo `select` proxy-groups resolve to the first listed
+proxy. Mihomo health-check /
 load-balancing / relay groups and sing-box `urltest` outbounds resolve
 statically only when they contain a single explicit candidate; multi-candidate
 policies fail explicitly because Aerion does not implement active runtime
