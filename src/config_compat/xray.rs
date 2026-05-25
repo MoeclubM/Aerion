@@ -2,6 +2,7 @@ use crate::config_compat::mihomo::OneOrManyStrings;
 use crate::http_connect::HttpProxyClientConfig;
 use crate::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
 use crate::reality::{RealityClientConfig, RealityServerConfig};
+use crate::router::RouteClientConfig;
 use crate::routing::{
     DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
 };
@@ -159,6 +160,14 @@ pub struct XrayOutboundSettings {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub network: Option<String>,
+    #[serde(default, rename = "domainStrategy", alias = "domain_strategy")]
+    pub domain_strategy: Option<String>,
+    #[serde(default)]
+    pub redirect: Option<String>,
+    #[serde(default, rename = "userLevel", alias = "user_level")]
+    pub user_level: Option<Value>,
+    #[serde(default)]
+    pub response: Option<Value>,
     #[serde(default)]
     pub flow: Option<String>,
     #[serde(default, rename = "packetEncoding", alias = "packet_encoding")]
@@ -489,6 +498,7 @@ pub struct XrayMuxOptions {
 
 #[derive(Clone, Debug)]
 pub enum XrayClientConfig {
+    Route(RouteClientConfig),
     HttpProxy(HttpProxyClientConfig),
     Shadowsocks(ShadowsocksClientConfig),
     SocksProxy(SocksProxyClientConfig),
@@ -1221,6 +1231,12 @@ impl XrayOutbound {
             self.decode_error.as_deref().unwrap_or_default()
         );
         match self.protocol.trim().to_ascii_lowercase().as_str() {
+            "freedom" => Ok(XrayClientConfig::Route(
+                self.to_route_client_config(listen, RouteDecision::Direct)?,
+            )),
+            "blackhole" => Ok(XrayClientConfig::Route(
+                self.to_route_client_config(listen, RouteDecision::Block)?,
+            )),
             "shadowsocks" | "ss" => Ok(XrayClientConfig::Shadowsocks(
                 self.to_shadowsocks_client_config(listen)?,
             )),
@@ -1244,6 +1260,45 @@ impl XrayOutbound {
             )),
             other => bail!("unsupported xray outbound protocol {other}"),
         }
+    }
+
+    fn to_route_client_config(
+        &self,
+        listen: SocketAddr,
+        default: RouteDecision,
+    ) -> Result<RouteClientConfig> {
+        ensure!(
+            !self.mux.as_ref().map(|mux| mux.enabled).unwrap_or(false),
+            "xray {} outbound {} enables mux; Aerion route client does not use Xray mux",
+            self.protocol,
+            self.name()
+        );
+        ensure_tcp_network("xray route", self.name(), &self.stream_settings.network)?;
+        let stream_security = self.stream_settings.security.trim();
+        ensure!(
+            stream_security.is_empty() || stream_security.eq_ignore_ascii_case("none"),
+            "xray {} outbound {} uses stream security {}; Aerion route client does not use Xray stream security",
+            self.protocol,
+            self.name(),
+            stream_security
+        );
+        ensure!(
+            self.stream_settings.hysteria_settings.is_none()
+                && self.stream_settings.finalmask.is_none()
+                && self.stream_settings.tls_settings.is_none()
+                && self.stream_settings.reality_settings.is_none()
+                && self.stream_settings.ws_settings.is_none()
+                && self.stream_settings.http_upgrade_settings.is_none()
+                && self.stream_settings.grpc_settings.is_none()
+                && self.stream_settings.http_settings.is_none()
+                && self.stream_settings.xhttp_settings.is_none()
+                && self.stream_settings.split_http_settings.is_none(),
+            "xray {} outbound {} sets stream transport options; Aerion route client handles plain direct/block routing",
+            self.protocol,
+            self.name()
+        );
+        ensure_empty_route_settings(&self.settings, &self.protocol, self.name())?;
+        Ok(RouteClientConfig { listen, default })
     }
 
     fn to_http_client_config(&self, listen: SocketAddr) -> Result<HttpProxyClientConfig> {
@@ -2049,6 +2104,109 @@ fn ensure_tcp_network(format: &str, name: &str, network: &str) -> Result<()> {
     bail!(
         "{format} outbound {name} uses network {network}; Aerion currently wires raw TCP transport only"
     )
+}
+
+fn ensure_empty_route_settings(
+    settings: &XrayOutboundSettings,
+    protocol: &str,
+    name: &str,
+) -> Result<()> {
+    let mut fields = Vec::new();
+    if settings.version.is_some() {
+        fields.push("version");
+    }
+    if option_text_has_data(&settings.address) {
+        fields.push("address");
+    }
+    if settings.port.is_some() {
+        fields.push("port");
+    }
+    if option_text_has_data(&settings.id) {
+        fields.push("id");
+    }
+    if option_text_has_data(&settings.password) {
+        fields.push("password");
+    }
+    if option_text_has_data(&settings.auth) {
+        fields.push("auth");
+    }
+    if option_text_has_data(&settings.user) {
+        fields.push("user");
+    }
+    if option_text_has_data(&settings.pass) {
+        fields.push("pass");
+    }
+    if !settings.headers.is_empty() {
+        fields.push("headers");
+    }
+    if option_text_has_data(&settings.network) {
+        fields.push("network");
+    }
+    if option_text_has_data(&settings.domain_strategy) {
+        fields.push("domainStrategy");
+    }
+    if option_text_has_data(&settings.redirect) {
+        fields.push("redirect");
+    }
+    if settings
+        .user_level
+        .as_ref()
+        .map(value_has_data)
+        .unwrap_or(false)
+    {
+        fields.push("userLevel");
+    }
+    if settings
+        .response
+        .as_ref()
+        .map(value_has_data)
+        .unwrap_or(false)
+    {
+        fields.push("response");
+    }
+    if option_text_has_data(&settings.flow) {
+        fields.push("flow");
+    }
+    if option_text_has_data(&settings.packet_encoding) {
+        fields.push("packetEncoding");
+    }
+    if option_text_has_data(&settings.security) {
+        fields.push("security");
+    }
+    if option_text_has_data(&settings.method) {
+        fields.push("method");
+    }
+    if option_text_has_data(&settings.decryption) {
+        fields.push("decryption");
+    }
+    if settings.alter_id.is_some() {
+        fields.push("alterId");
+    }
+    if !settings.clients.is_empty() {
+        fields.push("clients");
+    }
+    if !settings.fallbacks.is_empty() {
+        fields.push("fallbacks");
+    }
+    if !settings.vnext.is_empty() {
+        fields.push("vnext");
+    }
+    if !settings.servers.is_empty() {
+        fields.push("servers");
+    }
+    ensure!(
+        fields.is_empty(),
+        "xray {protocol} outbound {name} sets unsupported route settings fields {:?}",
+        fields
+    );
+    Ok(())
+}
+
+fn option_text_has_data(value: &Option<String>) -> bool {
+    value
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
 }
 
 fn xray_tcp_udp_network(network: Option<&str>) -> Result<(bool, bool)> {
@@ -3552,6 +3710,40 @@ mod tests {
         assert_eq!(socks.username, "user");
         assert_eq!(socks.password, "pass");
         assert!(socks.udp);
+        Ok(())
+    }
+
+    #[test]
+    fn converts_builtin_route_outbounds_to_client_config() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "tag": "direct-out",
+      "protocol": "freedom",
+      "settings": {}
+    },
+    {
+      "tag": "blackhole-out",
+      "protocol": "blackhole",
+      "settings": {}
+    }
+  ]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let XrayClientConfig::Route(direct) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected direct route client")
+        };
+        assert_eq!(direct.default, RouteDecision::Direct);
+        let XrayClientConfig::Route(blackhole) =
+            config.outbounds[1].to_client_config("127.0.0.1:1081".parse()?)?
+        else {
+            bail!("expected blackhole route client")
+        };
+        assert_eq!(blackhole.default, RouteDecision::Block);
         Ok(())
     }
 }

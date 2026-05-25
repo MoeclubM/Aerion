@@ -5,6 +5,7 @@ use crate::mieru::{MieruClientConfig, MieruTrafficPattern, MieruTransport};
 use crate::naive::{NaiveClientConfig, default_naive_quic_congestion_control};
 use crate::padding::PaddingScheme;
 use crate::reality::RealityClientConfig;
+use crate::router::RouteClientConfig;
 use crate::routing::{
     DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
 };
@@ -653,6 +654,7 @@ pub enum OneOrManyStrings {
 
 #[derive(Clone, Debug)]
 pub enum MihomoClientConfig {
+    Route(RouteClientConfig),
     Shadowsocks(ShadowsocksClientConfig),
     SocksProxy(SocksProxyClientConfig),
     HttpProxy(HttpProxyClientConfig),
@@ -784,6 +786,20 @@ impl MihomoUnsupportedProxy {
     fn to_client_config(&self, listen: SocketAddr) -> Result<MihomoClientConfig> {
         let value = self.value();
         Ok(match self.kind.trim().to_ascii_lowercase().as_str() {
+            "direct" => {
+                self.ensure_route_fields()?;
+                MihomoClientConfig::Route(RouteClientConfig {
+                    listen,
+                    default: RouteDecision::Direct,
+                })
+            }
+            "reject" | "block" => {
+                self.ensure_route_fields()?;
+                MihomoClientConfig::Route(RouteClientConfig {
+                    listen,
+                    default: RouteDecision::Block,
+                })
+            }
             "ss" | "shadowsocks" => MihomoClientConfig::Shadowsocks(
                 serde_yaml::from_value::<MihomoShadowsocksProxy>(value)
                     .with_context(|| format!("parse mihomo Shadowsocks proxy {}", self.name))?
@@ -845,6 +861,33 @@ impl MihomoUnsupportedProxy {
                 self.kind
             ),
         })
+    }
+
+    fn ensure_route_fields(&self) -> Result<()> {
+        let unsupported = self
+            .fields
+            .keys()
+            .filter(|key| {
+                !key.eq_ignore_ascii_case("name")
+                    && !key.eq_ignore_ascii_case("type")
+                    && !key.eq_ignore_ascii_case("udp")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        ensure!(
+            unsupported.is_empty(),
+            "mihomo proxy {} type {} sets unsupported fields {:?}",
+            self.name,
+            self.kind,
+            unsupported
+        );
+        ensure!(
+            !matches!(self.fields.get("udp"), Some(Value::Bool(false))),
+            "mihomo proxy {} type {} disables UDP; Aerion route client exposes TCP and UDP together",
+            self.name,
+            self.kind
+        );
+        Ok(())
     }
 
     fn value(&self) -> Value {
@@ -1658,6 +1701,14 @@ proxies:
             config.proxy("direct-out").context("direct proxy")?.name(),
             "direct-out"
         );
+        let MihomoClientConfig::Route(direct) = config
+            .proxy("direct-out")
+            .context("direct proxy")?
+            .to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected route client")
+        };
+        assert_eq!(direct.default, RouteDecision::Direct);
         let error = config
             .proxy("wireguard-out")
             .context("wireguard proxy")?
@@ -2374,6 +2425,31 @@ proxies:
         assert_eq!(socks.username, "user");
         assert_eq!(socks.password, "pass");
         assert!(socks.udp);
+        Ok(())
+    }
+
+    #[test]
+    fn converts_mihomo_builtin_route_proxies() -> Result<()> {
+        let yaml = r#"
+proxies:
+  - name: direct-out
+    type: direct
+  - name: reject-out
+    type: reject
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let MihomoClientConfig::Route(direct) =
+            config.proxies[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected direct route client")
+        };
+        assert_eq!(direct.default, RouteDecision::Direct);
+        let MihomoClientConfig::Route(reject) =
+            config.proxies[1].to_client_config("127.0.0.1:1081".parse()?)?
+        else {
+            bail!("expected reject route client")
+        };
+        assert_eq!(reject.default, RouteDecision::Block);
         Ok(())
     }
 

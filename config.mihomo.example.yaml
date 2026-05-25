@@ -113,3 +113,9 @@ proxies:
     congestion-controller: cubic
     udp-relay-mode: native
     udp: true
+
+  - name: direct-out
+    type: direct
+
+  - name: reject-out
+    type: reject

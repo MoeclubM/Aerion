@@ -46,6 +46,9 @@ Aerion now provides these server/client protocol stacks:
   - local SOCKS5 CONNECT and UDP ASSOCIATE client over upstream SOCKS5 proxy
   - no-auth and username/password upstream authentication
   - mihomo `socks5`, sing-box `socks`, and Xray `socks` outbound profile mapping
+- Direct / block route clients:
+  - local SOCKS5 CONNECT and UDP ASSOCIATE with direct outbound routing or explicit block replies
+  - mihomo `direct` / `reject`, sing-box `direct` / `block`, and Xray `freedom` / `blackhole` outbound profile mapping
 - Shadowsocks:
   - local SOCKS5 CONNECT and UDP ASSOCIATE client
   - TCP and UDP server relay
@@ -104,13 +107,13 @@ Aerion now provides these server/client protocol stacks:
   - config compatibility is stored separately under `src/config_compat/`
   - `MihomoConfig` parses Clash.Meta / mihomo-style `proxies:` YAML for
     Shadowsocks, HTTP proxy, VLESS, VMess, Trojan, Hysteria2, AnyTLS, Mieru,
-    Naive, and TUIC core profiles
+    Naive, TUIC, direct, and reject core profiles
   - `XrayConfig` parses Xray JSON / JSONC `inbounds` and `outbounds`
-    profiles with Shadowsocks, HTTP proxy, VLESS, VMess, Trojan, and Hysteria2
-    selection helpers
+    profiles with Shadowsocks, HTTP proxy, SOCKS proxy, VLESS, VMess, Trojan,
+    Hysteria2, freedom, and blackhole selection helpers
   - `SingBoxConfig` parses sing-box JSON / JSONC `inbounds` and `outbounds`
     profiles with Shadowsocks, HTTP proxy, VLESS, VMess, Trojan, Hysteria2,
-    AnyTLS, Naive, and TUIC selection helpers
+    AnyTLS, Naive, TUIC, direct, and block selection helpers
   - protocol modules expose the bottom-level connection capability; profile
     selection and service/app policy stay in the integrating client or server
   - unsupported transport mismatches such as mihomo `smux` fail with explicit
@@ -207,16 +210,22 @@ cargo run -- run --config config.mihomo.example.yaml --profile mieru-tcp
 cargo run -- run --config config.mihomo.example.yaml --profile naive-h2
 cargo run -- run --config config.mihomo.example.yaml --profile http-proxy
 cargo run -- run --config config.mihomo.example.yaml --profile socks-proxy
+cargo run -- run --config config.mihomo.example.yaml --profile direct-out
+cargo run -- run --config config.mihomo.example.yaml --profile reject-out
 cargo run -- run --config config.xray.example.json --profile vless-reality
 cargo run -- run --config config.xray.example.json --profile http-proxy
 cargo run -- run --config config.xray.example.json --profile socks-proxy
 cargo run -- run --config config.xray.example.json --profile shadowsocks
 cargo run -- run --config config.xray.example.json --profile hysteria2
+cargo run -- run --config config.xray.example.json --profile direct-out
+cargo run -- run --config config.xray.example.json --profile blackhole-out
 cargo run -- run --config config.singbox.example.json --profile anytls
 cargo run -- run --config config.singbox.example.json --profile shadowsocks
 cargo run -- run --config config.singbox.example.json --profile naive-h2
 cargo run -- run --config config.singbox.example.json --profile http-proxy
 cargo run -- run --config config.singbox.example.json --profile socks-proxy
+cargo run -- run --config config.singbox.example.json --profile direct-out
+cargo run -- run --config config.singbox.example.json --profile block-out
 ```
 
 Aerion-native TOML can keep multiple `[[clients]]` or `[[servers]]` profiles in
@@ -242,7 +251,8 @@ and VMess server profiles.
 The CLI can run mihomo YAML, Xray JSON/JSONC, and sing-box JSON/JSONC client
 profiles directly. If those files contain multiple proxies/outbounds, select one
 with `--profile`; unsupported transports still fail explicitly instead of being
-silently downgraded.
+silently downgraded. Built-in direct/block-style outbounds run as local route
+clients and do not start fake upstream proxy processes.
 Inbound-only sing-box JSON can also run AnyTLS, Shadowsocks, Trojan, VMess,
 Hysteria2, TUIC, Naive, and VLESS server profiles, including Naive TCP-only /
 HTTP/3-only listener networks and VLESS raw, TLS, or REALITY inbound TLS

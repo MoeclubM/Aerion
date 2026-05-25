@@ -5,6 +5,7 @@ use crate::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
 use crate::naive::{NaiveClientConfig, NaiveServerConfig, default_naive_quic_congestion_control};
 use crate::padding::PaddingScheme;
 use crate::reality::{RealityClientConfig, RealityServerConfig};
+use crate::router::RouteClientConfig;
 use crate::routing::{
     DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
 };
@@ -589,6 +590,7 @@ pub struct SingBoxHysteria2Obfs {
 
 #[derive(Clone, Debug)]
 pub enum SingBoxClientConfig {
+    Route(RouteClientConfig),
     Shadowsocks(ShadowsocksClientConfig),
     SocksProxy(SocksProxyClientConfig),
     HttpProxy(HttpProxyClientConfig),
@@ -1428,6 +1430,30 @@ impl SingBoxOutbound {
 
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<SingBoxClientConfig> {
         match self.kind.trim().to_ascii_lowercase().as_str() {
+            "direct" => {
+                ensure!(
+                    self.fields.is_empty(),
+                    "sing-box direct outbound {} has unsupported fields {:?}",
+                    self.name(),
+                    self.fields.keys().collect::<Vec<_>>()
+                );
+                Ok(SingBoxClientConfig::Route(RouteClientConfig {
+                    listen,
+                    default: RouteDecision::Direct,
+                }))
+            }
+            "block" => {
+                ensure!(
+                    self.fields.is_empty(),
+                    "sing-box block outbound {} has unsupported fields {:?}",
+                    self.name(),
+                    self.fields.keys().collect::<Vec<_>>()
+                );
+                Ok(SingBoxClientConfig::Route(RouteClientConfig {
+                    listen,
+                    default: RouteDecision::Block,
+                }))
+            }
             "shadowsocks" | "ss" => Ok(SingBoxClientConfig::Shadowsocks(
                 self.decode::<SingBoxShadowsocksOutbound>()?
                     .to_client_config(self.name(), listen)?,
@@ -3967,6 +3993,32 @@ mod tests {
         assert_eq!(socks.username, "user");
         assert_eq!(socks.password, "pass");
         assert!(socks.udp);
+        Ok(())
+    }
+
+    #[test]
+    fn converts_builtin_route_outbounds_to_client_config() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    { "type": "direct", "tag": "direct-out" },
+    { "type": "block", "tag": "block-out" }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxClientConfig::Route(direct) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected direct route client")
+        };
+        assert_eq!(direct.default, RouteDecision::Direct);
+        let SingBoxClientConfig::Route(block) =
+            config.outbounds[1].to_client_config("127.0.0.1:1081".parse()?)?
+        else {
+            bail!("expected block route client")
+        };
+        assert_eq!(block.default, RouteDecision::Block);
         Ok(())
     }
 }

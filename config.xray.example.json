@@ -160,6 +160,24 @@
         "network": "tcp",
         "security": "none"
       }
+    },
+    {
+      "tag": "direct-out",
+      "protocol": "freedom",
+      "settings": {},
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      }
+    },
+    {
+      "tag": "blackhole-out",
+      "protocol": "blackhole",
+      "settings": {},
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      }
     }
   ]
 }

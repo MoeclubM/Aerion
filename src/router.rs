@@ -20,6 +20,12 @@ pub struct RouteProxyConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct RouteClientConfig {
+    pub listen: SocketAddr,
+    pub default: RouteDecision,
+}
+
+#[derive(Clone, Debug)]
 pub struct RouteProxyState {
     routes: SharedRouteTable,
     upstreams: Arc<RwLock<BTreeMap<String, SocketAddr>>>,
@@ -34,6 +40,30 @@ struct UdpCommand {
 
 pub async fn run_route_proxy(listener: TcpListener, config: RouteProxyConfig) -> Result<()> {
     run_route_proxy_with_state(listener, RouteProxyState::from_config(config)).await
+}
+
+pub async fn run_route_client(config: RouteClientConfig) -> Result<()> {
+    let listener = TcpListener::bind(config.listen)
+        .await
+        .with_context(|| format!("bind route client on {}", config.listen))?;
+    run_route_client_listener(listener, config).await
+}
+
+pub async fn run_route_client_listener(
+    listener: TcpListener,
+    config: RouteClientConfig,
+) -> Result<()> {
+    run_route_proxy(
+        listener,
+        RouteProxyConfig {
+            routes: RouteTable {
+                default: config.default,
+                ..RouteTable::default()
+            },
+            upstreams: BTreeMap::new(),
+        },
+    )
+    .await
 }
 
 pub async fn run_route_proxy_until(

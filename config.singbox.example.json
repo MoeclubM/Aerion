@@ -122,6 +122,14 @@
       "network": "tcp+udp"
     },
     {
+      "type": "direct",
+      "tag": "direct-out"
+    },
+    {
+      "type": "block",
+      "tag": "block-out"
+    },
+    {
       "type": "tuic",
       "tag": "tuic-v5",
       "server": "example.com",

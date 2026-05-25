@@ -19,19 +19,19 @@ use aerion::tun::{
 use aerion::vless_transport::VlessTransportConfig;
 use aerion::{
     ClientConfig, MihomoClientConfig, MihomoProxy, RealityClientConfig, RealityServerConfig,
-    RouteDecision, RouteProxyConfig, RouteTable, ServerConfig, ShadowsocksClientConfig,
-    ShadowsocksServerConfig, SingBoxClientConfig, SingBoxOutbound, SingBoxServerConfig,
-    SocksProxyClientConfig, TrojanClientConfig, TrojanServerConfig, VlessClientConfig,
-    VlessServerConfig, VmessClientConfig, VmessServerConfig, XrayClientConfig, XrayOutbound,
-    XrayServerConfig, run_client, run_client_listener, run_hysteria2_client,
+    RouteClientConfig, RouteDecision, RouteProxyConfig, RouteTable, ServerConfig,
+    ShadowsocksClientConfig, ShadowsocksServerConfig, SingBoxClientConfig, SingBoxOutbound,
+    SingBoxServerConfig, SocksProxyClientConfig, TrojanClientConfig, TrojanServerConfig,
+    VlessClientConfig, VlessServerConfig, VmessClientConfig, VmessServerConfig, XrayClientConfig,
+    XrayOutbound, XrayServerConfig, run_client, run_client_listener, run_hysteria2_client,
     run_hysteria2_client_listener, run_hysteria2_server, run_mieru_client,
     run_mieru_client_listener, run_mieru_server, run_naive_client, run_naive_client_listener,
-    run_naive_server, run_route_proxy, run_server, run_shadowsocks_client,
-    run_shadowsocks_client_listener, run_shadowsocks_server, run_socks_proxy_client,
-    run_socks_proxy_client_listener, run_trojan_client, run_trojan_client_listener,
-    run_trojan_server, run_tuic_client, run_tuic_client_listener, run_tuic_server,
-    run_vless_client, run_vless_client_listener, run_vless_server, run_vmess_client,
-    run_vmess_client_listener, run_vmess_server, tls,
+    run_naive_server, run_route_client, run_route_client_listener, run_route_proxy, run_server,
+    run_shadowsocks_client, run_shadowsocks_client_listener, run_shadowsocks_server,
+    run_socks_proxy_client, run_socks_proxy_client_listener, run_trojan_client,
+    run_trojan_client_listener, run_trojan_server, run_tuic_client, run_tuic_client_listener,
+    run_tuic_server, run_vless_client, run_vless_client_listener, run_vless_server,
+    run_vmess_client, run_vmess_client_listener, run_vmess_server, tls,
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
@@ -577,6 +577,7 @@ enum RunnableClientConfig {
     Hysteria2(Hysteria2ClientConfig),
     Mieru(MieruClientConfig),
     Naive(NaiveClientConfig),
+    Route(RouteClientConfig),
     Shadowsocks(ShadowsocksClientConfig),
     SocksProxy(SocksProxyClientConfig),
     Trojan(TrojanClientConfig),
@@ -593,6 +594,7 @@ impl From<MihomoClientConfig> for RunnableClientConfig {
             MihomoClientConfig::Hysteria2(config) => Self::Hysteria2(config),
             MihomoClientConfig::Mieru(config) => Self::Mieru(config),
             MihomoClientConfig::Naive(config) => Self::Naive(config),
+            MihomoClientConfig::Route(config) => Self::Route(config),
             MihomoClientConfig::Shadowsocks(config) => Self::Shadowsocks(config),
             MihomoClientConfig::SocksProxy(config) => Self::SocksProxy(config),
             MihomoClientConfig::Trojan(config) => Self::Trojan(config),
@@ -610,6 +612,7 @@ impl From<SingBoxClientConfig> for RunnableClientConfig {
             SingBoxClientConfig::HttpProxy(config) => Self::HttpProxy(config),
             SingBoxClientConfig::Hysteria2(config) => Self::Hysteria2(config),
             SingBoxClientConfig::Naive(config) => Self::Naive(config),
+            SingBoxClientConfig::Route(config) => Self::Route(config),
             SingBoxClientConfig::Shadowsocks(config) => Self::Shadowsocks(config),
             SingBoxClientConfig::SocksProxy(config) => Self::SocksProxy(config),
             SingBoxClientConfig::Trojan(config) => Self::Trojan(config),
@@ -625,6 +628,7 @@ impl From<XrayClientConfig> for RunnableClientConfig {
         match config {
             XrayClientConfig::HttpProxy(config) => Self::HttpProxy(config),
             XrayClientConfig::Hysteria2(config) => Self::Hysteria2(config),
+            XrayClientConfig::Route(config) => Self::Route(config),
             XrayClientConfig::Shadowsocks(config) => Self::Shadowsocks(config),
             XrayClientConfig::SocksProxy(config) => Self::SocksProxy(config),
             XrayClientConfig::Trojan(config) => Self::Trojan(config),
@@ -1398,6 +1402,7 @@ async fn run_client_config(config: RunnableClientConfig) -> Result<()> {
         RunnableClientConfig::Hysteria2(config) => run_hysteria2_client(config).await,
         RunnableClientConfig::Mieru(config) => run_mieru_client(config).await,
         RunnableClientConfig::Naive(config) => run_naive_client(config).await,
+        RunnableClientConfig::Route(config) => run_route_client(config).await,
         RunnableClientConfig::Shadowsocks(config) => run_shadowsocks_client(config).await,
         RunnableClientConfig::SocksProxy(config) => run_socks_proxy_client(config).await,
         RunnableClientConfig::Trojan(config) => run_trojan_client(config).await,
@@ -1427,6 +1432,7 @@ async fn run_client_config_with_listener(
         }
         RunnableClientConfig::Mieru(config) => run_mieru_client_listener(listener, config).await,
         RunnableClientConfig::Naive(config) => run_naive_client_listener(listener, config).await,
+        RunnableClientConfig::Route(config) => run_route_client_listener(listener, config).await,
         RunnableClientConfig::Shadowsocks(config) => {
             run_shadowsocks_client_listener(listener, config).await
         }

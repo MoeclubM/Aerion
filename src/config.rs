@@ -559,7 +559,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.mihomo.example.yaml");
         assert!(matches!(
             load_config(&path).expect("mihomo config"),
-            FileConfig::Mihomo(config) if config.proxies.len() == 11
+            FileConfig::Mihomo(config) if config.proxies.len() == 13
         ));
     }
 
@@ -568,7 +568,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.xray.example.json");
         assert!(matches!(
             load_config(&path).expect("xray config"),
-            FileConfig::Xray(config) if config.outbounds.len() == 7
+            FileConfig::Xray(config) if config.outbounds.len() == 9
         ));
     }
 
@@ -577,7 +577,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.singbox.example.json");
         assert!(matches!(
             load_config(&path).expect("sing-box config"),
-            FileConfig::SingBox(config) if config.outbounds.len() == 10
+            FileConfig::SingBox(config) if config.outbounds.len() == 12
         ));
     }
 

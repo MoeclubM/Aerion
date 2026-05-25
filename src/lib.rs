@@ -78,8 +78,9 @@ pub use reality::{
     build_reality_client_hello_with_alpn,
 };
 pub use router::{
-    RouteProxyConfig, RouteProxyState, run_route_proxy, run_route_proxy_until,
-    run_route_proxy_with_state, run_route_proxy_with_state_until,
+    RouteClientConfig, RouteProxyConfig, RouteProxyState, run_route_client,
+    run_route_client_listener, run_route_proxy, run_route_proxy_until, run_route_proxy_with_state,
+    run_route_proxy_with_state_until,
 };
 pub use routing::{
     DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
