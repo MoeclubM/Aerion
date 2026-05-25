@@ -269,8 +269,11 @@ sing-box route rules accept `route` / `reject` actions, logical route rules,
 inline route rule-sets, and local source JSON rule-sets when they can be
 represented by Aerion's static route table. Remote and binary rule-set loading
 still fails explicitly.
-Xray routing `balancerTag` resolves only when its balancer selectors identify
-exactly one outbound and no runtime strategy/fallback state is required.
+Xray routing `domain` entries follow Xray's plain substring, `domain:`,
+`full:`, `keyword:`, `dotless:`, and regex forms; `balancerTag` resolves only
+when its balancer selectors identify exactly one outbound and no runtime
+strategy/fallback state is required. Xray `domainStrategy` values that require
+DNS resolution during routing fail explicitly.
 Inbound-only sing-box JSON can also run AnyTLS, Shadowsocks, Trojan, VMess,
 Hysteria2, TUIC, Naive, and VLESS server profiles, including Naive TCP-only /
 HTTP/3-only listener networks and VLESS raw, TLS, or REALITY inbound TLS

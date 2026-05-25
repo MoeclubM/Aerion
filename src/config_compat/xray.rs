@@ -37,6 +37,8 @@ pub struct XrayRoutingConfig {
     pub rules: Vec<XrayRoutingRule>,
     #[serde(default)]
     pub balancers: Vec<XrayBalancer>,
+    #[serde(default, rename = "domainStrategy", alias = "domain_strategy")]
+    pub domain_strategy: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -564,6 +566,12 @@ impl XrayConfig {
 
 impl XrayRoutingConfig {
     pub fn to_route_table(&self, outbounds: &[XrayOutbound]) -> Result<RouteTable> {
+        if let Some(strategy) = self.domain_strategy.as_deref().map(str::trim) {
+            ensure!(
+                strategy.is_empty() || strategy.eq_ignore_ascii_case("AsIs"),
+                "xray routing.domainStrategy {strategy} requires DNS resolution during routing"
+            );
+        }
         let mut table = RouteTable::default();
         for (index, rule) in self.rules.iter().enumerate() {
             table
@@ -615,7 +623,7 @@ impl XrayRoutingRule {
         for domain in &self.domain {
             if let Some(name) = DomainMatcher::geosite_name(domain) {
                 rule.add_geosite_set(name);
-            } else if let Some(matcher) = DomainMatcher::from_prefixed(domain)? {
+            } else if let Some(matcher) = DomainMatcher::xray(domain)? {
                 rule.domains.push(matcher);
             }
         }
@@ -2779,6 +2787,7 @@ mod tests {
     "rules": [
       { "type": "field", "domain": ["domain:example.com"], "outboundTag": "direct" },
       { "type": "field", "domain": ["keyword:video"], "outboundTag": "proxy-a" },
+      { "type": "field", "domain": ["cdn"], "outboundTag": "proxy-c" },
       { "type": "field", "ip": ["10.0.0.0/8"], "port": "53", "network": "udp", "outboundTag": "direct" }
     ]
   }
@@ -2801,9 +2810,36 @@ mod tests {
             RouteDecision::Proxy("proxy-a".to_string())
         );
         assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("static-cdn.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-c".to_string())
+        );
+        assert_eq!(
             routes.decide(&ProxyTarget::Ip("10.1.2.3:53".parse()?), RouteNetwork::Udp),
             RouteDecision::Direct
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_xray_routing_domain_strategy_that_requires_dns() -> Result<()> {
+        let json = r#"
+{
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      { "type": "field", "ip": ["10.0.0.0/8"], "outboundTag": "direct" }
+    ]
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("xray domainStrategy must not be ignored");
+        assert!(error.to_string().contains("domainStrategy"));
         Ok(())
     }
 

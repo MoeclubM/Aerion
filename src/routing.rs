@@ -50,6 +50,7 @@ pub enum DomainMatcher {
     Exact(String),
     Suffix(String),
     Keyword(String),
+    Dotless(String),
     Regex(Regex),
 }
 
@@ -318,6 +319,10 @@ impl DomainMatcher {
         Self::Keyword(keyword.trim().to_ascii_lowercase())
     }
 
+    pub fn dotless(keyword: &str) -> Self {
+        Self::Dotless(keyword.trim().to_ascii_lowercase())
+    }
+
     pub fn regex(pattern: &str) -> Result<Self> {
         Ok(Self::Regex(Regex::new(pattern)?))
     }
@@ -388,13 +393,54 @@ impl DomainMatcher {
         if let Some(keyword) = value.strip_prefix("keyword:") {
             return Ok(Some(Self::keyword(keyword)));
         }
+        if let Some(keyword) = value.strip_prefix("dotless:") {
+            return Ok(Some(Self::dotless(keyword)));
+        }
         if let Some(domain) = value.strip_prefix("*.") {
             return Ok(Some(Self::suffix(domain)));
         }
         if Self::geosite_name(value).is_some() {
             bail!("geosite route rules require rule-set data");
         }
+        if value
+            .get(..4)
+            .map(|prefix| prefix.eq_ignore_ascii_case("ext:"))
+            .unwrap_or(false)
+        {
+            bail!("external domain route rules require rule-set data");
+        }
         Ok(Some(Self::exact(value)))
+    }
+
+    pub fn xray(value: &str) -> Result<Option<Self>> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Ok(None);
+        }
+        if let Some(name) = Self::geosite_name(value) {
+            bail!("xray geosite {name} must be represented as a route set");
+        }
+        if let Some(matcher) = Self::from_prefixed(value)? {
+            let prefixed = matches!(
+                value.split_once(':').map(|(prefix, _)| prefix.to_ascii_lowercase()),
+                Some(prefix)
+                    if matches!(
+                        prefix.as_str(),
+                        "regexp"
+                            | "regex"
+                            | "full"
+                            | "domain_full"
+                            | "domain"
+                            | "suffix"
+                            | "keyword"
+                            | "dotless"
+                    )
+            );
+            if prefixed || value.strip_prefix("*.").is_some() {
+                return Ok(Some(matcher));
+            }
+        }
+        Ok(Some(Self::keyword(value)))
     }
 
     pub fn geosite_name(value: &str) -> Option<String> {
@@ -410,6 +456,7 @@ impl DomainMatcher {
             Self::Exact(expected) => domain == expected,
             Self::Suffix(suffix) => domain == suffix || domain.ends_with(&format!(".{suffix}")),
             Self::Keyword(keyword) => domain.contains(keyword),
+            Self::Dotless(keyword) => !domain.contains('.') && domain.contains(keyword),
             Self::Regex(regex) => regex.is_match(domain),
         }
     }
@@ -612,10 +659,24 @@ mod tests {
         let exact = DomainMatcher::from_prefixed("full:api.example.com")?.unwrap();
         let suffix = DomainMatcher::from_prefixed("domain:example.org")?.unwrap();
         let regex = DomainMatcher::from_prefixed(r"regexp:^cdn\d+\.example\.net$")?.unwrap();
+        let dotless = DomainMatcher::from_prefixed("dotless:local")?.unwrap();
         assert!(exact.matches("api.example.com"));
         assert!(!exact.matches("www.api.example.com"));
         assert!(suffix.matches("static.example.org"));
         assert!(regex.matches("cdn12.example.net"));
+        assert!(dotless.matches("my-local-host"));
+        assert!(!dotless.matches("my-local-host.example.com"));
+        Ok(())
+    }
+
+    #[test]
+    fn xray_plain_domain_matchers_are_substrings() -> Result<()> {
+        let plain = DomainMatcher::xray("cdn")?.unwrap();
+        let full = DomainMatcher::xray("full:cdn.example.com")?.unwrap();
+        assert!(plain.matches("video-cdn.example.com"));
+        assert!(!plain.matches("video.example.com"));
+        assert!(full.matches("cdn.example.com"));
+        assert!(!full.matches("video-cdn.example.com"));
         Ok(())
     }
 
