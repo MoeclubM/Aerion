@@ -20,11 +20,11 @@ use aerion::vless_transport::VlessTransportConfig;
 use aerion::{
     ClientConfig, MihomoClientConfig, MihomoProxy, RealityClientConfig, RealityServerConfig,
     RouteClientConfig, RouteDecision, RouteProxyConfig, RouteTable, ServerConfig,
-    ShadowsocksClientConfig, ShadowsocksServerConfig, SingBoxClientConfig, SingBoxOutbound,
-    SingBoxServerConfig, SocksProxyClientConfig, TrojanClientConfig, TrojanServerConfig,
-    VlessClientConfig, VlessServerConfig, VmessClientConfig, VmessServerConfig, XrayClientConfig,
-    XrayOutbound, XrayServerConfig, run_client, run_client_listener, run_hysteria2_client,
-    run_hysteria2_client_listener, run_hysteria2_server, run_mieru_client,
+    ShadowsocksClientConfig, ShadowsocksServerConfig, SingBoxClientConfig, SingBoxConfig,
+    SingBoxOutbound, SingBoxServerConfig, SocksProxyClientConfig, TrojanClientConfig,
+    TrojanServerConfig, VlessClientConfig, VlessServerConfig, VmessClientConfig, VmessServerConfig,
+    XrayClientConfig, XrayOutbound, XrayServerConfig, run_client, run_client_listener,
+    run_hysteria2_client, run_hysteria2_client_listener, run_hysteria2_server, run_mieru_client,
     run_mieru_client_listener, run_mieru_server, run_naive_client, run_naive_client_listener,
     run_naive_server, run_route_client, run_route_client_listener, run_route_proxy, run_server,
     run_shadowsocks_client, run_shadowsocks_client_listener, run_shadowsocks_server,
@@ -708,7 +708,7 @@ async fn run_file_config(
                     .unwrap_or("127.0.0.1:0".parse()?);
                 let listener = bind_client_listener("sing-box", listen).await?;
                 let listen = listener.local_addr()?;
-                let outbound = select_singbox_outbound(&config.outbounds, profile)?;
+                let outbound = select_singbox_outbound(&config, profile)?;
                 let tun = config
                     .tun_config(listen)?
                     .context("sing-box TUN inbound was found but no TUN config was produced")?;
@@ -722,7 +722,7 @@ async fn run_file_config(
             let listen = listen
                 .or(config.local_socks_listen()?)
                 .context("sing-box config has no mixed/socks inbound; pass --listen")?;
-            let outbound = select_singbox_outbound(&config.outbounds, profile)?;
+            let outbound = select_singbox_outbound(&config, profile)?;
             run_client_config(outbound.to_client_config(listen)?.into()).await
         }
     }
@@ -794,8 +794,8 @@ async fn run_singbox_route_config(
         .await?;
         let upstream = listener.local_addr()?;
         let outbound = config
-            .outbound(&tag)
-            .with_context(|| format!("sing-box route outbound {tag} was not found"))?;
+            .resolved_outbound(&tag)
+            .with_context(|| format!("resolve sing-box route outbound {tag}"))?;
         let runnable = outbound.to_client_config(upstream)?.into();
         spawn_route_outbound(tag.clone(), listener, runnable, outbound_tx.clone());
         upstreams.insert(tag, upstream);
@@ -1626,21 +1626,19 @@ fn select_xray_inbound<'a>(
 }
 
 fn select_singbox_outbound<'a>(
-    outbounds: &'a [SingBoxOutbound],
+    config: &'a SingBoxConfig,
     profile: Option<&str>,
 ) -> Result<&'a SingBoxOutbound> {
     if let Some(profile) = profile {
-        return outbounds
-            .iter()
-            .find(|outbound| outbound.name() == profile)
-            .with_context(|| format!("sing-box outbound {profile} was not found"));
+        return config.resolved_outbound_profile(profile);
     }
-    match outbounds {
-        [outbound] => Ok(outbound),
+    match config.outbounds.as_slice() {
+        [outbound] => config.resolved_outbound_profile(outbound.name()),
         [] => bail!("sing-box config has no outbounds"),
         _ => bail!(
             "sing-box config has multiple outbounds [{}]; pass --profile",
-            outbounds
+            config
+                .outbounds
                 .iter()
                 .map(SingBoxOutbound::name)
                 .collect::<Vec<_>>()

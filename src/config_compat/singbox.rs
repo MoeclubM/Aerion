@@ -23,7 +23,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
@@ -497,6 +497,18 @@ pub struct SingBoxTuicOutbound {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct SingBoxSelectorOutbound {
+    #[serde(default)]
+    pub outbounds: Vec<String>,
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default, rename = "interrupt_exist_connections")]
+    pub interrupt_exist_connections: Option<bool>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct SingBoxTlsOptions {
     #[serde(default)]
     pub enabled: bool,
@@ -619,6 +631,42 @@ impl SingBoxConfig {
         self.outbounds
             .iter()
             .find(|outbound| outbound.tag.as_deref() == Some(tag))
+    }
+
+    pub fn resolved_outbound(&self, tag: &str) -> Result<&SingBoxOutbound> {
+        let outbound = self
+            .outbound(tag)
+            .with_context(|| format!("sing-box outbound {tag} was not found"))?;
+        self.resolve_policy_outbound(outbound)
+    }
+
+    pub fn resolved_outbound_profile(&self, profile: &str) -> Result<&SingBoxOutbound> {
+        let outbound = self
+            .outbounds
+            .iter()
+            .find(|outbound| outbound.name() == profile)
+            .with_context(|| format!("sing-box outbound {profile} was not found"))?;
+        self.resolve_policy_outbound(outbound)
+    }
+
+    fn resolve_policy_outbound<'a>(
+        &'a self,
+        mut outbound: &'a SingBoxOutbound,
+    ) -> Result<&'a SingBoxOutbound> {
+        let mut seen = BTreeSet::new();
+        loop {
+            ensure!(
+                seen.insert(outbound.name().to_string()),
+                "sing-box selector outbound cycle includes {}",
+                outbound.name()
+            );
+            let Some(target) = outbound.static_policy_target()? else {
+                return Ok(outbound);
+            };
+            outbound = self
+                .outbound(&target)
+                .with_context(|| format!("sing-box outbound {target} was not found"))?;
+        }
     }
 
     pub fn local_socks_listen(&self) -> Result<Option<SocketAddr>> {
@@ -1428,6 +1476,20 @@ impl SingBoxOutbound {
         self.tag.as_deref().unwrap_or(&self.kind)
     }
 
+    fn static_policy_target(&self) -> Result<Option<String>> {
+        match self.kind.trim().to_ascii_lowercase().as_str() {
+            "selector" => Ok(Some(
+                self.decode::<SingBoxSelectorOutbound>()?
+                    .selected_target(self.name())?,
+            )),
+            "urltest" => bail!(
+                "sing-box urltest outbound {} requires active latency selection; Aerion does not implement urltest policy yet",
+                self.name()
+            ),
+            _ => Ok(None),
+        }
+    }
+
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<SingBoxClientConfig> {
         match self.kind.trim().to_ascii_lowercase().as_str() {
             "direct" => {
@@ -1494,6 +1556,14 @@ impl SingBoxOutbound {
                 self.decode::<SingBoxTuicOutbound>()?
                     .to_client_config(self.name(), listen)?,
             )),
+            "selector" => bail!(
+                "sing-box selector outbound {} must be resolved through its selected outbound before conversion",
+                self.name()
+            ),
+            "urltest" => bail!(
+                "sing-box urltest outbound {} requires active latency selection; Aerion does not implement urltest policy yet",
+                self.name()
+            ),
             other => bail!("unsupported sing-box outbound type {other}"),
         }
     }
@@ -1504,6 +1574,31 @@ impl SingBoxOutbound {
     {
         serde_json::from_value(Value::Object(self.fields.clone()))
             .with_context(|| format!("parse sing-box outbound {}", self.name()))
+    }
+}
+
+impl SingBoxSelectorOutbound {
+    fn selected_target(&self, name: &str) -> Result<String> {
+        ensure!(
+            !self.outbounds.is_empty(),
+            "sing-box selector outbound {name} has no outbounds"
+        );
+        ensure!(
+            self.extra.is_empty(),
+            "sing-box selector outbound {name} has unsupported fields {:?}",
+            self.extra.keys().collect::<Vec<_>>()
+        );
+        let target = self
+            .default
+            .as_deref()
+            .map(str::trim)
+            .filter(|default| !default.is_empty())
+            .unwrap_or(&self.outbounds[0]);
+        ensure!(
+            self.outbounds.iter().any(|outbound| outbound == target),
+            "sing-box selector outbound {name} default {target} is not listed in outbounds"
+        );
+        Ok(target.to_string())
     }
 }
 
@@ -4019,6 +4114,107 @@ mod tests {
             bail!("expected block route client")
         };
         assert_eq!(block.default, RouteDecision::Block);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_selector_outbound_default() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "select",
+      "outbounds": ["direct-out", "block-out"],
+      "default": "block-out"
+    },
+    { "type": "direct", "tag": "direct-out" },
+    { "type": "block", "tag": "block-out" }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        assert_eq!(config.resolved_outbound("select")?.name(), "block-out");
+        let SingBoxClientConfig::Route(block) = config
+            .resolved_outbound_profile("select")?
+            .to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected selected block route client")
+        };
+        assert_eq!(block.default, RouteDecision::Block);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_selector_first_outbound_without_default() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "select",
+      "outbounds": ["direct-out", "block-out"]
+    },
+    { "type": "direct", "tag": "direct-out" },
+    { "type": "block", "tag": "block-out" }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        assert_eq!(config.resolved_outbound("select")?.name(), "direct-out");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_selector_cycle() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "a",
+      "outbounds": ["b"],
+      "default": "b"
+    },
+    {
+      "type": "selector",
+      "tag": "b",
+      "outbounds": ["a"],
+      "default": "a"
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .resolved_outbound("a")
+            .expect_err("selector cycles must fail");
+        assert!(error.to_string().contains("cycle"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_urltest_policy_outbound() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "type": "urltest",
+      "tag": "auto",
+      "outbounds": ["direct-out", "block-out"],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m"
+    },
+    { "type": "direct", "tag": "direct-out" },
+    { "type": "block", "tag": "block-out" }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .resolved_outbound("auto")
+            .expect_err("urltest requires active latency selection");
+        assert!(error.to_string().contains("urltest"));
         Ok(())
     }
 }

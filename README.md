@@ -252,7 +252,10 @@ The CLI can run mihomo YAML, Xray JSON/JSONC, and sing-box JSON/JSONC client
 profiles directly. If those files contain multiple proxies/outbounds, select one
 with `--profile`; unsupported transports still fail explicitly instead of being
 silently downgraded. Built-in direct/block-style outbounds run as local route
-clients and do not start fake upstream proxy processes.
+clients and do not start fake upstream proxy processes. sing-box `selector`
+outbounds are resolved to their startup selection (`default`, or the first
+listed outbound when `default` is omitted); `urltest` still fails explicitly
+because Aerion does not implement active latency policy selection yet.
 Inbound-only sing-box JSON can also run AnyTLS, Shadowsocks, Trojan, VMess,
 Hysteria2, TUIC, Naive, and VLESS server profiles, including Naive TCP-only /
 HTTP/3-only listener networks and VLESS raw, TLS, or REALITY inbound TLS
