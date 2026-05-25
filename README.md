@@ -259,7 +259,9 @@ include exact, suffix, keyword, wildcard, regex, geo, IP CIDR, port, network,
 match/final forms, statically representable `OR` / `AND` logical rules, and
 `RULE-SET` expansion from inline or local YAML/text file
 `rule-providers` with `domain`, `ipcidr`, or `classical` behavior. Remote HTTP
-and binary MRS rule-provider loading still fails explicitly. Mihomo `select`
+and binary MRS rule-provider loading still fails explicitly. Source/process
+matchers and `src` route parameters require routing metadata and fail
+explicitly. Mihomo `select`
 proxy-groups resolve to the first listed proxy. Mihomo health-check /
 load-balancing / relay groups and sing-box `urltest` outbounds resolve
 statically only when they contain a single explicit candidate; multi-candidate

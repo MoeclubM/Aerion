@@ -2158,14 +2158,15 @@ fn parse_mihomo_route_rule_parts(
         "{location} is empty"
     );
     let kind = parts[0].to_ascii_uppercase();
+    let action_index = if matches!(kind.as_str(), "MATCH" | "FINAL") {
+        1
+    } else {
+        2
+    };
+    let inherited_action = action.is_some();
     let action = match action {
         Some(action) => action,
         None => {
-            let action_index = if matches!(kind.as_str(), "MATCH" | "FINAL") {
-                1
-            } else {
-                2
-            };
             ensure!(parts.len() > action_index, "{location} is missing outbound");
             RouteDecision::from_outbound(parts[action_index])?
         }
@@ -2174,6 +2175,25 @@ fn parse_mihomo_route_rule_parts(
         ensure!(
             parts.len() > 1 && !parts[1].is_empty(),
             "{location} is missing rule value"
+        );
+    }
+    let param_start = if inherited_action {
+        if matches!(kind.as_str(), "MATCH" | "FINAL") {
+            1
+        } else {
+            2
+        }
+    } else {
+        action_index + 1
+    };
+    let params = parts.get(param_start..).unwrap_or(&[]);
+    if params.iter().any(|param| param.eq_ignore_ascii_case("src")) {
+        bail!("{location} src route parameter requires source IP metadata");
+    }
+    for param in params.iter().filter(|param| !param.is_empty()) {
+        ensure!(
+            param.eq_ignore_ascii_case("no-resolve"),
+            "{location} unsupported mihomo route parameter {param}"
         );
     }
     let mut rule = RouteRule::new(action);
@@ -2622,6 +2642,17 @@ rules:
             .route_table()
             .expect_err("AND of multiple domain matchers must fail explicitly");
         assert!(error.to_string().contains("multiple domain matchers"));
+
+        let src_yaml = r#"
+proxies: []
+rules:
+  - IP-CIDR,10.0.0.0/8,DIRECT,src
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(src_yaml)?;
+        let error = config
+            .route_table()
+            .expect_err("src route parameter requires source metadata");
+        assert!(error.to_string().contains("source IP metadata"));
         Ok(())
     }
 
