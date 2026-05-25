@@ -22,7 +22,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, de};
 use serde_yaml::{Mapping, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -39,6 +39,8 @@ pub struct MihomoConfig {
     pub bind_address: Option<String>,
     #[serde(default)]
     pub proxies: Vec<MihomoProxy>,
+    #[serde(default, rename = "proxy-groups", alias = "proxy_groups")]
+    pub proxy_groups: Vec<MihomoProxyGroup>,
     #[serde(default)]
     pub rules: Vec<String>,
     #[serde(default)]
@@ -149,6 +151,57 @@ impl<'de> Deserialize<'de> for MihomoProxy {
 pub struct MihomoUnsupportedProxy {
     pub name: String,
     pub kind: String,
+    pub fields: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct MihomoProxyGroup {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub proxies: Vec<String>,
+    #[serde(default, rename = "use")]
+    pub use_providers: Vec<String>,
+    #[serde(default, rename = "disable-udp", alias = "disable_udp")]
+    pub disable_udp: bool,
+    #[serde(default, rename = "include-all", alias = "include_all")]
+    pub include_all: bool,
+    #[serde(default, rename = "include-all-proxies", alias = "include_all_proxies")]
+    pub include_all_proxies: bool,
+    #[serde(
+        default,
+        rename = "include-all-providers",
+        alias = "include_all_providers"
+    )]
+    pub include_all_providers: bool,
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default, rename = "exclude-filter", alias = "exclude_filter")]
+    pub exclude_filter: Option<String>,
+    #[serde(default, rename = "exclude-type", alias = "exclude_type")]
+    pub exclude_type: Option<String>,
+    #[serde(default, rename = "interface-name", alias = "interface_name")]
+    pub interface_name: Option<Value>,
+    #[serde(default, rename = "routing-mark", alias = "routing_mark")]
+    pub routing_mark: Option<Value>,
+    #[serde(default)]
+    pub url: Option<Value>,
+    #[serde(default)]
+    pub interval: Option<Value>,
+    #[serde(default)]
+    pub lazy: Option<Value>,
+    #[serde(default)]
+    pub timeout: Option<Value>,
+    #[serde(default, rename = "max-failed-times", alias = "max_failed_times")]
+    pub max_failed_times: Option<Value>,
+    #[serde(default, rename = "expected-status", alias = "expected_status")]
+    pub expected_status: Option<Value>,
+    #[serde(default)]
+    pub hidden: Option<Value>,
+    #[serde(default)]
+    pub icon: Option<Value>,
+    #[serde(flatten)]
     pub fields: BTreeMap<String, Value>,
 }
 
@@ -668,9 +721,72 @@ pub enum MihomoClientConfig {
     Tuic(TuicClientConfig),
 }
 
+enum MihomoResolvedProxy<'a> {
+    Proxy(&'a MihomoProxy),
+    Route(RouteDecision),
+}
+
 impl MihomoConfig {
     pub fn proxy(&self, name: &str) -> Option<&MihomoProxy> {
         self.proxies.iter().find(|proxy| proxy.name() == name)
+    }
+
+    pub fn proxy_group(&self, name: &str) -> Option<&MihomoProxyGroup> {
+        self.proxy_groups
+            .iter()
+            .find(|group| group.name.as_str() == name)
+    }
+
+    pub fn profile_names(&self) -> Vec<&str> {
+        self.proxies
+            .iter()
+            .map(MihomoProxy::name)
+            .chain(self.proxy_groups.iter().map(|group| group.name.as_str()))
+            .collect()
+    }
+
+    pub fn resolved_proxy_config(
+        &self,
+        name: &str,
+        listen: SocketAddr,
+    ) -> Result<MihomoClientConfig> {
+        match self.resolve_proxy_target(name)? {
+            MihomoResolvedProxy::Proxy(proxy) => proxy.to_client_config(listen),
+            MihomoResolvedProxy::Route(default) => {
+                Ok(MihomoClientConfig::Route(RouteClientConfig {
+                    listen,
+                    default,
+                }))
+            }
+        }
+    }
+
+    fn resolve_proxy_target<'a>(&'a self, name: &str) -> Result<MihomoResolvedProxy<'a>> {
+        let mut current = name.trim().to_string();
+        ensure!(!current.is_empty(), "mihomo proxy name is empty");
+        let mut seen = BTreeSet::new();
+        loop {
+            match RouteDecision::from_outbound(&current)? {
+                RouteDecision::Direct => {
+                    return Ok(MihomoResolvedProxy::Route(RouteDecision::Direct));
+                }
+                RouteDecision::Block => {
+                    return Ok(MihomoResolvedProxy::Route(RouteDecision::Block));
+                }
+                RouteDecision::Proxy(tag) => current = tag,
+            }
+            if let Some(proxy) = self.proxy(&current) {
+                return Ok(MihomoResolvedProxy::Proxy(proxy));
+            }
+            ensure!(
+                seen.insert(current.clone()),
+                "mihomo proxy-group cycle includes {current}"
+            );
+            let group = self
+                .proxy_group(&current)
+                .with_context(|| format!("mihomo proxy {current} was not found"))?;
+            current = group.static_target()?;
+        }
     }
 
     pub fn local_socks_listen(&self) -> Result<Option<SocketAddr>> {
@@ -779,6 +895,86 @@ impl MihomoProxy {
             Self::Tuic(proxy) => MihomoClientConfig::Tuic(proxy.to_client_config(listen)?),
             Self::Unsupported(proxy) => proxy.to_client_config(listen)?,
         })
+    }
+}
+
+impl MihomoProxyGroup {
+    fn static_target(&self) -> Result<String> {
+        match self.kind.trim().to_ascii_lowercase().as_str() {
+            "select" => {
+                self.ensure_static_select_supported()?;
+                let target = self
+                    .proxies
+                    .first()
+                    .map(|proxy| proxy.trim())
+                    .filter(|proxy| !proxy.is_empty())
+                    .with_context(|| {
+                        format!("mihomo select proxy-group {} has no proxies", self.name)
+                    })?;
+                Ok(target.to_string())
+            }
+            "url-test" => bail!(
+                "mihomo url-test proxy-group {} requires active latency selection; Aerion does not implement url-test policy yet",
+                self.name
+            ),
+            "fallback" => bail!(
+                "mihomo fallback proxy-group {} requires active health-check selection; Aerion does not implement fallback policy yet",
+                self.name
+            ),
+            "load-balance" => bail!(
+                "mihomo load-balance proxy-group {} requires per-connection policy selection; Aerion does not implement load-balance policy yet",
+                self.name
+            ),
+            "relay" => bail!(
+                "mihomo relay proxy-group {} requires proxy chaining; Aerion does not implement relay groups yet",
+                self.name
+            ),
+            other => bail!("unsupported mihomo proxy-group {} type {other}", self.name),
+        }
+    }
+
+    fn ensure_static_select_supported(&self) -> Result<()> {
+        ensure!(
+            !self.disable_udp,
+            "mihomo select proxy-group {} disables UDP; Aerion route clients expose TCP and UDP together",
+            self.name
+        );
+        let mut unsupported = Vec::new();
+        if !self.use_providers.is_empty() {
+            unsupported.push("use".to_string());
+        }
+        if self.include_all {
+            unsupported.push("include-all".to_string());
+        }
+        if self.include_all_proxies {
+            unsupported.push("include-all-proxies".to_string());
+        }
+        if self.include_all_providers {
+            unsupported.push("include-all-providers".to_string());
+        }
+        if self.filter.is_some() {
+            unsupported.push("filter".to_string());
+        }
+        if self.exclude_filter.is_some() {
+            unsupported.push("exclude-filter".to_string());
+        }
+        if self.exclude_type.is_some() {
+            unsupported.push("exclude-type".to_string());
+        }
+        if self.interface_name.is_some() {
+            unsupported.push("interface-name".to_string());
+        }
+        if self.routing_mark.is_some() {
+            unsupported.push("routing-mark".to_string());
+        }
+        unsupported.extend(self.fields.keys().cloned());
+        ensure!(
+            unsupported.is_empty(),
+            "mihomo select proxy-group {} has unsupported fields {:?}",
+            self.name,
+            unsupported
+        );
+        Ok(())
     }
 }
 
@@ -1724,6 +1920,89 @@ proxies:
             bail!("expected Naive")
         };
         assert!(naive.quic);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_select_proxy_group_to_first_proxy() -> Result<()> {
+        let yaml = r#"
+proxy-groups:
+  - name: auto
+    type: select
+    proxies:
+      - http-a
+      - DIRECT
+proxies:
+  - name: http-a
+    type: http
+    server: proxy.example.com
+    port: 8080
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        assert_eq!(config.profile_names(), vec!["http-a", "auto"]);
+        let MihomoClientConfig::HttpProxy(http) =
+            config.resolved_proxy_config("auto", "127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected selected HTTP proxy")
+        };
+        assert_eq!(http.server_host, "proxy.example.com");
+        assert_eq!(http.server_port, 8080);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_select_proxy_group_to_builtin_route() -> Result<()> {
+        let yaml = r#"
+proxy-groups:
+  - name: direct-group
+    type: select
+    proxies:
+      - DIRECT
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let MihomoClientConfig::Route(route) =
+            config.resolved_proxy_config("direct-group", "127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected direct route client")
+        };
+        assert_eq!(route.default, RouteDecision::Direct);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mihomo_proxy_group_cycles() -> Result<()> {
+        let yaml = r#"
+proxy-groups:
+  - name: a
+    type: select
+    proxies: [b]
+  - name: b
+    type: select
+    proxies: [a]
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let error = config
+            .resolved_proxy_config("a", "127.0.0.1:1080".parse()?)
+            .expect_err("proxy-group cycles must fail");
+        assert!(error.to_string().contains("cycle"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mihomo_policy_proxy_groups_without_static_equivalence() -> Result<()> {
+        let yaml = r#"
+proxy-groups:
+  - name: auto
+    type: url-test
+    proxies: [DIRECT, REJECT]
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let error = config
+            .resolved_proxy_config("auto", "127.0.0.1:1080".parse()?)
+            .expect_err("url-test requires active selection");
+        assert!(error.to_string().contains("url-test"));
         Ok(())
     }
 

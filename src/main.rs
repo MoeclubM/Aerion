@@ -18,13 +18,13 @@ use aerion::tun::{
 };
 use aerion::vless_transport::VlessTransportConfig;
 use aerion::{
-    ClientConfig, MihomoClientConfig, MihomoProxy, RealityClientConfig, RealityServerConfig,
-    RouteClientConfig, RouteDecision, RouteProxyConfig, RouteTable, ServerConfig,
-    ShadowsocksClientConfig, ShadowsocksServerConfig, SingBoxClientConfig, SingBoxConfig,
-    SingBoxOutbound, SingBoxServerConfig, SocksProxyClientConfig, TrojanClientConfig,
-    TrojanServerConfig, VlessClientConfig, VlessServerConfig, VmessClientConfig, VmessServerConfig,
-    XrayClientConfig, XrayOutbound, XrayServerConfig, run_client, run_client_listener,
-    run_hysteria2_client, run_hysteria2_client_listener, run_hysteria2_server, run_mieru_client,
+    ClientConfig, MihomoClientConfig, RealityClientConfig, RealityServerConfig, RouteClientConfig,
+    RouteDecision, RouteProxyConfig, RouteTable, ServerConfig, ShadowsocksClientConfig,
+    ShadowsocksServerConfig, SingBoxClientConfig, SingBoxConfig, SingBoxOutbound,
+    SingBoxServerConfig, SocksProxyClientConfig, TrojanClientConfig, TrojanServerConfig,
+    VlessClientConfig, VlessServerConfig, VmessClientConfig, VmessServerConfig, XrayClientConfig,
+    XrayOutbound, XrayServerConfig, run_client, run_client_listener, run_hysteria2_client,
+    run_hysteria2_client_listener, run_hysteria2_server, run_mieru_client,
     run_mieru_client_listener, run_mieru_server, run_naive_client, run_naive_client_listener,
     run_naive_server, run_route_client, run_route_client_listener, run_route_proxy, run_server,
     run_shadowsocks_client, run_shadowsocks_client_listener, run_shadowsocks_server,
@@ -657,22 +657,16 @@ async fn run_file_config(
                     .unwrap_or("127.0.0.1:0".parse()?);
                 let listener = bind_client_listener("mihomo", listen).await?;
                 let listen = listener.local_addr()?;
-                let proxy = select_mihomo_proxy(&config.proxies, profile)?;
+                let client_config = select_mihomo_client_config(&config, profile, listen)?;
                 let tun = config
                     .tun_config(listen)?
                     .context("mihomo TUN is enabled but no TUN config was produced")?;
-                return run_client_config_with_tun(
-                    listener,
-                    proxy.to_client_config(listen)?.into(),
-                    tun,
-                )
-                .await;
+                return run_client_config_with_tun(listener, client_config.into(), tun).await;
             }
             let listen = listen
                 .or(config.local_socks_listen()?)
                 .context("mihomo config has no mixed-port/socks-port/port; pass --listen")?;
-            let proxy = select_mihomo_proxy(&config.proxies, profile)?;
-            run_client_config(proxy.to_client_config(listen)?.into()).await
+            run_client_config(select_mihomo_client_config(&config, profile, listen)?.into()).await
         }
         FileConfig::Xray(config) => {
             if config.outbounds.is_empty() {
@@ -748,10 +742,10 @@ async fn run_mihomo_route_config(
         )
         .await?;
         let upstream = listener.local_addr()?;
-        let proxy = config
-            .proxy(&tag)
-            .with_context(|| format!("mihomo route outbound {tag} was not found"))?;
-        let runnable = proxy.to_client_config(upstream)?.into();
+        let runnable = config
+            .resolved_proxy_config(&tag, upstream)
+            .with_context(|| format!("resolve mihomo route outbound {tag}"))?
+            .into();
         spawn_route_outbound(tag.clone(), listener, runnable, outbound_tx.clone());
         upstreams.insert(tag, upstream);
     }
@@ -1553,26 +1547,21 @@ async fn run_xray_server_config(config: XrayServerConfig) -> Result<()> {
     }
 }
 
-fn select_mihomo_proxy<'a>(
-    proxies: &'a [MihomoProxy],
+fn select_mihomo_client_config(
+    config: &aerion::MihomoConfig,
     profile: Option<&str>,
-) -> Result<&'a MihomoProxy> {
+    listen: SocketAddr,
+) -> Result<MihomoClientConfig> {
     if let Some(profile) = profile {
-        return proxies
-            .iter()
-            .find(|proxy| proxy.name() == profile)
-            .with_context(|| format!("mihomo proxy {profile} was not found"));
+        return config.resolved_proxy_config(profile, listen);
     }
-    match proxies {
-        [proxy] => Ok(proxy),
-        [] => bail!("mihomo config has no proxies"),
+    let profiles = config.profile_names();
+    match profiles.as_slice() {
+        [profile] => config.resolved_proxy_config(profile, listen),
+        [] => bail!("mihomo config has no proxies or proxy-groups"),
         _ => bail!(
-            "mihomo config has multiple proxies [{}]; pass --profile",
-            proxies
-                .iter()
-                .map(MihomoProxy::name)
-                .collect::<Vec<_>>()
-                .join(", ")
+            "mihomo config has multiple profiles [{}]; pass --profile",
+            profiles.join(", ")
         ),
     }
 }

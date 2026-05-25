@@ -107,7 +107,8 @@ Aerion now provides these server/client protocol stacks:
   - config compatibility is stored separately under `src/config_compat/`
   - `MihomoConfig` parses Clash.Meta / mihomo-style `proxies:` YAML for
     Shadowsocks, HTTP proxy, VLESS, VMess, Trojan, Hysteria2, AnyTLS, Mieru,
-    Naive, TUIC, direct, and reject core profiles
+    Naive, TUIC, direct, and reject core profiles, plus static `select`
+    `proxy-groups`
   - `XrayConfig` parses Xray JSON / JSONC `inbounds` and `outbounds`
     profiles with Shadowsocks, HTTP proxy, SOCKS proxy, VLESS, VMess, Trojan,
     Hysteria2, freedom, and blackhole selection helpers
@@ -252,10 +253,12 @@ The CLI can run mihomo YAML, Xray JSON/JSONC, and sing-box JSON/JSONC client
 profiles directly. If those files contain multiple proxies/outbounds, select one
 with `--profile`; unsupported transports still fail explicitly instead of being
 silently downgraded. Built-in direct/block-style outbounds run as local route
-clients and do not start fake upstream proxy processes. sing-box `selector`
-outbounds are resolved to their startup selection (`default`, or the first
-listed outbound when `default` is omitted); `urltest` still fails explicitly
-because Aerion does not implement active latency policy selection yet.
+clients and do not start fake upstream proxy processes. Mihomo `select`
+proxy-groups resolve to the first listed proxy, while health-check /
+load-balancing groups fail explicitly. sing-box `selector` outbounds are
+resolved to their startup selection (`default`, or the first listed outbound
+when `default` is omitted); `urltest` still fails explicitly because Aerion
+does not implement active latency policy selection yet.
 Inbound-only sing-box JSON can also run AnyTLS, Shadowsocks, Trojan, VMess,
 Hysteria2, TUIC, Naive, and VLESS server profiles, including Naive TCP-only /
 HTTP/3-only listener networks and VLESS raw, TLS, or REALITY inbound TLS
