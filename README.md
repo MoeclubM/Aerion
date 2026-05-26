@@ -329,7 +329,8 @@ and unknown TLS/uTLS/REALITY nested fields likewise fail explicitly instead of
 being silently ignored. Unknown sing-box protocol inbound/outbound fields,
 unsupported VLESS transport fields, Hysteria2 obfs fields, and disabled
 `multiplex` blocks that still carry settings fail explicitly too. sing-box
-local `socks` / `mixed` inbound options fail explicitly for the same reason.
+local inbound protocols other than `socks` / `mixed` / `tun`, plus local
+`socks` / `mixed` inbound options, fail explicitly for the same reason.
 Inbound-only sing-box JSON can also run AnyTLS, Shadowsocks, Trojan, VMess,
 Hysteria2, TUIC, Naive, and VLESS server profiles, including Naive TCP-only /
 HTTP/3-only listener networks and VLESS raw, TLS, or REALITY inbound TLS

@@ -934,6 +934,16 @@ impl SingBoxConfig {
 
     pub fn local_socks_listen(&self) -> Result<Option<SocketAddr>> {
         self.reject_unsupported_top_level_fields()?;
+        for inbound in &self.inbounds {
+            ensure!(
+                inbound.kind.eq_ignore_ascii_case("socks")
+                    || inbound.kind.eq_ignore_ascii_case("mixed")
+                    || inbound.kind.eq_ignore_ascii_case("tun"),
+                "sing-box inbound {} type {} is not a local SOCKS/mixed/TUN listener; Aerion config runner exposes SOCKS and TUN listeners only",
+                inbound.name(),
+                inbound.kind
+            );
+        }
         let Some(inbound) = self.inbounds.iter().find(|inbound| {
             inbound.kind.eq_ignore_ascii_case("socks") || inbound.kind.eq_ignore_ascii_case("mixed")
         }) else {
@@ -3964,6 +3974,25 @@ mod tests {
             .local_socks_listen()
             .expect_err("local mixed inbound sniffing must not be ignored");
         assert!(error.to_string().contains("sniff"));
+
+        let json = r#"
+{
+  "inbounds": [
+    {
+      "type": "http",
+      "tag": "http-in",
+      "listen": "127.0.0.1",
+      "listen_port": 8080
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .local_socks_listen()
+            .expect_err("local HTTP inbound must not be ignored");
+        assert!(error.to_string().contains("local SOCKS/mixed/TUN listener"));
+        assert!(error.to_string().contains("http"));
         Ok(())
     }
 
