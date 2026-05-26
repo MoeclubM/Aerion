@@ -2241,10 +2241,10 @@ fn parse_mihomo_route_rule_parts(
         "DOMAIN-KEYWORD" => rule.domains.push(DomainMatcher::keyword(parts[1])),
         "DOMAIN-WILDCARD" => rule.domains.push(DomainMatcher::wildcard(parts[1])?),
         "DOMAIN-REGEX" => rule.domains.push(DomainMatcher::regex(parts[1])?),
-        "GEOSITE" => rule.add_geosite_set(parts[1]),
+        "GEOSITE" => bail!("{location} GEOSITE requires geosite rule-set data"),
         "IP-CIDR" | "IP-CIDR6" => rule.ip_cidrs.push(IpCidr::parse(parts[1])?),
         "GEOIP" if parts[1].eq_ignore_ascii_case("private") => rule.ip_is_private = true,
-        "GEOIP" => rule.add_geoip_set(parts[1]),
+        "GEOIP" => bail!("{location} GEOIP requires geoip rule-set data"),
         "DST-PORT" => rule.ports.push(PortRange::parse(parts[1])?),
         "NETWORK" => rule.networks.push(RouteNetwork::parse(parts[1])?),
         "MATCH" | "FINAL" => {}
@@ -2691,6 +2691,28 @@ rules:
             .route_table()
             .expect_err("src route parameter requires source metadata");
         assert!(error.to_string().contains("source IP metadata"));
+
+        let geo_yaml = r#"
+proxies: []
+rules:
+  - GEOSITE,category-ads-all,REJECT
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(geo_yaml)?;
+        let error = config
+            .route_table()
+            .expect_err("direct GEOSITE must fail without data");
+        assert!(error.to_string().contains("geosite rule-set data"));
+
+        let geoip_yaml = r#"
+proxies: []
+rules:
+  - GEOIP,CN,DIRECT
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(geoip_yaml)?;
+        let error = config
+            .route_table()
+            .expect_err("direct GEOIP must fail without data");
+        assert!(error.to_string().contains("geoip rule-set data"));
         Ok(())
     }
 

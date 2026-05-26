@@ -622,7 +622,7 @@ impl XrayRoutingRule {
         let mut rule = RouteRule::new(action);
         for domain in &self.domain {
             if let Some(name) = DomainMatcher::geosite_name(domain) {
-                rule.add_geosite_set(name);
+                bail!("xray routing.rules[{index}] geosite {name} requires geosite rule-set data");
             } else if let Some(matcher) = DomainMatcher::xray(domain)? {
                 rule.domains.push(matcher);
             }
@@ -631,7 +631,7 @@ impl XrayRoutingRule {
             if ip.eq_ignore_ascii_case("geoip:private") {
                 rule.ip_is_private = true;
             } else if let Some(name) = IpCidr::geoip_name(ip) {
-                rule.add_geoip_set(name);
+                bail!("xray routing.rules[{index}] geoip {name} requires geoip rule-set data");
             } else {
                 rule.ip_cidrs.push(IpCidr::parse(ip)?);
             }
@@ -2820,6 +2820,40 @@ mod tests {
             routes.decide(&ProxyTarget::Ip("10.1.2.3:53".parse()?), RouteNetwork::Udp),
             RouteDecision::Direct
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_xray_geo_route_rules_without_data() -> Result<()> {
+        let json = r#"
+{
+  "routing": {
+    "rules": [
+      { "type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block" }
+    ]
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("geosite needs explicit route-set data");
+        assert!(error.to_string().contains("geosite rule-set data"));
+
+        let json = r#"
+{
+  "routing": {
+    "rules": [
+      { "type": "field", "ip": ["geoip:cn"], "outboundTag": "direct" }
+    ]
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("geoip needs explicit route-set data");
+        assert!(error.to_string().contains("geoip rule-set data"));
         Ok(())
     }
 

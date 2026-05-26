@@ -1081,7 +1081,7 @@ impl SingBoxRouteRule {
             rule.domains.push(DomainMatcher::regex(&value)?);
         }
         for value in route_value_strings(self.geosite.as_ref())? {
-            rule.add_geosite_set(value);
+            bail!("sing-box route.rules[{index}] geosite {value} requires geosite rule-set data");
         }
         for value in route_value_strings(self.ip_cidr.as_ref())? {
             rule.ip_cidrs.push(IpCidr::parse(&value)?);
@@ -1090,7 +1090,7 @@ impl SingBoxRouteRule {
             if value.eq_ignore_ascii_case("private") {
                 rule.ip_is_private = true;
             } else {
-                rule.add_geoip_set(value);
+                bail!("sing-box route.rules[{index}] geoip {value} requires geoip rule-set data");
             }
         }
         rule.ip_is_private |= self.ip_is_private;
@@ -3450,6 +3450,40 @@ mod tests {
             ),
             RouteDecision::Proxy("proxy-b".to_string())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_singbox_geo_route_rules_without_data() -> Result<()> {
+        let json = r#"
+{
+  "route": {
+    "rules": [
+      { "geosite": ["category-ads-all"], "outbound": "block" }
+    ]
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("geosite needs explicit route-set data");
+        assert!(error.to_string().contains("geosite rule-set data"));
+
+        let json = r#"
+{
+  "route": {
+    "rules": [
+      { "geoip": ["cn"], "outbound": "direct" }
+    ]
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("geoip needs explicit route-set data");
+        assert!(error.to_string().contains("geoip rule-set data"));
         Ok(())
     }
 

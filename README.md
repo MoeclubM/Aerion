@@ -260,7 +260,9 @@ match/final forms, statically representable `OR` / `AND` logical rules, and
 `RULE-SET` expansion from inline or local YAML/text file
 `rule-providers` with `domain`, `ipcidr`, or `classical` behavior, including
 statically representable logical rules in classical payloads. Remote HTTP and
-binary MRS rule-provider loading still fails explicitly. Source/process
+binary MRS rule-provider loading still fails explicitly. Direct geo route
+references that are not backed by expanded rule-set data fail at config compile
+time instead of during route decisions. Source/process
 matchers and `src` route parameters require routing metadata and fail
 explicitly. Mihomo `select`
 proxy-groups resolve to the first listed proxy. Mihomo health-check /
