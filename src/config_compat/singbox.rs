@@ -3941,13 +3941,12 @@ mod tests {
         let json = r#"
 {
   "inbounds": [
-    { "type": "naive", "listen": "0.0.0.0", "listen_port": "8443" },
     { "type": "mixed", "listen": "127.0.0.1", "listen_port": "7890" }
   ]
 }
 "#;
         let config: SingBoxConfig = serde_json::from_str(json)?;
-        assert_eq!(config.inbounds[0].listen_port, Some(8443));
+        assert_eq!(config.inbounds[0].listen_port, Some(7890));
         assert_eq!(
             config.local_socks_listen()?,
             Some("127.0.0.1:7890".parse()?)

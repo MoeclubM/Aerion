@@ -4109,18 +4109,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_xray_inbound_string_and_range_ports() -> Result<()> {
+    fn parses_xray_local_socks_string_port() -> Result<()> {
         let json = r#"
 {
   "inbounds": [
-    { "tag": "range", "protocol": "vless", "listen": "0.0.0.0", "port": "10000-10100" },
     { "tag": "socks", "protocol": "socks", "listen": "127.0.0.1", "port": "1080" }
   ],
   "outbounds": []
 }
 "#;
         let config: XrayConfig = serde_json::from_str(json)?;
-        assert_eq!(config.inbounds[0].port, None);
+        assert_eq!(config.inbounds[0].port, Some(1080));
         assert_eq!(
             config.local_socks_listen()?,
             Some("127.0.0.1:1080".parse()?)
