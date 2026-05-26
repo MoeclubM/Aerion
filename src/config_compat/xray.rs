@@ -429,6 +429,96 @@ impl XrayOutboundSettings {
         }
         Ok(())
     }
+
+    fn reject_local_socks_fields(&self, owner: &str) -> Result<()> {
+        self.reject_unsupported_extra_fields(owner)?;
+        let auth = self.auth.as_deref().unwrap_or_default().trim();
+        ensure!(
+            auth.is_empty() || auth.eq_ignore_ascii_case("noauth"),
+            "{owner} settings.auth {auth} requires an authenticated local SOCKS listener"
+        );
+        let mut fields = Vec::new();
+        if self.version.is_some() {
+            fields.push("version");
+        }
+        if option_text_has_data(&self.address) {
+            fields.push("address");
+        }
+        if self.port.is_some() {
+            fields.push("port");
+        }
+        if option_text_has_data(&self.id) {
+            fields.push("id");
+        }
+        if option_text_has_data(&self.password) {
+            fields.push("password");
+        }
+        if option_text_has_data(&self.user) {
+            fields.push("user");
+        }
+        if option_text_has_data(&self.pass) {
+            fields.push("pass");
+        }
+        if !self.headers.is_empty() {
+            fields.push("headers");
+        }
+        if option_text_has_data(&self.network) {
+            fields.push("network");
+        }
+        if option_text_has_data(&self.domain_strategy) {
+            fields.push("domainStrategy");
+        }
+        if option_text_has_data(&self.redirect) {
+            fields.push("redirect");
+        }
+        if self
+            .user_level
+            .as_ref()
+            .map(value_has_data)
+            .unwrap_or(false)
+        {
+            fields.push("userLevel");
+        }
+        if self.response.as_ref().map(value_has_data).unwrap_or(false) {
+            fields.push("response");
+        }
+        if option_text_has_data(&self.flow) {
+            fields.push("flow");
+        }
+        if option_text_has_data(&self.packet_encoding) {
+            fields.push("packetEncoding");
+        }
+        if option_text_has_data(&self.security) {
+            fields.push("security");
+        }
+        if option_text_has_data(&self.method) {
+            fields.push("method");
+        }
+        if option_text_has_data(&self.decryption) {
+            fields.push("decryption");
+        }
+        if self.alter_id.is_some() {
+            fields.push("alterId");
+        }
+        if !self.clients.is_empty() {
+            fields.push("clients");
+        }
+        if !self.fallbacks.is_empty() {
+            fields.push("fallbacks");
+        }
+        if !self.vnext.is_empty() {
+            fields.push("vnext");
+        }
+        if !self.servers.is_empty() {
+            fields.push("servers");
+        }
+        ensure!(
+            fields.is_empty(),
+            "{owner} settings has unsupported local SOCKS fields {:?}",
+            fields
+        );
+        Ok(())
+    }
 }
 
 impl XrayStreamSettings {
@@ -495,6 +585,36 @@ impl XrayStreamSettings {
         if let Some(split_http) = &self.split_http_settings {
             split_http.reject_unsupported_extra_fields(owner, "splitHTTPSettings")?;
         }
+        Ok(())
+    }
+
+    fn reject_local_socks_listener_fields(&self, owner: &str) -> Result<()> {
+        self.reject_unsupported_fields(owner)?;
+        let network = self.network.trim();
+        ensure!(
+            network.is_empty()
+                || network.eq_ignore_ascii_case("tcp")
+                || network.eq_ignore_ascii_case("raw"),
+            "{owner} uses stream network {network}; Aerion local SOCKS listener accepts raw TCP only"
+        );
+        let security = self.security.trim();
+        ensure!(
+            security.is_empty() || security.eq_ignore_ascii_case("none"),
+            "{owner} uses stream security {security}; Aerion local SOCKS listener accepts raw TCP only"
+        );
+        ensure!(
+            self.hysteria_settings.is_none()
+                && self.finalmask.is_none()
+                && self.tls_settings.is_none()
+                && self.reality_settings.is_none()
+                && self.ws_settings.is_none()
+                && self.http_upgrade_settings.is_none()
+                && self.grpc_settings.is_none()
+                && self.http_settings.is_none()
+                && self.xhttp_settings.is_none()
+                && self.split_http_settings.is_none(),
+            "{owner} sets stream transport options; Aerion local SOCKS listener accepts plain SOCKS over TCP"
+        );
         Ok(())
     }
 }
@@ -991,6 +1111,12 @@ impl XrayConfig {
         else {
             return Ok(None);
         };
+        let owner = format!("xray SOCKS inbound {}", inbound.name());
+        ensure_no_extra_fields(&owner, &inbound.extra)?;
+        inbound.settings.reject_local_socks_fields(&owner)?;
+        inbound
+            .stream_settings
+            .reject_local_socks_listener_fields(&owner)?;
         let port = inbound.port.context("xray socks inbound is missing port")?;
         let host = inbound.listen.as_deref().unwrap_or("0.0.0.0");
         Ok(Some(SocketAddr::new(parse_listen_ip("xray", host)?, port)))
@@ -3370,7 +3496,12 @@ mod tests {
     fn parses_vless_reality_outbound() -> Result<()> {
         let json = r#"
 {
-  "inbounds": [{ "protocol": "socks", "listen": "127.0.0.1", "port": 1080 }],
+  "inbounds": [{
+    "protocol": "socks",
+    "listen": "127.0.0.1",
+    "port": 1080,
+    "settings": { "auth": "noauth" }
+  }],
   "outbounds": [{
     "tag": "proxy",
     "protocol": "vless",
@@ -3413,6 +3544,62 @@ mod tests {
         assert_eq!(vless.sni, "www.example.com");
         assert_eq!(vless.client_fingerprint, Some(UtlsFingerprint::Chrome));
         assert!(vless.reality.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_xray_unsupported_local_socks_inbound_fields() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [{
+    "protocol": "socks",
+    "listen": "127.0.0.1",
+    "port": 1080,
+    "settings": { "auth": "password" }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let auth_error = config
+            .local_socks_listen()
+            .expect_err("local SOCKS auth must not be ignored");
+        assert!(auth_error.to_string().contains("settings.auth"));
+
+        let json = r#"
+{
+  "inbounds": [{
+    "protocol": "socks",
+    "listen": "127.0.0.1",
+    "port": 1080,
+    "streamSettings": {
+      "network": "ws",
+      "wsSettings": { "path": "/socks" }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let transport_error = config
+            .local_socks_listen()
+            .expect_err("local SOCKS transport must not be ignored");
+        assert!(transport_error.to_string().contains("local SOCKS listener"));
+        assert!(transport_error.to_string().contains("network ws"));
+
+        let json = r#"
+{
+  "inbounds": [{
+    "protocol": "socks",
+    "listen": "127.0.0.1",
+    "port": 1080,
+    "sniffing": { "enabled": true }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let sniff_error = config
+            .local_socks_listen()
+            .expect_err("local SOCKS sniffing must not be ignored");
+        assert!(sniff_error.to_string().contains("sniffing"));
         Ok(())
     }
 

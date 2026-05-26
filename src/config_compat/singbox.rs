@@ -932,6 +932,10 @@ impl SingBoxConfig {
         }) else {
             return Ok(None);
         };
+        ensure_no_extra_fields(
+            &format!("sing-box local SOCKS inbound {}", inbound.name()),
+            &inbound.fields,
+        )?;
         let port = inbound.listen_port.with_context(|| {
             format!("sing-box inbound {} is missing listen_port", inbound.name())
         })?;
@@ -3911,6 +3915,28 @@ mod tests {
             config.local_socks_listen()?,
             Some("127.0.0.1:7890".parse()?)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_singbox_unsupported_local_socks_inbound_fields() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [
+    {
+      "type": "mixed",
+      "listen": "127.0.0.1",
+      "listen_port": 7890,
+      "sniff": true
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .local_socks_listen()
+            .expect_err("local mixed inbound sniffing must not be ignored");
+        assert!(error.to_string().contains("sniff"));
         Ok(())
     }
 

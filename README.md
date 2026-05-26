@@ -304,14 +304,17 @@ profile, `settings`, stream transport, REALITY/finalmask, mux, and
 version/cipher/curve policy overrides, separate peer-name verification,
 server-side unknown-SNI rejection, session resumption, key logging, ECH fields,
 unsupported certificate loading options, and unknown `tlsSettings` fields also
-fail explicitly until Aerion exposes equivalent TLS controls.
+fail explicitly until Aerion exposes equivalent TLS controls. Xray local SOCKS
+inbound authentication, sniffing, and non-raw transport settings also fail
+explicitly because the Aerion client listener is plain no-auth SOCKS over TCP.
 sing-box TLS engine/version/cipher/curve overrides, SNI suppression, certificate
 pinning, mutual-TLS client certificate/authentication fields, kernel TLS,
 handshake timeout, certificate providers, fragmentation/spoofing/ACME options,
 and unknown TLS/uTLS/REALITY nested fields likewise fail explicitly instead of
 being silently ignored. Unknown sing-box protocol inbound/outbound fields,
 unsupported VLESS transport fields, Hysteria2 obfs fields, and disabled
-`multiplex` blocks that still carry settings fail explicitly too.
+`multiplex` blocks that still carry settings fail explicitly too. sing-box
+local `socks` / `mixed` inbound options fail explicitly for the same reason.
 Inbound-only sing-box JSON can also run AnyTLS, Shadowsocks, Trojan, VMess,
 Hysteria2, TUIC, Naive, and VLESS server profiles, including Naive TCP-only /
 HTTP/3-only listener networks and VLESS raw, TLS, or REALITY inbound TLS
