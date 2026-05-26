@@ -684,6 +684,7 @@ async fn run_file_config(
             run_client_config(outbound.to_client_config(listen)?.into()).await
         }
         FileConfig::SingBox(config) => {
+            config.reject_unsupported_top_level_fields()?;
             if config.outbounds.is_empty() {
                 let inbound = select_singbox_inbound(&config.inbounds, profile)?;
                 return run_singbox_server_config(inbound.to_server_config()?).await;

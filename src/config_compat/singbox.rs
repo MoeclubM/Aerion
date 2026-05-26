@@ -35,6 +35,8 @@ pub struct SingBoxConfig {
     pub outbounds: Vec<SingBoxOutbound>,
     #[serde(default)]
     pub route: Option<SingBoxRouteConfig>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
     #[serde(skip)]
     pub source_dir: Option<PathBuf>,
 }
@@ -884,6 +886,10 @@ pub enum SingBoxServerConfig {
 }
 
 impl SingBoxConfig {
+    pub fn reject_unsupported_top_level_fields(&self) -> Result<()> {
+        ensure_no_extra_fields("sing-box config", &self.extra)
+    }
+
     pub fn outbound(&self, tag: &str) -> Option<&SingBoxOutbound> {
         self.outbounds
             .iter()
@@ -927,6 +933,7 @@ impl SingBoxConfig {
     }
 
     pub fn local_socks_listen(&self) -> Result<Option<SocketAddr>> {
+        self.reject_unsupported_top_level_fields()?;
         let Some(inbound) = self.inbounds.iter().find(|inbound| {
             inbound.kind.eq_ignore_ascii_case("socks") || inbound.kind.eq_ignore_ascii_case("mixed")
         }) else {
@@ -947,6 +954,7 @@ impl SingBoxConfig {
     }
 
     pub fn route_table(&self) -> Result<RouteTable> {
+        self.reject_unsupported_top_level_fields()?;
         match &self.route {
             Some(route) => route.to_route_table(self.source_dir.as_deref(), &self.outbounds),
             None => Ok(RouteTable::default()),
@@ -3937,6 +3945,30 @@ mod tests {
             .local_socks_listen()
             .expect_err("local mixed inbound sniffing must not be ignored");
         assert!(error.to_string().contains("sniff"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_singbox_unsupported_top_level_options() -> Result<()> {
+        let json = r#"
+{
+  "log": { "level": "debug" },
+  "outbounds": [
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": {
+    "rules": [
+      { "domain_suffix": "example.com", "outbound": "direct" }
+    ]
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("unsupported sing-box top-level options must not be ignored");
+        assert!(error.to_string().contains("sing-box config"));
+        assert!(error.to_string().contains("log"));
         Ok(())
     }
 
