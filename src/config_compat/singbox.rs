@@ -673,18 +673,32 @@ pub struct SingBoxUrlTestOutbound {
 pub struct SingBoxTlsOptions {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub engine: Option<Value>,
     #[serde(default, rename = "server_name")]
     pub server_name: Option<String>,
+    #[serde(default, rename = "disable_sni")]
+    pub disable_sni: Option<bool>,
     #[serde(default)]
     pub insecure: bool,
     #[serde(default, rename = "disable_system_root")]
     pub disable_system_root: bool,
+    #[serde(default, rename = "min_version")]
+    pub min_version: Option<Value>,
+    #[serde(default, rename = "max_version")]
+    pub max_version: Option<Value>,
+    #[serde(default, rename = "cipher_suites")]
+    pub cipher_suites: Option<Value>,
+    #[serde(default, rename = "curve_preferences")]
+    pub curve_preferences: Option<Value>,
     #[serde(default)]
     pub alpn: Option<OneOrManyStrings>,
     #[serde(default)]
     pub utls: Option<SingBoxUtlsOptions>,
     #[serde(default)]
     pub reality: Option<SingBoxRealityOptions>,
+    #[serde(default, rename = "certificate_public_key_sha256")]
+    pub certificate_public_key_sha256: Option<Value>,
     #[serde(default)]
     pub certificate: Option<Value>,
     #[serde(default)]
@@ -693,8 +707,42 @@ pub struct SingBoxTlsOptions {
     pub certificate_path: Option<Value>,
     #[serde(default, rename = "key_path")]
     pub key_path: Option<Value>,
+    #[serde(default, rename = "client_certificate")]
+    pub client_certificate: Option<Value>,
+    #[serde(default, rename = "client_certificate_path")]
+    pub client_certificate_path: Option<Value>,
+    #[serde(default, rename = "client_key")]
+    pub client_key: Option<Value>,
+    #[serde(default, rename = "client_key_path")]
+    pub client_key_path: Option<Value>,
+    #[serde(default, rename = "client_authentication")]
+    pub client_authentication: Option<Value>,
+    #[serde(default, rename = "client_certificate_public_key_sha256")]
+    pub client_certificate_public_key_sha256: Option<Value>,
+    #[serde(default, rename = "kernel_tx")]
+    pub kernel_tx: Option<Value>,
+    #[serde(default, rename = "kernel_rx")]
+    pub kernel_rx: Option<Value>,
+    #[serde(default, rename = "handshake_timeout")]
+    pub handshake_timeout: Option<Value>,
+    #[serde(default, rename = "certificate_provider")]
+    pub certificate_provider: Option<Value>,
     #[serde(default)]
     pub ech: Option<Value>,
+    #[serde(default)]
+    pub fragment: Option<Value>,
+    #[serde(default, rename = "fragment_fallback_delay")]
+    pub fragment_fallback_delay: Option<Value>,
+    #[serde(default, rename = "record_fragment")]
+    pub record_fragment: Option<Value>,
+    #[serde(default)]
+    pub spoof: Option<Value>,
+    #[serde(default, rename = "spoof_method")]
+    pub spoof_method: Option<Value>,
+    #[serde(default)]
+    pub acme: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -707,6 +755,8 @@ pub struct SingBoxUtlsOptions {
         alias = "client_fingerprint"
     )]
     pub fingerprint: Option<UtlsFingerprint>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -721,6 +771,8 @@ pub struct SingBoxRealityOptions {
     pub handshake: Option<SingBoxRealityHandshake>,
     #[serde(default, rename = "private_key")]
     pub private_key: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -728,6 +780,8 @@ pub struct SingBoxRealityHandshake {
     pub server: String,
     #[serde(rename = "server_port")]
     pub server_port: u16,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -1811,6 +1865,9 @@ impl SingBoxVlessInbound {
         )?;
         let tls = self.tls.as_ref();
         let tls_enabled = tls.map(|tls| tls.enabled).unwrap_or(false);
+        if let Some(tls) = tls {
+            tls.reject_unsupported_fields("VLESS", name, "inbound")?;
+        }
         let reality = tls
             .and_then(|tls| tls.reality.as_ref())
             .filter(|reality| reality.enabled);
@@ -1851,6 +1908,10 @@ impl SingBoxVlessInbound {
             let handshake = reality.handshake.as_ref().with_context(|| {
                 format!("sing-box VLESS inbound {name} REALITY is missing handshake")
             })?;
+            ensure!(
+                reality.public_key.is_none(),
+                "sing-box VLESS inbound {name} REALITY sets client-side public_key; Aerion server expects private_key"
+            );
             Some(RealityServerConfig::from_strings(
                 handshake.server.clone(),
                 handshake.server_port,
@@ -2971,6 +3032,7 @@ impl SingBoxTlsOptions {
         name: &str,
         allow_certificate_path: bool,
     ) -> Result<()> {
+        self.reject_unsupported_fields(protocol, name, "outbound")?;
         ensure!(
             (allow_certificate_path || !json_value_non_empty_option(self.certificate.as_ref()))
                 && !self.key.as_ref().map(json_value_non_empty).unwrap_or(false)
@@ -3003,6 +3065,7 @@ impl SingBoxTlsOptions {
         name: &str,
         tls_disabled: bool,
     ) -> Result<()> {
+        self.reject_unsupported_fields(protocol, name, "inbound")?;
         ensure_disabled_utls(name, self)?;
         ensure_disabled_reality(name, self)?;
         ensure!(
@@ -3017,6 +3080,143 @@ impl SingBoxTlsOptions {
                     && !json_value_non_empty_option(self.key.as_ref()),
                 "sing-box {protocol} inbound {name} sets TLS certificate fields while TLS is disabled"
             );
+        }
+        Ok(())
+    }
+
+    fn reject_unsupported_fields(&self, protocol: &str, name: &str, direction: &str) -> Result<()> {
+        ensure!(
+            self.extra.is_empty(),
+            "sing-box {protocol} {direction} {name} tls has unsupported fields {:?}",
+            self.extra.keys().collect::<Vec<_>>()
+        );
+        for (field, value, reason) in [
+            (
+                "engine",
+                self.engine.as_ref(),
+                "TLS engine/backend selection",
+            ),
+            (
+                "min_version",
+                self.min_version.as_ref(),
+                "TLS version policy override",
+            ),
+            (
+                "max_version",
+                self.max_version.as_ref(),
+                "TLS version policy override",
+            ),
+            (
+                "cipher_suites",
+                self.cipher_suites.as_ref(),
+                "TLS cipher suite policy",
+            ),
+            (
+                "curve_preferences",
+                self.curve_preferences.as_ref(),
+                "TLS curve preference policy",
+            ),
+            (
+                "certificate_public_key_sha256",
+                self.certificate_public_key_sha256.as_ref(),
+                "certificate public key pinning",
+            ),
+            (
+                "client_certificate",
+                self.client_certificate.as_ref(),
+                "mutual TLS client certificate support",
+            ),
+            (
+                "client_certificate_path",
+                self.client_certificate_path.as_ref(),
+                "mutual TLS client certificate support",
+            ),
+            (
+                "client_key",
+                self.client_key.as_ref(),
+                "mutual TLS client key support",
+            ),
+            (
+                "client_key_path",
+                self.client_key_path.as_ref(),
+                "mutual TLS client key support",
+            ),
+            (
+                "client_certificate_public_key_sha256",
+                self.client_certificate_public_key_sha256.as_ref(),
+                "client certificate public key pinning",
+            ),
+            (
+                "kernel_tx",
+                self.kernel_tx.as_ref(),
+                "kernel TLS transmit offload",
+            ),
+            (
+                "kernel_rx",
+                self.kernel_rx.as_ref(),
+                "kernel TLS receive offload",
+            ),
+            (
+                "handshake_timeout",
+                self.handshake_timeout.as_ref(),
+                "TLS handshake timeout policy",
+            ),
+            (
+                "certificate_provider",
+                self.certificate_provider.as_ref(),
+                "certificate provider integration",
+            ),
+            (
+                "fragment",
+                self.fragment.as_ref(),
+                "TLS fragmentation policy",
+            ),
+            (
+                "fragment_fallback_delay",
+                self.fragment_fallback_delay.as_ref(),
+                "TLS fragmentation fallback timing",
+            ),
+            (
+                "record_fragment",
+                self.record_fragment.as_ref(),
+                "TLS record fragmentation policy",
+            ),
+            ("spoof", self.spoof.as_ref(), "TLS ClientHello spoofing"),
+            (
+                "spoof_method",
+                self.spoof_method.as_ref(),
+                "TLS ClientHello spoofing",
+            ),
+            ("acme", self.acme.as_ref(), "ACME certificate automation"),
+        ] {
+            ensure!(
+                !value.is_some_and(value_has_data),
+                "sing-box {protocol} {direction} {name} tls.{field} requires {reason}"
+            );
+        }
+        if let Some(client_authentication) = &self.client_authentication {
+            let no_client_authentication = client_authentication
+                .as_str()
+                .map(str::trim)
+                .is_some_and(|value| value.is_empty() || value.eq_ignore_ascii_case("no"));
+            ensure!(
+                no_client_authentication || !value_has_data(client_authentication),
+                "sing-box {protocol} {direction} {name} tls.client_authentication requires mutual TLS client authentication policy"
+            );
+        }
+        ensure!(
+            !self.disable_sni.unwrap_or(false),
+            "sing-box {protocol} {direction} {name} tls.disable_sni requires TLS SNI suppression support"
+        );
+        if let Some(utls) = &self.utls {
+            utls.reject_unsupported_fields(&format!(
+                "sing-box {protocol} {direction} {name} tls.utls"
+            ))?;
+        }
+        if let Some(reality) = &self.reality {
+            reality.reject_unsupported_fields(&format!(
+                "sing-box {protocol} {direction} {name} tls.reality"
+            ))?;
         }
         Ok(())
     }
@@ -3049,6 +3249,10 @@ impl SingBoxTlsOptions {
             );
             return Ok(None);
         }
+        ensure!(
+            reality.handshake.is_none() && reality.private_key.is_none(),
+            "sing-box outbound {name} sets REALITY server-only fields"
+        );
         let short_id = reality
             .short_id
             .as_ref()
@@ -3063,7 +3267,46 @@ impl SingBoxTlsOptions {
     }
 }
 
+impl SingBoxUtlsOptions {
+    fn reject_unsupported_fields(&self, owner: &str) -> Result<()> {
+        ensure!(
+            self.extra.is_empty(),
+            "{owner} has unsupported fields {:?}",
+            self.extra.keys().collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+}
+
+impl SingBoxRealityOptions {
+    fn reject_unsupported_fields(&self, owner: &str) -> Result<()> {
+        ensure!(
+            self.extra.is_empty(),
+            "{owner} has unsupported fields {:?}",
+            self.extra.keys().collect::<Vec<_>>()
+        );
+        if let Some(handshake) = &self.handshake {
+            handshake.reject_unsupported_fields(&format!("{owner}.handshake"))?;
+        }
+        Ok(())
+    }
+}
+
+impl SingBoxRealityHandshake {
+    fn reject_unsupported_fields(&self, owner: &str) -> Result<()> {
+        ensure!(
+            self.extra.is_empty(),
+            "{owner} has unsupported fields {:?}",
+            self.extra.keys().collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+}
+
 fn ensure_disabled_utls(name: &str, tls: &SingBoxTlsOptions) -> Result<()> {
+    if let Some(utls) = &tls.utls {
+        utls.reject_unsupported_fields(&format!("sing-box profile {name} tls.utls"))?;
+    }
     ensure!(
         tls.utls
             .as_ref()
@@ -3074,6 +3317,9 @@ fn ensure_disabled_utls(name: &str, tls: &SingBoxTlsOptions) -> Result<()> {
 }
 
 fn ensure_disabled_reality(name: &str, tls: &SingBoxTlsOptions) -> Result<()> {
+    if let Some(reality) = &tls.reality {
+        reality.reject_unsupported_fields(&format!("sing-box profile {name} tls.reality"))?;
+    }
     ensure!(
         tls.reality.as_ref().is_none_or(|reality| {
             !reality.enabled
@@ -5171,6 +5417,101 @@ mod tests {
         };
         assert_eq!(tuic.ca_cert_paths, vec![PathBuf::from("tuic-ca.pem")]);
         assert_eq!(tuic.ca_certificates, vec!["tuic-inline-ca"]);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_singbox_unsupported_tls_options() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-min-version",
+      "server": "vless.example.com",
+      "server_port": 443,
+      "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+      "tls": {
+        "enabled": true,
+        "min_version": "1.3"
+      }
+    },
+    {
+      "type": "naive",
+      "tag": "naive-disable-sni",
+      "server": "naive.example.com",
+      "server_port": 443,
+      "tls": {
+        "enabled": true,
+        "disable_sni": true
+      }
+    },
+    {
+      "type": "http",
+      "tag": "http-utls-extra",
+      "server": "proxy.example.com",
+      "server_port": 443,
+      "tls": {
+        "enabled": true,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome",
+          "randomized": true
+        }
+      }
+    }
+  ],
+  "inbounds": [
+    {
+      "type": "trojan",
+      "tag": "trojan-mtls",
+      "listen_port": 8443,
+      "users": [{ "password": "secret" }],
+      "tls": {
+        "enabled": true,
+        "client_authentication": "require"
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "anytls-unknown-tls",
+      "listen_port": 8444,
+      "users": [{ "password": "secret" }],
+      "tls": {
+        "enabled": true,
+        "unexpected_tls_field": true
+      }
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let version_error = config.outbounds[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("TLS min_version must not be ignored");
+        assert!(version_error.to_string().contains("tls.min_version"));
+
+        let disable_sni_error = config.outbounds[1]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("TLS disable_sni must not be ignored");
+        assert!(disable_sni_error.to_string().contains("tls.disable_sni"));
+
+        let utls_error = config.outbounds[2]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("unknown uTLS fields must not be ignored");
+        assert!(utls_error.to_string().contains("tls.utls"));
+
+        let mtls_error = config.inbounds[0]
+            .to_server_config()
+            .err()
+            .context("TLS client_authentication must not be ignored")?;
+        assert!(mtls_error.to_string().contains("tls.client_authentication"));
+
+        let unknown_error = config.inbounds[1]
+            .to_server_config()
+            .err()
+            .context("unknown TLS fields must not be ignored")?;
+        assert!(unknown_error.to_string().contains("unsupported fields"));
         Ok(())
     }
 
