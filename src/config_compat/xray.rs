@@ -116,6 +116,8 @@ pub struct XrayInbound {
     pub settings: XrayOutboundSettings,
     #[serde(default, rename = "streamSettings")]
     pub stream_settings: XrayStreamSettings,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -126,6 +128,7 @@ pub struct XrayOutbound {
     pub stream_settings: XrayStreamSettings,
     pub mux: Option<XrayMuxOptions>,
     pub decode_error: Option<String>,
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -139,6 +142,8 @@ struct XrayOutboundDecoded {
     stream_settings: XrayStreamSettings,
     #[serde(default)]
     mux: Option<XrayMuxOptions>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 impl<'de> Deserialize<'de> for XrayOutbound {
@@ -165,6 +170,7 @@ impl<'de> Deserialize<'de> for XrayOutbound {
                 stream_settings: decoded.stream_settings,
                 mux: decoded.mux,
                 decode_error: None,
+                extra: decoded.extra,
             }),
             Err(error) => {
                 if protocol.trim().is_empty() {
@@ -177,6 +183,7 @@ impl<'de> Deserialize<'de> for XrayOutbound {
                     stream_settings: XrayStreamSettings::default(),
                     mux: None,
                     decode_error: Some(error.to_string()),
+                    extra: Map::new(),
                 })
             }
         }
@@ -233,6 +240,8 @@ pub struct XrayOutboundSettings {
     pub vnext: Vec<XrayVnext>,
     #[serde(default)]
     pub servers: Vec<XrayServer>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -241,6 +250,8 @@ pub struct XrayVnext {
     pub port: u16,
     #[serde(default)]
     pub users: Vec<XrayUser>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -263,6 +274,8 @@ pub struct XrayUser {
     pub security: Option<String>,
     #[serde(default, rename = "alterId", alias = "alter_id")]
     pub alter_id: Option<u16>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -275,6 +288,8 @@ pub struct XrayServer {
     pub method: Option<String>,
     #[serde(default)]
     pub users: Vec<XrayHttpUser>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -283,6 +298,8 @@ pub struct XrayHttpUser {
     pub user: Option<String>,
     #[serde(default, rename = "pass")]
     pub pass: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -380,13 +397,43 @@ impl Default for XrayStreamSettings {
     }
 }
 
+impl XrayOutboundSettings {
+    fn reject_unsupported_extra_fields(&self, owner: &str) -> Result<()> {
+        ensure_no_extra_fields(&format!("{owner} settings"), &self.extra)?;
+        for (index, client) in self.clients.iter().enumerate() {
+            ensure_no_extra_fields(&format!("{owner} settings.clients[{index}]"), &client.extra)?;
+        }
+        for (vnext_index, vnext) in self.vnext.iter().enumerate() {
+            ensure_no_extra_fields(
+                &format!("{owner} settings.vnext[{vnext_index}]"),
+                &vnext.extra,
+            )?;
+            for (user_index, user) in vnext.users.iter().enumerate() {
+                ensure_no_extra_fields(
+                    &format!("{owner} settings.vnext[{vnext_index}].users[{user_index}]"),
+                    &user.extra,
+                )?;
+            }
+        }
+        for (server_index, server) in self.servers.iter().enumerate() {
+            ensure_no_extra_fields(
+                &format!("{owner} settings.servers[{server_index}]"),
+                &server.extra,
+            )?;
+            for (user_index, user) in server.users.iter().enumerate() {
+                ensure_no_extra_fields(
+                    &format!("{owner} settings.servers[{server_index}].users[{user_index}]"),
+                    &user.extra,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl XrayStreamSettings {
     fn reject_unsupported_fields(&self, owner: &str) -> Result<()> {
-        ensure!(
-            self.extra.is_empty(),
-            "{owner} streamSettings has unsupported fields {:?}",
-            self.extra.keys().collect::<Vec<_>>()
-        );
+        ensure_no_extra_fields(&format!("{owner} streamSettings"), &self.extra)?;
         ensure!(
             !self
                 .raw_settings
@@ -421,6 +468,33 @@ impl XrayStreamSettings {
         if let Some(tls) = &self.tls_settings {
             tls.reject_unsupported_fields(owner)?;
         }
+        if let Some(reality) = &self.reality_settings {
+            reality.reject_unsupported_extra_fields(owner)?;
+        }
+        if let Some(hysteria) = &self.hysteria_settings {
+            hysteria.reject_unsupported_extra_fields(owner)?;
+        }
+        if let Some(finalmask) = &self.finalmask {
+            finalmask.reject_unsupported_extra_fields(owner)?;
+        }
+        if let Some(ws) = &self.ws_settings {
+            ws.reject_unsupported_extra_fields(owner)?;
+        }
+        if let Some(http_upgrade) = &self.http_upgrade_settings {
+            http_upgrade.reject_unsupported_extra_fields(owner)?;
+        }
+        if let Some(grpc) = &self.grpc_settings {
+            grpc.reject_unsupported_extra_fields(owner)?;
+        }
+        if let Some(http) = &self.http_settings {
+            http.reject_unsupported_extra_fields(owner)?;
+        }
+        if let Some(xhttp) = &self.xhttp_settings {
+            xhttp.reject_unsupported_extra_fields(owner, "xhttpSettings")?;
+        }
+        if let Some(split_http) = &self.split_http_settings {
+            split_http.reject_unsupported_extra_fields(owner, "splitHTTPSettings")?;
+        }
         Ok(())
     }
 }
@@ -441,6 +515,8 @@ pub struct XrayHysteriaSettings {
     pub udp_hop: Option<Value>,
     #[serde(default)]
     pub masquerade: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -451,6 +527,8 @@ pub struct XrayFinalMask {
     pub udp: Vec<XrayMask>,
     #[serde(default, rename = "quicParams", alias = "quic_params")]
     pub quic_params: Option<XrayQuicParams>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -459,6 +537,8 @@ pub struct XrayMask {
     pub kind: String,
     #[serde(default)]
     pub settings: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -485,6 +565,8 @@ pub struct XrayQuicParams {
     pub brutal_down: Option<u64>,
     #[serde(default, rename = "udpHop", alias = "udp_hop")]
     pub udp_hop: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -493,6 +575,8 @@ pub struct XrayWsSettings {
     pub path: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -503,6 +587,8 @@ pub struct XrayHttpUpgradeSettings {
     pub host: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -513,6 +599,8 @@ pub struct XrayGrpcSettings {
     pub authority: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -523,6 +611,8 @@ pub struct XrayHttpSettings {
     pub host: Option<OneOrManyStrings>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -535,6 +625,8 @@ pub struct XrayXhttpSettings {
     pub mode: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -748,12 +840,114 @@ pub struct XrayRealitySettings {
     pub short_ids: Vec<String>,
     #[serde(default)]
     pub alpn: Option<OneOrManyStrings>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct XrayMuxOptions {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl XrayHysteriaSettings {
+    fn reject_unsupported_extra_fields(&self, owner: &str) -> Result<()> {
+        ensure_no_extra_fields(
+            &format!("{owner} streamSettings.hysteriaSettings"),
+            &self.extra,
+        )
+    }
+}
+
+impl XrayFinalMask {
+    fn reject_unsupported_extra_fields(&self, owner: &str) -> Result<()> {
+        ensure_no_extra_fields(&format!("{owner} streamSettings.finalmask"), &self.extra)?;
+        for (index, mask) in self.tcp.iter().enumerate() {
+            mask.reject_unsupported_extra_fields(&format!(
+                "{owner} streamSettings.finalmask.tcp[{index}]"
+            ))?;
+        }
+        for (index, mask) in self.udp.iter().enumerate() {
+            mask.reject_unsupported_extra_fields(&format!(
+                "{owner} streamSettings.finalmask.udp[{index}]"
+            ))?;
+        }
+        if let Some(quic_params) = &self.quic_params {
+            quic_params.reject_unsupported_extra_fields(owner)?;
+        }
+        Ok(())
+    }
+}
+
+impl XrayMask {
+    fn reject_unsupported_extra_fields(&self, owner: &str) -> Result<()> {
+        ensure_no_extra_fields(owner, &self.extra)?;
+        if let Some(Value::Object(settings)) = &self.settings {
+            let unsupported = settings
+                .keys()
+                .filter(|key| key.as_str() != "password")
+                .collect::<Vec<_>>();
+            ensure!(
+                unsupported.is_empty(),
+                "{owner} settings has unsupported fields {:?}",
+                unsupported
+            );
+        }
+        Ok(())
+    }
+}
+
+impl XrayQuicParams {
+    fn reject_unsupported_extra_fields(&self, owner: &str) -> Result<()> {
+        ensure_no_extra_fields(
+            &format!("{owner} streamSettings.finalmask.quicParams"),
+            &self.extra,
+        )
+    }
+}
+
+impl XrayWsSettings {
+    fn reject_unsupported_extra_fields(&self, owner: &str) -> Result<()> {
+        ensure_no_extra_fields(&format!("{owner} streamSettings.wsSettings"), &self.extra)
+    }
+}
+
+impl XrayHttpUpgradeSettings {
+    fn reject_unsupported_extra_fields(&self, owner: &str) -> Result<()> {
+        ensure_no_extra_fields(
+            &format!("{owner} streamSettings.httpUpgradeSettings"),
+            &self.extra,
+        )
+    }
+}
+
+impl XrayGrpcSettings {
+    fn reject_unsupported_extra_fields(&self, owner: &str) -> Result<()> {
+        ensure_no_extra_fields(&format!("{owner} streamSettings.grpcSettings"), &self.extra)
+    }
+}
+
+impl XrayHttpSettings {
+    fn reject_unsupported_extra_fields(&self, owner: &str) -> Result<()> {
+        ensure_no_extra_fields(&format!("{owner} streamSettings.httpSettings"), &self.extra)
+    }
+}
+
+impl XrayXhttpSettings {
+    fn reject_unsupported_extra_fields(&self, owner: &str, field: &str) -> Result<()> {
+        ensure_no_extra_fields(&format!("{owner} streamSettings.{field}"), &self.extra)
+    }
+}
+
+impl XrayRealitySettings {
+    fn reject_unsupported_extra_fields(&self, owner: &str) -> Result<()> {
+        ensure_no_extra_fields(
+            &format!("{owner} streamSettings.realitySettings"),
+            &self.extra,
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1046,11 +1240,10 @@ impl XrayInbound {
     }
 
     pub fn to_server_config(&self) -> Result<XrayServerConfig> {
-        self.stream_settings.reject_unsupported_fields(&format!(
-            "xray {} inbound {}",
-            self.protocol,
-            self.name()
-        ))?;
+        let owner = format!("xray {} inbound {}", self.protocol, self.name());
+        ensure_no_extra_fields(&owner, &self.extra)?;
+        self.settings.reject_unsupported_extra_fields(&owner)?;
+        self.stream_settings.reject_unsupported_fields(&owner)?;
         match self.protocol.trim().to_ascii_lowercase().as_str() {
             "shadowsocks" | "ss" => Ok(XrayServerConfig::Shadowsocks(
                 self.to_shadowsocks_server_config()
@@ -1370,6 +1563,7 @@ impl XrayInbound {
             stream_settings: self.stream_settings.clone(),
             mux: None,
             decode_error: None,
+            extra: Map::new(),
         }
         .vless_transport_config()?;
         ensure_vless_alpn(
@@ -1455,6 +1649,7 @@ impl XrayInbound {
             stream_settings: self.stream_settings.clone(),
             mux: None,
             decode_error: None,
+            extra: Map::new(),
         }
         .vless_transport_config()?;
         if stream_security.eq_ignore_ascii_case("tls")
@@ -1565,6 +1760,7 @@ impl XrayInbound {
             stream_settings: self.stream_settings.clone(),
             mux: None,
             decode_error: None,
+            extra: Map::new(),
         }
         .vless_transport_config()?;
         let tls_enabled = self
@@ -1669,11 +1865,10 @@ impl XrayOutbound {
             self.name(),
             self.decode_error.as_deref().unwrap_or_default()
         );
-        self.stream_settings.reject_unsupported_fields(&format!(
-            "xray {} outbound {}",
-            self.protocol,
-            self.name()
-        ))?;
+        let owner = format!("xray {} outbound {}", self.protocol, self.name());
+        ensure_no_extra_fields(&owner, &self.extra)?;
+        self.settings.reject_unsupported_extra_fields(&owner)?;
+        self.stream_settings.reject_unsupported_fields(&owner)?;
         match self.protocol.trim().to_ascii_lowercase().as_str() {
             "freedom" => Ok(XrayClientConfig::Route(
                 self.to_route_client_config(listen, RouteDecision::Direct)?,
@@ -1711,12 +1906,11 @@ impl XrayOutbound {
         listen: SocketAddr,
         default: RouteDecision,
     ) -> Result<RouteClientConfig> {
-        ensure!(
-            !self.mux.as_ref().map(|mux| mux.enabled).unwrap_or(false),
-            "xray {} outbound {} enables mux; Aerion route client does not use Xray mux",
-            self.protocol,
-            self.name()
-        );
+        ensure_xray_mux_disabled(
+            &format!("xray {} outbound {}", self.protocol, self.name()),
+            self.mux.as_ref(),
+            "Aerion route client does not use Xray mux",
+        )?;
         ensure_tcp_network("xray route", self.name(), &self.stream_settings.network)?;
         let stream_security = self.stream_settings.security.trim();
         ensure!(
@@ -1746,11 +1940,11 @@ impl XrayOutbound {
     }
 
     fn to_http_client_config(&self, listen: SocketAddr) -> Result<HttpProxyClientConfig> {
-        ensure!(
-            !self.mux.as_ref().map(|mux| mux.enabled).unwrap_or(false),
-            "xray HTTP outbound {} enables mux; HTTP CONNECT proxying does not use Xray mux",
-            self.name()
-        );
+        ensure_xray_mux_disabled(
+            &format!("xray HTTP outbound {}", self.name()),
+            self.mux.as_ref(),
+            "HTTP CONNECT proxying does not use Xray mux",
+        )?;
         let stream_security = self.stream_settings.security.trim();
         ensure!(
             stream_security.is_empty()
@@ -1835,11 +2029,11 @@ impl XrayOutbound {
     }
 
     fn to_socks_client_config(&self, listen: SocketAddr) -> Result<SocksProxyClientConfig> {
-        ensure!(
-            !self.mux.as_ref().map(|mux| mux.enabled).unwrap_or(false),
-            "xray SOCKS outbound {} enables mux; SOCKS proxying does not use Xray mux",
-            self.name()
-        );
+        ensure_xray_mux_disabled(
+            &format!("xray SOCKS outbound {}", self.name()),
+            self.mux.as_ref(),
+            "SOCKS proxying does not use Xray mux",
+        )?;
         ensure_tcp_network("xray SOCKS", self.name(), &self.stream_settings.network)?;
         let stream_security = self.stream_settings.security.trim();
         ensure!(
@@ -1902,6 +2096,10 @@ impl XrayOutbound {
 
     fn to_vless_client_config(&self, listen: SocketAddr) -> Result<VlessClientConfig> {
         let peer = self.first_vless_or_vmess_peer()?;
+        let mux = xray_mux_enabled(
+            &format!("xray VLESS outbound {}", self.name()),
+            self.mux.as_ref(),
+        )?;
         ensure!(
             peer.user
                 .encryption
@@ -1984,7 +2182,7 @@ impl XrayOutbound {
                 .packet_encoding
                 .or(self.settings.packet_encoding.clone())
                 .unwrap_or_default(),
-            mux: self.mux.as_ref().map(|mux| mux.enabled).unwrap_or(false),
+            mux,
             udp: true,
             client_fingerprint,
             reality,
@@ -1993,6 +2191,11 @@ impl XrayOutbound {
     }
 
     fn to_shadowsocks_client_config(&self, listen: SocketAddr) -> Result<ShadowsocksClientConfig> {
+        ensure_xray_mux_disabled(
+            &format!("xray Shadowsocks outbound {}", self.name()),
+            self.mux.as_ref(),
+            "Aerion Shadowsocks client does not use Xray mux",
+        )?;
         let server = self.first_trojan_server()?;
         ensure_tcp_network("xray", self.name(), &self.stream_settings.network)?;
         let stream_security = self.stream_settings.security.trim();
@@ -2028,6 +2231,11 @@ impl XrayOutbound {
     }
 
     fn to_vmess_client_config(&self, listen: SocketAddr) -> Result<VmessClientConfig> {
+        ensure_xray_mux_disabled(
+            &format!("xray VMess outbound {}", self.name()),
+            self.mux.as_ref(),
+            "Aerion VMess client does not use Xray mux",
+        )?;
         let peer = self.first_vless_or_vmess_peer()?;
         ensure_raw_or_tls_stream_security(
             "xray VMess",
@@ -2106,6 +2314,11 @@ impl XrayOutbound {
     }
 
     fn to_trojan_client_config(&self, listen: SocketAddr) -> Result<TrojanClientConfig> {
+        ensure_xray_mux_disabled(
+            &format!("xray Trojan outbound {}", self.name()),
+            self.mux.as_ref(),
+            "Aerion Trojan client does not use Xray mux",
+        )?;
         let server = self.first_trojan_server()?;
         let transport = self.vless_transport_config()?;
         ensure_tls_or_reality("xray Trojan", self.name(), &self.stream_settings.security)?;
@@ -2142,6 +2355,11 @@ impl XrayOutbound {
     }
 
     fn to_hysteria2_client_config(&self, listen: SocketAddr) -> Result<Hysteria2ClientConfig> {
+        ensure_xray_mux_disabled(
+            &format!("xray Hysteria outbound {}", self.name()),
+            self.mux.as_ref(),
+            "Aerion Hysteria2 client does not use Xray mux",
+        )?;
         let server = self.first_trojan_server()?;
         let hysteria = self.stream_settings.hysteria_settings.as_ref();
         let version = self
@@ -2361,6 +2579,7 @@ impl XrayOutbound {
                 packet_encoding: self.settings.packet_encoding.clone(),
                 security: self.settings.security.clone(),
                 alter_id: self.settings.alter_id,
+                extra: Map::new(),
             },
         })
     }
@@ -2382,6 +2601,7 @@ impl XrayOutbound {
             password: self.settings.password.clone(),
             method: self.settings.method.clone(),
             users: Vec::new(),
+            extra: Map::new(),
         })
     }
 
@@ -2548,6 +2768,31 @@ fn ensure_tcp_network(format: &str, name: &str, network: &str) -> Result<()> {
     bail!(
         "{format} outbound {name} uses network {network}; Aerion currently wires raw TCP transport only"
     )
+}
+
+fn ensure_no_extra_fields(owner: &str, extra: &Map<String, Value>) -> Result<()> {
+    ensure!(
+        extra.is_empty(),
+        "{owner} has unsupported fields {:?}",
+        extra.keys().collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+fn xray_mux_enabled(owner: &str, mux: Option<&XrayMuxOptions>) -> Result<bool> {
+    let Some(mux) = mux else {
+        return Ok(false);
+    };
+    ensure_no_extra_fields(&format!("{owner} mux"), &mux.extra)?;
+    Ok(mux.enabled)
+}
+
+fn ensure_xray_mux_disabled(owner: &str, mux: Option<&XrayMuxOptions>, reason: &str) -> Result<()> {
+    ensure!(
+        !xray_mux_enabled(owner, mux)?,
+        "{owner} enables mux; {reason}"
+    );
+    Ok(())
 }
 
 fn ensure_empty_route_settings(
@@ -4563,6 +4808,140 @@ mod tests {
             .expect_err("unknown streamSettings fields must not be ignored");
         assert!(error.to_string().contains("unsupported fields"));
         assert!(error.to_string().contains("unknownStreamField"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_xray_unsupported_profile_fields() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "tag": "vless-send-through",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [{
+          "address": "example.com",
+          "port": 443,
+          "users": [{ "id": "a3482e88-686a-4a58-8126-99c9df64b7bf", "encryption": "none" }]
+        }]
+      },
+      "streamSettings": { "network": "tcp", "security": "none" },
+      "sendThrough": "192.0.2.1"
+    },
+    {
+      "tag": "vless-user-email",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [{
+          "address": "example.com",
+          "port": 443,
+          "users": [{
+            "id": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+            "encryption": "none",
+            "email": "user@example.com"
+          }]
+        }]
+      },
+      "streamSettings": { "network": "tcp", "security": "none" }
+    },
+    {
+      "tag": "vless-ws-extra",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [{
+          "address": "example.com",
+          "port": 443,
+          "users": [{ "id": "a3482e88-686a-4a58-8126-99c9df64b7bf", "encryption": "none" }]
+        }]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "/ws",
+          "maxEarlyData": 2048
+        }
+      }
+    },
+    {
+      "tag": "ss-mux-fields",
+      "protocol": "shadowsocks",
+      "settings": {
+        "servers": [{
+          "address": "ss.example.com",
+          "port": 8388,
+          "method": "aes-128-gcm",
+          "password": "secret"
+        }]
+      },
+      "mux": {
+        "enabled": false,
+        "concurrency": 8
+      }
+    }
+  ],
+  "inbounds": [
+    {
+      "tag": "trojan-sniffing",
+      "protocol": "trojan",
+      "sniffing": { "enabled": true }
+    },
+    {
+      "tag": "hy2-mask-extra",
+      "protocol": "hysteria2",
+      "streamSettings": {
+        "network": "hysteria",
+        "finalmask": {
+          "udp": [{
+            "type": "salamander",
+            "settings": {
+              "password": "obfs-pass",
+              "padding": true
+            }
+          }]
+        }
+      }
+    }
+  ]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let top_level_error = config.outbounds[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("unsupported xray outbound fields must not be ignored");
+        assert!(top_level_error.to_string().contains("sendThrough"));
+
+        let user_error = config.outbounds[1]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("unsupported xray user fields must not be ignored");
+        assert!(user_error.to_string().contains("users[0]"));
+        assert!(user_error.to_string().contains("email"));
+
+        let ws_error = config.outbounds[2]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("unsupported xray wsSettings fields must not be ignored");
+        assert!(ws_error.to_string().contains("wsSettings"));
+        assert!(ws_error.to_string().contains("maxEarlyData"));
+
+        let mux_error = config.outbounds[3]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("disabled mux settings must not be ignored");
+        assert!(mux_error.to_string().contains("mux"));
+        assert!(mux_error.to_string().contains("concurrency"));
+
+        let inbound_error = config.inbounds[0]
+            .to_server_config()
+            .err()
+            .context("unsupported xray inbound fields must not be ignored")?;
+        assert!(inbound_error.to_string().contains("sniffing"));
+
+        let mask_error = config.inbounds[1]
+            .to_server_config()
+            .err()
+            .context("unsupported xray finalmask settings must not be ignored")?;
+        assert!(mask_error.to_string().contains("finalmask"));
+        assert!(mask_error.to_string().contains("padding"));
         Ok(())
     }
 
