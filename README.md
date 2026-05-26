@@ -119,7 +119,9 @@ Aerion now provides these server/client protocol stacks:
   - protocol modules expose the bottom-level connection capability; profile
     selection and service/app policy stay in the integrating client or server
   - unsupported transport mismatches such as mihomo `smux` fail with explicit
-    errors instead of falling back silently
+    errors instead of falling back silently; unknown mihomo proxy fields and
+    unsupported nested `ws-opts` / `grpc-opts` / `xhttp-opts` / `reality-opts`
+    fields also fail explicitly instead of being ignored
 - VMess:
   - AEAD request/response header
   - raw TCP/TLS plus TCP / WebSocket / HTTPUpgrade / HTTP/2 / gRPC / XHTTP transports for client/server
@@ -264,7 +266,9 @@ binary MRS rule-provider loading still fails explicitly. Direct geo route
 references that are not backed by expanded rule-set data fail at config compile
 time instead of during route decisions. Source/process/inbound/sniffed-metadata
 matchers and Mihomo `src` route parameters require routing metadata and fail
-explicitly. Mihomo `select`
+explicitly. Unknown mihomo proxy fields, unsupported WebSocket/gRPC/XHTTP/
+REALITY option fields, and transport option blocks attached to a different
+`network` fail explicitly rather than being silently dropped. Mihomo `select`
 proxy-groups resolve to the first listed proxy. Mihomo health-check /
 load-balancing / relay groups and sing-box `urltest` outbounds resolve
 statically only when they contain a single explicit candidate; multi-candidate

@@ -275,6 +275,8 @@ pub struct MihomoShadowsocksProxy {
     pub plugin_opts: Option<BTreeMap<String, String>>,
     #[serde(default, rename = "udp-over-tcp", alias = "udp_over_tcp")]
     pub udp_over_tcp: Option<MihomoUdpOverTcpOptions>,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -294,6 +296,8 @@ pub struct MihomoSocksProxy {
     pub skip_cert_verify: bool,
     #[serde(default)]
     pub alpn: Option<OneOrManyStrings>,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -322,6 +326,8 @@ pub struct MihomoHttpProxy {
     pub alpn: Option<OneOrManyStrings>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -338,6 +344,8 @@ pub struct MihomoVlessProxy {
     pub network: String,
     #[serde(default)]
     pub flow: String,
+    #[serde(default)]
+    pub encryption: Option<String>,
     #[serde(default, rename = "packet-encoding", alias = "packet_encoding")]
     pub packet_encoding: String,
     #[serde(default, alias = "server-name", alias = "sni")]
@@ -371,6 +379,8 @@ pub struct MihomoVlessProxy {
         alias = "splithttp_opts"
     )]
     pub xhttp_opts: Option<MihomoXhttpOptions>,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -408,6 +418,8 @@ pub struct MihomoVmessProxy {
     pub ws_opts: Option<MihomoWsOptions>,
     #[serde(default, rename = "grpc-opts", alias = "grpc_opts")]
     pub grpc_opts: Option<MihomoGrpcOptions>,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -439,6 +451,8 @@ pub struct MihomoTrojanProxy {
     pub ws_opts: Option<MihomoWsOptions>,
     #[serde(default, rename = "grpc-opts", alias = "grpc_opts")]
     pub grpc_opts: Option<MihomoGrpcOptions>,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -503,6 +517,8 @@ pub struct MihomoHysteria2Proxy {
     pub udp: bool,
     #[serde(default)]
     pub alpn: Option<OneOrManyStrings>,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -519,6 +535,8 @@ pub struct MihomoMieruProxy {
     pub traffic_pattern: Option<String>,
     #[serde(default, rename = "nonce-pattern", alias = "nonce_pattern")]
     pub nonce_pattern: Option<String>,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -540,6 +558,8 @@ pub struct MihomoAnyTlsProxy {
     pub client_fingerprint: Option<UtlsFingerprint>,
     #[serde(default, rename = "padding-scheme", alias = "padding_scheme")]
     pub padding_scheme: Vec<String>,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -562,6 +582,8 @@ pub struct MihomoNaiveProxy {
     pub udp_over_tcp: Option<MihomoUdpOverTcpOptions>,
     #[serde(default, rename = "extra-headers", alias = "extra_headers")]
     pub extra_headers: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -618,6 +640,8 @@ pub struct MihomoTuicProxy {
         alias = "udp_relay_mode"
     )]
     pub udp_relay_mode: String,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -626,6 +650,8 @@ pub struct MihomoRealityOpts {
     pub public_key: String,
     #[serde(default, rename = "short-id", alias = "short_id")]
     pub short_id: String,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -640,6 +666,8 @@ pub struct MihomoSmuxOptions {
     pub min_streams: Option<u32>,
     #[serde(default, rename = "max-streams", alias = "max_streams")]
     pub max_streams: Option<u32>,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -648,12 +676,16 @@ pub struct MihomoWsOptions {
     pub path: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct MihomoGrpcOptions {
     #[serde(default, rename = "grpc-service-name", alias = "grpc_service_name")]
     pub grpc_service_name: Option<String>,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -666,12 +698,15 @@ pub struct MihomoXhttpOptions {
     pub mode: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MihomoUdpOverTcpOptions {
     pub enabled: bool,
     pub version: Option<Value>,
+    pub fields: BTreeMap<String, Value>,
 }
 
 impl<'de> Deserialize<'de> for MihomoUdpOverTcpOptions {
@@ -688,6 +723,8 @@ impl<'de> Deserialize<'de> for MihomoUdpOverTcpOptions {
                 enabled: bool,
                 #[serde(default)]
                 version: Option<Value>,
+                #[serde(flatten)]
+                fields: BTreeMap<String, Value>,
             },
         }
 
@@ -695,15 +732,34 @@ impl<'de> Deserialize<'de> for MihomoUdpOverTcpOptions {
             Raw::Bool(enabled) => Ok(Self {
                 enabled,
                 version: None,
+                fields: BTreeMap::new(),
             }),
-            Raw::Object { enabled, version } => Ok(Self { enabled, version }),
+            Raw::Object {
+                enabled,
+                version,
+                fields,
+            } => Ok(Self {
+                enabled,
+                version,
+                fields,
+            }),
         }
     }
 }
 
 impl MihomoUdpOverTcpOptions {
     fn enabled_for(&self, protocol: &str, name: &str) -> Result<bool> {
+        ensure_no_extra_fields(
+            &format!("mihomo {protocol} proxy {name} udp-over-tcp"),
+            &self.fields,
+        )?;
         if !self.enabled {
+            ensure!(
+                self.version
+                    .as_ref()
+                    .is_none_or(|value| !value_has_data(value)),
+                "mihomo {protocol} proxy {name} sets udp-over-tcp version while udp-over-tcp is disabled"
+            );
             return Ok(false);
         }
         if let Some(version) = &self.version {
@@ -1321,6 +1377,10 @@ impl MihomoUnsupportedProxy {
 
 impl MihomoShadowsocksProxy {
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<ShadowsocksClientConfig> {
+        ensure_no_proxy_extra_fields(
+            &format!("mihomo Shadowsocks proxy {}", self.name),
+            &self.fields,
+        )?;
         ensure!(
             self.plugin
                 .as_deref()
@@ -1351,6 +1411,7 @@ impl MihomoShadowsocksProxy {
 
 impl MihomoSocksProxy {
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<SocksProxyClientConfig> {
+        ensure_no_proxy_extra_fields(&format!("mihomo SOCKS proxy {}", self.name), &self.fields)?;
         ensure!(
             !self.tls && !self.skip_cert_verify && alpn_values(self.alpn.as_ref()).is_empty(),
             "mihomo SOCKS proxy {} sets TLS options; Aerion SOCKS outbound is plain SOCKS5",
@@ -1369,6 +1430,7 @@ impl MihomoSocksProxy {
 
 impl MihomoHttpProxy {
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<HttpProxyClientConfig> {
+        ensure_no_proxy_extra_fields(&format!("mihomo HTTP proxy {}", self.name), &self.fields)?;
         if self.tls {
             ensure_http_alpn(&self.name, self.alpn.as_ref())?;
         } else {
@@ -1401,41 +1463,29 @@ impl MihomoHttpProxy {
 
 impl MihomoVlessProxy {
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<VlessClientConfig> {
+        ensure_no_proxy_extra_fields(&format!("mihomo VLESS proxy {}", self.name), &self.fields)?;
+        if let Some(encryption) = self.encryption.as_deref().map(str::trim) {
+            ensure!(
+                encryption.is_empty() || encryption.eq_ignore_ascii_case("none"),
+                "mihomo VLESS proxy {} uses encryption {}; Aerion VLESS supports none/empty encryption",
+                self.name,
+                encryption
+            );
+        }
         let reality = self
             .reality_opts
             .as_ref()
             .map(MihomoRealityOpts::to_client_config)
             .transpose()?;
         let network = self.network.trim();
-        let transport = if network.eq_ignore_ascii_case("grpc") {
-            VlessTransportConfig::from_network(
-                network,
-                self.grpc_opts
-                    .as_ref()
-                    .and_then(|opts| opts.grpc_service_name.clone()),
-                None,
-                Vec::new(),
-            )?
-        } else if network.eq_ignore_ascii_case("xhttp") || network.eq_ignore_ascii_case("splithttp")
-        {
-            let opts = self.xhttp_opts.as_ref();
-            VlessTransportConfig::xhttp(
-                opts.and_then(|opts| opts.path.clone()),
-                opts.and_then(|opts| opts.host.clone()),
-                opts.map(|opts| opts.headers.clone().into_iter().collect())
-                    .unwrap_or_default(),
-                opts.and_then(|opts| opts.mode.clone()),
-            )?
-        } else {
-            VlessTransportConfig::from_headers(
-                network,
-                self.ws_opts.as_ref().and_then(|opts| opts.path.clone()),
-                self.ws_opts
-                    .as_ref()
-                    .map(|opts| opts.headers.clone())
-                    .unwrap_or_default(),
-            )?
-        };
+        let transport = mihomo_transport_config(
+            "VLESS",
+            &self.name,
+            network,
+            self.ws_opts.as_ref(),
+            self.grpc_opts.as_ref(),
+            self.xhttp_opts.as_ref(),
+        )?;
         if self.tls || reality.is_some() {
             ensure_vless_alpn(&self.name, &transport, self.alpn.as_ref())?;
         } else {
@@ -1476,6 +1526,7 @@ impl MihomoVlessProxy {
 
 impl MihomoVmessProxy {
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<VmessClientConfig> {
+        ensure_no_proxy_extra_fields(&format!("mihomo VMess proxy {}", self.name), &self.fields)?;
         ensure!(
             self.alter_id == 0,
             "mihomo VMess proxy {} uses legacy alterId {}; Aerion implements AEAD VMess only",
@@ -1490,25 +1541,14 @@ impl MihomoVmessProxy {
         ensure_vmess_packet_encoding(&self.packet_encoding)
             .with_context(|| format!("mihomo VMess proxy {} packet-encoding", self.name))?;
         let network = self.network.trim();
-        let transport = if network.eq_ignore_ascii_case("grpc") {
-            VlessTransportConfig::from_network(
-                network,
-                self.grpc_opts
-                    .as_ref()
-                    .and_then(|opts| opts.grpc_service_name.clone()),
-                None,
-                Vec::new(),
-            )?
-        } else {
-            VlessTransportConfig::from_headers(
-                network,
-                self.ws_opts.as_ref().and_then(|opts| opts.path.clone()),
-                self.ws_opts
-                    .as_ref()
-                    .map(|opts| opts.headers.clone())
-                    .unwrap_or_default(),
-            )?
-        };
+        let transport = mihomo_transport_config(
+            "VMess",
+            &self.name,
+            network,
+            self.ws_opts.as_ref(),
+            self.grpc_opts.as_ref(),
+            None,
+        )?;
         if self.tls {
             ensure_vless_alpn(&self.name, &transport, self.alpn.as_ref())?;
         } else {
@@ -1545,31 +1585,21 @@ impl MihomoVmessProxy {
 
 impl MihomoTrojanProxy {
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<TrojanClientConfig> {
+        ensure_no_proxy_extra_fields(&format!("mihomo Trojan proxy {}", self.name), &self.fields)?;
         ensure!(
             self.tls,
             "mihomo Trojan proxy {} disables TLS; Trojan requires TLS in Aerion",
             self.name
         );
         let network = self.network.trim();
-        let transport = if network.eq_ignore_ascii_case("grpc") {
-            VlessTransportConfig::from_network(
-                network,
-                self.grpc_opts
-                    .as_ref()
-                    .and_then(|opts| opts.grpc_service_name.clone()),
-                None,
-                Vec::new(),
-            )?
-        } else {
-            VlessTransportConfig::from_headers(
-                network,
-                self.ws_opts.as_ref().and_then(|opts| opts.path.clone()),
-                self.ws_opts
-                    .as_ref()
-                    .map(|opts| opts.headers.clone())
-                    .unwrap_or_default(),
-            )?
-        };
+        let transport = mihomo_transport_config(
+            "Trojan",
+            &self.name,
+            network,
+            self.ws_opts.as_ref(),
+            self.grpc_opts.as_ref(),
+            None,
+        )?;
         ensure_vless_alpn(&self.name, &transport, self.alpn.as_ref())?;
         Ok(TrojanClientConfig {
             listen,
@@ -1591,6 +1621,10 @@ impl MihomoTrojanProxy {
 
 impl MihomoHysteria2Proxy {
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<Hysteria2ClientConfig> {
+        ensure_no_proxy_extra_fields(
+            &format!("mihomo Hysteria2 proxy {}", self.name),
+            &self.fields,
+        )?;
         ensure!(
             self.ports.is_none(),
             "mihomo Hysteria2 proxy {} uses port hopping; Aerion Hysteria2 client expects one fixed port",
@@ -1689,6 +1723,7 @@ impl MihomoHysteria2Proxy {
 
 impl MihomoAnyTlsProxy {
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<ClientConfig> {
+        ensure_no_proxy_extra_fields(&format!("mihomo AnyTLS proxy {}", self.name), &self.fields)?;
         Ok(ClientConfig {
             listen,
             server_host: self.server.clone(),
@@ -1713,6 +1748,7 @@ impl MihomoAnyTlsProxy {
 
 impl MihomoMieruProxy {
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<MieruClientConfig> {
+        ensure_no_proxy_extra_fields(&format!("mihomo Mieru proxy {}", self.name), &self.fields)?;
         Ok(MieruClientConfig {
             listen,
             server_host: self.server.clone(),
@@ -1736,6 +1772,7 @@ impl MihomoMieruProxy {
 
 impl MihomoNaiveProxy {
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<NaiveClientConfig> {
+        ensure_no_proxy_extra_fields(&format!("mihomo Naive proxy {}", self.name), &self.fields)?;
         Ok(NaiveClientConfig {
             listen,
             server_host: self.server.clone(),
@@ -1763,6 +1800,7 @@ impl MihomoNaiveProxy {
 
 impl MihomoTuicProxy {
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<TuicClientConfig> {
+        ensure_no_proxy_extra_fields(&format!("mihomo TUIC proxy {}", self.name), &self.fields)?;
         ensure!(
             self.token.as_deref().unwrap_or_default().trim().is_empty(),
             "mihomo TUIC proxy {} uses TUIC v4 token; Aerion implements TUIC v5 UUID/password auth",
@@ -1846,6 +1884,7 @@ impl MihomoTuicProxy {
 
 impl MihomoRealityOpts {
     pub fn to_client_config(&self) -> Result<RealityClientConfig> {
+        ensure_no_extra_fields("mihomo reality-opts", &self.fields)?;
         RealityClientConfig::from_strings(&self.public_key, &self.short_id)
     }
 }
@@ -1853,6 +1892,76 @@ impl MihomoRealityOpts {
 impl MihomoSmuxOptions {
     fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    fn has_settings(&self) -> bool {
+        self.enabled
+            || self
+                .protocol
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self.max_connections.is_some()
+            || self.min_streams.is_some()
+            || self.max_streams.is_some()
+            || !self.fields.is_empty()
+    }
+
+    fn ensure_supported(&self, name: &str) -> Result<()> {
+        ensure_no_extra_fields(&format!("mihomo proxy {name} smux"), &self.fields)?;
+        ensure!(
+            !self.has_settings(),
+            "mihomo proxy {name} sets smux options; Aerion VLESS mux.cool is not wire-compatible with mihomo smux"
+        );
+        Ok(())
+    }
+}
+
+impl MihomoWsOptions {
+    fn ensure_supported(&self, owner: &str) -> Result<()> {
+        ensure_no_extra_fields(owner, &self.fields)
+    }
+
+    fn has_settings(&self) -> bool {
+        self.path
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || !self.headers.is_empty()
+            || !self.fields.is_empty()
+    }
+}
+
+impl MihomoGrpcOptions {
+    fn ensure_supported(&self, owner: &str) -> Result<()> {
+        ensure_no_extra_fields(owner, &self.fields)
+    }
+
+    fn has_settings(&self) -> bool {
+        self.grpc_service_name
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || !self.fields.is_empty()
+    }
+}
+
+impl MihomoXhttpOptions {
+    fn ensure_supported(&self, owner: &str) -> Result<()> {
+        ensure_no_extra_fields(owner, &self.fields)
+    }
+
+    fn has_settings(&self) -> bool {
+        self.path
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .host
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .mode
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || !self.headers.is_empty()
+            || !self.fields.is_empty()
     }
 }
 
@@ -1877,6 +1986,28 @@ fn value_has_data(value: &Value) -> bool {
     }
 }
 
+fn ensure_no_extra_fields(owner: &str, fields: &BTreeMap<String, Value>) -> Result<()> {
+    ensure!(
+        fields.is_empty(),
+        "{owner} has unsupported fields {:?}",
+        fields.keys().collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+fn ensure_no_proxy_extra_fields(owner: &str, fields: &BTreeMap<String, Value>) -> Result<()> {
+    let unsupported = fields
+        .keys()
+        .filter(|key| !key.eq_ignore_ascii_case("type"))
+        .collect::<Vec<_>>();
+    ensure!(
+        unsupported.is_empty(),
+        "{owner} has unsupported fields {:?}",
+        unsupported
+    );
+    Ok(())
+}
+
 fn mihomo_mapping_str<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a str> {
     mapping
         .get(&Value::String(key.to_string()))
@@ -1895,7 +2026,114 @@ fn mihomo_string_fields(mapping: &Mapping) -> BTreeMap<String, Value> {
         .collect()
 }
 
+fn mihomo_transport_config(
+    protocol: &str,
+    name: &str,
+    network: &str,
+    ws_opts: Option<&MihomoWsOptions>,
+    grpc_opts: Option<&MihomoGrpcOptions>,
+    xhttp_opts: Option<&MihomoXhttpOptions>,
+) -> Result<VlessTransportConfig> {
+    let normalized = network.trim().to_ascii_lowercase().replace(['-', '_'], "");
+    match normalized.as_str() {
+        "grpc" => {
+            ensure_unused_ws_opts(protocol, name, ws_opts)?;
+            ensure_unused_xhttp_opts(protocol, name, xhttp_opts)?;
+            if let Some(opts) = grpc_opts {
+                opts.ensure_supported(&format!("mihomo {protocol} proxy {name} grpc-opts"))?;
+            }
+            VlessTransportConfig::from_network(
+                network,
+                grpc_opts.and_then(|opts| opts.grpc_service_name.clone()),
+                None,
+                Vec::new(),
+            )
+        }
+        "xhttp" | "splithttp" => {
+            ensure!(
+                protocol.eq_ignore_ascii_case("VLESS"),
+                "mihomo {protocol} proxy {name} uses {network}; Aerion only wires XHTTP transport for VLESS"
+            );
+            ensure_unused_ws_opts(protocol, name, ws_opts)?;
+            ensure_unused_grpc_opts(protocol, name, grpc_opts)?;
+            if let Some(opts) = xhttp_opts {
+                opts.ensure_supported(&format!("mihomo {protocol} proxy {name} xhttp-opts"))?;
+            }
+            VlessTransportConfig::xhttp(
+                xhttp_opts.and_then(|opts| opts.path.clone()),
+                xhttp_opts.and_then(|opts| opts.host.clone()),
+                xhttp_opts
+                    .map(|opts| opts.headers.clone().into_iter().collect())
+                    .unwrap_or_default(),
+                xhttp_opts.and_then(|opts| opts.mode.clone()),
+            )
+        }
+        "ws" | "websocket" => {
+            ensure_unused_grpc_opts(protocol, name, grpc_opts)?;
+            ensure_unused_xhttp_opts(protocol, name, xhttp_opts)?;
+            if let Some(opts) = ws_opts {
+                opts.ensure_supported(&format!("mihomo {protocol} proxy {name} ws-opts"))?;
+            }
+            VlessTransportConfig::from_headers(
+                network,
+                ws_opts.and_then(|opts| opts.path.clone()),
+                ws_opts.map(|opts| opts.headers.clone()).unwrap_or_default(),
+            )
+        }
+        _ => {
+            ensure_unused_ws_opts(protocol, name, ws_opts)?;
+            ensure_unused_grpc_opts(protocol, name, grpc_opts)?;
+            ensure_unused_xhttp_opts(protocol, name, xhttp_opts)?;
+            VlessTransportConfig::from_network(network, None, None, Vec::new())
+        }
+    }
+}
+
+fn ensure_unused_ws_opts(protocol: &str, name: &str, opts: Option<&MihomoWsOptions>) -> Result<()> {
+    if let Some(opts) = opts {
+        opts.ensure_supported(&format!("mihomo {protocol} proxy {name} ws-opts"))?;
+        ensure!(
+            !opts.has_settings(),
+            "mihomo {protocol} proxy {name} sets ws-opts while network is not WebSocket"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_unused_grpc_opts(
+    protocol: &str,
+    name: &str,
+    opts: Option<&MihomoGrpcOptions>,
+) -> Result<()> {
+    if let Some(opts) = opts {
+        opts.ensure_supported(&format!("mihomo {protocol} proxy {name} grpc-opts"))?;
+        ensure!(
+            !opts.has_settings(),
+            "mihomo {protocol} proxy {name} sets grpc-opts while network is not gRPC"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_unused_xhttp_opts(
+    protocol: &str,
+    name: &str,
+    opts: Option<&MihomoXhttpOptions>,
+) -> Result<()> {
+    if let Some(opts) = opts {
+        opts.ensure_supported(&format!("mihomo {protocol} proxy {name} xhttp-opts"))?;
+        ensure!(
+            !opts.has_settings(),
+            "mihomo {protocol} proxy {name} sets xhttp-opts while network is not XHTTP"
+        );
+    }
+    Ok(())
+}
+
 fn ensure_no_smux(name: &str, smux: Option<&MihomoSmuxOptions>) -> Result<()> {
+    if let Some(smux) = smux {
+        smux.ensure_supported(name)?;
+    }
     ensure!(
         !smux.map(MihomoSmuxOptions::is_enabled).unwrap_or(false),
         "mihomo proxy {name} enables smux; Aerion VLESS mux.cool is not wire-compatible with mihomo smux"
@@ -3276,6 +3514,102 @@ proxies:
             "edge.example.com"
         );
         assert_eq!(vless.transport.mode, "stream-one");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mihomo_unsupported_proxy_and_transport_fields() -> Result<()> {
+        let yaml = r#"
+proxies:
+  - name: vless-dialer
+    type: vless
+    server: example.com
+    port: 443
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    dialer-proxy: bootstrap
+  - name: vless-ws-early
+    type: vless
+    server: example.com
+    port: 443
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    network: ws
+    ws-opts:
+      path: /vless
+      max-early-data: 2048
+  - name: vless-unused-ws
+    type: vless
+    server: example.com
+    port: 443
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    network: tcp
+    ws-opts:
+      path: /ignored
+  - name: vless-xhttp-extra
+    type: vless
+    server: example.com
+    port: 443
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    network: xhttp
+    alpn: http/1.1
+    xhttp-opts:
+      path: /xhttp
+      no-grpc-header: true
+  - name: vless-reality-extra
+    type: vless
+    server: example.com
+    port: 443
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    tls: true
+    reality-opts:
+      public-key: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
+      short-id: a1b2
+      server-name: www.example.com
+  - name: vless-smux-disabled-fields
+    type: vless
+    server: example.com
+    port: 443
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    smux:
+      enabled: false
+      protocol: h2mux
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let dialer_error = config.proxies[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("unsupported proxy fields must not be ignored");
+        assert!(dialer_error.to_string().contains("dialer-proxy"));
+
+        let ws_error = config.proxies[1]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("unsupported ws-opts fields must not be ignored");
+        assert!(ws_error.to_string().contains("ws-opts"));
+        assert!(ws_error.to_string().contains("max-early-data"));
+
+        let unused_ws_error = config.proxies[2]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("unused ws-opts must not be ignored");
+        assert!(
+            unused_ws_error
+                .to_string()
+                .contains("network is not WebSocket")
+        );
+
+        let xhttp_error = config.proxies[3]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("unsupported xhttp-opts fields must not be ignored");
+        assert!(xhttp_error.to_string().contains("xhttp-opts"));
+        assert!(xhttp_error.to_string().contains("no-grpc-header"));
+
+        let reality_error = config.proxies[4]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("unsupported reality-opts fields must not be ignored");
+        assert!(reality_error.to_string().contains("reality-opts"));
+        assert!(reality_error.to_string().contains("server-name"));
+
+        let smux_error = config.proxies[5]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("disabled smux fields must not be ignored");
+        assert!(smux_error.to_string().contains("smux"));
         Ok(())
     }
 
