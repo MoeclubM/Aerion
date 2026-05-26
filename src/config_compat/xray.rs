@@ -291,6 +291,29 @@ pub struct XrayStreamSettings {
     pub network: String,
     #[serde(default)]
     pub security: String,
+    #[serde(
+        default,
+        rename = "rawSettings",
+        alias = "raw_settings",
+        alias = "tcpSettings",
+        alias = "tcp_settings"
+    )]
+    pub raw_settings: Option<Value>,
+    #[serde(
+        default,
+        rename = "kcpSettings",
+        alias = "kcp_settings",
+        alias = "mkcpSettings",
+        alias = "mKCPSettings",
+        alias = "mkcp_settings"
+    )]
+    pub kcp_settings: Option<Value>,
+    #[serde(default, rename = "quicSettings", alias = "quic_settings")]
+    pub quic_settings: Option<Value>,
+    #[serde(default, rename = "dsSettings", alias = "ds_settings")]
+    pub ds_settings: Option<Value>,
+    #[serde(default)]
+    pub sockopt: Option<Value>,
     #[serde(default, rename = "hysteriaSettings", alias = "hysteria_settings")]
     pub hysteria_settings: Option<XrayHysteriaSettings>,
     #[serde(default)]
@@ -328,6 +351,8 @@ pub struct XrayStreamSettings {
         alias = "split_http_settings"
     )]
     pub split_http_settings: Option<XrayXhttpSettings>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl Default for XrayStreamSettings {
@@ -335,6 +360,11 @@ impl Default for XrayStreamSettings {
         Self {
             network: default_tcp_network(),
             security: String::new(),
+            raw_settings: None,
+            kcp_settings: None,
+            quic_settings: None,
+            ds_settings: None,
+            sockopt: None,
             hysteria_settings: None,
             finalmask: None,
             tls_settings: None,
@@ -345,7 +375,50 @@ impl Default for XrayStreamSettings {
             http_settings: None,
             xhttp_settings: None,
             split_http_settings: None,
+            extra: Map::new(),
         }
+    }
+}
+
+impl XrayStreamSettings {
+    fn reject_unsupported_fields(&self, owner: &str) -> Result<()> {
+        ensure!(
+            self.extra.is_empty(),
+            "{owner} streamSettings has unsupported fields {:?}",
+            self.extra.keys().collect::<Vec<_>>()
+        );
+        ensure!(
+            !self
+                .raw_settings
+                .as_ref()
+                .map(xray_raw_settings_has_unsupported_data)
+                .unwrap_or(false),
+            "{owner} streamSettings rawSettings/tcpSettings requires raw TCP header options"
+        );
+        for (field, value, reason) in [
+            (
+                "kcpSettings",
+                &self.kcp_settings,
+                "mKCP stream transport support",
+            ),
+            (
+                "quicSettings",
+                &self.quic_settings,
+                "QUIC stream transport support",
+            ),
+            (
+                "dsSettings",
+                &self.ds_settings,
+                "domain-socket stream transport support",
+            ),
+            ("sockopt", &self.sockopt, "socket option plumbing"),
+        ] {
+            ensure!(
+                !value.as_ref().map(value_has_data).unwrap_or(false),
+                "{owner} streamSettings {field} requires {reason}"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -831,6 +904,11 @@ impl XrayInbound {
     }
 
     pub fn to_server_config(&self) -> Result<XrayServerConfig> {
+        self.stream_settings.reject_unsupported_fields(&format!(
+            "xray {} inbound {}",
+            self.protocol,
+            self.name()
+        ))?;
         match self.protocol.trim().to_ascii_lowercase().as_str() {
             "shadowsocks" | "ss" => Ok(XrayServerConfig::Shadowsocks(
                 self.to_shadowsocks_server_config()
@@ -1449,6 +1527,11 @@ impl XrayOutbound {
             self.name(),
             self.decode_error.as_deref().unwrap_or_default()
         );
+        self.stream_settings.reject_unsupported_fields(&format!(
+            "xray {} outbound {}",
+            self.protocol,
+            self.name()
+        ))?;
         match self.protocol.trim().to_ascii_lowercase().as_str() {
             "freedom" => Ok(XrayClientConfig::Route(
                 self.to_route_client_config(listen, RouteDecision::Direct)?,
@@ -2575,6 +2658,53 @@ fn value_has_data(value: &Value) -> bool {
         Value::Array(value) => !value.is_empty(),
         Value::Object(value) => !value.is_empty(),
     }
+}
+
+fn xray_raw_settings_has_unsupported_data(value: &Value) -> bool {
+    let Value::Object(settings) = value else {
+        return value_has_data(value);
+    };
+    for (field, value) in settings {
+        match field.as_str() {
+            "acceptProxyProtocol" | "accept_proxy_protocol" => {
+                if value_has_data(value) {
+                    return true;
+                }
+            }
+            "header" => {
+                let Value::Object(header) = value else {
+                    if value_has_data(value) {
+                        return true;
+                    }
+                    continue;
+                };
+                for (field, value) in header {
+                    match field.as_str() {
+                        "type" => {
+                            let kind = value.as_str().map(str::trim).unwrap_or_default();
+                            if !kind.is_empty()
+                                && !kind.eq_ignore_ascii_case("none")
+                                && value_has_data(value)
+                            {
+                                return true;
+                            }
+                        }
+                        _ => {
+                            if value_has_data(value) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                if value_has_data(value) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn xray_tls_server_identity(
@@ -4202,6 +4332,95 @@ mod tests {
             "edge.example.com"
         );
         assert_eq!(vless.transport.mode, "stream-one");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_xray_unsupported_stream_settings() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [{
+    "tag": "direct-out",
+    "protocol": "freedom",
+    "streamSettings": {
+      "network": "tcp",
+      "tcpSettings": {
+        "acceptProxyProtocol": false,
+        "header": { "type": "none" }
+      }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let XrayClientConfig::Route(route) =
+            config.outbounds[0].to_client_config("127.0.0.1:1080".parse()?)?
+        else {
+            bail!("expected route client")
+        };
+        assert_eq!(route.default, RouteDecision::Direct);
+
+        let json = r#"
+{
+  "outbounds": [{
+    "tag": "http-proxy",
+    "protocol": "http",
+    "settings": {
+      "address": "proxy.example.com",
+      "port": 8443
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "tls",
+      "tcpSettings": {
+        "header": { "type": "http" }
+      }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config.outbounds[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("raw TCP header options must not be ignored");
+        assert!(error.to_string().contains("streamSettings"));
+        assert!(error.to_string().contains("tcpSettings"));
+
+        let json = r#"
+{
+  "outbounds": [{
+    "tag": "direct-out",
+    "protocol": "freedom",
+    "streamSettings": {
+      "sockopt": { "interface": "eth0" }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config.outbounds[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("socket options must not be ignored");
+        assert!(error.to_string().contains("sockopt"));
+        assert!(error.to_string().contains("socket option"));
+
+        let json = r#"
+{
+  "outbounds": [{
+    "tag": "direct-out",
+    "protocol": "freedom",
+    "streamSettings": {
+      "unknownStreamField": true
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config.outbounds[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("unknown streamSettings fields must not be ignored");
+        assert!(error.to_string().contains("unsupported fields"));
+        assert!(error.to_string().contains("unknownStreamField"));
         Ok(())
     }
 
