@@ -316,9 +316,10 @@ profile, `settings`, stream transport, REALITY/finalmask, mux, and
 version/cipher/curve policy overrides, separate peer-name verification,
 server-side unknown-SNI rejection, session resumption, key logging, ECH fields,
 unsupported certificate loading options, and unknown `tlsSettings` fields also
-fail explicitly until Aerion exposes equivalent TLS controls. Xray local SOCKS
-inbound authentication, sniffing, and non-raw transport settings also fail
-explicitly because the Aerion client listener is plain no-auth SOCKS over TCP.
+fail explicitly until Aerion exposes equivalent TLS controls. Xray non-SOCKS
+local inbound protocols, local SOCKS inbound authentication, sniffing, and
+non-raw transport settings also fail explicitly because the Aerion client
+listener is plain no-auth SOCKS over TCP.
 Unsupported sing-box top-level config options such as `log` / `dns` /
 `experimental` fail explicitly for the same reason.
 sing-box TLS engine/version/cipher/curve overrides, SNI suppression, certificate

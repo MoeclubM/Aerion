@@ -1111,6 +1111,14 @@ impl XrayConfig {
 
     pub fn local_socks_listen(&self) -> Result<Option<SocketAddr>> {
         self.reject_unsupported_top_level_fields()?;
+        for inbound in &self.inbounds {
+            let protocol = inbound.protocol.trim();
+            ensure!(
+                protocol.eq_ignore_ascii_case("socks"),
+                "xray inbound {} protocol {protocol} is not a local SOCKS listener; Aerion config runner exposes a SOCKS listener only",
+                inbound.name()
+            );
+        }
         let Some(inbound) = self
             .inbounds
             .iter()
@@ -3608,6 +3616,23 @@ mod tests {
             .local_socks_listen()
             .expect_err("local SOCKS sniffing must not be ignored");
         assert!(sniff_error.to_string().contains("sniffing"));
+
+        let json = r#"
+{
+  "inbounds": [{
+    "tag": "http-in",
+    "protocol": "http",
+    "listen": "127.0.0.1",
+    "port": 8080
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let http_error = config
+            .local_socks_listen()
+            .expect_err("local HTTP inbound must not be ignored");
+        assert!(http_error.to_string().contains("local SOCKS listener"));
+        assert!(http_error.to_string().contains("http"));
         Ok(())
     }
 
