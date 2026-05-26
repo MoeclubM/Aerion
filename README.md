@@ -308,7 +308,9 @@ sing-box TLS engine/version/cipher/curve overrides, SNI suppression, certificate
 pinning, mutual-TLS client certificate/authentication fields, kernel TLS,
 handshake timeout, certificate providers, fragmentation/spoofing/ACME options,
 and unknown TLS/uTLS/REALITY nested fields likewise fail explicitly instead of
-being silently ignored.
+being silently ignored. Unknown sing-box protocol inbound/outbound fields,
+unsupported VLESS transport fields, Hysteria2 obfs fields, and disabled
+`multiplex` blocks that still carry settings fail explicitly too.
 Inbound-only sing-box JSON can also run AnyTLS, Shadowsocks, Trojan, VMess,
 Hysteria2, TUIC, Naive, and VLESS server profiles, including Naive TCP-only /
 HTTP/3-only listener networks and VLESS raw, TLS, or REALITY inbound TLS

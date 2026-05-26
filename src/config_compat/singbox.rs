@@ -271,6 +271,8 @@ pub struct SingBoxNaiveInbound {
     pub tls: SingBoxTlsOptions,
     #[serde(default, rename = "quic_congestion_control")]
     pub quic_congestion_control: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -291,6 +293,8 @@ pub struct SingBoxVlessInbound {
     pub multiplex: Option<SingBoxMultiplexOptions>,
     #[serde(default)]
     pub transport: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -314,6 +318,8 @@ pub struct SingBoxShadowsocksInbound {
     pub multiplex: Option<SingBoxMultiplexOptions>,
     #[serde(default)]
     pub destinations: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -334,6 +340,8 @@ pub struct SingBoxVmessInbound {
     pub multiplex: Option<SingBoxMultiplexOptions>,
     #[serde(default)]
     pub transport: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -359,6 +367,8 @@ pub struct SingBoxTrojanInbound {
     pub fallback: Option<Value>,
     #[serde(default, rename = "fallback_for_alpn")]
     pub fallback_for_alpn: BTreeMap<String, Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -373,6 +383,8 @@ pub struct SingBoxAnyTlsInbound {
     pub tls: SingBoxTlsOptions,
     #[serde(default)]
     pub padding_scheme: Vec<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -403,6 +415,8 @@ pub struct SingBoxHysteria2Inbound {
     pub bbr_profile: Option<String>,
     #[serde(default, rename = "brutal_debug")]
     pub brutal_debug: bool,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -425,6 +439,8 @@ pub struct SingBoxTuicInbound {
     pub heartbeat: Option<String>,
     #[serde(default, rename = "udp_relay_mode")]
     pub udp_relay_mode: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -461,6 +477,8 @@ pub struct SingBoxVlessOutbound {
     pub multiplex: Option<SingBoxMultiplexOptions>,
     #[serde(default)]
     pub transport: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -483,6 +501,8 @@ pub struct SingBoxVmessOutbound {
     pub multiplex: Option<SingBoxMultiplexOptions>,
     #[serde(default)]
     pub transport: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -499,6 +519,8 @@ pub struct SingBoxTrojanOutbound {
     pub multiplex: Option<SingBoxMultiplexOptions>,
     #[serde(default)]
     pub transport: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -518,6 +540,8 @@ pub struct SingBoxShadowsocksOutbound {
     pub multiplex: Option<SingBoxMultiplexOptions>,
     #[serde(default, rename = "udp_over_tcp")]
     pub udp_over_tcp: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -531,6 +555,8 @@ pub struct SingBoxSocksOutbound {
     pub password: Option<String>,
     #[serde(default)]
     pub network: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -546,6 +572,8 @@ pub struct SingBoxHttpOutbound {
     pub tls: Option<SingBoxTlsOptions>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -579,6 +607,8 @@ pub struct SingBoxHysteria2Outbound {
     pub bbr_profile: Option<String>,
     #[serde(default, rename = "brutal_debug")]
     pub brutal_debug: bool,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -589,6 +619,8 @@ pub struct SingBoxAnyTlsOutbound {
     pub password: String,
     #[serde(default)]
     pub tls: Option<SingBoxTlsOptions>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -614,6 +646,8 @@ pub struct SingBoxNaiveOutbound {
     pub insecure_concurrency: Option<u16>,
     #[serde(default, rename = "quic_congestion_control")]
     pub quic_congestion_control: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -637,6 +671,8 @@ pub struct SingBoxTuicOutbound {
     pub zero_rtt_handshake: bool,
     #[serde(default, rename = "udp_over_stream")]
     pub udp_over_stream: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -790,6 +826,8 @@ pub struct SingBoxMultiplexOptions {
     pub enabled: bool,
     #[serde(default)]
     pub protocol: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -806,6 +844,8 @@ pub struct SingBoxTransportOptions {
     pub mode: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -813,6 +853,8 @@ pub struct SingBoxHysteria2Obfs {
     #[serde(rename = "type")]
     pub kind: String,
     pub password: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -1783,6 +1825,7 @@ impl SingBoxNaiveInbound {
         listen: Option<&str>,
         listen_port: Option<u16>,
     ) -> Result<NaiveServerConfig> {
+        ensure_no_extra_fields(&format!("sing-box Naive inbound {name}"), &self.extra)?;
         ensure!(
             self.tls.enabled,
             "sing-box Naive inbound {name} disables TLS; Naive requires HTTPS/TLS"
@@ -1849,14 +1892,8 @@ impl SingBoxVlessInbound {
         listen: Option<&str>,
         listen_port: Option<u16>,
     ) -> Result<VlessServerConfig> {
-        ensure!(
-            !self
-                .multiplex
-                .as_ref()
-                .map(|multiplex| multiplex.enabled)
-                .unwrap_or(false),
-            "sing-box VLESS inbound {name} enables multiplex; Aerion VLESS server does not implement sing-box multiplex"
-        );
+        ensure_no_extra_fields(&format!("sing-box VLESS inbound {name}"), &self.extra)?;
+        ensure_multiplex_disabled("sing-box VLESS inbound", name, self.multiplex.as_ref())?;
         let transport = vless_transport_config(
             "sing-box",
             name,
@@ -1975,6 +2012,7 @@ impl SingBoxAnyTlsInbound {
         listen: Option<&str>,
         listen_port: Option<u16>,
     ) -> Result<ServerConfig> {
+        ensure_no_extra_fields(&format!("sing-box AnyTLS inbound {name}"), &self.extra)?;
         ensure!(
             self.tls.enabled,
             "sing-box AnyTLS inbound {name} disables TLS; AnyTLS requires TLS"
@@ -2022,6 +2060,7 @@ impl SingBoxHysteria2Inbound {
         listen: Option<&str>,
         listen_port: Option<u16>,
     ) -> Result<Hysteria2ServerConfig> {
+        ensure_no_extra_fields(&format!("sing-box Hysteria2 inbound {name}"), &self.extra)?;
         ensure!(
             self.tls.enabled,
             "sing-box Hysteria2 inbound {name} disables TLS; Hysteria2 requires TLS"
@@ -2064,6 +2103,10 @@ impl SingBoxHysteria2Inbound {
         };
         let obfs = match &self.obfs {
             Some(obfs) => {
+                ensure_no_extra_fields(
+                    &format!("sing-box Hysteria2 inbound {name} obfs"),
+                    &obfs.extra,
+                )?;
                 ensure!(
                     obfs.kind.eq_ignore_ascii_case("salamander"),
                     "sing-box Hysteria2 inbound {name} uses obfs {}; Aerion supports salamander",
@@ -2109,6 +2152,7 @@ impl SingBoxTuicInbound {
         listen: Option<&str>,
         listen_port: Option<u16>,
     ) -> Result<TuicServerConfig> {
+        ensure_no_extra_fields(&format!("sing-box TUIC inbound {name}"), &self.extra)?;
         ensure!(
             self.tls.enabled,
             "sing-box TUIC inbound {name} disables TLS; TUIC requires TLS"
@@ -2177,6 +2221,7 @@ impl SingBoxShadowsocksInbound {
         listen: Option<&str>,
         listen_port: Option<u16>,
     ) -> Result<ShadowsocksServerConfig> {
+        ensure_no_extra_fields(&format!("sing-box Shadowsocks inbound {name}"), &self.extra)?;
         ensure!(
             !self.managed,
             "sing-box Shadowsocks inbound {name} enables managed users; Aerion does not implement the SSM API"
@@ -2219,6 +2264,7 @@ impl SingBoxTrojanInbound {
         listen: Option<&str>,
         listen_port: Option<u16>,
     ) -> Result<TrojanServerConfig> {
+        ensure_no_extra_fields(&format!("sing-box Trojan inbound {name}"), &self.extra)?;
         ensure_multiplex_disabled("sing-box", name, self.multiplex.as_ref())?;
         ensure!(
             !json_value_non_empty_option(self.fallback.as_ref())
@@ -2274,6 +2320,7 @@ impl SingBoxVmessInbound {
         listen: Option<&str>,
         listen_port: Option<u16>,
     ) -> Result<VmessServerConfig> {
+        ensure_no_extra_fields(&format!("sing-box VMess inbound {name}"), &self.extra)?;
         ensure_multiplex_disabled("sing-box", name, self.multiplex.as_ref())?;
         let transport = vless_transport_config(
             "sing-box",
@@ -2519,6 +2566,10 @@ impl SingBoxShadowsocksOutbound {
         name: &str,
         listen: SocketAddr,
     ) -> Result<ShadowsocksClientConfig> {
+        ensure_no_extra_fields(
+            &format!("sing-box Shadowsocks outbound {name}"),
+            &self.extra,
+        )?;
         ensure_multiplex_disabled("sing-box", name, self.multiplex.as_ref())?;
         ensure!(
             self.plugin.is_none() && self.plugin_opts.is_none(),
@@ -2543,6 +2594,7 @@ impl SingBoxSocksOutbound {
         name: &str,
         listen: SocketAddr,
     ) -> Result<SocksProxyClientConfig> {
+        ensure_no_extra_fields(&format!("sing-box SOCKS outbound {name}"), &self.extra)?;
         let (tcp, udp) = tcp_udp_network("sing-box SOCKS outbound", name, self.network.as_deref())?;
         ensure!(
             tcp,
@@ -2565,6 +2617,7 @@ impl SingBoxHttpOutbound {
         name: &str,
         listen: SocketAddr,
     ) -> Result<HttpProxyClientConfig> {
+        ensure_no_extra_fields(&format!("sing-box HTTP outbound {name}"), &self.extra)?;
         let tls_enabled = self.tls.as_ref().map(|tls| tls.enabled).unwrap_or(false);
         if let Some(tls) = &self.tls {
             tls.ensure_supported_client_options("HTTP", name, true)?;
@@ -2620,6 +2673,7 @@ impl SingBoxHttpOutbound {
 
 impl SingBoxVlessOutbound {
     pub fn to_client_config(&self, name: &str, listen: SocketAddr) -> Result<VlessClientConfig> {
+        ensure_no_extra_fields(&format!("sing-box VLESS outbound {name}"), &self.extra)?;
         ensure_multiplex_disabled("sing-box", name, self.multiplex.as_ref())?;
         let transport = vless_transport_config(
             "sing-box",
@@ -2698,6 +2752,7 @@ impl SingBoxVlessOutbound {
 
 impl SingBoxVmessOutbound {
     pub fn to_client_config(&self, name: &str, listen: SocketAddr) -> Result<VmessClientConfig> {
+        ensure_no_extra_fields(&format!("sing-box VMess outbound {name}"), &self.extra)?;
         ensure_multiplex_disabled("sing-box", name, self.multiplex.as_ref())?;
         let transport = vless_transport_config(
             "sing-box",
@@ -2770,6 +2825,7 @@ impl SingBoxVmessOutbound {
 
 impl SingBoxTrojanOutbound {
     pub fn to_client_config(&self, name: &str, listen: SocketAddr) -> Result<TrojanClientConfig> {
+        ensure_no_extra_fields(&format!("sing-box Trojan outbound {name}"), &self.extra)?;
         ensure_multiplex_disabled("sing-box", name, self.multiplex.as_ref())?;
         let transport = vless_transport_config(
             "sing-box",
@@ -2811,6 +2867,7 @@ impl SingBoxHysteria2Outbound {
         name: &str,
         listen: SocketAddr,
     ) -> Result<Hysteria2ClientConfig> {
+        ensure_no_extra_fields(&format!("sing-box Hysteria2 outbound {name}"), &self.extra)?;
         ensure_supported_network("sing-box", name, self.network.as_deref())?;
         ensure!(
             !self
@@ -2858,6 +2915,10 @@ impl SingBoxHysteria2Outbound {
         ensure_hy2_alpn("sing-box", name, tls.alpn.as_ref())?;
         let (obfs, obfs_password) = match &self.obfs {
             Some(obfs) => {
+                ensure_no_extra_fields(
+                    &format!("sing-box Hysteria2 outbound {name} obfs"),
+                    &obfs.extra,
+                )?;
                 ensure!(
                     obfs.kind.eq_ignore_ascii_case("salamander"),
                     "sing-box Hysteria2 outbound {name} uses obfs {}; Aerion supports salamander",
@@ -2891,6 +2952,7 @@ impl SingBoxHysteria2Outbound {
 
 impl SingBoxAnyTlsOutbound {
     pub fn to_client_config(&self, name: &str, listen: SocketAddr) -> Result<ClientConfig> {
+        ensure_no_extra_fields(&format!("sing-box AnyTLS outbound {name}"), &self.extra)?;
         let tls = self
             .tls
             .as_ref()
@@ -2920,6 +2982,7 @@ impl SingBoxAnyTlsOutbound {
 
 impl SingBoxNaiveOutbound {
     pub fn to_client_config(&self, name: &str, listen: SocketAddr) -> Result<NaiveClientConfig> {
+        ensure_no_extra_fields(&format!("sing-box Naive outbound {name}"), &self.extra)?;
         let tls = self
             .tls
             .as_ref()
@@ -2969,6 +3032,7 @@ impl SingBoxNaiveOutbound {
 
 impl SingBoxTuicOutbound {
     pub fn to_client_config(&self, name: &str, listen: SocketAddr) -> Result<TuicClientConfig> {
+        ensure_no_extra_fields(&format!("sing-box TUIC outbound {name}"), &self.extra)?;
         ensure_supported_network("sing-box", name, self.network.as_deref())?;
         ensure!(
             !self.zero_rtt_handshake,
@@ -3370,6 +3434,15 @@ fn value_has_data(value: &Value) -> bool {
     }
 }
 
+fn ensure_no_extra_fields(owner: &str, extra: &Map<String, Value>) -> Result<()> {
+    ensure!(
+        extra.is_empty(),
+        "{owner} has unsupported fields {:?}",
+        extra.keys().collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
 fn network_allows_udp(network: Option<&str>) -> bool {
     !network
         .unwrap_or_default()
@@ -3407,6 +3480,7 @@ fn vless_transport_config(
         let options: SingBoxTransportOptions =
             serde_json::from_value(Value::Object(map.clone()))
                 .with_context(|| format!("parse {format} VLESS {name} transport"))?;
+        ensure_no_extra_fields(&format!("{format} VLESS {name} transport"), &options.extra)?;
         let kind = if options.kind.trim().is_empty() {
             network
         } else {
@@ -3449,6 +3523,20 @@ fn ensure_multiplex_disabled(
     name: &str,
     multiplex: Option<&SingBoxMultiplexOptions>,
 ) -> Result<()> {
+    if let Some(multiplex) = multiplex {
+        ensure_no_extra_fields(
+            &format!("{format} profile {name} multiplex"),
+            &multiplex.extra,
+        )?;
+        ensure!(
+            !multiplex.enabled
+                && multiplex
+                    .protocol
+                    .as_deref()
+                    .is_none_or(|protocol| protocol.trim().is_empty()),
+            "{format} profile {name} sets multiplex options; Aerion does not implement sing-box multiplex because it is not wire-compatible with Aerion mux.cool"
+        );
+    }
     ensure!(
         !multiplex
             .map(|multiplex| multiplex.enabled)
@@ -5512,6 +5600,102 @@ mod tests {
             .err()
             .context("unknown TLS fields must not be ignored")?;
         assert!(unknown_error.to_string().contains("unsupported fields"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_singbox_unsupported_profile_fields() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-dialer",
+      "server": "vless.example.com",
+      "server_port": 443,
+      "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+      "tls": { "enabled": true },
+      "dialer_proxy": "bootstrap"
+    },
+    {
+      "type": "vless",
+      "tag": "vless-ws-early",
+      "server": "vless.example.com",
+      "server_port": 443,
+      "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
+      "tls": { "enabled": true },
+      "transport": {
+        "type": "ws",
+        "path": "/vless",
+        "max_early_data": 2048
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-mux-fields",
+      "server": "ss.example.com",
+      "server_port": 8388,
+      "method": "aes-128-gcm",
+      "password": "secret",
+      "multiplex": {
+        "enabled": false,
+        "protocol": "smux"
+      }
+    }
+  ],
+  "inbounds": [
+    {
+      "type": "trojan",
+      "tag": "trojan-sniff",
+      "listen_port": 8443,
+      "users": [{ "password": "secret" }],
+      "tls": { "enabled": true, "certificate_path": "server.crt", "key_path": "server.key" },
+      "sniff": true
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2-obfs-extra",
+      "listen_port": 8444,
+      "password": "secret",
+      "tls": { "enabled": true, "certificate_path": "server.crt", "key_path": "server.key" },
+      "obfs": {
+        "type": "salamander",
+        "password": "obfs-pass",
+        "padding": true
+      }
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let dialer_error = config.outbounds[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("unsupported outbound fields must not be ignored");
+        assert!(dialer_error.to_string().contains("dialer_proxy"));
+
+        let transport_error = config.outbounds[1]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("unsupported transport fields must not be ignored");
+        assert!(transport_error.to_string().contains("transport"));
+        assert!(transport_error.to_string().contains("max_early_data"));
+
+        let multiplex_error = config.outbounds[2]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("disabled multiplex settings must not be ignored");
+        assert!(multiplex_error.to_string().contains("multiplex"));
+
+        let inbound_error = config.inbounds[0]
+            .to_server_config()
+            .err()
+            .context("unsupported inbound fields must not be ignored")?;
+        assert!(inbound_error.to_string().contains("sniff"));
+
+        let obfs_error = config.inbounds[1]
+            .to_server_config()
+            .err()
+            .context("unsupported obfs fields must not be ignored")?;
+        assert!(obfs_error.to_string().contains("obfs"));
+        assert!(obfs_error.to_string().contains("padding"));
         Ok(())
     }
 
