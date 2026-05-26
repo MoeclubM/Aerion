@@ -676,7 +676,24 @@ impl XrayRoutingRule {
             }
         }
         for ip in &self.ip {
-            if ip.eq_ignore_ascii_case("geoip:private") {
+            let ip = ip.trim();
+            if let Some(value) = ip.strip_prefix('!') {
+                ensure!(
+                    !value.trim().is_empty(),
+                    "xray routing.rules[{index}] inverse IP matcher is empty"
+                );
+                bail!(
+                    "xray routing.rules[{index}] inverse IP matcher {value} requires negative route matching"
+                );
+            } else if ip
+                .get(..4)
+                .map(|prefix| prefix.eq_ignore_ascii_case("ext:"))
+                .unwrap_or(false)
+            {
+                bail!(
+                    "xray routing.rules[{index}] external IP matcher {ip} requires geoip rule-set data"
+                );
+            } else if ip.eq_ignore_ascii_case("geoip:private") {
                 rule.ip_is_private = true;
             } else if let Some(name) = IpCidr::geoip_name(ip) {
                 bail!("xray routing.rules[{index}] geoip {name} requires geoip rule-set data");
@@ -3102,6 +3119,38 @@ mod tests {
             .route_table()
             .expect_err("geoip needs explicit route-set data");
         assert!(error.to_string().contains("geoip rule-set data"));
+
+        let json = r#"
+{
+  "routing": {
+    "rules": [
+      { "type": "field", "ip": ["ext:geoip.dat:cn"], "outboundTag": "direct" }
+    ]
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("external geoip needs explicit route-set data");
+        assert!(error.to_string().contains("external IP matcher"));
+        assert!(error.to_string().contains("geoip rule-set data"));
+
+        let json = r#"
+{
+  "routing": {
+    "rules": [
+      { "type": "field", "ip": ["!geoip:cn"], "outboundTag": "direct" }
+    ]
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("inverse IP matcher needs negative matching");
+        assert!(error.to_string().contains("inverse IP matcher"));
+        assert!(error.to_string().contains("negative route matching"));
         Ok(())
     }
 

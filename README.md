@@ -291,7 +291,9 @@ Xray's `outboundTag` precedence; string `ruleTag` values are accepted as debug
 labels and do not affect route decisions.
 Xray `domainMatcher` accepts `linear` / `hybrid` / `mph` as implementation
 hints; unknown routing fields and `domainStrategy` values that require DNS
-resolution during routing fail explicitly.
+resolution during routing fail explicitly. Xray external `ext:` GeoIP routing
+files and `!` inverse IP matchers fail explicitly until rule-set data loading
+and negative route matching are wired.
 Inbound-only sing-box JSON can also run AnyTLS, Shadowsocks, Trojan, VMess,
 Hysteria2, TUIC, Naive, and VLESS server profiles, including Naive TCP-only /
 HTTP/3-only listener networks and VLESS raw, TLS, or REALITY inbound TLS
