@@ -127,6 +127,8 @@ pub struct MihomoRuleProvider {
     pub url: Option<String>,
     #[serde(default)]
     pub payload: Vec<String>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1242,6 +1244,7 @@ impl MihomoRuleProvider {
         source_dir: Option<&Path>,
         action: RouteDecision,
     ) -> Result<Vec<RouteRule>> {
+        ensure_no_extra_fields(&format!("mihomo rule-provider {name}"), &self.extra)?;
         let lines = self.rule_lines(name, source_dir)?;
         let behavior = self.behavior.trim().to_ascii_lowercase();
         match behavior.as_str() {
@@ -1327,6 +1330,8 @@ impl MihomoRuleProvider {
                 #[derive(Deserialize)]
                 struct RuleProviderFile {
                     payload: Vec<String>,
+                    #[serde(flatten)]
+                    extra: BTreeMap<String, Value>,
                 }
                 let file: RuleProviderFile = serde_yaml::from_str(&text).with_context(|| {
                     format!(
@@ -1334,6 +1339,10 @@ impl MihomoRuleProvider {
                         path.display()
                     )
                 })?;
+                ensure_no_extra_fields(
+                    &format!("mihomo rule-provider {name} YAML file"),
+                    &file.extra,
+                )?;
                 Ok(clean_mihomo_rule_provider_lines(&file.payload))
             }
             "text" => Ok(text
@@ -3175,6 +3184,59 @@ rules:
             ),
             RouteDecision::Block
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mihomo_unsupported_rule_provider_fields() -> Result<()> {
+        let yaml = r#"
+rule-providers:
+  ads:
+    type: inline
+    behavior: domain
+    interval: 3600
+    payload:
+      - +.example.com
+rules:
+  - RULE-SET,ads,REJECT
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let error = config
+            .route_table()
+            .expect_err("unsupported rule-provider fields must not be ignored");
+        assert!(error.to_string().contains("rule-provider ads"));
+        assert!(error.to_string().contains("interval"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mihomo_unsupported_rule_provider_file_fields() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(
+            dir.path().join("ads.yaml"),
+            r#"
+payload:
+  - +.example.com
+metadata:
+  source: generated
+"#,
+        )?;
+        let yaml = r#"
+rule-providers:
+  ads:
+    type: file
+    behavior: domain
+    path: ads.yaml
+rules:
+  - RULE-SET,ads,REJECT
+"#;
+        let mut config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        config.source_dir = Some(dir.path().to_path_buf());
+        let error = config
+            .route_table()
+            .expect_err("unsupported rule-provider file fields must not be ignored");
+        assert!(error.to_string().contains("YAML file"));
+        assert!(error.to_string().contains("metadata"));
         Ok(())
     }
 

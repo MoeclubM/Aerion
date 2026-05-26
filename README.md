@@ -124,7 +124,8 @@ Aerion now provides these server/client protocol stacks:
     fields also fail explicitly instead of being ignored; unsupported mihomo
     top-level runtime options such as `log-level`, `mode`, and
     `external-controller` fail explicitly too; unsupported mihomo `dns` and
-    `tun` nested fields fail explicitly instead of being ignored
+    `tun` nested fields and rule-provider metadata fail explicitly instead of
+    being ignored
 - VMess:
   - AEAD request/response header
   - raw TCP/TLS plus TCP / WebSocket / HTTPUpgrade / HTTP/2 / gRPC / XHTTP transports for client/server
