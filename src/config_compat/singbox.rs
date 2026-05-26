@@ -47,6 +47,38 @@ pub struct SingBoxRouteConfig {
     pub rule_sets: Vec<SingBoxRuleSet>,
     #[serde(default, rename = "final")]
     pub final_outbound: Option<String>,
+    #[serde(default, rename = "auto_detect_interface")]
+    pub auto_detect_interface: Option<Value>,
+    #[serde(default, rename = "override_android_vpn")]
+    pub override_android_vpn: Option<Value>,
+    #[serde(default, rename = "default_interface")]
+    pub default_interface: Option<Value>,
+    #[serde(default, rename = "default_mark")]
+    pub default_mark: Option<Value>,
+    #[serde(default, rename = "default_domain_resolver")]
+    pub default_domain_resolver: Option<Value>,
+    #[serde(default, rename = "default_network_strategy")]
+    pub default_network_strategy: Option<Value>,
+    #[serde(default, rename = "default_network_type")]
+    pub default_network_type: Option<Value>,
+    #[serde(default, rename = "default_fallback_network_type")]
+    pub default_fallback_network_type: Option<Value>,
+    #[serde(default, rename = "default_fallback_delay")]
+    pub default_fallback_delay: Option<Value>,
+    #[serde(default, rename = "find_process")]
+    pub find_process: Option<Value>,
+    #[serde(default, rename = "find_neighbor")]
+    pub find_neighbor: Option<Value>,
+    #[serde(default, rename = "default_transport")]
+    pub default_transport: Option<Value>,
+    #[serde(default, rename = "default_udp_timeout")]
+    pub default_udp_timeout: Option<Value>,
+    #[serde(default, rename = "geoip")]
+    pub geoip: Option<Value>,
+    #[serde(default, rename = "geosite")]
+    pub geosite: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -870,6 +902,7 @@ impl SingBoxRouteConfig {
         source_dir: Option<&Path>,
         outbounds: &[SingBoxOutbound],
     ) -> Result<RouteTable> {
+        self.reject_unsupported_route_options()?;
         let rule_sets = self.static_rule_sets(source_dir)?;
         let default = match self
             .final_outbound
@@ -889,6 +922,97 @@ impl SingBoxRouteConfig {
             table.rules.extend(rule.to_route_rules(index, &rule_sets)?);
         }
         Ok(table)
+    }
+
+    fn reject_unsupported_route_options(&self) -> Result<()> {
+        ensure!(
+            self.extra.is_empty(),
+            "sing-box route has unsupported fields {:?}",
+            self.extra.keys().collect::<Vec<_>>()
+        );
+        for (field, value, reason) in [
+            (
+                "auto_detect_interface",
+                &self.auto_detect_interface,
+                "active platform interface detection",
+            ),
+            (
+                "override_android_vpn",
+                &self.override_android_vpn,
+                "Android VPN route ownership",
+            ),
+            (
+                "default_interface",
+                &self.default_interface,
+                "platform interface binding",
+            ),
+            (
+                "default_mark",
+                &self.default_mark,
+                "platform socket mark support",
+            ),
+            (
+                "default_domain_resolver",
+                &self.default_domain_resolver,
+                "DNS resolver integration during routing",
+            ),
+            (
+                "default_network_strategy",
+                &self.default_network_strategy,
+                "DNS network strategy integration",
+            ),
+            (
+                "default_network_type",
+                &self.default_network_type,
+                "platform network metadata",
+            ),
+            (
+                "default_fallback_network_type",
+                &self.default_fallback_network_type,
+                "platform network fallback metadata",
+            ),
+            (
+                "default_fallback_delay",
+                &self.default_fallback_delay,
+                "platform network fallback timers",
+            ),
+            (
+                "find_process",
+                &self.find_process,
+                "process metadata lookup",
+            ),
+            (
+                "find_neighbor",
+                &self.find_neighbor,
+                "LAN neighbor metadata lookup",
+            ),
+            (
+                "default_transport",
+                &self.default_transport,
+                "global dialer transport policy",
+            ),
+            (
+                "default_udp_timeout",
+                &self.default_udp_timeout,
+                "global UDP session timeout policy",
+            ),
+            (
+                "geoip",
+                &self.geoip,
+                "loading sing-box legacy geoip databases",
+            ),
+            (
+                "geosite",
+                &self.geosite,
+                "loading sing-box legacy geosite databases",
+            ),
+        ] {
+            ensure!(
+                !value.as_ref().map(value_has_data).unwrap_or(false),
+                "sing-box route {field} requires {reason}"
+            );
+        }
+        Ok(())
     }
 
     fn static_rule_sets(
@@ -3528,6 +3652,52 @@ mod tests {
             .route_table()
             .expect_err("tagless default proxy outbound cannot be spawned");
         assert!(error.to_string().contains("requires a tag"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_singbox_route_top_level_runtime_options() -> Result<()> {
+        let json = r#"
+{
+  "route": {
+    "auto_detect_interface": true,
+    "rules": []
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("platform interface detection must not be ignored");
+        assert!(error.to_string().contains("auto_detect_interface"));
+
+        let json = r#"
+{
+  "route": {
+    "default_domain_resolver": "local",
+    "rules": []
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("default resolver must not be ignored");
+        assert!(error.to_string().contains("default_domain_resolver"));
+
+        let json = r#"
+{
+  "route": {
+    "unknown_route_option": true,
+    "rules": []
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("unknown route options must not be ignored");
+        assert!(error.to_string().contains("unsupported fields"));
         Ok(())
     }
 

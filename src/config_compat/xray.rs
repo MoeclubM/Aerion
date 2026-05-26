@@ -39,6 +39,10 @@ pub struct XrayRoutingConfig {
     pub balancers: Vec<XrayBalancer>,
     #[serde(default, rename = "domainStrategy", alias = "domain_strategy")]
     pub domain_strategy: Option<String>,
+    #[serde(default, rename = "domainMatcher", alias = "domain_matcher")]
+    pub domain_matcher: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -590,6 +594,20 @@ impl XrayConfig {
 
 impl XrayRoutingConfig {
     pub fn to_route_table(&self, outbounds: &[XrayOutbound]) -> Result<RouteTable> {
+        ensure!(
+            self.extra.is_empty(),
+            "xray routing has unsupported fields {:?}",
+            self.extra.keys().collect::<Vec<_>>()
+        );
+        if let Some(matcher) = self.domain_matcher.as_deref().map(str::trim) {
+            ensure!(
+                matcher.is_empty()
+                    || matcher.eq_ignore_ascii_case("linear")
+                    || matcher.eq_ignore_ascii_case("hybrid")
+                    || matcher.eq_ignore_ascii_case("mph"),
+                "unsupported xray routing.domainMatcher {matcher}"
+            );
+        }
         if let Some(strategy) = self.domain_strategy.as_deref().map(str::trim) {
             ensure!(
                 strategy.is_empty() || strategy.eq_ignore_ascii_case("AsIs"),
@@ -2953,6 +2971,58 @@ mod tests {
             .route_table()
             .expect_err("tagless default proxy outbound cannot be spawned");
         assert!(error.to_string().contains("requires a tag"));
+        Ok(())
+    }
+
+    #[test]
+    fn handles_xray_routing_top_level_options_explicitly() -> Result<()> {
+        let json = r#"
+{
+  "routing": {
+    "domainMatcher": "hybrid",
+    "rules": [
+      { "type": "field", "domain": ["domain:example.com"], "outboundTag": "direct" }
+    ]
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let routes = config.route_table()?;
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Direct
+        );
+
+        let json = r#"
+{
+  "routing": {
+    "domainMatcher": "unknown",
+    "rules": []
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("unknown domain matcher must not be ignored");
+        assert!(error.to_string().contains("domainMatcher"));
+
+        let json = r#"
+{
+  "routing": {
+    "observatory": {},
+    "rules": []
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("unknown routing fields must not be ignored");
+        assert!(error.to_string().contains("unsupported fields"));
         Ok(())
     }
 
