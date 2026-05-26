@@ -276,9 +276,11 @@ inline route rule-sets, and local source JSON rule-sets when they can be
 represented by Aerion's static route table. If sing-box `final` is omitted,
 the route default follows the first outbound when it is tag-addressable (or a
 tagless direct/block outbound). sing-box route-level runtime options such as
-interface detection, DNS resolver policies, process/neighbor lookup, legacy geo
-databases, and unknown route fields fail explicitly instead of being ignored.
-Remote and binary rule-set loading still fails explicitly.
+interface detection, DNS resolver policies, process/neighbor/DHCP lease lookup,
+remote rule-set HTTP client selection, legacy geo databases, and unknown route
+fields fail explicitly instead of being ignored. `network: icmp` route rules
+also fail explicitly because Aerion route decisions currently cover TCP/UDP
+proxy flows. Remote and binary rule-set loading still fails explicitly.
 Xray routing `domain` entries follow Xray's plain substring, `domain:`,
 `full:`, `keyword:`, `dotless:`, and regex forms; `balancerTag` resolves only
 when its balancer selectors identify exactly one outbound and no runtime

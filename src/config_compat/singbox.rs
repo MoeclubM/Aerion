@@ -69,6 +69,10 @@ pub struct SingBoxRouteConfig {
     pub find_process: Option<Value>,
     #[serde(default, rename = "find_neighbor")]
     pub find_neighbor: Option<Value>,
+    #[serde(default, rename = "dhcp_lease_files")]
+    pub dhcp_lease_files: Option<Value>,
+    #[serde(default, rename = "default_http_client")]
+    pub default_http_client: Option<Value>,
     #[serde(default, rename = "default_transport")]
     pub default_transport: Option<Value>,
     #[serde(default, rename = "default_udp_timeout")]
@@ -987,6 +991,16 @@ impl SingBoxRouteConfig {
                 "LAN neighbor metadata lookup",
             ),
             (
+                "dhcp_lease_files",
+                &self.dhcp_lease_files,
+                "DHCP lease metadata lookup",
+            ),
+            (
+                "default_http_client",
+                &self.default_http_client,
+                "remote rule-set HTTP client integration",
+            ),
+            (
                 "default_transport",
                 &self.default_transport,
                 "global dialer transport policy",
@@ -1278,6 +1292,10 @@ impl SingBoxRouteRule {
             None => self.route_decision(index)?,
         });
         for value in route_value_strings(self.network.as_ref())? {
+            ensure!(
+                !value.eq_ignore_ascii_case("icmp"),
+                "sing-box route.rules[{index}] network icmp requires ICMP routing support"
+            );
             rule.networks.push(RouteNetwork::parse(&value)?);
         }
         for value in route_value_strings(self.domain.as_ref())? {
@@ -3688,6 +3706,34 @@ mod tests {
         let json = r#"
 {
   "route": {
+    "dhcp_lease_files": ["/var/lib/misc/dnsmasq.leases"],
+    "rules": []
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("DHCP lease lookup must not be ignored");
+        assert!(error.to_string().contains("dhcp_lease_files"));
+
+        let json = r#"
+{
+  "route": {
+    "default_http_client": "rule-set-fetcher",
+    "rules": []
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("remote rule-set HTTP client must not be ignored");
+        assert!(error.to_string().contains("default_http_client"));
+
+        let json = r#"
+{
+  "route": {
     "unknown_route_option": true,
     "rules": []
   }
@@ -3698,6 +3744,25 @@ mod tests {
             .route_table()
             .expect_err("unknown route options must not be ignored");
         assert!(error.to_string().contains("unsupported fields"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_singbox_icmp_route_network() -> Result<()> {
+        let json = r#"
+{
+  "route": {
+    "rules": [
+      { "network": "icmp", "outbound": "direct" }
+    ]
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("ICMP route rules require ICMP routing support");
+        assert!(error.to_string().contains("network icmp"));
         Ok(())
     }
 
