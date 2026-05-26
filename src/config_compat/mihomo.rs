@@ -76,6 +76,8 @@ pub struct MihomoDnsConfig {
     pub enhanced_mode: Option<String>,
     #[serde(default, rename = "fake-ip-range", alias = "fake_ip_range")]
     pub fake_ip_range: Option<String>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -108,6 +110,8 @@ pub struct MihomoTunConfig {
         alias = "route_exclude_address_set"
     )]
     pub route_exclude_address_set: Option<OneOrManyStrings>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -822,7 +826,12 @@ enum MihomoResolvedProxy<'a> {
 
 impl MihomoConfig {
     pub fn reject_unsupported_top_level_fields(&self) -> Result<()> {
-        ensure_no_extra_fields("mihomo config", &self.extra)
+        ensure_no_extra_fields("mihomo config", &self.extra)?;
+        self.dns.reject_unsupported_fields()?;
+        if let Some(tun) = &self.tun {
+            tun.reject_unsupported_fields()?;
+        }
+        Ok(())
     }
 
     pub fn proxy(&self, name: &str) -> Option<&MihomoProxy> {
@@ -1077,6 +1086,18 @@ impl MihomoConfig {
             config.bypass = bypass.to_vec();
         }
         Ok(Some(config))
+    }
+}
+
+impl MihomoDnsConfig {
+    fn reject_unsupported_fields(&self) -> Result<()> {
+        ensure_no_extra_fields("mihomo dns", &self.extra)
+    }
+}
+
+impl MihomoTunConfig {
+    fn reject_unsupported_fields(&self) -> Result<()> {
+        ensure_no_extra_fields("mihomo tun", &self.extra)
     }
 }
 
@@ -3261,6 +3282,37 @@ proxies:
             .expect_err("unsupported mihomo top-level options must not be ignored");
         assert!(error.to_string().contains("mihomo config"));
         assert!(error.to_string().contains("log-level"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mihomo_unsupported_dns_and_tun_fields() -> Result<()> {
+        let yaml = r#"
+mixed-port: 7890
+dns:
+  enhanced-mode: fake-ip
+  nameserver:
+    - 1.1.1.1
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let dns_error = config
+            .local_socks_listen()
+            .expect_err("unsupported mihomo dns fields must not be ignored");
+        assert!(dns_error.to_string().contains("mihomo dns"));
+        assert!(dns_error.to_string().contains("nameserver"));
+
+        let yaml = r#"
+mixed-port: 7890
+tun:
+  enable: true
+  stack: system
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let tun_error = config
+            .tun_config("127.0.0.1:7890".parse()?)
+            .expect_err("unsupported mihomo tun fields must not be ignored");
+        assert!(tun_error.to_string().contains("mihomo tun"));
+        assert!(tun_error.to_string().contains("stack"));
         Ok(())
     }
 
