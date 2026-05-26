@@ -1293,11 +1293,29 @@ impl MihomoRuleProvider {
     fn rule_lines(&self, name: &str, source_dir: Option<&Path>) -> Result<Vec<String>> {
         let kind = self.kind.trim().to_ascii_lowercase();
         match kind.as_str() {
-            "inline" => Ok(clean_mihomo_rule_provider_lines(&self.payload)),
+            "inline" => {
+                ensure!(
+                    self.path.is_none(),
+                    "mihomo inline rule-provider {name} sets path"
+                );
+                ensure!(
+                    !option_text_has_data(self.url.as_ref()),
+                    "mihomo inline rule-provider {name} sets url"
+                );
+                ensure!(
+                    !option_text_has_data(self.format.as_ref()),
+                    "mihomo inline rule-provider {name} sets format"
+                );
+                Ok(clean_mihomo_rule_provider_lines(&self.payload))
+            }
             "file" => {
                 ensure!(
                     self.payload.is_empty(),
                     "mihomo file rule-provider {name} embeds inline payload"
+                );
+                ensure!(
+                    !option_text_has_data(self.url.as_ref()),
+                    "mihomo file rule-provider {name} sets url"
                 );
                 let path = self
                     .path
@@ -2082,6 +2100,10 @@ fn value_has_data(value: &Value) -> bool {
         Value::Mapping(value) => !value.is_empty(),
         Value::Tagged(value) => value_has_data(&value.value),
     }
+}
+
+fn option_text_has_data(value: Option<&String>) -> bool {
+    value.is_some_and(|value| !value.trim().is_empty())
 }
 
 fn ensure_no_extra_fields(owner: &str, fields: &BTreeMap<String, Value>) -> Result<()> {
@@ -3206,6 +3228,49 @@ rules:
             .expect_err("unsupported rule-provider fields must not be ignored");
         assert!(error.to_string().contains("rule-provider ads"));
         assert!(error.to_string().contains("interval"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mihomo_misplaced_rule_provider_fields() -> Result<()> {
+        let yaml = r#"
+rule-providers:
+  ads:
+    type: inline
+    behavior: domain
+    path: ads.yaml
+    payload:
+      - +.example.com
+rules:
+  - RULE-SET,ads,REJECT
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let inline_error = config
+            .route_table()
+            .expect_err("inline rule-provider path must not be ignored");
+        assert!(
+            inline_error
+                .to_string()
+                .contains("inline rule-provider ads")
+        );
+        assert!(inline_error.to_string().contains("path"));
+
+        let yaml = r#"
+rule-providers:
+  ads:
+    type: file
+    behavior: domain
+    path: ads.yaml
+    url: https://rules.example.test/ads.yaml
+rules:
+  - RULE-SET,ads,REJECT
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let file_error = config
+            .route_table()
+            .expect_err("file rule-provider url must not be ignored");
+        assert!(file_error.to_string().contains("file rule-provider ads"));
+        assert!(file_error.to_string().contains("url"));
         Ok(())
     }
 
