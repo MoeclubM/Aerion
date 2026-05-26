@@ -2535,6 +2535,10 @@ impl SingBoxSelectorOutbound {
             "sing-box selector outbound {name} has unsupported fields {:?}",
             self.extra.keys().collect::<Vec<_>>()
         );
+        ensure!(
+            self.interrupt_exist_connections.is_none(),
+            "sing-box selector outbound {name} interrupt_exist_connections requires runtime selector state"
+        );
         let target = self
             .default
             .as_deref()
@@ -2555,6 +2559,21 @@ impl SingBoxUrlTestOutbound {
             self.extra.is_empty(),
             "sing-box urltest outbound {name} has unsupported fields {:?}",
             self.extra.keys().collect::<Vec<_>>()
+        );
+        for (field, value) in [
+            ("url", &self.url),
+            ("interval", &self.interval),
+            ("tolerance", &self.tolerance),
+            ("idle_timeout", &self.idle_timeout),
+        ] {
+            ensure!(
+                !value.as_ref().map(value_has_data).unwrap_or(false),
+                "sing-box urltest outbound {name} {field} requires active latency testing"
+            );
+        }
+        ensure!(
+            self.interrupt_exist_connections.is_none(),
+            "sing-box urltest outbound {name} interrupt_exist_connections requires runtime policy state"
         );
         let outbounds = self
             .outbounds
@@ -6170,10 +6189,7 @@ mod tests {
     {
       "type": "urltest",
       "tag": "auto",
-      "outbounds": ["direct-out"],
-      "url": "https://www.gstatic.com/generate_204",
-      "interval": "3m",
-      "tolerance": 50
+      "outbounds": ["direct-out"]
     },
     { "type": "direct", "tag": "direct-out" }
   ]
@@ -6192,6 +6208,54 @@ mod tests {
     }
 
     #[test]
+    fn rejects_selector_runtime_policy_fields() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "select",
+      "outbounds": ["direct-out"],
+      "interrupt_exist_connections": false
+    },
+    { "type": "direct", "tag": "direct-out" }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .resolved_outbound("select")
+            .expect_err("selector runtime policy must not be ignored");
+        assert!(error.to_string().contains("interrupt_exist_connections"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_urltest_runtime_policy_fields() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    {
+      "type": "urltest",
+      "tag": "auto",
+      "outbounds": ["direct-out"],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m"
+    },
+    { "type": "direct", "tag": "direct-out" }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .resolved_outbound("auto")
+            .expect_err("urltest runtime policy must not be ignored");
+        assert!(error.to_string().contains("active latency testing"));
+        assert!(error.to_string().contains("url"));
+        Ok(())
+    }
+
+    #[test]
     fn rejects_urltest_policy_outbound() -> Result<()> {
         let json = r#"
 {
@@ -6199,9 +6263,7 @@ mod tests {
     {
       "type": "urltest",
       "tag": "auto",
-      "outbounds": ["direct-out", "block-out"],
-      "url": "https://www.gstatic.com/generate_204",
-      "interval": "3m"
+      "outbounds": ["direct-out", "block-out"]
     },
     { "type": "direct", "tag": "direct-out" },
     { "type": "block", "tag": "block-out" }

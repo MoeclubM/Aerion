@@ -283,6 +283,9 @@ statically only when they contain a single explicit candidate; multi-candidate
 policies fail explicitly because Aerion does not implement active runtime
 selection yet. sing-box `selector` outbounds are resolved to their startup
 selection (`default`, or the first listed outbound when `default` is omitted).
+sing-box selector/urltest runtime policy fields such as
+`interrupt_exist_connections`, `url`, `interval`, `tolerance`, and
+`idle_timeout` fail explicitly instead of being ignored.
 sing-box route rules accept `route` / `reject` actions, logical route rules,
 inline route rule-sets, and local source JSON rule-sets when they can be
 represented by Aerion's static route table. If sing-box `final` is omitted,
