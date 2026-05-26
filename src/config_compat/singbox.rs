@@ -75,16 +75,74 @@ pub struct SingBoxRouteRule {
     pub domain_regex: Option<Value>,
     #[serde(default)]
     pub geosite: Option<Value>,
+    #[serde(default)]
+    pub inbound: Option<Value>,
+    #[serde(default, rename = "ip_version")]
+    pub ip_version: Option<Value>,
+    #[serde(default, rename = "auth_user")]
+    pub auth_user: Option<Value>,
+    #[serde(default)]
+    pub protocol: Option<Value>,
+    #[serde(default)]
+    pub client: Option<Value>,
     #[serde(default, rename = "ip_cidr")]
     pub ip_cidr: Option<Value>,
     #[serde(default)]
     pub geoip: Option<Value>,
     #[serde(default, rename = "ip_is_private")]
     pub ip_is_private: bool,
+    #[serde(default, rename = "source_geoip")]
+    pub source_geoip: Option<Value>,
+    #[serde(default, rename = "source_ip_cidr")]
+    pub source_ip_cidr: Option<Value>,
+    #[serde(default, rename = "source_ip_is_private")]
+    pub source_ip_is_private: Option<Value>,
     #[serde(default)]
     pub port: Option<Value>,
     #[serde(default, rename = "port_range")]
     pub port_range: Option<Value>,
+    #[serde(default, rename = "source_port")]
+    pub source_port: Option<Value>,
+    #[serde(default, rename = "source_port_range")]
+    pub source_port_range: Option<Value>,
+    #[serde(default, rename = "process_name")]
+    pub process_name: Option<Value>,
+    #[serde(default, rename = "process_path")]
+    pub process_path: Option<Value>,
+    #[serde(default, rename = "process_path_regex")]
+    pub process_path_regex: Option<Value>,
+    #[serde(default, rename = "package_name")]
+    pub package_name: Option<Value>,
+    #[serde(default, rename = "package_name_regex")]
+    pub package_name_regex: Option<Value>,
+    #[serde(default)]
+    pub user: Option<Value>,
+    #[serde(default, rename = "user_id")]
+    pub user_id: Option<Value>,
+    #[serde(default, rename = "clash_mode")]
+    pub clash_mode: Option<Value>,
+    #[serde(default, rename = "network_type")]
+    pub network_type: Option<Value>,
+    #[serde(default, rename = "network_is_expensive")]
+    pub network_is_expensive: Option<Value>,
+    #[serde(default, rename = "network_is_constrained")]
+    pub network_is_constrained: Option<Value>,
+    #[serde(default, rename = "interface_address")]
+    pub interface_address: Option<Value>,
+    #[serde(default, rename = "network_interface_address")]
+    pub network_interface_address: Option<Value>,
+    #[serde(default, rename = "default_interface_address")]
+    pub default_interface_address: Option<Value>,
+    #[serde(default, rename = "wifi_ssid")]
+    pub wifi_ssid: Option<Value>,
+    #[serde(default, rename = "wifi_bssid")]
+    pub wifi_bssid: Option<Value>,
+    #[serde(default, rename = "preferred_by")]
+    pub preferred_by: Option<Value>,
+    #[serde(default, rename = "source_mac_address")]
+    pub source_mac_address: Option<Value>,
+    #[serde(default, rename = "source_hostname")]
+    pub source_hostname: Option<Value>,
     #[serde(default, rename = "rule_set")]
     pub rule_set: Option<Value>,
     #[serde(
@@ -1061,6 +1119,7 @@ impl SingBoxRouteRule {
             self.mode.is_none() && self.rules.is_empty(),
             "sing-box route.rules[{index}] sets logical fields on a default rule"
         );
+        self.reject_unsupported_metadata_matchers(index)?;
         let mut rule = RouteRule::new(match action_override {
             Some(action) => action.clone(),
             None => self.route_decision(index)?,
@@ -1101,6 +1160,102 @@ impl SingBoxRouteRule {
             rule.ports.push(PortRange::parse(&value)?);
         }
         Ok(rule)
+    }
+
+    fn reject_unsupported_metadata_matchers(&self, index: usize) -> Result<()> {
+        for (field, value, reason) in [
+            ("inbound", &self.inbound, "inbound tag metadata"),
+            ("ip_version", &self.ip_version, "IP-version route metadata"),
+            (
+                "auth_user",
+                &self.auth_user,
+                "authenticated inbound user metadata",
+            ),
+            ("protocol", &self.protocol, "sniffed protocol metadata"),
+            ("client", &self.client, "sniffed client metadata"),
+            ("source_geoip", &self.source_geoip, "source IP metadata"),
+            ("source_ip_cidr", &self.source_ip_cidr, "source IP metadata"),
+            (
+                "source_ip_is_private",
+                &self.source_ip_is_private,
+                "source IP metadata",
+            ),
+            ("source_port", &self.source_port, "source port metadata"),
+            (
+                "source_port_range",
+                &self.source_port_range,
+                "source port metadata",
+            ),
+            ("process_name", &self.process_name, "process metadata"),
+            ("process_path", &self.process_path, "process metadata"),
+            (
+                "process_path_regex",
+                &self.process_path_regex,
+                "process metadata",
+            ),
+            ("package_name", &self.package_name, "process metadata"),
+            (
+                "package_name_regex",
+                &self.package_name_regex,
+                "process metadata",
+            ),
+            ("user", &self.user, "process owner metadata"),
+            ("user_id", &self.user_id, "process owner metadata"),
+            ("clash_mode", &self.clash_mode, "Clash mode state"),
+            (
+                "network_type",
+                &self.network_type,
+                "platform network metadata",
+            ),
+            (
+                "network_is_expensive",
+                &self.network_is_expensive,
+                "platform network metadata",
+            ),
+            (
+                "network_is_constrained",
+                &self.network_is_constrained,
+                "platform network metadata",
+            ),
+            (
+                "interface_address",
+                &self.interface_address,
+                "platform interface metadata",
+            ),
+            (
+                "network_interface_address",
+                &self.network_interface_address,
+                "platform interface metadata",
+            ),
+            (
+                "default_interface_address",
+                &self.default_interface_address,
+                "platform interface metadata",
+            ),
+            ("wifi_ssid", &self.wifi_ssid, "platform Wi-Fi metadata"),
+            ("wifi_bssid", &self.wifi_bssid, "platform Wi-Fi metadata"),
+            (
+                "preferred_by",
+                &self.preferred_by,
+                "platform route ownership metadata",
+            ),
+            (
+                "source_mac_address",
+                &self.source_mac_address,
+                "source device metadata",
+            ),
+            (
+                "source_hostname",
+                &self.source_hostname,
+                "source device metadata",
+            ),
+        ] {
+            ensure!(
+                value.is_none(),
+                "sing-box route.rules[{index}] {field} requires {reason}"
+            );
+        }
+        Ok(())
     }
 
     fn to_logical_route_rules(
@@ -1246,11 +1401,40 @@ impl SingBoxRouteRule {
             || self.domain_keyword.is_some()
             || self.domain_regex.is_some()
             || self.geosite.is_some()
+            || self.inbound.is_some()
+            || self.ip_version.is_some()
+            || self.auth_user.is_some()
+            || self.protocol.is_some()
+            || self.client.is_some()
             || self.ip_cidr.is_some()
             || self.geoip.is_some()
             || self.ip_is_private
+            || self.source_geoip.is_some()
+            || self.source_ip_cidr.is_some()
+            || self.source_ip_is_private.is_some()
             || self.port.is_some()
             || self.port_range.is_some()
+            || self.source_port.is_some()
+            || self.source_port_range.is_some()
+            || self.process_name.is_some()
+            || self.process_path.is_some()
+            || self.process_path_regex.is_some()
+            || self.package_name.is_some()
+            || self.package_name_regex.is_some()
+            || self.user.is_some()
+            || self.user_id.is_some()
+            || self.clash_mode.is_some()
+            || self.network_type.is_some()
+            || self.network_is_expensive.is_some()
+            || self.network_is_constrained.is_some()
+            || self.interface_address.is_some()
+            || self.network_interface_address.is_some()
+            || self.default_interface_address.is_some()
+            || self.wifi_ssid.is_some()
+            || self.wifi_bssid.is_some()
+            || self.preferred_by.is_some()
+            || self.source_mac_address.is_some()
+            || self.source_hostname.is_some()
             || self.rule_set.is_some()
             || self.rule_set_ip_cidr_match_source
     }
@@ -3484,6 +3668,55 @@ mod tests {
             .route_table()
             .expect_err("geoip needs explicit route-set data");
         assert!(error.to_string().contains("geoip rule-set data"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_singbox_metadata_route_matchers() -> Result<()> {
+        let json = r#"
+{
+  "route": {
+    "rules": [
+      { "source_ip_cidr": ["10.0.0.0/8"], "outbound": "direct" }
+    ]
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("source route matcher requires metadata");
+        assert!(error.to_string().contains("source IP metadata"));
+
+        let json = r#"
+{
+  "route": {
+    "rules": [
+      { "process_name": ["curl"], "outbound": "direct" }
+    ]
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("process route matcher requires metadata");
+        assert!(error.to_string().contains("process metadata"));
+
+        let json = r#"
+{
+  "route": {
+    "rules": [
+      { "inbound": ["mixed-in"], "outbound": "direct" }
+    ]
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("inbound route matcher requires metadata");
+        assert!(error.to_string().contains("inbound tag metadata"));
         Ok(())
     }
 

@@ -55,8 +55,32 @@ pub struct XrayRoutingRule {
     pub ip: Vec<String>,
     #[serde(default)]
     pub port: Option<Value>,
+    #[serde(default, rename = "sourcePort", alias = "source_port")]
+    pub source_port: Option<Value>,
+    #[serde(default, rename = "localPort", alias = "local_port")]
+    pub local_port: Option<Value>,
     #[serde(default)]
     pub network: Option<String>,
+    #[serde(default, rename = "sourceIP", alias = "source", alias = "source_ip")]
+    pub source_ip: Option<Value>,
+    #[serde(default, rename = "localIP", alias = "local_ip")]
+    pub local_ip: Option<Value>,
+    #[serde(default)]
+    pub user: Option<Value>,
+    #[serde(default, rename = "vlessRoute", alias = "vless_route")]
+    pub vless_route: Option<Value>,
+    #[serde(default, rename = "inboundTag", alias = "inbound_tag")]
+    pub inbound_tag: Option<Value>,
+    #[serde(default)]
+    pub protocol: Option<Value>,
+    #[serde(default)]
+    pub attrs: Option<Value>,
+    #[serde(default)]
+    pub process: Option<Value>,
+    #[serde(default, rename = "ruleTag", alias = "rule_tag")]
+    pub rule_tag: Option<Value>,
+    #[serde(default)]
+    pub webhook: Option<Value>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -594,6 +618,7 @@ impl XrayRoutingRule {
             "xray routing.rules[{index}] has unsupported fields {:?}",
             self.extra.keys().collect::<Vec<_>>()
         );
+        self.reject_unsupported_match_metadata(index)?;
         ensure!(
             self.kind.trim().is_empty() || self.kind.eq_ignore_ascii_case("field"),
             "unsupported xray routing.rules[{index}] type {}",
@@ -649,6 +674,41 @@ impl XrayRoutingRule {
             rule.ports.push(PortRange::parse(&value)?);
         }
         Ok(rule)
+    }
+
+    fn reject_unsupported_match_metadata(&self, index: usize) -> Result<()> {
+        for (field, value, reason) in [
+            (
+                "sourcePort",
+                &self.source_port,
+                "source port matching metadata",
+            ),
+            ("localPort", &self.local_port, "local inbound port metadata"),
+            (
+                "sourceIP/source",
+                &self.source_ip,
+                "source IP matching metadata",
+            ),
+            ("localIP", &self.local_ip, "local inbound IP metadata"),
+            ("user", &self.user, "authenticated inbound user metadata"),
+            (
+                "vlessRoute",
+                &self.vless_route,
+                "VLESS inbound route metadata",
+            ),
+            ("inboundTag", &self.inbound_tag, "inbound tag metadata"),
+            ("protocol", &self.protocol, "sniffed protocol metadata"),
+            ("attrs", &self.attrs, "sniffed HTTP attribute metadata"),
+            ("process", &self.process, "process metadata"),
+            ("ruleTag", &self.rule_tag, "Xray route-hit logging state"),
+            ("webhook", &self.webhook, "route-hit webhook side effects"),
+        ] {
+            ensure!(
+                value.is_none(),
+                "xray routing.rules[{index}] {field} requires {reason}"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -2854,6 +2914,40 @@ mod tests {
             .route_table()
             .expect_err("geoip needs explicit route-set data");
         assert!(error.to_string().contains("geoip rule-set data"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_xray_metadata_route_matchers() -> Result<()> {
+        let json = r#"
+{
+  "routing": {
+    "rules": [
+      { "type": "field", "source": ["10.0.0.0/8"], "outboundTag": "direct" }
+    ]
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("source route matcher requires metadata");
+        assert!(error.to_string().contains("source IP matching metadata"));
+
+        let json = r#"
+{
+  "routing": {
+    "rules": [
+      { "type": "field", "process": ["curl"], "outboundTag": "direct" }
+    ]
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("process route matcher requires metadata");
+        assert!(error.to_string().contains("process metadata"));
         Ok(())
     }
 

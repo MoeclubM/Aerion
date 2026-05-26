@@ -262,8 +262,8 @@ match/final forms, statically representable `OR` / `AND` logical rules, and
 statically representable logical rules in classical payloads. Remote HTTP and
 binary MRS rule-provider loading still fails explicitly. Direct geo route
 references that are not backed by expanded rule-set data fail at config compile
-time instead of during route decisions. Source/process
-matchers and `src` route parameters require routing metadata and fail
+time instead of during route decisions. Source/process/inbound/sniffed-metadata
+matchers and Mihomo `src` route parameters require routing metadata and fail
 explicitly. Mihomo `select`
 proxy-groups resolve to the first listed proxy. Mihomo health-check /
 load-balancing / relay groups and sing-box `urltest` outbounds resolve
