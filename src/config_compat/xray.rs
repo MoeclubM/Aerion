@@ -596,7 +596,10 @@ impl XrayRoutingConfig {
                 "xray routing.domainStrategy {strategy} requires DNS resolution during routing"
             );
         }
-        let mut table = RouteTable::default();
+        let mut table = RouteTable {
+            default: xray_default_route_decision(outbounds)?,
+            ..RouteTable::default()
+        };
         for (index, rule) in self.rules.iter().enumerate() {
             table
                 .rules
@@ -709,6 +712,27 @@ impl XrayRoutingRule {
             );
         }
         Ok(())
+    }
+}
+
+fn xray_default_route_decision(outbounds: &[XrayOutbound]) -> Result<RouteDecision> {
+    let Some(outbound) = outbounds.first() else {
+        return Ok(RouteDecision::Direct);
+    };
+    if let Some(tag) = outbound
+        .tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+    {
+        return RouteDecision::from_outbound(tag);
+    }
+    match outbound.protocol.trim().to_ascii_lowercase().as_str() {
+        "freedom" => Ok(RouteDecision::Direct),
+        "blackhole" => Ok(RouteDecision::Block),
+        protocol => bail!(
+            "xray routing default uses first outbound protocol {protocol} without tag; Aerion route proxy requires a tag"
+        ),
     }
 }
 
@@ -2880,6 +2904,55 @@ mod tests {
             routes.decide(&ProxyTarget::Ip("10.1.2.3:53".parse()?), RouteNetwork::Udp),
             RouteDecision::Direct
         );
+        Ok(())
+    }
+
+    #[test]
+    fn xray_route_default_uses_first_outbound() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    { "tag": "proxy-a", "protocol": "socks" }
+  ],
+  "routing": {
+    "rules": [
+      { "type": "field", "domain": ["domain:example.com"], "outboundTag": "direct" }
+    ]
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let routes = config.route_table()?;
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("unmatched.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-a".to_string())
+        );
+
+        let json = r#"
+{
+  "outbounds": [
+    { "protocol": "socks" }
+  ],
+  "routing": {
+    "rules": []
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("tagless default proxy outbound cannot be spawned");
+        assert!(error.to_string().contains("requires a tag"));
         Ok(())
     }
 

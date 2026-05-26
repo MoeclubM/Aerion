@@ -812,7 +812,7 @@ impl SingBoxConfig {
 
     pub fn route_table(&self) -> Result<RouteTable> {
         match &self.route {
-            Some(route) => route.to_route_table(self.source_dir.as_deref()),
+            Some(route) => route.to_route_table(self.source_dir.as_deref(), &self.outbounds),
             None => Ok(RouteTable::default()),
         }
     }
@@ -865,16 +865,24 @@ impl SingBoxConfig {
 }
 
 impl SingBoxRouteConfig {
-    pub fn to_route_table(&self, source_dir: Option<&Path>) -> Result<RouteTable> {
+    pub fn to_route_table(
+        &self,
+        source_dir: Option<&Path>,
+        outbounds: &[SingBoxOutbound],
+    ) -> Result<RouteTable> {
         let rule_sets = self.static_rule_sets(source_dir)?;
+        let default = match self
+            .final_outbound
+            .as_deref()
+            .map(RouteDecision::from_outbound)
+            .transpose()?
+        {
+            Some(default) => default,
+            None => singbox_default_route_decision(outbounds)?,
+        };
         let mut table = RouteTable {
             rules: Vec::new(),
-            default: self
-                .final_outbound
-                .as_deref()
-                .map(RouteDecision::from_outbound)
-                .transpose()?
-                .unwrap_or(RouteDecision::Direct),
+            default,
             ..RouteTable::default()
         };
         for (index, rule) in self.rules.iter().enumerate() {
@@ -1030,6 +1038,27 @@ impl SingBoxRuleSet {
             return Ok("binary".to_string());
         }
         bail!("sing-box route.rule_set {} is missing format", self.tag)
+    }
+}
+
+fn singbox_default_route_decision(outbounds: &[SingBoxOutbound]) -> Result<RouteDecision> {
+    let Some(outbound) = outbounds.first() else {
+        return Ok(RouteDecision::Direct);
+    };
+    if let Some(tag) = outbound
+        .tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+    {
+        return RouteDecision::from_outbound(tag);
+    }
+    match outbound.kind.trim().to_ascii_lowercase().as_str() {
+        "direct" => Ok(RouteDecision::Direct),
+        "block" => Ok(RouteDecision::Block),
+        kind => bail!(
+            "sing-box route default uses first outbound type {kind} without tag; Aerion route proxy requires a tag"
+        ),
     }
 }
 
@@ -3450,6 +3479,55 @@ mod tests {
             ),
             RouteDecision::Proxy("proxy-b".to_string())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn singbox_route_default_uses_first_outbound() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [
+    { "type": "vless", "tag": "proxy-a" }
+  ],
+  "route": {
+    "rules": [
+      { "domain_suffix": ["example.com"], "outbound": "direct" }
+    ]
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let routes = config.route_table()?;
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("unmatched.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-a".to_string())
+        );
+
+        let json = r#"
+{
+  "outbounds": [
+    { "type": "vless" }
+  ],
+  "route": {
+    "rules": []
+  }
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("tagless default proxy outbound cannot be spawned");
+        assert!(error.to_string().contains("requires a tag"));
         Ok(())
     }
 
