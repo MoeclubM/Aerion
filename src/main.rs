@@ -669,6 +669,7 @@ async fn run_file_config(
             run_client_config(select_mihomo_client_config(&config, profile, listen)?.into()).await
         }
         FileConfig::Xray(config) => {
+            config.reject_unsupported_top_level_fields()?;
             if config.outbounds.is_empty() {
                 let inbound = select_xray_inbound(&config.inbounds, profile)?;
                 return run_xray_server_config(inbound.to_server_config()?).await;

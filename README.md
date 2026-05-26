@@ -302,6 +302,7 @@ resolution during routing fail explicitly. Xray external `ext:` GeoIP routing
 files and `!` inverse IP matchers fail explicitly until rule-set data loading
 and negative route matching are wired. Xray `rawSettings` / `tcpSettings`,
 `sockopt`, and KCP/QUIC/domain-socket stream settings with data, plus unknown
+top-level profile options such as `log` / `dns` / `api`, unknown outbound
 profile, `settings`, stream transport, REALITY/finalmask, mux, and
 `streamSettings` fields, fail explicitly instead of being ignored. Xray TLS
 version/cipher/curve policy overrides, separate peer-name verification,

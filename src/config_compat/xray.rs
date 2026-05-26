@@ -29,6 +29,8 @@ pub struct XrayConfig {
     pub outbounds: Vec<XrayOutbound>,
     #[serde(default)]
     pub routing: XrayRoutingConfig,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -1097,6 +1099,10 @@ struct XrayServerUser {
 }
 
 impl XrayConfig {
+    pub fn reject_unsupported_top_level_fields(&self) -> Result<()> {
+        ensure_no_extra_fields("xray config", &self.extra)
+    }
+
     pub fn outbound(&self, tag: &str) -> Option<&XrayOutbound> {
         self.outbounds
             .iter()
@@ -1104,6 +1110,7 @@ impl XrayConfig {
     }
 
     pub fn local_socks_listen(&self) -> Result<Option<SocketAddr>> {
+        self.reject_unsupported_top_level_fields()?;
         let Some(inbound) = self
             .inbounds
             .iter()
@@ -1123,6 +1130,7 @@ impl XrayConfig {
     }
 
     pub fn route_table(&self) -> Result<RouteTable> {
+        self.reject_unsupported_top_level_fields()?;
         self.routing.to_route_table(&self.outbounds)
     }
 }
@@ -3745,6 +3753,30 @@ mod tests {
             .route_table()
             .expect_err("unknown routing fields must not be ignored");
         assert!(error.to_string().contains("unsupported fields"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_xray_unsupported_top_level_options() -> Result<()> {
+        let json = r#"
+{
+  "log": { "loglevel": "debug" },
+  "outbounds": [
+    { "tag": "direct", "protocol": "freedom" }
+  ],
+  "routing": {
+    "rules": [
+      { "type": "field", "domain": ["domain:example.com"], "outboundTag": "direct" }
+    ]
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("unsupported xray top-level options must not be ignored");
+        assert!(error.to_string().contains("xray config"));
+        assert!(error.to_string().contains("log"));
         Ok(())
     }
 
