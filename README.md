@@ -268,8 +268,11 @@ time instead of during route decisions. Source/process/inbound/sniffed-metadata
 matchers and Mihomo `src` route parameters require routing metadata and fail
 explicitly. Unknown mihomo proxy fields, unsupported WebSocket/gRPC/XHTTP/
 REALITY option fields, and transport option blocks attached to a different
-`network` fail explicitly rather than being silently dropped. Mihomo `select`
-proxy-groups resolve to the first listed proxy. Mihomo health-check /
+`network` fail explicitly rather than being silently dropped. Mihomo local
+HTTP-only `port`, transparent proxy listeners, authentication, and LAN source
+filters fail explicitly because the Aerion config runner exposes a plain SOCKS
+listener for mihomo client profiles. Mihomo `select` proxy-groups resolve to
+the first listed proxy. Mihomo health-check /
 load-balancing / relay groups and sing-box `urltest` outbounds resolve
 statically only when they contain a single explicit candidate; multi-candidate
 policies fail explicitly because Aerion does not implement active runtime

@@ -34,10 +34,22 @@ pub struct MihomoConfig {
     pub socks_port: Option<u16>,
     #[serde(default)]
     pub port: Option<u16>,
+    #[serde(default, rename = "redir-port", alias = "redir_port")]
+    pub redir_port: Option<Value>,
+    #[serde(default, rename = "tproxy-port", alias = "tproxy_port")]
+    pub tproxy_port: Option<Value>,
     #[serde(default, rename = "allow-lan", alias = "allow_lan")]
     pub allow_lan: bool,
     #[serde(default, rename = "bind-address", alias = "bind_address")]
     pub bind_address: Option<String>,
+    #[serde(default)]
+    pub authentication: Option<Value>,
+    #[serde(default, rename = "skip-auth-prefixes", alias = "skip_auth_prefixes")]
+    pub skip_auth_prefixes: Option<Value>,
+    #[serde(default, rename = "lan-allowed-ips", alias = "lan_allowed_ips")]
+    pub lan_allowed_ips: Option<Value>,
+    #[serde(default, rename = "lan-disallowed-ips", alias = "lan_disallowed_ips")]
+    pub lan_disallowed_ips: Option<Value>,
     #[serde(default)]
     pub proxies: Vec<MihomoProxy>,
     #[serde(default, rename = "proxy-groups", alias = "proxy_groups")]
@@ -870,7 +882,8 @@ impl MihomoConfig {
     }
 
     pub fn local_socks_listen(&self) -> Result<Option<SocketAddr>> {
-        let Some(port) = self.mixed_port.or(self.socks_port).or(self.port) else {
+        self.reject_unsupported_local_listener_options()?;
+        let Some(port) = self.mixed_port.or(self.socks_port) else {
             return Ok(None);
         };
         let ip = match self.bind_address.as_deref().map(str::trim) {
@@ -882,6 +895,51 @@ impl MihomoConfig {
                 .with_context(|| format!("parse mihomo bind-address {value}"))?,
         };
         Ok(Some(SocketAddr::new(ip, port)))
+    }
+
+    fn reject_unsupported_local_listener_options(&self) -> Result<()> {
+        ensure!(
+            self.port.is_none(),
+            "mihomo port is an HTTP proxy listener; Aerion config runner exposes a SOCKS listener only"
+        );
+        for (field, value, reason) in [
+            (
+                "redir-port",
+                &self.redir_port,
+                "redirect transparent proxy listener support",
+            ),
+            (
+                "tproxy-port",
+                &self.tproxy_port,
+                "TPROXY transparent proxy listener support",
+            ),
+            (
+                "authentication",
+                &self.authentication,
+                "authenticated local proxy listener support",
+            ),
+            (
+                "skip-auth-prefixes",
+                &self.skip_auth_prefixes,
+                "local authentication bypass prefix support",
+            ),
+            (
+                "lan-allowed-ips",
+                &self.lan_allowed_ips,
+                "LAN source allow-list enforcement",
+            ),
+            (
+                "lan-disallowed-ips",
+                &self.lan_disallowed_ips,
+                "LAN source deny-list enforcement",
+            ),
+        ] {
+            ensure!(
+                !value.as_ref().map(value_has_data).unwrap_or(false),
+                "mihomo {field} requires {reason}"
+            );
+        }
+        Ok(())
     }
 
     pub fn route_table(&self) -> Result<RouteTable> {
@@ -3139,6 +3197,42 @@ tun:
         assert_eq!(tun.virtual_dns_pool, "198.18.0.0/15");
         assert_eq!(tun.bypass, vec!["10.0.0.0/8"]);
         assert!(tun.ipv6);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mihomo_unsupported_local_listener_options() -> Result<()> {
+        let yaml = r#"
+socks-port: 7890
+authentication:
+  - user:pass
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let auth_error = config
+            .local_socks_listen()
+            .expect_err("local listener authentication must not be ignored");
+        assert!(auth_error.to_string().contains("authentication"));
+
+        let yaml = r#"
+port: 8080
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let port_error = config
+            .local_socks_listen()
+            .expect_err("HTTP-only port must not be exposed as SOCKS");
+        assert!(port_error.to_string().contains("HTTP proxy listener"));
+
+        let yaml = r#"
+socks-port: 7890
+redir-port: 7892
+lan-allowed-ips:
+  - 192.168.0.0/16
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let redir_error = config
+            .local_socks_listen()
+            .expect_err("transparent proxy listeners must not be ignored");
+        assert!(redir_error.to_string().contains("redir-port"));
         Ok(())
     }
 
