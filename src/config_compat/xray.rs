@@ -640,14 +640,16 @@ impl XrayRoutingRule {
             self.extra.keys().collect::<Vec<_>>()
         );
         self.reject_unsupported_match_metadata(index)?;
+        if let Some(rule_tag) = &self.rule_tag {
+            ensure!(
+                rule_tag.as_str().is_some(),
+                "xray routing.rules[{index}] ruleTag must be a string"
+            );
+        }
         ensure!(
             self.kind.trim().is_empty() || self.kind.eq_ignore_ascii_case("field"),
             "unsupported xray routing.rules[{index}] type {}",
             self.kind
-        );
-        ensure!(
-            self.outbound_tag.trim().is_empty() || self.balancer_tag.trim().is_empty(),
-            "xray routing.rules[{index}] sets both outboundTag and balancerTag"
         );
         let action = if !self.outbound_tag.trim().is_empty() {
             RouteDecision::from_outbound(&self.outbound_tag)?
@@ -721,7 +723,6 @@ impl XrayRoutingRule {
             ("protocol", &self.protocol, "sniffed protocol metadata"),
             ("attrs", &self.attrs, "sniffed HTTP attribute metadata"),
             ("process", &self.process, "process metadata"),
-            ("ruleTag", &self.rule_tag, "Xray route-hit logging state"),
             ("webhook", &self.webhook, "route-hit webhook side effects"),
         ] {
             ensure!(
@@ -3023,6 +3024,50 @@ mod tests {
             .route_table()
             .expect_err("unknown routing fields must not be ignored");
         assert!(error.to_string().contains("unsupported fields"));
+        Ok(())
+    }
+
+    #[test]
+    fn handles_xray_route_rule_tags_and_action_precedence() -> Result<()> {
+        let json = r#"
+{
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "domain": ["domain:example.com"],
+        "outboundTag": "direct",
+        "balancerTag": "missing-balancer",
+        "ruleTag": "debug-label"
+      }
+    ]
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let routes = config.route_table()?;
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.example.com".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Direct
+        );
+
+        let json = r#"
+{
+  "routing": {
+    "rules": [
+      { "type": "field", "ruleTag": 7, "outboundTag": "direct" }
+    ]
+  }
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config
+            .route_table()
+            .expect_err("non-string ruleTag must be rejected");
+        assert!(error.to_string().contains("ruleTag"));
         Ok(())
     }
 

@@ -286,6 +286,9 @@ Xray routing `domain` entries follow Xray's plain substring, `domain:`,
 when its balancer selectors identify exactly one outbound and no runtime
 strategy/fallback state is required. Xray routing defaults follow the first
 outbound when it is tag-addressable (or a tagless freedom/blackhole outbound).
+If a route rule sets both `outboundTag` and `balancerTag`, Aerion follows
+Xray's `outboundTag` precedence; string `ruleTag` values are accepted as debug
+labels and do not affect route decisions.
 Xray `domainMatcher` accepts `linear` / `hybrid` / `mph` as implementation
 hints; unknown routing fields and `domainStrategy` values that require DNS
 resolution during routing fail explicitly.
