@@ -648,6 +648,7 @@ async fn run_file_config(
         FileConfig::Server { server } => run_native_server(server, listen).await,
         FileConfig::Aerion(config) => run_aerion_config(config, profile, listen).await,
         FileConfig::Mihomo(config) => {
+            config.reject_unsupported_top_level_fields()?;
             if profile.is_none() && !config.rules.is_empty() {
                 return run_mihomo_route_config(config, listen).await;
             }

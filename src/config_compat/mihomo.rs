@@ -64,6 +64,8 @@ pub struct MihomoConfig {
     pub dns: MihomoDnsConfig,
     #[serde(default)]
     pub tun: Option<MihomoTunConfig>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
     #[serde(skip)]
     pub source_dir: Option<PathBuf>,
 }
@@ -819,6 +821,10 @@ enum MihomoResolvedProxy<'a> {
 }
 
 impl MihomoConfig {
+    pub fn reject_unsupported_top_level_fields(&self) -> Result<()> {
+        ensure_no_extra_fields("mihomo config", &self.extra)
+    }
+
     pub fn proxy(&self, name: &str) -> Option<&MihomoProxy> {
         self.proxies.iter().find(|proxy| proxy.name() == name)
     }
@@ -842,6 +848,7 @@ impl MihomoConfig {
         name: &str,
         listen: SocketAddr,
     ) -> Result<MihomoClientConfig> {
+        self.reject_unsupported_top_level_fields()?;
         match self.resolve_proxy_target(name)? {
             MihomoResolvedProxy::Proxy(proxy) => proxy.to_client_config(listen),
             MihomoResolvedProxy::Route(default) => {
@@ -882,6 +889,7 @@ impl MihomoConfig {
     }
 
     pub fn local_socks_listen(&self) -> Result<Option<SocketAddr>> {
+        self.reject_unsupported_top_level_fields()?;
         self.reject_unsupported_local_listener_options()?;
         let Some(port) = self.mixed_port.or(self.socks_port) else {
             return Ok(None);
@@ -943,6 +951,7 @@ impl MihomoConfig {
     }
 
     pub fn route_table(&self) -> Result<RouteTable> {
+        self.reject_unsupported_top_level_fields()?;
         let mut table = RouteTable::default();
         for (index, rule) in self.rules.iter().enumerate() {
             table
@@ -1029,6 +1038,7 @@ impl MihomoConfig {
     }
 
     pub fn tun_config(&self, proxy_listen: SocketAddr) -> Result<Option<TunConfig>> {
+        self.reject_unsupported_top_level_fields()?;
         let Some(tun) = &self.tun else {
             return Ok(None);
         };
@@ -3233,6 +3243,24 @@ lan-allowed-ips:
             .local_socks_listen()
             .expect_err("transparent proxy listeners must not be ignored");
         assert!(redir_error.to_string().contains("redir-port"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mihomo_unsupported_top_level_options() -> Result<()> {
+        let yaml = r#"
+log-level: debug
+mixed-port: 7890
+proxies:
+  - name: direct-out
+    type: direct
+"#;
+        let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+        let error = config
+            .local_socks_listen()
+            .expect_err("unsupported mihomo top-level options must not be ignored");
+        assert!(error.to_string().contains("mihomo config"));
+        assert!(error.to_string().contains("log-level"));
         Ok(())
     }
 

@@ -121,7 +121,9 @@ Aerion now provides these server/client protocol stacks:
   - unsupported transport mismatches such as mihomo `smux` fail with explicit
     errors instead of falling back silently; unknown mihomo proxy fields and
     unsupported nested `ws-opts` / `grpc-opts` / `xhttp-opts` / `reality-opts`
-    fields also fail explicitly instead of being ignored
+    fields also fail explicitly instead of being ignored; unsupported mihomo
+    top-level runtime options such as `log-level`, `mode`, and
+    `external-controller` fail explicitly too
 - VMess:
   - AEAD request/response header
   - raw TCP/TLS plus TCP / WebSocket / HTTPUpgrade / HTTP/2 / gRPC / XHTTP transports for client/server
