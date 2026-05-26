@@ -418,6 +418,9 @@ impl XrayStreamSettings {
                 "{owner} streamSettings {field} requires {reason}"
             );
         }
+        if let Some(tls) = &self.tls_settings {
+            tls.reject_unsupported_fields(owner)?;
+        }
         Ok(())
     }
 }
@@ -542,6 +545,12 @@ pub struct XrayTlsSettings {
     pub allow_insecure: bool,
     #[serde(
         default,
+        rename = "verifyPeerCertByName",
+        alias = "verify_peer_cert_by_name"
+    )]
+    pub verify_peer_cert_by_name: Option<String>,
+    #[serde(
+        default,
         deserialize_with = "deserialize_optional_fingerprint",
         alias = "clientFingerprint",
         alias = "client_fingerprint"
@@ -558,8 +567,34 @@ pub struct XrayTlsSettings {
         alias = "pinnedPeerCertificateChainSha256"
     )]
     pub pinned_peer_cert_sha256: Option<String>,
+    #[serde(default, rename = "rejectUnknownSni", alias = "reject_unknown_sni")]
+    pub reject_unknown_sni: bool,
+    #[serde(default, rename = "minVersion", alias = "min_version")]
+    pub min_version: Option<String>,
+    #[serde(default, rename = "maxVersion", alias = "max_version")]
+    pub max_version: Option<String>,
+    #[serde(default, rename = "cipherSuites", alias = "cipher_suites")]
+    pub cipher_suites: Option<String>,
+    #[serde(
+        default,
+        rename = "enableSessionResumption",
+        alias = "enable_session_resumption"
+    )]
+    pub enable_session_resumption: bool,
+    #[serde(default, rename = "curvePreferences", alias = "curve_preferences")]
+    pub curve_preferences: Option<Value>,
+    #[serde(default, rename = "masterKeyLog", alias = "master_key_log")]
+    pub master_key_log: Option<String>,
+    #[serde(default, rename = "echServerKeys", alias = "ech_server_keys")]
+    pub ech_server_keys: Option<String>,
+    #[serde(default, rename = "echConfigList", alias = "ech_config_list")]
+    pub ech_config_list: Option<String>,
+    #[serde(default, rename = "echSockopt", alias = "ech_sockopt")]
+    pub ech_sockopt: Option<Value>,
     #[serde(default)]
     pub certificates: Vec<XrayCertificate>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -574,6 +609,113 @@ pub struct XrayCertificate {
     pub certificate_file: Option<PathBuf>,
     #[serde(default, rename = "keyFile", alias = "key_file")]
     pub key_file: Option<PathBuf>,
+    #[serde(default, rename = "ocspStapling", alias = "ocsp_stapling")]
+    pub ocsp_stapling: Option<Value>,
+    #[serde(default, rename = "oneTimeLoading", alias = "one_time_loading")]
+    pub one_time_loading: bool,
+    #[serde(default, rename = "buildChain", alias = "build_chain")]
+    pub build_chain: bool,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl XrayTlsSettings {
+    fn reject_unsupported_fields(&self, owner: &str) -> Result<()> {
+        ensure!(
+            self.extra.is_empty(),
+            "{owner} tlsSettings has unsupported fields {:?}",
+            self.extra.keys().collect::<Vec<_>>()
+        );
+        for (field, value, reason) in [
+            (
+                "verifyPeerCertByName",
+                &self.verify_peer_cert_by_name,
+                "separate certificate name verification",
+            ),
+            ("minVersion", &self.min_version, "TLS version policy"),
+            ("maxVersion", &self.max_version, "TLS version policy"),
+            (
+                "cipherSuites",
+                &self.cipher_suites,
+                "TLS cipher suite policy",
+            ),
+            ("masterKeyLog", &self.master_key_log, "TLS key log output"),
+            ("echServerKeys", &self.ech_server_keys, "ECH server support"),
+            ("echConfigList", &self.ech_config_list, "ECH client support"),
+        ] {
+            ensure!(
+                !option_text_has_data(value),
+                "{owner} tlsSettings {field} requires {reason}"
+            );
+        }
+        for (field, value, reason) in [
+            (
+                "rejectUnknownSni",
+                self.reject_unknown_sni,
+                "SNI-based server rejection",
+            ),
+            (
+                "enableSessionResumption",
+                self.enable_session_resumption,
+                "TLS session resumption policy",
+            ),
+        ] {
+            ensure!(!value, "{owner} tlsSettings {field} requires {reason}");
+        }
+        for (field, value, reason) in [
+            (
+                "curvePreferences",
+                &self.curve_preferences,
+                "TLS curve preference policy",
+            ),
+            (
+                "echSockopt",
+                &self.ech_sockopt,
+                "ECH socket option plumbing",
+            ),
+        ] {
+            ensure!(
+                !value.as_ref().map(value_has_data).unwrap_or(false),
+                "{owner} tlsSettings {field} requires {reason}"
+            );
+        }
+        for (index, certificate) in self.certificates.iter().enumerate() {
+            certificate.reject_unsupported_fields(owner, index)?;
+        }
+        Ok(())
+    }
+}
+
+impl XrayCertificate {
+    fn reject_unsupported_fields(&self, owner: &str, index: usize) -> Result<()> {
+        ensure!(
+            self.extra.is_empty(),
+            "{owner} tlsSettings.certificates[{index}] has unsupported fields {:?}",
+            self.extra.keys().collect::<Vec<_>>()
+        );
+        for (field, value, reason) in [
+            (
+                "ocspStapling",
+                self.ocsp_stapling
+                    .as_ref()
+                    .map(value_has_data)
+                    .unwrap_or(false),
+                "OCSP stapling",
+            ),
+            (
+                "oneTimeLoading",
+                self.one_time_loading,
+                "certificate one-time loading policy",
+            ),
+            ("buildChain", self.build_chain, "certificate chain building"),
+        ] {
+            ensure!(
+                !value,
+                "{owner} tlsSettings.certificates[{index}] {field} requires {reason}"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -4421,6 +4563,117 @@ mod tests {
             .expect_err("unknown streamSettings fields must not be ignored");
         assert!(error.to_string().contains("unsupported fields"));
         assert!(error.to_string().contains("unknownStreamField"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_xray_unsupported_tls_settings() -> Result<()> {
+        let json = r#"
+{
+  "outbounds": [{
+    "tag": "http-proxy",
+    "protocol": "http",
+    "settings": {
+      "address": "proxy.example.com",
+      "port": 8443
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "tls",
+      "tlsSettings": {
+        "minVersion": "1.2"
+      }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config.outbounds[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("TLS version policy must not be ignored");
+        assert!(error.to_string().contains("tlsSettings"));
+        assert!(error.to_string().contains("minVersion"));
+        assert!(error.to_string().contains("TLS version policy"));
+
+        let json = r#"
+{
+  "outbounds": [{
+    "tag": "http-proxy",
+    "protocol": "http",
+    "settings": {
+      "address": "proxy.example.com",
+      "port": 8443
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "tls",
+      "tlsSettings": {
+        "disableSystemRoot": true,
+        "certificates": [{
+          "usage": "verify",
+          "certificate": ["ca-line"],
+          "oneTimeLoading": true
+        }]
+      }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config.outbounds[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("certificate loading policy must not be ignored");
+        assert!(error.to_string().contains("certificates[0]"));
+        assert!(error.to_string().contains("oneTimeLoading"));
+
+        let json = r#"
+{
+  "inbounds": [{
+    "tag": "vless-server",
+    "protocol": "vless",
+    "listen": "127.0.0.1",
+    "port": 8443,
+    "settings": {
+      "decryption": "none",
+      "clients": [{ "id": "a3482e88-686a-4a58-8126-99c9df64b7bf" }]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "tls",
+      "tlsSettings": {
+        "rejectUnknownSni": true
+      }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config.inbounds[0]
+            .to_server_config()
+            .err()
+            .context("SNI rejection policy must not be ignored")?;
+        assert!(error.to_string().contains("rejectUnknownSni"));
+        assert!(error.to_string().contains("SNI-based server rejection"));
+
+        let json = r#"
+{
+  "outbounds": [{
+    "tag": "direct-out",
+    "protocol": "freedom",
+    "streamSettings": {
+      "tlsSettings": {
+        "unknownTlsOption": true
+      }
+    }
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        let error = config.outbounds[0]
+            .to_client_config("127.0.0.1:1080".parse()?)
+            .expect_err("unknown tlsSettings fields must not be ignored");
+        assert!(error.to_string().contains("unsupported fields"));
+        assert!(error.to_string().contains("unknownTlsOption"));
         Ok(())
     }
 

@@ -295,7 +295,11 @@ resolution during routing fail explicitly. Xray external `ext:` GeoIP routing
 files and `!` inverse IP matchers fail explicitly until rule-set data loading
 and negative route matching are wired. Xray `rawSettings` / `tcpSettings`,
 `sockopt`, and KCP/QUIC/domain-socket stream settings with data, plus unknown
-`streamSettings` fields, fail explicitly instead of being ignored.
+`streamSettings` fields, fail explicitly instead of being ignored. Xray TLS
+version/cipher/curve policy overrides, separate peer-name verification,
+server-side unknown-SNI rejection, session resumption, key logging, ECH fields,
+unsupported certificate loading options, and unknown `tlsSettings` fields also
+fail explicitly until Aerion exposes equivalent TLS controls.
 Inbound-only sing-box JSON can also run AnyTLS, Shadowsocks, Trojan, VMess,
 Hysteria2, TUIC, Naive, and VLESS server profiles, including Naive TCP-only /
 HTTP/3-only listener networks and VLESS raw, TLS, or REALITY inbound TLS
