@@ -258,8 +258,9 @@ clients and do not start fake upstream proxy processes. Mihomo route rules
 include exact, suffix, keyword, wildcard, regex, geo, IP CIDR, port, network,
 match/final forms, statically representable `OR` / `AND` logical rules, and
 `RULE-SET` expansion from inline or local YAML/text file
-`rule-providers` with `domain`, `ipcidr`, or `classical` behavior. Remote HTTP
-and binary MRS rule-provider loading still fails explicitly. Source/process
+`rule-providers` with `domain`, `ipcidr`, or `classical` behavior, including
+statically representable logical rules in classical payloads. Remote HTTP and
+binary MRS rule-provider loading still fails explicitly. Source/process
 matchers and `src` route parameters require routing metadata and fail
 explicitly. Mihomo `select`
 proxy-groups resolve to the first listed proxy. Mihomo health-check /

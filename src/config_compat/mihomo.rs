@@ -901,47 +901,13 @@ impl MihomoConfig {
         action: Option<RouteDecision>,
     ) -> Result<Vec<RouteRule>> {
         let (kind, payload, action) = split_mihomo_logical_rule(raw, location, action)?;
-        if kind == "NOT" {
-            bail!("{location} NOT requires negative route matching");
-        }
-        let children = mihomo_logical_children(payload, location)?;
-        ensure!(
-            !children.is_empty(),
-            "{location} {kind} rule has no child rules"
-        );
-        if kind == "OR" {
-            let mut rules = Vec::new();
-            for (child_index, child) in children.iter().enumerate() {
-                let child_location = format!("{location} {kind}[{child_index}]");
-                rules.extend(self.parse_mihomo_route_expr(
-                    child,
-                    &child_location,
-                    Some(action.clone()),
-                )?);
-            }
-            return Ok(rules);
-        }
-
-        let mut branches = vec![RouteRule::new(action.clone())];
-        for (child_index, child) in children.iter().enumerate() {
-            let child_location = format!("{location} {kind}[{child_index}]");
-            let child_rules =
-                self.parse_mihomo_route_expr(child, &child_location, Some(action.clone()))?;
-            ensure!(
-                !child_rules.is_empty(),
-                "{child_location} expands to no route rules"
-            );
-            let mut next = Vec::new();
-            for branch in &branches {
-                for child_rule in &child_rules {
-                    let mut merged = branch.clone();
-                    merge_mihomo_and_route_rule(&mut merged, child_rule.clone(), &child_location)?;
-                    next.push(merged);
-                }
-            }
-            branches = next;
-        }
-        Ok(branches)
+        parse_mihomo_logical_rules(
+            &kind,
+            payload,
+            location,
+            action,
+            |child, location, action| self.parse_mihomo_route_expr(child, location, Some(action)),
+        )
     }
 
     pub fn tun_enabled(&self) -> bool {
@@ -1160,7 +1126,7 @@ impl MihomoRuleProvider {
                 let mut rules = Vec::new();
                 for (index, line) in lines.iter().enumerate() {
                     let location = format!("mihomo rule-provider {name} payload[{index}]");
-                    rules.push(parse_mihomo_route_rule_with_action(
+                    rules.extend(parse_mihomo_route_expr_with_action(
                         line,
                         &location,
                         action.clone(),
@@ -2139,13 +2105,85 @@ fn mihomo_logical_children<'a>(payload: &'a str, location: &str) -> Result<Vec<&
     Ok(children)
 }
 
-fn parse_mihomo_route_rule_with_action(
+fn parse_mihomo_logical_rules<F>(
+    kind: &str,
+    payload: &str,
+    location: &str,
+    action: RouteDecision,
+    mut parse_child: F,
+) -> Result<Vec<RouteRule>>
+where
+    F: FnMut(&str, &str, RouteDecision) -> Result<Vec<RouteRule>>,
+{
+    if kind == "NOT" {
+        bail!("{location} NOT requires negative route matching");
+    }
+    let children = mihomo_logical_children(payload, location)?;
+    ensure!(
+        !children.is_empty(),
+        "{location} {kind} rule has no child rules"
+    );
+    if kind == "OR" {
+        let mut rules = Vec::new();
+        for (child_index, child) in children.iter().enumerate() {
+            let child_location = format!("{location} {kind}[{child_index}]");
+            rules.extend(parse_child(child, &child_location, action.clone())?);
+        }
+        return Ok(rules);
+    }
+
+    let mut branches = vec![RouteRule::new(action.clone())];
+    for (child_index, child) in children.iter().enumerate() {
+        let child_location = format!("{location} {kind}[{child_index}]");
+        let child_rules = parse_child(child, &child_location, action.clone())?;
+        ensure!(
+            !child_rules.is_empty(),
+            "{child_location} expands to no route rules"
+        );
+        let mut next = Vec::new();
+        for branch in &branches {
+            for child_rule in &child_rules {
+                let mut merged = branch.clone();
+                merge_mihomo_and_route_rule(&mut merged, child_rule.clone(), &child_location)?;
+                next.push(merged);
+            }
+        }
+        branches = next;
+    }
+    Ok(branches)
+}
+
+fn parse_mihomo_route_expr_with_action(
     raw: &str,
     location: &str,
     action: RouteDecision,
-) -> Result<RouteRule> {
+) -> Result<Vec<RouteRule>> {
     let parts = split_mihomo_rule(raw);
-    parse_mihomo_route_rule_parts(&parts, location, Some(action))
+    ensure!(
+        !parts.is_empty() && !parts[0].is_empty(),
+        "{location} is empty"
+    );
+    let kind = parts[0].to_ascii_uppercase();
+    match kind.as_str() {
+        "RULE-SET" => bail!("{location} nested RULE-SET requires rule-set expansion"),
+        "OR" | "AND" | "NOT" => {
+            let (kind, payload, action) = split_mihomo_logical_rule(raw, location, Some(action))?;
+            parse_mihomo_logical_rules(
+                &kind,
+                payload,
+                location,
+                action,
+                |child, location, action| {
+                    parse_mihomo_route_expr_with_action(child, location, action)
+                },
+            )
+        }
+        _ => Ok(vec![parse_mihomo_route_rule_parts(
+            &parts,
+            location,
+            Some(action),
+        )?]),
+    }
 }
 
 fn parse_mihomo_route_rule_parts(
@@ -2678,6 +2716,8 @@ rule-providers:
     payload:
       - DOMAIN-KEYWORD,video
       - DST-PORT,53
+      - OR,((DOMAIN-SUFFIX,or-a.test),(DOMAIN-SUFFIX,or-b.test))
+      - AND,((DOMAIN-SUFFIX,and.test),(DST-PORT,8443))
 rules:
   - RULE-SET,ads,REJECT
   - RULE-SET,lan,DIRECT
@@ -2731,6 +2771,27 @@ rules:
                 RouteNetwork::Udp
             ),
             RouteDecision::Proxy("proxy-a".to_string())
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("cdn.or-b.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-a".to_string())
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.and.test".to_string(), 8443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-a".to_string())
+        );
+        assert_eq!(
+            routes.decide(
+                &ProxyTarget::Domain("api.and.test".to_string(), 443),
+                RouteNetwork::Tcp
+            ),
+            RouteDecision::Proxy("proxy-b".to_string())
         );
         Ok(())
     }
