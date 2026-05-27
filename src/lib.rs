@@ -95,6 +95,8 @@ pub use shadowsocks::{
     run_shadowsocks_client_listener, run_shadowsocks_server,
 };
 pub use socks::{SocksProxyClientConfig, run_socks_proxy_client, run_socks_proxy_client_listener};
+pub use tls::TlsEchServerKeys;
+pub use tls_ech::{tls_ech_from_compat_reference, tls_ech_from_inline, tls_ech_from_path};
 pub use trojan::{
     TrojanClientConfig, TrojanServerConfig, run_trojan_client, run_trojan_client_listener,
     run_trojan_server, run_trojan_server_with_core,
