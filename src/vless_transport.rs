@@ -1,5 +1,7 @@
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
+use tokio::io::{AsyncRead, AsyncWrite};
+use crate::{vless_h2, vless_http, vless_websocket, vless_xhttp};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VlessTransportKind {
@@ -230,6 +232,64 @@ fn percent_encode_path_segment(value: &str) -> String {
         }
     }
     output
+}
+
+pub trait TransportStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T> TransportStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+pub type BoxedTransportStream = Box<dyn TransportStream>;
+
+pub async fn apply_client_transport<S>(
+    stream: S,
+    transport: &VlessTransportConfig,
+    default_host: &str,
+) -> Result<BoxedTransportStream>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match transport.kind {
+        VlessTransportKind::Tcp => Ok(Box::new(stream)),
+        VlessTransportKind::HttpUpgrade => {
+            let mut stream = stream;
+            vless_http::client_upgrade(&mut stream, transport, default_host).await?;
+            Ok(Box::new(stream))
+        }
+        VlessTransportKind::WebSocket => Ok(Box::new(
+            vless_websocket::client(stream, transport, default_host).await?,
+        )),
+        VlessTransportKind::Http2 => Ok(Box::new(
+            vless_h2::client(stream, transport, default_host).await?,
+        )),
+        VlessTransportKind::Grpc => Ok(Box::new(
+            vless_h2::grpc_client(stream, transport, default_host).await?,
+        )),
+        VlessTransportKind::Xhttp => Ok(Box::new(
+            vless_xhttp::client(stream, transport, default_host).await?,
+        )),
+    }
+}
+
+pub async fn apply_server_transport<S>(
+    stream: S,
+    transport: &VlessTransportConfig,
+) -> Result<BoxedTransportStream>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match transport.kind {
+        VlessTransportKind::Tcp => Ok(Box::new(stream)),
+        VlessTransportKind::HttpUpgrade => {
+            let mut stream = stream;
+            vless_http::server_upgrade(&mut stream, transport).await?;
+            Ok(Box::new(stream))
+        }
+        VlessTransportKind::WebSocket => {
+            Ok(Box::new(vless_websocket::server(stream, transport).await?))
+        }
+        VlessTransportKind::Http2 => Ok(Box::new(vless_h2::server(stream, transport).await?)),
+        VlessTransportKind::Grpc => Ok(Box::new(vless_h2::grpc_server(stream, transport).await?)),
+        VlessTransportKind::Xhttp => Ok(Box::new(vless_xhttp::server(stream, transport).await?)),
+    }
 }
 
 #[cfg(test)]

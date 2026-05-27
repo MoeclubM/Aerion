@@ -1,4 +1,4 @@
-use crate::protocol::ProxyTarget;
+use crate::protocol::{ProxyTarget, decode_target, encode_target};
 use anyhow::{Context, Result, bail, ensure};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -252,67 +252,12 @@ fn associate_packet_len(packet: &[u8]) -> Result<Option<usize>> {
 }
 
 fn write_socks_address(bytes: &mut Vec<u8>, target: &ProxyTarget) -> Result<()> {
-    match target {
-        ProxyTarget::Ip(addr) => match addr.ip() {
-            IpAddr::V4(ip) => {
-                bytes.push(0x01);
-                bytes.extend_from_slice(&ip.octets());
-                bytes.extend_from_slice(&addr.port().to_be_bytes());
-            }
-            IpAddr::V6(ip) => {
-                bytes.push(0x04);
-                bytes.extend_from_slice(&ip.octets());
-                bytes.extend_from_slice(&addr.port().to_be_bytes());
-            }
-        },
-        ProxyTarget::Domain(host, port) => {
-            ensure!(host.len() <= u8::MAX as usize, "domain too long");
-            bytes.push(0x03);
-            bytes.push(host.len() as u8);
-            bytes.extend_from_slice(host.as_bytes());
-            bytes.extend_from_slice(&port.to_be_bytes());
-        }
-    }
+    bytes.extend_from_slice(&encode_target(target)?);
     Ok(())
 }
 
 fn read_socks_address(packet: &[u8]) -> Result<(ProxyTarget, &[u8])> {
-    ensure!(!packet.is_empty(), "SOCKS address is empty");
-    match packet[0] {
-        0x01 => {
-            ensure!(packet.len() >= 7, "SOCKS IPv4 address is too short");
-            let ip = Ipv4Addr::new(packet[1], packet[2], packet[3], packet[4]);
-            let port = u16::from_be_bytes([packet[5], packet[6]]);
-            Ok((
-                ProxyTarget::Ip(SocketAddr::new(IpAddr::V4(ip), port)),
-                &packet[7..],
-            ))
-        }
-        0x03 => {
-            ensure!(packet.len() >= 2, "SOCKS domain address is too short");
-            let length = packet[1] as usize;
-            let port_offset = 2 + length;
-            ensure!(
-                packet.len() >= port_offset + 2,
-                "SOCKS domain address missing port"
-            );
-            let host = String::from_utf8(packet[2..port_offset].to_vec())
-                .context("decode SOCKS domain address")?;
-            let port = u16::from_be_bytes([packet[port_offset], packet[port_offset + 1]]);
-            Ok((ProxyTarget::Domain(host, port), &packet[port_offset + 2..]))
-        }
-        0x04 => {
-            ensure!(packet.len() >= 19, "SOCKS IPv6 address is too short");
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&packet[1..17]);
-            let port = u16::from_be_bytes([packet[17], packet[18]]);
-            Ok((
-                ProxyTarget::Ip(SocketAddr::new(IpAddr::from(octets), port)),
-                &packet[19..],
-            ))
-        }
-        other => bail!("unsupported SOCKS address type: {other}"),
-    }
+    decode_target(packet)
 }
 
 fn write_uot_address(bytes: &mut Vec<u8>, target: &ProxyTarget) -> Result<()> {

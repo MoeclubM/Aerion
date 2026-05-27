@@ -1,8 +1,9 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::{Duration, Instant};
 
@@ -825,6 +826,57 @@ fn rate_value(bytes_per_second: Option<u64>) -> u64 {
 
 fn normalize_ip(ip: IpAddr) -> String {
     ip.to_string().trim_start_matches("::ffff:").to_string()
+}
+
+pub async fn relay_bidirectional_counted<A, B>(
+    left: &mut A,
+    right: &mut B,
+    session: CoreSession,
+    label: &str,
+) -> Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut lr, mut lw) = tokio::io::split(left);
+    let (mut rr, mut rw) = tokio::io::split(right);
+    let uplink_session = session.clone();
+    let uplink = async {
+        let mut buffer = vec![0u8; 32 * 1024];
+        loop {
+            let read = lr
+                .read(&mut buffer)
+                .await
+                .with_context(|| format!("read {label} uplink"))?;
+            if read == 0 {
+                let _ = rw.shutdown().await;
+                return Ok::<(), anyhow::Error>(());
+            }
+            uplink_session.record_upload(read).await?;
+            rw.write_all(&buffer[..read])
+                .await
+                .with_context(|| format!("write {label} uplink"))?;
+        }
+    };
+    let downlink = async {
+        let mut buffer = vec![0u8; 32 * 1024];
+        loop {
+            let read = rr
+                .read(&mut buffer)
+                .await
+                .with_context(|| format!("read {label} downlink"))?;
+            if read == 0 {
+                let _ = lw.shutdown().await;
+                return Ok::<(), anyhow::Error>(());
+            }
+            session.record_download(read).await?;
+            lw.write_all(&buffer[..read])
+                .await
+                .with_context(|| format!("write {label} downlink"))?;
+        }
+    };
+    tokio::try_join!(uplink, downlink)?;
+    Ok(())
 }
 
 #[cfg(test)]

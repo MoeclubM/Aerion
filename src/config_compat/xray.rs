@@ -10,6 +10,8 @@ use crate::routing::{
     DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
 };
 use crate::server::ServerConfig;
+use crate::tls::TlsEchServerKeys;
+use crate::tls_ech::tls_ech_from_compat_reference;
 use crate::shadowsocks::{ShadowsocksClientConfig, ShadowsocksServerConfig};
 use crate::socks::SocksProxyClientConfig;
 use crate::trojan::{TrojanClientConfig, TrojanServerConfig};
@@ -859,7 +861,6 @@ impl XrayTlsSettings {
                 "TLS cipher suite policy",
             ),
             ("masterKeyLog", &self.master_key_log, "TLS key log output"),
-            ("echServerKeys", &self.ech_server_keys, "ECH server support"),
             ("echConfigList", &self.ech_config_list, "ECH client support"),
         ] {
             ensure!(
@@ -1631,6 +1632,7 @@ impl XrayInbound {
         )?;
         let (cert_path, key_path, certificates, key) =
             xray_tls_server_identity(certificate, "AnyTLS", self.name())?;
+        let ech = xray_tls_ech_server_keys(self.stream_settings.tls_settings.as_ref())?;
         let password = self
             .settings
             .password
@@ -1664,6 +1666,7 @@ impl XrayInbound {
             key,
             padding_scheme: PaddingScheme::default_lines(),
             heartbeat_interval_secs: 30,
+            ech,
         })
     }
 
@@ -2118,6 +2121,11 @@ impl XrayInbound {
             } else {
                 (PathBuf::new(), PathBuf::new(), Vec::new(), None)
             };
+        let ech = if stream_security.eq_ignore_ascii_case("tls") {
+            xray_tls_ech_server_keys(tls)?
+        } else {
+            None
+        };
         let reality = if stream_security.eq_ignore_ascii_case("reality") {
             let settings = reality_settings.with_context(|| {
                 format!(
@@ -2150,10 +2158,9 @@ impl XrayInbound {
             flow,
             reality,
             transport,
+            ech,
         })
     }
-
-    fn to_vmess_server_config(&self) -> Result<VmessServerConfig> {
         ensure_raw_or_tls_stream_security(
             "xray VMess",
             self.name(),
@@ -3588,6 +3595,17 @@ fn xray_raw_settings_has_unsupported_data(value: &Value) -> bool {
         }
     }
     false
+}
+
+fn xray_tls_ech_server_keys(tls: Option<&XrayTlsSettings>) -> Result<Option<TlsEchServerKeys>> {
+    let Some(value) = tls
+        .and_then(|settings| settings.ech_server_keys.as_ref())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(tls_ech_from_compat_reference(value)))
 }
 
 fn xray_tls_server_identity(

@@ -1,19 +1,21 @@
-use crate::core::{CoreSession, ProxyCore};
-use crate::protocol::{ProxyTarget, target_name};
-use crate::{
-    reality, reality_tls_client, socket_protect, socks, tls, uot, utls, vless_h2, vless_http,
-    vless_mux, vless_transport, vless_vision, vless_websocket, vless_xhttp, vless_xudp,
-};
+use crate::core::{CoreSession, ProxyCore, relay_bidirectional_counted};
+use crate::protocol::{ProxyTarget, parse_uuid, resolve_target_addr, target_name};
+use crate::tls::{ServerTlsAcceptor, ServerTlsMaterial, TlsEchServerKeys};
 use anyhow::{Context, Result, bail, ensure};
 use rustls::pki_types::ServerName;
+use crate::{
+    reality, reality_tls_client, socket_protect, socks, tls, uot, utls, vless_mux,
+    vless_transport, vless_vision, vless_xudp,
+};
 use std::collections::HashMap;
+use tokio::sync::Mutex;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use vless_transport::{VlessTransportConfig, VlessTransportKind};
+use vless_transport::VlessTransportConfig;
 
 const VERSION: u8 = 0x00;
 const CMD_TCP: u8 = 0x01;
@@ -59,6 +61,7 @@ pub struct VlessServerConfig {
     pub flow: String,
     pub reality: Option<reality::RealityServerConfig>,
     pub transport: VlessTransportConfig,
+    pub ech: Option<TlsEchServerKeys>,
 }
 
 struct VlessRequest {
@@ -68,9 +71,7 @@ struct VlessRequest {
     flow: String,
 }
 
-trait VlessIo: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T> VlessIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
-type BoxedVlessStream = Box<dyn VlessIo>;
+type BoxedVlessStream = vless_transport::BoxedTransportStream;
 
 #[derive(Clone)]
 struct RealityServerState {
@@ -119,19 +120,25 @@ pub async fn run_vless_server(config: VlessServerConfig) -> Result<()> {
 }
 
 pub async fn run_vless_server_with_core(config: VlessServerConfig, core: ProxyCore) -> Result<()> {
+    ensure!(
+        !(config.reality.is_some()
+            && config.ech.as_ref().is_some_and(TlsEchServerKeys::is_configured)),
+        "VLESS REALITY and TLS ECH are mutually exclusive server modes"
+    );
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind VLESS server on {}", config.listen))?;
     let acceptor = if config.reality.is_none() && config.tls {
-        let mut server_config = Arc::unwrap_or_clone(tls::server_config_from_material(
-            tls::present_path(&config.cert_path),
-            tls::present_path(&config.key_path),
-            &config.certificates,
-            config.key.as_deref(),
-            "VLESS server TLS",
-        )?);
-        server_config.alpn_protocols = config.transport.alpn_protocols();
-        Some(TlsAcceptor::from(Arc::new(server_config)))
+        Some(tls::build_server_tls_acceptor(&ServerTlsMaterial {
+            cert_path: tls::present_path(&config.cert_path).map(PathBuf::from),
+            key_path: tls::present_path(&config.key_path).map(PathBuf::from),
+            certificates: config.certificates.clone(),
+            key: config.key.clone(),
+            label: "VLESS server TLS".to_string(),
+            alpn_protocols: config.transport.alpn_protocols(),
+            early_data: false,
+            ech: config.ech.clone(),
+        })?)
     } else {
         None
     };
@@ -204,7 +211,7 @@ async fn handle_vless_socks_with_core(
             if is_vision_flow(&config.flow) {
                 relay_vision_client_counted(stream, server, user, session).await
             } else {
-                relay_counted(&mut stream, &mut server, session).await
+                relay_bidirectional_counted(&mut stream, &mut server, session, "VLESS").await
             }
         }
         socks::SocksRequest::UdpAssociate => {
@@ -234,9 +241,11 @@ async fn handle_vless_udp_associate_counted(
         return handle_vless_xudp_associate_counted(control, config, udp, user, session).await;
     }
 
+    let pool = Arc::new(VlessUdpSessionPool::new(config.clone(), user).await?);
     let udp_loop = {
         let udp = udp.clone();
         let session = session.clone();
+        let pool = pool.clone();
         async move {
             let mut buffer = vec![0u8; u16::MAX as usize + 32];
             loop {
@@ -246,14 +255,7 @@ async fn handle_vless_udp_associate_counted(
                     .context("receive SOCKS UDP packet")?;
                 let (target, payload) = uot::parse_socks_udp_packet(&buffer[..read])?;
                 session.record_upload(payload.len()).await?;
-                let response = vless_udp_roundtrip_counted(
-                    &config,
-                    user,
-                    target.clone(),
-                    payload,
-                    session.clone(),
-                )
-                .await?;
+                let response = pool.roundtrip(&target, payload).await?;
                 session.record_download(response.len()).await?;
                 let packet = uot::encode_socks_udp_packet(&target, &response)?;
                 udp.send_to(&packet, peer)
@@ -283,22 +285,46 @@ async fn handle_vless_udp_associate_counted(
     }
 }
 
-async fn vless_udp_roundtrip_counted(
-    config: &VlessClientConfig,
-    user: [u8; 16],
-    target: ProxyTarget,
-    payload: &[u8],
-    session: CoreSession,
-) -> Result<Vec<u8>> {
-    let mut server = connect_vless_server(config).await?;
-    write_vless_request(&mut server, &user, CMD_UDP, &target, "").await?;
-    read_vless_response_header(&mut server).await?;
-    write_vless_udp_frame(&mut server, payload).await?;
+async fn vless_udp_roundtrip_on_stream<S>(server: &mut S, payload: &[u8]) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_vless_udp_frame(server, payload).await?;
     server.flush().await.context("flush VLESS UDP request")?;
-    let response = read_vless_udp_frame(&mut server)
+    read_vless_udp_frame(server)
         .await?
-        .context("VLESS UDP response missing")?;
-    Ok(response)
+        .context("VLESS UDP response missing")
+}
+
+struct VlessUdpSessionPool {
+    config: VlessClientConfig,
+    user: [u8; 16],
+    sessions: Mutex<HashMap<String, BoxedVlessStream>>,
+}
+
+impl VlessUdpSessionPool {
+    async fn new(config: VlessClientConfig, user: [u8; 16]) -> Result<Self> {
+        Ok(Self {
+            config,
+            user,
+            sessions: Mutex::new(HashMap::new()),
+        })
+    }
+
+    async fn roundtrip(&self, target: &ProxyTarget, payload: &[u8]) -> Result<Vec<u8>> {
+        let key = target_name(target);
+        let mut sessions = self.sessions.lock().await;
+        if !sessions.contains_key(&key) {
+            let mut server = connect_vless_server(&self.config).await?;
+            write_vless_request(&mut server, &self.user, CMD_UDP, target, "").await?;
+            read_vless_response_header(&mut server).await?;
+            sessions.insert(key.clone(), server);
+        }
+        let server = sessions
+            .get_mut(&key)
+            .expect("VLESS UDP session pool entry exists");
+        vless_udp_roundtrip_on_stream(server, payload).await
+    }
 }
 
 async fn handle_vless_xudp_associate_counted(
@@ -394,10 +420,10 @@ async fn connect_vless_server(config: &VlessClientConfig) -> Result<BoxedVlessSt
         let stream = reality_tls_client::connect(tcp, reality, &config.sni, fingerprint, alpn)
             .await
             .context("REALITY connect to VLESS server")?;
-        return apply_client_transport(stream, config).await;
+        return vless_transport::apply_client_transport(stream, &config.transport, &config.server_host).await;
     }
     if !config.tls {
-        return apply_client_transport(tcp, config).await;
+        return vless_transport::apply_client_transport(tcp, &config.transport, &config.server_host).await;
     }
     let mut client_config = Arc::unwrap_or_clone(
         tls::client_config_with_fingerprint_and_custom_root_material_options(
@@ -420,35 +446,7 @@ async fn connect_vless_server(config: &VlessClientConfig) -> Result<BoxedVlessSt
         .connect(server_name, tcp)
         .await
         .context("TLS connect to VLESS server")?;
-    apply_client_transport(stream, config).await
-}
-
-async fn apply_client_transport<S>(
-    mut stream: S,
-    config: &VlessClientConfig,
-) -> Result<BoxedVlessStream>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    match config.transport.kind {
-        VlessTransportKind::Tcp => Ok(Box::new(stream)),
-        VlessTransportKind::HttpUpgrade => {
-            vless_http::client_upgrade(&mut stream, &config.transport, &config.server_host).await?;
-            Ok(Box::new(stream))
-        }
-        VlessTransportKind::WebSocket => Ok(Box::new(
-            vless_websocket::client(stream, &config.transport, &config.server_host).await?,
-        )),
-        VlessTransportKind::Http2 => Ok(Box::new(
-            vless_h2::client(stream, &config.transport, &config.server_host).await?,
-        )),
-        VlessTransportKind::Grpc => Ok(Box::new(
-            vless_h2::grpc_client(stream, &config.transport, &config.server_host).await?,
-        )),
-        VlessTransportKind::Xhttp => Ok(Box::new(
-            vless_xhttp::client(stream, &config.transport, &config.server_host).await?,
-        )),
-    }
+    vless_transport::apply_client_transport(stream, &config.transport, &config.server_host).await
 }
 
 async fn accept_reality_tls(
@@ -478,7 +476,7 @@ async fn accept_reality_tls(
 
 async fn handle_vless_client(
     stream: TcpStream,
-    acceptor: Option<TlsAcceptor>,
+    acceptor: Option<ServerTlsAcceptor>,
     reality: Option<RealityServerState>,
     users: HashMap<[u8; 16], String>,
     core: ProxyCore,
@@ -490,12 +488,12 @@ async fn handle_vless_client(
         let Some(stream) = accept_reality_tls(stream, &reality).await? else {
             return Ok(());
         };
-        apply_server_transport(stream, &transport).await?
+        vless_transport::apply_server_transport(stream, &transport).await?
     } else if let Some(acceptor) = acceptor {
         let stream = acceptor.accept(stream).await.context("accept VLESS TLS")?;
-        apply_server_transport(stream, &transport).await?
+        vless_transport::apply_server_transport(stream, &transport).await?
     } else {
-        apply_server_transport(stream, &transport).await?
+        vless_transport::apply_server_transport(stream, &transport).await?
     };
     let request = read_vless_request(&mut stream).await?;
     let credential = users
@@ -506,13 +504,13 @@ async fn handle_vless_client(
     let session = core.authenticate_from(&credential, peer).await?;
     match request.command {
         CMD_TCP => {
-            let mut remote = connect_target(&request.target).await?;
+            let mut remote = socket_protect::connect_proxy_target(&request.target).await?;
             write_vless_response_header(&mut stream).await?;
             tracing::info!("VLESS opened {}", target_name(&request.target));
             if is_vision_flow(&request.flow) {
                 relay_vision_server_counted(stream, remote, session, request.user).await
             } else {
-                relay_counted(&mut stream, &mut remote, session).await
+                relay_bidirectional_counted(&mut stream, &mut remote, session, "VLESS").await
             }
         }
         CMD_UDP => {
@@ -531,67 +529,6 @@ async fn handle_vless_client(
     }
 }
 
-async fn apply_server_transport<S>(
-    mut stream: S,
-    transport: &VlessTransportConfig,
-) -> Result<BoxedVlessStream>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    match transport.kind {
-        VlessTransportKind::Tcp => Ok(Box::new(stream)),
-        VlessTransportKind::HttpUpgrade => {
-            vless_http::server_upgrade(&mut stream, transport).await?;
-            Ok(Box::new(stream))
-        }
-        VlessTransportKind::WebSocket => {
-            Ok(Box::new(vless_websocket::server(stream, transport).await?))
-        }
-        VlessTransportKind::Http2 => Ok(Box::new(vless_h2::server(stream, transport).await?)),
-        VlessTransportKind::Grpc => Ok(Box::new(vless_h2::grpc_server(stream, transport).await?)),
-        VlessTransportKind::Xhttp => Ok(Box::new(vless_xhttp::server(stream, transport).await?)),
-    }
-}
-
-async fn relay_counted<A, B>(left: &mut A, right: &mut B, session: CoreSession) -> Result<()>
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-    B: AsyncRead + AsyncWrite + Unpin,
-{
-    let (mut lr, mut lw) = tokio::io::split(left);
-    let (mut rr, mut rw) = tokio::io::split(right);
-    let uplink_session = session.clone();
-    let uplink = async {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            let read = lr.read(&mut buffer).await.context("read VLESS uplink")?;
-            if read == 0 {
-                let _ = rw.shutdown().await;
-                return Ok::<(), anyhow::Error>(());
-            }
-            uplink_session.record_upload(read).await?;
-            rw.write_all(&buffer[..read])
-                .await
-                .context("write VLESS uplink")?;
-        }
-    };
-    let downlink = async {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            let read = rr.read(&mut buffer).await.context("read VLESS downlink")?;
-            if read == 0 {
-                let _ = lw.shutdown().await;
-                return Ok::<(), anyhow::Error>(());
-            }
-            session.record_download(read).await?;
-            lw.write_all(&buffer[..read])
-                .await
-                .context("write VLESS downlink")?;
-        }
-    };
-    tokio::try_join!(uplink, downlink)?;
-    Ok(())
-}
 
 async fn relay_vision_server_counted<S>(
     stream: S,
@@ -720,7 +657,7 @@ async fn relay_vless_udp<S>(mut stream: S, target: ProxyTarget, session: CoreSes
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let target_addr = target_socket_addr(&target).await?;
+    let target_addr = resolve_target_addr(&target).await?;
     let udp = UdpSocket::bind(if target_addr.is_ipv6() {
         "[::]:0"
     } else {
@@ -945,14 +882,6 @@ where
     }
 }
 
-fn parse_uuid(value: &str) -> Result<[u8; 16]> {
-    let normalized = value.chars().filter(|ch| *ch != '-').collect::<String>();
-    ensure!(normalized.len() == 32, "invalid VLESS UUID length");
-    let mut uuid = [0u8; 16];
-    hex::decode_to_slice(normalized, &mut uuid).context("decode VLESS UUID")?;
-    Ok(uuid)
-}
-
 fn is_vision_flow(flow: &str) -> bool {
     flow.trim().eq_ignore_ascii_case(FLOW_XTLS_RPRX_VISION)
 }
@@ -1073,28 +1002,6 @@ where
     let mut port = [0u8; 2];
     reader.read_exact(&mut port).await.context("read port")?;
     Ok(u16::from_be_bytes(port))
-}
-
-async fn connect_target(target: &ProxyTarget) -> Result<TcpStream> {
-    match target {
-        ProxyTarget::Ip(addr) => TcpStream::connect(addr)
-            .await
-            .with_context(|| format!("connect target {addr}")),
-        ProxyTarget::Domain(host, port) => TcpStream::connect((host.as_str(), *port))
-            .await
-            .with_context(|| format!("connect target {host}:{port}")),
-    }
-}
-
-async fn target_socket_addr(target: &ProxyTarget) -> Result<SocketAddr> {
-    match target {
-        ProxyTarget::Ip(addr) => Ok(*addr),
-        ProxyTarget::Domain(host, port) => tokio::net::lookup_host((host.as_str(), *port))
-            .await
-            .with_context(|| format!("resolve UDP target {host}:{port}"))?
-            .next()
-            .with_context(|| format!("UDP target resolved to no addresses: {host}:{port}")),
-    }
 }
 
 #[cfg(test)]

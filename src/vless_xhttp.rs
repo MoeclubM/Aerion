@@ -102,8 +102,10 @@ where
     ) -> Poll<std::io::Result<()>> {
         while self.pending_pos < self.pending_write.len() {
             let start = self.pending_pos;
-            let chunk = self.pending_write[start..].to_vec();
-            let written = ready!(Pin::new(&mut self.writer).poll_write(cx, &chunk))?;
+            let written = ready!(Pin::new(&mut self.writer).poll_write(
+                cx,
+                &self.pending_write[start..],
+            ))?;
             if written == 0 {
                 return Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,

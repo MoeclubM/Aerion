@@ -282,6 +282,13 @@ pub struct ServerFileConfig {
     pub padding_scheme: Vec<String>,
     #[serde(default = "default_heartbeat_interval_secs")]
     pub heartbeat_interval_secs: u64,
+    #[serde(
+        default,
+        alias = "ech-server-keys",
+        alias = "echServerKeys",
+        alias = "ech_server_keys"
+    )]
+    pub ech_server_keys: Option<String>,
     #[serde(default)]
     pub mtu: usize,
     #[serde(default, alias = "user-hint-mandatory", alias = "userHintMandatory")]

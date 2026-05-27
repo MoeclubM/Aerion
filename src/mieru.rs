@@ -1,5 +1,5 @@
-use crate::core::{CoreSession, CoreUser, ProxyCore};
-use crate::protocol::{ProxyTarget, target_name};
+use crate::core::{CoreSession, CoreUser, ProxyCore, relay_bidirectional_counted};
+use crate::protocol::{ProxyTarget, resolve_target_addr, target_name};
 use crate::socket_protect;
 use crate::uot;
 use anyhow::{Context, Result, bail, ensure};
@@ -2110,11 +2110,11 @@ async fn handle_mieru_server_socks_session(
 ) -> Result<()> {
     match read_socks_request(&mut session).await? {
         SocksRequest::Connect(target) => {
-            let mut remote = connect_target(&target).await?;
+            let mut remote = socket_protect::connect_proxy_target(&target).await?;
             let bind = remote.local_addr().unwrap_or_else(|_| unspecified_v4());
             write_socks_reply_with_bind(&mut session, 0, bind).await?;
             tracing::info!("Mieru opened {}", target_name(&target));
-            relay_counted(&mut session, &mut remote, core_session).await
+            relay_bidirectional_counted(&mut session, &mut remote, core_session, "Mieru").await
         }
         SocksRequest::UdpAssociate => handle_mieru_server_udp(session, core_session).await,
     }
@@ -2140,7 +2140,7 @@ async fn handle_mieru_server_udp(
             loop {
                 let read = read_packet_over_stream(&mut reader, &mut buffer).await?;
                 let (target, payload) = uot::parse_socks_udp_packet(&buffer[..read])?;
-                let target = target_socket_addr(&target).await?;
+                let target = resolve_target_addr(&target).await?;
                 core_session.record_upload(payload.len()).await?;
                 udp.send_to(payload, target).await?;
             }
@@ -2167,42 +2167,6 @@ async fn handle_mieru_server_udp(
         result = udp_to_remote => result,
         result = remote_to_udp => result,
     }
-}
-
-async fn relay_counted<A, B>(left: &mut A, right: &mut B, session: CoreSession) -> Result<()>
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-    B: AsyncRead + AsyncWrite + Unpin,
-{
-    let (mut lr, mut lw) = split(left);
-    let (mut rr, mut rw) = split(right);
-    let upload_session = session.clone();
-    let upload = async {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            let read = lr.read(&mut buffer).await?;
-            if read == 0 {
-                let _ = rw.shutdown().await;
-                return Ok::<(), anyhow::Error>(());
-            }
-            upload_session.record_upload(read).await?;
-            rw.write_all(&buffer[..read]).await?;
-        }
-    };
-    let download = async {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            let read = rr.read(&mut buffer).await?;
-            if read == 0 {
-                let _ = lw.shutdown().await;
-                return Ok::<(), anyhow::Error>(());
-            }
-            session.record_download(read).await?;
-            lw.write_all(&buffer[..read]).await?;
-        }
-    };
-    tokio::try_join!(upload, download)?;
-    Ok(())
 }
 
 async fn read_socks_greeting<R>(reader: &mut R) -> Result<Vec<u8>>
@@ -2391,28 +2355,6 @@ where
     writer.write_all(&[0xff]).await?;
     writer.flush().await?;
     Ok(())
-}
-
-async fn connect_target(target: &ProxyTarget) -> Result<TcpStream> {
-    match target {
-        ProxyTarget::Ip(addr) => TcpStream::connect(addr)
-            .await
-            .with_context(|| format!("connect target {addr}")),
-        ProxyTarget::Domain(host, port) => TcpStream::connect((host.as_str(), *port))
-            .await
-            .with_context(|| format!("connect target {host}:{port}")),
-    }
-}
-
-async fn target_socket_addr(target: &ProxyTarget) -> Result<SocketAddr> {
-    match target {
-        ProxyTarget::Ip(addr) => Ok(*addr),
-        ProxyTarget::Domain(host, port) => tokio::net::lookup_host((host.as_str(), *port))
-            .await
-            .with_context(|| format!("resolve UDP target {host}:{port}"))?
-            .next()
-            .with_context(|| format!("UDP target resolved to no addresses: {host}:{port}")),
-    }
 }
 
 fn unspecified_v4() -> SocketAddr {

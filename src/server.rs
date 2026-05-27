@@ -3,10 +3,11 @@ use crate::padding::PaddingScheme;
 use crate::protocol::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
     CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, Frame, ProxyTarget,
-    decode_target, parse_settings, read_auth_preface_user, read_frame, target_name, write_frame,
-    write_payload_chunks,
+    decode_target, parse_settings, read_auth_preface_user, read_frame, resolve_target_addr,
+    target_name, write_frame, write_payload_chunks,
 };
-use crate::tls;
+use crate::socket_protect;
+use crate::tls::{self, ServerTlsAcceptor, ServerTlsMaterial, ServerTlsStream, TlsEchServerKeys};
 use crate::uot;
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
@@ -20,8 +21,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, Wri
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, interval};
-use tokio_rustls::TlsAcceptor;
-use tokio_rustls::server::TlsStream;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -34,16 +33,17 @@ pub struct ServerConfig {
     pub key: Option<String>,
     pub padding_scheme: Vec<String>,
     pub heartbeat_interval_secs: u64,
+    pub ech: Option<TlsEchServerKeys>,
 }
 
 struct EarlyDataTlsStream {
     early_data: Vec<u8>,
     early_pos: usize,
-    inner: TlsStream<TcpStream>,
+    inner: ServerTlsStream,
 }
 
 impl EarlyDataTlsStream {
-    fn new(inner: TlsStream<TcpStream>, early_data: Vec<u8>) -> Self {
+    fn new(inner: ServerTlsStream, early_data: Vec<u8>) -> Self {
         Self {
             early_data,
             early_pos: 0,
@@ -107,14 +107,17 @@ pub async fn run_server_listener_with_core(
     config: ServerConfig,
     core: ProxyCore,
 ) -> Result<()> {
-    let tls_config = tls::server_config_early_data_from_material(
-        tls::present_path(&config.cert_path),
-        tls::present_path(&config.key_path),
-        &config.certificates,
-        config.key.as_deref(),
-        "AnyTLS server TLS",
-    )?;
-    let acceptor = TlsAcceptor::from(tls_config);
+    let tls_config = tls::build_server_tls_acceptor(&ServerTlsMaterial {
+        cert_path: tls::present_path(&config.cert_path).map(PathBuf::from),
+        key_path: tls::present_path(&config.key_path).map(PathBuf::from),
+        certificates: config.certificates.clone(),
+        key: config.key.clone(),
+        label: "AnyTLS server TLS".to_string(),
+        alpn_protocols: Vec::new(),
+        early_data: true,
+        ech: config.ech.clone(),
+    })?;
+    let acceptor = tls_config;
     let padding = PaddingScheme::from_lines(config.padding_scheme.clone())?;
     tracing::info!("server listening on {}", listener.local_addr()?);
     loop {
@@ -144,7 +147,7 @@ pub async fn run_server_listener_with_core(
 
 async fn handle_client(
     stream: TcpStream,
-    acceptor: TlsAcceptor,
+    acceptor: ServerTlsAcceptor,
     passwords: Vec<String>,
     padding: PaddingScheme,
     core: ProxyCore,
@@ -153,7 +156,7 @@ async fn handle_client(
 ) -> Result<()> {
     let mut tls_stream = acceptor.accept(stream).await.context("accept TLS client")?;
     let mut early_data = Vec::new();
-    if let Some(mut data) = tls_stream.get_mut().1.early_data() {
+    if let Some(mut data) = tls_stream.rustls_early_data() {
         data.read_to_end(&mut early_data)
             .context("read TLS early data")?;
     }
@@ -257,7 +260,7 @@ async fn open_stream(
     if uot::is_magic_target(&target) {
         return open_uot_stream(stream_id, &target, initial_payload, writer, session).await;
     }
-    let remote = match connect_target(&target).await {
+    let remote = match socket_protect::connect_proxy_target(&target).await {
         Ok(remote) => remote,
         Err(error) => {
             let mut writer = writer.lock().await;
@@ -297,13 +300,16 @@ async fn open_stream(
                     .read(&mut buffer)
                     .await
                     .context("read target payload")?;
-                let mut writer = downlink_writer.lock().await;
                 if read == 0 {
+                    let mut writer = downlink_writer.lock().await;
                     write_frame(&mut *writer, CMD_FIN, stream_id, &[]).await?;
                     return Ok::<(), anyhow::Error>(());
                 }
                 downlink_session.record_download(read).await?;
-                write_payload_chunks(&mut *writer, stream_id, &buffer[..read]).await?;
+                {
+                    let mut writer = downlink_writer.lock().await;
+                    write_payload_chunks(&mut *writer, stream_id, &buffer[..read]).await?;
+                }
             }
         }
         .await;
@@ -349,7 +355,7 @@ async fn open_uot_stream(
         _ => UdpSocket::bind("0.0.0.0:0").await?,
     };
     if request.is_connect {
-        let target = target_socket_addr(&request.destination).await?;
+        let target = resolve_target_addr(&request.destination).await?;
         udp.connect(target)
             .await
             .with_context(|| format!("connect UDP socket to {target}"))?;
@@ -387,7 +393,7 @@ async fn open_uot_stream(
                     }
                 } else {
                     let (target, payload) = uot::decode_associate_packet(&packet)?;
-                    let target = target_socket_addr(&target).await?;
+                    let target = resolve_target_addr(&target).await?;
                     uplink_session.record_upload(payload.len()).await?;
                     let sent = uplink_udp
                         .send_to(payload, target)
@@ -427,14 +433,15 @@ async fn open_uot_stream(
                         .context("receive UDP payload")?
                 };
                 let packet = if is_connect {
-                    downlink_session.record_download(read).await?;
                     uot::encode_connect_packet(&buffer[..read])?
                 } else {
-                    downlink_session.record_download(read).await?;
                     uot::encode_associate_packet(&ProxyTarget::Ip(source), &buffer[..read])?
                 };
-                let mut writer = downlink_writer.lock().await;
-                write_payload_chunks(&mut *writer, stream_id, &packet).await?;
+                downlink_session.record_download(read).await?;
+                {
+                    let mut writer = downlink_writer.lock().await;
+                    write_payload_chunks(&mut *writer, stream_id, &packet).await?;
+                }
             }
         }
         .await;
@@ -444,26 +451,4 @@ async fn open_uot_stream(
     });
 
     Ok((stream_id, sender))
-}
-
-async fn connect_target(target: &ProxyTarget) -> Result<TcpStream> {
-    match target {
-        ProxyTarget::Ip(addr) => TcpStream::connect(addr)
-            .await
-            .with_context(|| format!("connect target {addr}")),
-        ProxyTarget::Domain(host, port) => TcpStream::connect((host.as_str(), *port))
-            .await
-            .with_context(|| format!("connect target {host}:{port}")),
-    }
-}
-
-async fn target_socket_addr(target: &ProxyTarget) -> Result<SocketAddr> {
-    match target {
-        ProxyTarget::Ip(addr) => Ok(*addr),
-        ProxyTarget::Domain(host, port) => tokio::net::lookup_host((host.as_str(), *port))
-            .await
-            .with_context(|| format!("resolve UDP target {host}:{port}"))?
-            .next()
-            .with_context(|| format!("UDP target resolved to no addresses: {host}:{port}")),
-    }
 }

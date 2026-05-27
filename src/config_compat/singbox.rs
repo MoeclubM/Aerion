@@ -13,6 +13,8 @@ use crate::routing::{
     DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
 };
 use crate::server::ServerConfig;
+use crate::tls::TlsEchServerKeys;
+use crate::tls_ech::tls_ech_from_singbox_value;
 use crate::shadowsocks::{ShadowsocksClientConfig, ShadowsocksServerConfig};
 use crate::socks::SocksProxyClientConfig;
 use crate::trojan::{TrojanClientConfig, TrojanServerConfig};
@@ -2056,12 +2058,16 @@ impl SingBoxVlessInbound {
                         && !json_value_non_empty_option(tls.key_path.as_ref()),
                     "sing-box VLESS inbound {name} sets TLS certificate fields while TLS certificate mode is disabled"
                 );
-                ensure!(
-                    !json_value_non_empty_option(tls.ech.as_ref()),
-                    "sing-box VLESS inbound {name} sets ECH; Aerion VLESS server does not expose ECH"
-                );
             }
             (PathBuf::new(), PathBuf::new(), Vec::new(), None)
+        };
+        let ech = if tls_enabled && reality.is_none() {
+            tls.and_then(|settings| settings.ech.as_ref())
+                .map(tls_ech_from_singbox_value)
+                .transpose()?
+                .flatten()
+        } else {
+            None
         };
         Ok(VlessServerConfig {
             listen: SocketAddr::new(
@@ -2080,6 +2086,7 @@ impl SingBoxVlessInbound {
             flow,
             reality,
             transport,
+            ech,
         })
     }
 }
@@ -2104,6 +2111,13 @@ impl SingBoxAnyTlsInbound {
             .with_context(|| format!("sing-box AnyTLS inbound {name} is missing users"))?;
         let (cert_path, key_path, certificates, key) =
             singbox_tls_server_identity(&self.tls, "AnyTLS", name)?;
+        let ech = self
+            .tls
+            .ech
+            .as_ref()
+            .map(tls_ech_from_singbox_value)
+            .transpose()?
+            .flatten();
         Ok(ServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
@@ -2128,6 +2142,7 @@ impl SingBoxAnyTlsInbound {
                 self.padding_scheme.clone()
             },
             heartbeat_interval_secs: 30,
+            ech,
         })
     }
 }
@@ -3309,10 +3324,6 @@ impl SingBoxTlsOptions {
         self.reject_unsupported_fields(protocol, name, "inbound")?;
         ensure_disabled_utls(name, self)?;
         ensure_disabled_reality(name, self)?;
-        ensure!(
-            !json_value_non_empty_option(self.ech.as_ref()),
-            "sing-box {protocol} inbound {name} sets ECH; Aerion server does not expose ECH"
-        );
         if tls_disabled {
             ensure!(
                 !json_value_non_empty_option(self.certificate_path.as_ref())

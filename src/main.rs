@@ -385,6 +385,7 @@ async fn main() -> Result<()> {
                     padding_scheme
                 },
                 heartbeat_interval_secs,
+                ech: None,
             })
             .await
         }
@@ -1336,6 +1337,10 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             .transpose()?;
         let certificates = if tls { server.certificates } else { Vec::new() };
         let key = if tls { server.key_pem } else { None };
+        let ech = server
+            .ech_server_keys
+            .as_deref()
+            .map(aerion::tls_ech::tls_ech_from_compat_reference);
         return run_vless_server(VlessServerConfig {
             listen: server.listen,
             user_id: native_user_id(server.user_id, &server.username, "VLESS server")?,
@@ -1348,6 +1353,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             flow: server.flow,
             reality,
             transport,
+            ech,
         })
         .await;
     }
@@ -1389,6 +1395,10 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
     }
     ensure_supported_protocol(&server.protocol)?;
     let (cert_path, key_path) = native_tls_paths(&server, "AnyTLS")?;
+    let ech = server
+        .ech_server_keys
+        .as_deref()
+        .map(aerion::tls_ech::tls_ech_from_compat_reference);
     run_server(ServerConfig {
         listen: server.listen,
         password: server.password,
@@ -1399,6 +1409,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
         key: server.key_pem,
         padding_scheme: server.padding_scheme,
         heartbeat_interval_secs: server.heartbeat_interval_secs,
+        ech,
     })
     .await
 }

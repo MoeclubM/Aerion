@@ -1,7 +1,9 @@
-use anyhow::{Context, Result};
+use crate::protocol::ProxyTarget;
+use anyhow::{Context, Result, bail};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::task::JoinSet;
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -38,22 +40,63 @@ pub fn protect_socket_fd(fd: i32) -> Result<()> {
     Ok(())
 }
 
+pub async fn connect_proxy_target(target: &ProxyTarget) -> Result<TcpStream> {
+    match target {
+        ProxyTarget::Ip(addr) => connect_tcp_addr(*addr)
+            .await
+            .with_context(|| format!("connect target {addr}")),
+        ProxyTarget::Domain(host, port) => connect_tcp_host_port(host, *port)
+            .await
+            .with_context(|| format!("connect target {host}:{port}")),
+    }
+}
+
 pub async fn connect_tcp_host_port(host: &str, port: u16) -> Result<TcpStream> {
-    let mut last_error = None;
-    for addr in tokio::net::lookup_host((host, port))
+    let addrs = tokio::net::lookup_host((host, port))
         .await
         .with_context(|| format!("resolve TCP peer {host}:{port}"))?
-    {
-        match connect_tcp_addr(addr).await {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last_error = Some(error),
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        bail!("TCP peer resolved to no addresses: {host}:{port}");
+    }
+    if addrs.len() == 1 {
+        return connect_tcp_addr(addrs[0])
+            .await
+            .with_context(|| format!("connect target {}", addrs[0]));
+    }
+    let mut racers = JoinSet::new();
+    for addr in addrs {
+        racers.spawn(async move {
+            connect_tcp_addr(addr)
+                .await
+                .map_err(|error| (addr, error))
+        });
+    }
+    let mut last_error = None;
+    while let Some(result) = racers.join_next().await {
+        match result {
+            Ok(Ok(stream)) => {
+                racers.abort_all();
+                return Ok(stream);
+            }
+            Ok(Err((addr, error))) => {
+                last_error = Some(anyhow::anyhow!("connect TCP peer {addr}: {error:#}"));
+            }
+            Err(join_error) => {
+                last_error = Some(anyhow::anyhow!("TCP dial task failed: {join_error}"));
+            }
         }
     }
-    Err(last_error
-        .unwrap_or_else(|| anyhow::anyhow!("TCP peer resolved to no addresses: {host}:{port}")))
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("TCP peer resolved to no addresses: {host}:{port}")))
 }
 
 pub async fn connect_tcp_addr(addr: SocketAddr) -> Result<TcpStream> {
+    let stream = connect_tcp_addr_inner(addr).await?;
+    let _ = stream.set_nodelay(true);
+    Ok(stream)
+}
+
+async fn connect_tcp_addr_inner(addr: SocketAddr) -> Result<TcpStream> {
     #[cfg(unix)]
     {
         let socket = if addr.is_ipv4() {

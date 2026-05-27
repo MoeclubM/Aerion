@@ -1,6 +1,6 @@
 use crate::core::{CoreSession, CoreUser, ProxyCore};
 use crate::listener;
-use crate::protocol::{ProxyTarget, target_name};
+use crate::protocol::{ProxyTarget, parse_uuid, resolve_target_addr, target_name};
 use crate::{socket_protect, socks, tls};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use bytes::Bytes;
@@ -936,7 +936,7 @@ async fn handle_server_packet_bytes(
         return Ok(());
     };
     let session = auth.wait_session().await?;
-    let target = target_socket_addr(&packet.target).await?;
+    let target = resolve_target_addr(&packet.target).await?;
     let udp_session = get_server_udp_session(
         connection,
         udp_sessions,
@@ -1006,7 +1006,7 @@ async fn handle_server_bi_stream(
         .await?
         .context("TUIC connect target address is none")?;
     let session = auth.wait_session().await?;
-    let remote = match connect_target(&target).await {
+    let remote = match socket_protect::connect_proxy_target(&target).await {
         Ok(remote) => remote,
         Err(error) => {
             let _ = send.finish();
@@ -1517,23 +1517,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
-fn parse_uuid(value: &str) -> Result<[u8; 16]> {
-    let text = value.trim();
-    let mut hex = String::with_capacity(32);
-    for ch in text.chars() {
-        if ch != '-' {
-            hex.push(ch);
-        }
-    }
-    ensure!(hex.len() == 32, "UUID must contain 16 bytes");
-    let mut output = [0u8; 16];
-    for index in 0..16 {
-        output[index] =
-            u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).context("parse UUID hex")?;
-    }
-    Ok(output)
-}
-
 fn format_uuid(uuid: &[u8; 16]) -> String {
     let hex = hex::encode(uuid);
     format!(
@@ -1583,28 +1566,6 @@ fn tuic_user_map(config: &TuicServerConfig) -> Result<HashMap<[u8; 16], TuicUser
         );
     }
     Ok(map)
-}
-
-async fn connect_target(target: &ProxyTarget) -> Result<TcpStream> {
-    match target {
-        ProxyTarget::Ip(addr) => socket_protect::connect_tcp_addr(*addr)
-            .await
-            .with_context(|| format!("connect TUIC target {addr}")),
-        ProxyTarget::Domain(host, port) => socket_protect::connect_tcp_host_port(host, *port)
-            .await
-            .with_context(|| format!("connect TUIC target {host}:{port}")),
-    }
-}
-
-async fn target_socket_addr(target: &ProxyTarget) -> Result<SocketAddr> {
-    match target {
-        ProxyTarget::Ip(addr) => Ok(*addr),
-        ProxyTarget::Domain(host, port) => tokio::net::lookup_host((host.as_str(), *port))
-            .await
-            .with_context(|| format!("resolve TUIC UDP target {host}:{port}"))?
-            .next()
-            .with_context(|| format!("TUIC UDP target resolved to no addresses: {host}:{port}")),
-    }
 }
 
 async fn resolve_host_addr(host: &str, port: u16) -> Result<SocketAddr> {

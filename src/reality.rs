@@ -1,4 +1,6 @@
-use crate::client_hello::{BuiltClientHello, ClientHelloParams, build_client_hello};
+use crate::client_hello::{
+    BuiltClientHello, ClientHelloParams, build_client_hello, encode_tls_record,
+};
 use crate::utls::UtlsFingerprint;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -957,14 +959,6 @@ mod tests {
         handshake.push((body.len() & 0xff) as u8);
         handshake.extend_from_slice(&body);
         handshake
-    }
-
-    fn encode_tls_record(handshake: &[u8]) -> Result<Vec<u8>> {
-        ensure!(handshake.len() <= u16::MAX as usize);
-        let mut record = vec![TLS_CONTENT_TYPE_HANDSHAKE, 0x03, 0x03];
-        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
-        record.extend_from_slice(handshake);
-        Ok(record)
     }
 
     fn encode_server_name_extension(server_name: &str) -> Vec<u8> {

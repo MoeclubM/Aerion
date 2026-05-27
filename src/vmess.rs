@@ -1,11 +1,8 @@
 use crate::core::{CoreSession, ProxyCore};
-use crate::protocol::{ProxyTarget, target_name};
-use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
+use crate::protocol::{ProxyTarget, parse_uuid, resolve_target_addr, target_name};
+use crate::vless_transport::VlessTransportConfig;
 use crate::vmess_body::{BodyConfig, BodyReader, BodyWriter, RequestOptions, SecurityType};
-use crate::{
-    socket_protect, socks, tls, uot, utls, vless_h2, vless_http, vless_websocket, vless_xhttp,
-    vless_xudp,
-};
+use crate::{socket_protect, socks, tls, uot, utls, vless_transport, vless_xudp};
 use aes::Aes128;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, generic_array::GenericArray};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -78,11 +75,7 @@ pub struct VmessServerConfig {
     pub transport: VlessTransportConfig,
 }
 
-trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
-
-impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
-
-type VmessTransport = Box<dyn AsyncReadWrite>;
+type VmessTransport = vless_transport::BoxedTransportStream;
 
 struct VmessRequest {
     command: u8,
@@ -202,7 +195,7 @@ pub async fn run_vmess_server_with_core(config: VmessServerConfig, core: ProxyCo
         tokio::spawn(async move {
             let result = async {
                 let stream = accept_vmess_transport(stream, acceptor).await?;
-                let stream = apply_vmess_server_transport(stream, &transport).await?;
+                let stream = vless_transport::apply_server_transport(stream, &transport).await?;
                 handle_vmess_client(stream, users, core, peer).await
             }
             .await;
@@ -251,7 +244,7 @@ async fn connect_vmess_transport(config: &VmessClientConfig) -> Result<VmessTran
                 )
             })?;
     if !config.tls {
-        return apply_vmess_client_transport(tcp, config).await;
+        return vless_transport::apply_client_transport(tcp, &config.transport, &config.server_host).await;
     }
     let mut client_config = Arc::unwrap_or_clone(
         tls::client_config_with_fingerprint_and_custom_root_material_options(
@@ -279,7 +272,7 @@ async fn connect_vmess_transport(config: &VmessClientConfig) -> Result<VmessTran
         .connect(server_name, tcp)
         .await
         .context("TLS connect to VMess server")?;
-    apply_vmess_client_transport(stream, config).await
+    vless_transport::apply_client_transport(stream, &config.transport, &config.server_host).await
 }
 
 async fn accept_vmess_transport(
@@ -294,56 +287,6 @@ async fn accept_vmess_transport(
     }
 }
 
-async fn apply_vmess_client_transport<S>(
-    mut stream: S,
-    config: &VmessClientConfig,
-) -> Result<VmessTransport>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    match config.transport.kind {
-        VlessTransportKind::Tcp => Ok(Box::new(stream)),
-        VlessTransportKind::HttpUpgrade => {
-            vless_http::client_upgrade(&mut stream, &config.transport, &config.server_host).await?;
-            Ok(Box::new(stream))
-        }
-        VlessTransportKind::WebSocket => Ok(Box::new(
-            vless_websocket::client(stream, &config.transport, &config.server_host).await?,
-        )),
-        VlessTransportKind::Http2 => Ok(Box::new(
-            vless_h2::client(stream, &config.transport, &config.server_host).await?,
-        )),
-        VlessTransportKind::Grpc => Ok(Box::new(
-            vless_h2::grpc_client(stream, &config.transport, &config.server_host).await?,
-        )),
-        VlessTransportKind::Xhttp => Ok(Box::new(
-            vless_xhttp::client(stream, &config.transport, &config.server_host).await?,
-        )),
-    }
-}
-
-async fn apply_vmess_server_transport<S>(
-    mut stream: S,
-    transport: &VlessTransportConfig,
-) -> Result<VmessTransport>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    match transport.kind {
-        VlessTransportKind::Tcp => Ok(Box::new(stream)),
-        VlessTransportKind::HttpUpgrade => {
-            vless_http::server_upgrade(&mut stream, transport).await?;
-            Ok(Box::new(stream))
-        }
-        VlessTransportKind::WebSocket => {
-            Ok(Box::new(vless_websocket::server(stream, transport).await?))
-        }
-        VlessTransportKind::Http2 => Ok(Box::new(vless_h2::server(stream, transport).await?)),
-        VlessTransportKind::Grpc => Ok(Box::new(vless_h2::grpc_server(stream, transport).await?)),
-        VlessTransportKind::Xhttp => Ok(Box::new(vless_xhttp::server(stream, transport).await?)),
-    }
-}
-
 async fn handle_vmess_client(
     mut stream: VmessTransport,
     users: HashMap<[u8; 16], String>,
@@ -354,7 +297,7 @@ async fn handle_vmess_client(
     let session = core.authenticate_from(&credential, peer).await?;
     match request.command {
         CMD_TCP => {
-            let remote = connect_target(&request.target).await?;
+            let remote = socket_protect::connect_proxy_target(&request.target).await?;
             write_vmess_response_header(&mut stream, &request).await?;
             tracing::info!("VMess opened {}", target_name(&request.target));
             relay_vmess_tcp(stream, remote, request, session).await
@@ -842,7 +785,7 @@ async fn relay_vmess_udp(
         return relay_vmess_packetaddr_udp(client_reader, client_writer, session).await;
     }
 
-    let target = target_socket_addr(&request.target).await?;
+    let target = resolve_target_addr(&request.target).await?;
     let socket = Arc::new(
         UdpSocket::bind(if target.is_ipv4() {
             "0.0.0.0:0"
@@ -920,7 +863,7 @@ where
                 return Ok::<(), anyhow::Error>(());
             };
             uplink_session.record_upload(payload.len()).await?;
-            let target = target_socket_addr(&target).await?;
+            let target = resolve_target_addr(&target).await?;
             let sent = uplink_socket
                 .send_to(&payload, target)
                 .await
@@ -976,7 +919,7 @@ where
         while let Some(packet) = client_reader.read_packet().await? {
             let (target, payload) = decode_vmess_packetaddr_packet(&packet)?;
             uplink_session.record_upload(payload.len()).await?;
-            let target = target_socket_addr(&target).await?;
+            let target = resolve_target_addr(&target).await?;
             let sent = uplink_socket
                 .send_to(payload, target)
                 .await
@@ -1439,14 +1382,6 @@ fn decode_vmess_packetaddr_packet(data: &[u8]) -> Result<(ProxyTarget, &[u8])> {
     }
 }
 
-fn parse_uuid(value: &str) -> Result<[u8; 16]> {
-    let normalized = value.chars().filter(|ch| *ch != '-').collect::<String>();
-    ensure!(normalized.len() == 32, "invalid VMess UUID length");
-    let mut uuid = [0u8; 16];
-    hex::decode_to_slice(normalized, &mut uuid).context("decode VMess UUID")?;
-    Ok(uuid)
-}
-
 fn vmess_users(user_id: &str, users: &[String]) -> Result<HashMap<[u8; 16], String>> {
     let mut map = HashMap::new();
     for credential in std::iter::once(user_id).chain(users.iter().map(String::as_str)) {
@@ -1650,28 +1585,6 @@ fn vmess_request_options(command: u8, security: SecurityType) -> RequestOptions 
         options.enable_chunk_stream();
     }
     options
-}
-
-async fn connect_target(target: &ProxyTarget) -> Result<TcpStream> {
-    match target {
-        ProxyTarget::Ip(addr) => TcpStream::connect(addr)
-            .await
-            .with_context(|| format!("connect target {addr}")),
-        ProxyTarget::Domain(host, port) => TcpStream::connect((host.as_str(), *port))
-            .await
-            .with_context(|| format!("connect target {host}:{port}")),
-    }
-}
-
-async fn target_socket_addr(target: &ProxyTarget) -> Result<SocketAddr> {
-    match target {
-        ProxyTarget::Ip(addr) => Ok(*addr),
-        ProxyTarget::Domain(host, port) => tokio::net::lookup_host((host.as_str(), *port))
-            .await
-            .with_context(|| format!("resolve UDP target {host}:{port}"))?
-            .next()
-            .with_context(|| format!("no UDP address resolved for {host}:{port}")),
-    }
 }
 
 #[cfg(test)]

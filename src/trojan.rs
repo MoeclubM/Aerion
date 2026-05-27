@@ -1,8 +1,8 @@
-use crate::core::{CoreSession, ProxyCore};
-use crate::protocol::{ProxyTarget, target_name};
+use crate::core::{CoreSession, ProxyCore, relay_bidirectional_counted};
+use crate::protocol::{ProxyTarget, resolve_target_addr, target_name};
 use crate::socket_protect;
-use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
-use crate::{socks, tls, uot, utls, vless_h2, vless_http, vless_websocket, vless_xhttp};
+use crate::vless_transport::VlessTransportConfig;
+use crate::{socks, tls, uot, utls, vless_transport};
 use anyhow::{Context, Result, bail, ensure};
 use rustls::pki_types::ServerName;
 use sha2::{Digest, Sha224};
@@ -52,11 +52,7 @@ pub struct TrojanServerConfig {
     pub transport: VlessTransportConfig,
 }
 
-trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
-
-impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
-
-type TrojanTransport = Box<dyn AsyncReadWrite>;
+type TrojanTransport = vless_transport::BoxedTransportStream;
 
 enum TrojanRequest {
     Connect(ProxyTarget),
@@ -164,7 +160,7 @@ async fn handle_trojan_socks_with_core(
             write_trojan_request(&mut server, &config.password, CMD_CONNECT, &target).await?;
             socks::write_reply(&mut stream, 0x00).await?;
             tracing::info!("Trojan proxying {}", target_name(&target));
-            relay_counted(&mut stream, &mut server, session).await
+            relay_bidirectional_counted(&mut stream, &mut server, session, "Trojan").await
         }
         socks::SocksRequest::UdpAssociate => {
             let bind_ip = match stream.local_addr()?.ip() {
@@ -303,57 +299,7 @@ async fn connect_trojan_server(config: &TrojanClientConfig) -> Result<TrojanTran
         .connect(server_name, tcp)
         .await
         .context("TLS connect to Trojan server")?;
-    apply_trojan_client_transport(stream, config).await
-}
-
-async fn apply_trojan_client_transport<S>(
-    mut stream: S,
-    config: &TrojanClientConfig,
-) -> Result<TrojanTransport>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    match config.transport.kind {
-        VlessTransportKind::Tcp => Ok(Box::new(stream)),
-        VlessTransportKind::HttpUpgrade => {
-            vless_http::client_upgrade(&mut stream, &config.transport, &config.server_host).await?;
-            Ok(Box::new(stream))
-        }
-        VlessTransportKind::WebSocket => Ok(Box::new(
-            vless_websocket::client(stream, &config.transport, &config.server_host).await?,
-        )),
-        VlessTransportKind::Http2 => Ok(Box::new(
-            vless_h2::client(stream, &config.transport, &config.server_host).await?,
-        )),
-        VlessTransportKind::Grpc => Ok(Box::new(
-            vless_h2::grpc_client(stream, &config.transport, &config.server_host).await?,
-        )),
-        VlessTransportKind::Xhttp => Ok(Box::new(
-            vless_xhttp::client(stream, &config.transport, &config.server_host).await?,
-        )),
-    }
-}
-
-async fn apply_trojan_server_transport<S>(
-    mut stream: S,
-    transport: &VlessTransportConfig,
-) -> Result<TrojanTransport>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    match transport.kind {
-        VlessTransportKind::Tcp => Ok(Box::new(stream)),
-        VlessTransportKind::HttpUpgrade => {
-            vless_http::server_upgrade(&mut stream, transport).await?;
-            Ok(Box::new(stream))
-        }
-        VlessTransportKind::WebSocket => {
-            Ok(Box::new(vless_websocket::server(stream, transport).await?))
-        }
-        VlessTransportKind::Http2 => Ok(Box::new(vless_h2::server(stream, transport).await?)),
-        VlessTransportKind::Grpc => Ok(Box::new(vless_h2::grpc_server(stream, transport).await?)),
-        VlessTransportKind::Xhttp => Ok(Box::new(vless_xhttp::server(stream, transport).await?)),
-    }
+    vless_transport::apply_client_transport(stream, &config.transport, &config.server_host).await
 }
 
 async fn handle_trojan_client(
@@ -365,57 +311,17 @@ async fn handle_trojan_client(
     transport: VlessTransportConfig,
 ) -> Result<()> {
     let stream = acceptor.accept(stream).await.context("accept Trojan TLS")?;
-    let mut stream = apply_trojan_server_transport(stream, &transport).await?;
+    let mut stream = vless_transport::apply_server_transport(stream, &transport).await?;
     let credential = read_trojan_auth(&mut stream, &auth).await?;
     let session = core.authenticate_from(&credential, peer).await?;
     match read_trojan_request(&mut stream).await? {
         TrojanRequest::Connect(target) => {
-            let mut remote = connect_target(&target).await?;
+            let mut remote = socket_protect::connect_proxy_target(&target).await?;
             tracing::info!("Trojan opened {}", target_name(&target));
-            relay_counted(&mut stream, &mut remote, session).await
+            relay_bidirectional_counted(&mut stream, &mut remote, session, "Trojan").await
         }
         TrojanRequest::UdpAssociate => relay_trojan_udp(stream, session).await,
     }
-}
-
-async fn relay_counted<A, B>(left: &mut A, right: &mut B, session: CoreSession) -> Result<()>
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-    B: AsyncRead + AsyncWrite + Unpin,
-{
-    let (mut lr, mut lw) = tokio::io::split(left);
-    let (mut rr, mut rw) = tokio::io::split(right);
-    let uplink_session = session.clone();
-    let uplink = async {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            let read = lr.read(&mut buffer).await.context("read Trojan uplink")?;
-            if read == 0 {
-                let _ = rw.shutdown().await;
-                return Ok::<(), anyhow::Error>(());
-            }
-            uplink_session.record_upload(read).await?;
-            rw.write_all(&buffer[..read])
-                .await
-                .context("write Trojan uplink")?;
-        }
-    };
-    let downlink = async {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            let read = rr.read(&mut buffer).await.context("read Trojan downlink")?;
-            if read == 0 {
-                let _ = lw.shutdown().await;
-                return Ok::<(), anyhow::Error>(());
-            }
-            session.record_download(read).await?;
-            lw.write_all(&buffer[..read])
-                .await
-                .context("write Trojan downlink")?;
-        }
-    };
-    tokio::try_join!(uplink, downlink)?;
-    Ok(())
 }
 
 async fn relay_trojan_udp(stream: TrojanTransport, session: CoreSession) -> Result<()> {
@@ -431,7 +337,7 @@ async fn relay_trojan_udp(stream: TrojanTransport, session: CoreSession) -> Resu
         let session = session.clone();
         async move {
             while let Some(packet) = read_trojan_udp_packet(&mut reader).await? {
-                let target = target_socket_addr(&packet.target).await?;
+                let target = resolve_target_addr(&packet.target).await?;
                 session.record_upload(packet.payload.len()).await?;
                 udp.send_to(&packet.payload, target)
                     .await
@@ -693,28 +599,6 @@ fn trojan_auth_map(password: &str, users: &[String]) -> HashMap<[u8; TROJAN_AUTH
         map.insert(auth, credential.to_string());
     }
     map
-}
-
-async fn connect_target(target: &ProxyTarget) -> Result<TcpStream> {
-    match target {
-        ProxyTarget::Ip(addr) => TcpStream::connect(addr)
-            .await
-            .with_context(|| format!("connect target {addr}")),
-        ProxyTarget::Domain(host, port) => TcpStream::connect((host.as_str(), *port))
-            .await
-            .with_context(|| format!("connect target {host}:{port}")),
-    }
-}
-
-async fn target_socket_addr(target: &ProxyTarget) -> Result<SocketAddr> {
-    match target {
-        ProxyTarget::Ip(addr) => Ok(*addr),
-        ProxyTarget::Domain(host, port) => tokio::net::lookup_host((host.as_str(), *port))
-            .await
-            .with_context(|| format!("resolve UDP target {host}:{port}"))?
-            .next()
-            .with_context(|| format!("UDP target resolved to no addresses: {host}:{port}")),
-    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 use crate::core::CoreSession;
-use crate::protocol::ProxyTarget;
+use crate::protocol::{ProxyTarget, resolve_target_addr};
+use crate::socket_protect;
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -296,7 +297,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let generation = next_session_generation();
-    let remote = connect_target(&destination).await?;
+    let remote = socket_protect::connect_proxy_target(&destination).await?;
     let (remote_reader, remote_writer) = split(remote);
     let remote_writer = Arc::new(AsyncMutex::new(remote_writer));
     let task = tokio::spawn({
@@ -697,28 +698,13 @@ async fn target_socket_addr_cached(
             {
                 return Ok(addr);
             }
-            let addr = tokio::net::lookup_host((host.as_str(), *port))
-                .await
-                .with_context(|| format!("resolve UDP target {host}:{port}"))?
-                .next()
-                .with_context(|| format!("UDP target resolved to no addresses: {host}:{port}"))?;
+            let addr = resolve_target_addr(target).await?;
             cache
                 .lock()
                 .expect("vless mux UDP cache poisoned")
                 .insert(key, addr);
             Ok(addr)
         }
-    }
-}
-
-async fn connect_target(target: &ProxyTarget) -> Result<TcpStream> {
-    match target {
-        ProxyTarget::Ip(addr) => TcpStream::connect(addr)
-            .await
-            .with_context(|| format!("connect mux TCP target {addr}")),
-        ProxyTarget::Domain(host, port) => TcpStream::connect((host.as_str(), *port))
-            .await
-            .with_context(|| format!("connect mux TCP target {host}:{port}")),
     }
 }
 

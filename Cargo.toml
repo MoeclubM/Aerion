@@ -3,6 +3,11 @@ name = "aerion"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# Server-side TLS ECH via BoringSSL (rustls/ring does not support server ECH yet).
+boring-ech = ["dep:boring", "dep:tokio-boring"]
+
 [dependencies]
 anyhow = "1"
 aes = "0.8"
@@ -43,6 +48,8 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 tun2proxy = { version = "0.7.21", default-features = false }
 tproxy-config = { version = "^7.0.7", default-features = false }
 regex = "1"
+boring = { version = "5", optional = true }
+tokio-boring = { version = "5", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

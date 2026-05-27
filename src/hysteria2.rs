@@ -1,6 +1,6 @@
 use crate::core::{CoreSession, CoreUserLimits, ProxyCore};
 use crate::listener;
-use crate::protocol::{ProxyTarget, target_name};
+use crate::protocol::{ProxyTarget, resolve_target_addr, target_name};
 use crate::{socket_protect, socks, tls, uot};
 use anyhow::{Context, Result, bail, ensure};
 use blake2::Blake2bVar;
@@ -985,7 +985,7 @@ async fn handle_hy2_tcp_stream(
             return Err(error);
         }
     };
-    let mut remote = match connect_target(&target).await {
+    let mut remote = match socket_protect::connect_proxy_target(&target).await {
         Ok(remote) => remote,
         Err(error) => {
             write_tcp_response(&mut send, 1, &error.to_string()).await?;
@@ -1045,7 +1045,7 @@ async fn handle_server_udp_datagrams(
                 continue;
             }
         };
-        let target_addr = match target_socket_addr(&target).await {
+        let target_addr = match resolve_target_addr(&target).await {
             Ok(addr) => addr,
             Err(error) => {
                 tracing::warn!(?error, target = %target_name(&target), "resolve Hysteria2 UDP target failed");
@@ -1427,28 +1427,6 @@ async fn resolve_host_addr(host: &str, port: u16) -> Result<SocketAddr> {
         .with_context(|| format!("resolve {host}:{port}"))?
         .next()
         .with_context(|| format!("{host}:{port} resolved to no addresses"))
-}
-
-async fn connect_target(target: &ProxyTarget) -> Result<TcpStream> {
-    match target {
-        ProxyTarget::Ip(addr) => TcpStream::connect(addr)
-            .await
-            .with_context(|| format!("connect target {addr}")),
-        ProxyTarget::Domain(host, port) => TcpStream::connect((host.as_str(), *port))
-            .await
-            .with_context(|| format!("connect target {host}:{port}")),
-    }
-}
-
-async fn target_socket_addr(target: &ProxyTarget) -> Result<SocketAddr> {
-    match target {
-        ProxyTarget::Ip(addr) => Ok(*addr),
-        ProxyTarget::Domain(host, port) => tokio::net::lookup_host((host.as_str(), *port))
-            .await
-            .with_context(|| format!("resolve UDP target {host}:{port}"))?
-            .next()
-            .with_context(|| format!("UDP target resolved to no addresses: {host}:{port}")),
-    }
 }
 
 async fn bind_udp_socket_for_target(target: SocketAddr) -> Result<UdpSocket> {

@@ -1,4 +1,4 @@
-use crate::protocol::{ProxyTarget, target_name};
+use crate::protocol::{ProxyTarget, resolve_target_addr, target_name};
 use crate::{socket_protect, socks, uot};
 use anyhow::{Context, Result, bail, ensure};
 use shadowsocks::config::{
@@ -212,7 +212,7 @@ where
         );
         return relay_shadowsocks_uot_stream(inbound, target).await;
     }
-    let mut outbound = connect_proxy_target(&target).await?;
+    let mut outbound = socket_protect::connect_proxy_target(&target).await?;
     tracing::info!("Shadowsocks serving TCP {}", target_name(&target));
     tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
         .await
@@ -523,7 +523,7 @@ where
         .context("bind Shadowsocks UOT UDP socket")?,
     );
     if request.is_connect {
-        let target = resolve_proxy_target(&request.destination).await?;
+        let target = resolve_target_addr(&request.destination).await?;
         udp.connect(target)
             .await
             .with_context(|| format!("connect Shadowsocks UOT UDP target {target}"))?;
@@ -554,7 +554,7 @@ where
                             );
                         }
                     } else {
-                        let target = resolve_proxy_target(&destination).await?;
+                        let target = resolve_target_addr(&destination).await?;
                         let sent = udp
                             .send_to(&payload, target)
                             .await
@@ -643,26 +643,6 @@ async fn connect_shadowsocks_udp_server(
         &runtime.server,
         ShadowsocksUdpSocket::from(udp),
     ))
-}
-
-async fn connect_proxy_target(target: &ProxyTarget) -> Result<TcpStream> {
-    match target {
-        ProxyTarget::Ip(addr) => socket_protect::connect_tcp_addr(*addr).await,
-        ProxyTarget::Domain(host, port) => socket_protect::connect_tcp_host_port(host, *port).await,
-    }
-}
-
-async fn resolve_proxy_target(target: &ProxyTarget) -> Result<SocketAddr> {
-    match target {
-        ProxyTarget::Ip(addr) => Ok(*addr),
-        ProxyTarget::Domain(host, port) => tokio::net::lookup_host((host.as_str(), *port))
-            .await
-            .with_context(|| format!("resolve Shadowsocks UOT target {host}:{port}"))?
-            .next()
-            .with_context(|| {
-                format!("Shadowsocks UOT target resolved to no addresses: {host}:{port}")
-            }),
-    }
 }
 
 async fn resolve_shadowsocks_address(target: &ShadowsocksAddress) -> Result<SocketAddr> {

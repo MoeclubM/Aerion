@@ -1,5 +1,7 @@
+use crate::tls_ech::{TlsEchServerKeys, ensure_server_ech_available};
 use crate::utls::UtlsFingerprint;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
+use std::path::PathBuf;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{
@@ -9,11 +11,188 @@ use rustls::{
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const MAX_EARLY_DATA_SIZE: u32 = 64 * 1024;
+
+pub use crate::tls_ech::TlsEchServerKeys;
+
+/// Material required to build a server-side TLS acceptor (rustls or BoringSSL+ECH).
+#[derive(Clone, Debug)]
+pub struct ServerTlsMaterial {
+    pub cert_path: Option<PathBuf>,
+    pub key_path: Option<PathBuf>,
+    pub certificates: Vec<String>,
+    pub key: Option<String>,
+    pub label: String,
+    pub alpn_protocols: Vec<Vec<u8>>,
+    pub early_data: bool,
+    pub ech: Option<TlsEchServerKeys>,
+}
+
+impl ServerTlsMaterial {
+    pub fn ensure_supported(&self) -> Result<()> {
+        if self.ech.as_ref().is_some_and(TlsEchServerKeys::is_configured) && self.early_data {
+            bail!(
+                "TLS early data is incompatible with server ECH on {}; disable one of them",
+                self.label
+            );
+        }
+        ensure_server_ech_available(&self.ech)
+    }
+}
+
+pub enum ServerTlsAcceptor {
+    Rustls(tokio_rustls::TlsAcceptor),
+    #[cfg(feature = "boring-ech")]
+    Boring(std::sync::Arc<crate::tls_ech::boring_backend::BoringTlsAcceptor>),
+}
+
+impl Clone for ServerTlsAcceptor {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Rustls(acceptor) => Self::Rustls(acceptor.clone()),
+            #[cfg(feature = "boring-ech")]
+            Self::Boring(acceptor) => Self::Boring(acceptor.clone()),
+        }
+    }
+}
+
+impl ServerTlsAcceptor {
+    pub async fn accept(
+        &self,
+        stream: tokio::net::TcpStream,
+    ) -> Result<ServerTlsStream> {
+        match self {
+            Self::Rustls(acceptor) => {
+                let stream = acceptor
+                    .accept(stream)
+                    .await
+                    .context("accept rustls client")?;
+                Ok(ServerTlsStream::Rustls(stream))
+            }
+            #[cfg(feature = "boring-ech")]
+            Self::Boring(acceptor) => {
+                let stream = acceptor.accept(stream).await?;
+                Ok(ServerTlsStream::Boring(stream))
+            }
+        }
+    }
+}
+
+pub enum ServerTlsStream {
+    Rustls(tokio_rustls::server::TlsStream<tokio::net::TcpStream>),
+    #[cfg(feature = "boring-ech")]
+    Boring(tokio_boring::SslStream<tokio::net::TcpStream>),
+}
+
+impl ServerTlsStream {
+    pub fn rustls_early_data(&mut self) -> Option<impl Read + '_> {
+        match self {
+            Self::Rustls(stream) => stream.get_mut().1.early_data(),
+            #[cfg(feature = "boring-ech")]
+            Self::Boring(_) => None,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for ServerTlsStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Rustls(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            #[cfg(feature = "boring-ech")]
+            Self::Boring(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for ServerTlsStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
+        match &mut *self {
+            Self::Rustls(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            #[cfg(feature = "boring-ech")]
+            Self::Boring(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        match &mut *self {
+            Self::Rustls(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            #[cfg(feature = "boring-ech")]
+            Self::Boring(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        match &mut *self {
+            Self::Rustls(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            #[cfg(feature = "boring-ech")]
+            Self::Boring(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+pub fn build_server_tls_acceptor(material: &ServerTlsMaterial) -> Result<ServerTlsAcceptor> {
+    material.ensure_supported()?;
+    if material.ech.as_ref().is_some_and(TlsEchServerKeys::is_configured) {
+        #[cfg(feature = "boring-ech")]
+        {
+            return Ok(ServerTlsAcceptor::Boring(
+                crate::tls_ech::boring_backend::build_boring_acceptor(
+                    material.cert_path.as_deref(),
+                    material.key_path.as_deref(),
+                    &material.certificates,
+                    material.key.as_deref(),
+                    &material.label,
+                    &material.alpn_protocols,
+                    &material.ech,
+                )?,
+            ));
+        }
+        #[cfg(not(feature = "boring-ech"))]
+        {
+            bail!(
+                "TLS ECH server keys are configured for {} but Aerion was built without the `boring-ech` feature",
+                material.label
+            );
+        }
+    }
+    let (certs, key) = server_identity(
+        material.cert_path.as_deref(),
+        material.key_path.as_deref(),
+        &material.certificates,
+        material.key.as_deref(),
+        &material.label,
+    )?;
+    let mut config = build_server_config(certs, key, &material.label)?;
+    if !material.alpn_protocols.is_empty() {
+        config.alpn_protocols = material.alpn_protocols.clone();
+    } else {
+        config.alpn_protocols.clear();
+    }
+    if material.early_data {
+        config.max_early_data_size = MAX_EARLY_DATA_SIZE;
+    }
+    Ok(ServerTlsAcceptor::Rustls(tokio_rustls::TlsAcceptor::from(
+        Arc::new(config),
+    )))
+}
 
 #[derive(Debug)]
 pub(crate) struct InsecureVerifier;

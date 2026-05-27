@@ -89,19 +89,32 @@ where
     }
 
     pub async fn write_frame(&mut self, cmd: u8, stream_id: u32, payload: &[u8]) -> Result<()> {
+        self.write_frame_with_flush(cmd, stream_id, payload, true).await
+    }
+
+    pub async fn write_frame_with_flush(
+        &mut self,
+        cmd: u8,
+        stream_id: u32,
+        payload: &[u8],
+        flush: bool,
+    ) -> Result<()> {
         ensure!(
             payload.len() <= MAX_FRAME_PAYLOAD_LEN,
             "Aerion frame payload too large"
         );
         let frame = encode_frame(cmd, stream_id, payload);
-        self.write_packet(&frame)
+        self.write_packet(&frame, flush)
             .await
             .context("write Aerion frame")
     }
 
     pub async fn write_payload_chunks(&mut self, stream_id: u32, payload: &[u8]) -> Result<()> {
-        for chunk in payload.chunks(MAX_FRAME_PAYLOAD_LEN) {
-            self.write_frame(CMD_PSH, stream_id, chunk).await?;
+        let chunks = payload.chunks(MAX_FRAME_PAYLOAD_LEN).collect::<Vec<_>>();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let flush = index + 1 == chunks.len();
+            self.write_frame_with_flush(CMD_PSH, stream_id, chunk, flush)
+                .await?;
         }
         Ok(())
     }
@@ -113,7 +126,7 @@ where
         Ok(())
     }
 
-    async fn write_packet(&mut self, mut payload: &[u8]) -> Result<()> {
+    async fn write_packet(&mut self, mut payload: &[u8], flush: bool) -> Result<()> {
         if self.send_padding {
             self.packet_counter = self.packet_counter.saturating_add(1);
             let packet = self.packet_counter;
@@ -160,7 +173,9 @@ where
                     }
                 }
                 if payload.is_empty() {
-                    self.inner.flush().await.context("flush padded packet")?;
+                    if flush {
+                        self.inner.flush().await.context("flush padded packet")?;
+                    }
                     return Ok(());
                 }
             } else {
@@ -171,7 +186,10 @@ where
             .write_all(payload)
             .await
             .context("write payload")?;
-        self.inner.flush().await.context("flush packet")
+        if flush {
+            self.inner.flush().await.context("flush packet")?;
+        }
+        Ok(())
     }
 }
 
@@ -369,6 +387,25 @@ pub fn target_name(target: &ProxyTarget) -> String {
         ProxyTarget::Ip(addr) => addr.to_string(),
         ProxyTarget::Domain(host, port) => format!("{host}:{port}"),
     }
+}
+
+pub async fn resolve_target_addr(target: &ProxyTarget) -> Result<SocketAddr> {
+    match target {
+        ProxyTarget::Ip(addr) => Ok(*addr),
+        ProxyTarget::Domain(host, port) => tokio::net::lookup_host((host.as_str(), *port))
+            .await
+            .with_context(|| format!("resolve UDP target {host}:{port}"))?
+            .next()
+            .with_context(|| format!("UDP target resolved to no addresses: {host}:{port}")),
+    }
+}
+
+pub fn parse_uuid(value: &str) -> Result<[u8; 16]> {
+    let normalized = value.chars().filter(|ch| *ch != '-').collect::<String>();
+    ensure!(normalized.len() == 32, "invalid UUID length");
+    let mut uuid = [0u8; 16];
+    hex::decode_to_slice(normalized, &mut uuid).context("decode UUID")?;
+    Ok(uuid)
 }
 
 #[cfg(test)]
