@@ -308,28 +308,18 @@ pub mod boring_backend {
         let entries = ech.load_entries()?;
         let mut keys = boring::ssl::SslEchKeys::builder().context("allocate SslEchKeys")?;
         for (index, entry) in entries.iter().enumerate() {
-            add_ech_entry(&mut keys, entry, index == 0)
+            ensure!(
+                !entry.private_key.is_empty() && !entry.config.is_empty(),
+                "ECH key entry is missing private key or config"
+            );
+            let hpke_key =
+                HpkeKey::dhkem_p256_sha256(&entry.private_key).context("parse ECH HPKE private key")?;
+            keys.add_key(index == 0, &entry.config, hpke_key)
                 .with_context(|| format!("add ECH server key entry {}", index + 1))?;
         }
         builder
             .set_ech_keys(&keys.build())
             .context("register ECH server keys on TLS context")?;
-        Ok(())
-    }
-
-    fn add_ech_entry(
-        keys: &mut boring::ssl::SslEchKeysBuilder,
-        entry: &EchServerKeyEntry,
-        is_retry_config: bool,
-    ) -> Result<()> {
-        ensure!(
-            !entry.private_key.is_empty() && !entry.config.is_empty(),
-            "ECH key entry is missing private key or config"
-        );
-        let hpke_key =
-            HpkeKey::dhkem_p256_sha256(&entry.private_key).context("parse ECH HPKE private key")?;
-        keys.add_key(is_retry_config, &entry.config, hpke_key)
-            .context("register ECH config and private key")?;
         Ok(())
     }
 }
