@@ -122,6 +122,38 @@
       }
     },
     {
+      "tag": "anytls",
+      "protocol": "anytls",
+      "settings": {
+        "address": "example.com",
+        "port": 443,
+        "password": "secret"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "example.com",
+          "allowInsecure": false
+        }
+      }
+    },
+    {
+      "tag": "mieru-tcp",
+      "protocol": "mieru",
+      "settings": {
+        "address": "example.com",
+        "port": 8964,
+        "user": "default",
+        "password": "secret",
+        "network": "tcp"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      }
+    },
+    {
       "tag": "http-proxy",
       "protocol": "http",
       "settings": {

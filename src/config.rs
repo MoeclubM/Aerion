@@ -576,7 +576,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.xray.example.json");
         assert!(matches!(
             load_config(&path).expect("xray config"),
-            FileConfig::Xray(config) if config.outbounds.len() == 9
+            FileConfig::Xray(config) if config.outbounds.len() == 11
         ));
     }
 
@@ -585,7 +585,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.singbox.example.json");
         assert!(matches!(
             load_config(&path).expect("sing-box config"),
-            FileConfig::SingBox(config) if config.outbounds.len() == 12
+            FileConfig::SingBox(config) if config.outbounds.len() == 13
         ));
     }
 

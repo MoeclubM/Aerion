@@ -87,6 +87,15 @@
       }
     },
     {
+      "type": "mieru",
+      "tag": "mieru-tcp",
+      "server": "example.com",
+      "server_port": 8964,
+      "username": "default",
+      "password": "secret",
+      "transport": "tcp"
+    },
+    {
       "type": "naive",
       "tag": "naive-h2",
       "server": "example.com",

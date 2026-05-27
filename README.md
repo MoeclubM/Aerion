@@ -111,11 +111,12 @@ Aerion now provides these server/client protocol stacks:
     `proxy-groups`
   - `XrayConfig` parses Xray JSON / JSONC `inbounds` and `outbounds`
     profiles with Shadowsocks, HTTP proxy, SOCKS proxy, VLESS, VMess, Trojan,
-    Hysteria2, freedom, blackhole, and statically equivalent single-outbound
-    routing balancer selection helpers
+    Hysteria2, AnyTLS, Mieru, freedom, blackhole, local TUN inbound, and
+    statically equivalent single-outbound routing balancer selection helpers
   - `SingBoxConfig` parses sing-box JSON / JSONC `inbounds` and `outbounds`
     profiles with Shadowsocks, HTTP proxy, VLESS, VMess, Trojan, Hysteria2,
-    AnyTLS, Naive, TUIC, direct, and block selection helpers
+    AnyTLS, Mieru, Naive, TUIC, direct, block, and local TUN inbound selection
+    helpers
   - protocol modules expose the bottom-level connection capability; profile
     selection and service/app policy stay in the integrating client or server
   - unsupported transport mismatches such as mihomo `smux` fail with explicit
@@ -226,9 +227,12 @@ cargo run -- run --config config.xray.example.json --profile http-proxy
 cargo run -- run --config config.xray.example.json --profile socks-proxy
 cargo run -- run --config config.xray.example.json --profile shadowsocks
 cargo run -- run --config config.xray.example.json --profile hysteria2
+cargo run -- run --config config.xray.example.json --profile anytls
+cargo run -- run --config config.xray.example.json --profile mieru-tcp
 cargo run -- run --config config.xray.example.json --profile direct-out
 cargo run -- run --config config.xray.example.json --profile blackhole-out
 cargo run -- run --config config.singbox.example.json --profile anytls
+cargo run -- run --config config.singbox.example.json --profile mieru-tcp
 cargo run -- run --config config.singbox.example.json --profile shadowsocks
 cargo run -- run --config config.singbox.example.json --profile naive-h2
 cargo run -- run --config config.singbox.example.json --profile http-proxy
@@ -316,10 +320,10 @@ profile, `settings`, stream transport, REALITY/finalmask, mux, and
 version/cipher/curve policy overrides, separate peer-name verification,
 server-side unknown-SNI rejection, session resumption, key logging, ECH fields,
 unsupported certificate loading options, and unknown `tlsSettings` fields also
-fail explicitly until Aerion exposes equivalent TLS controls. Xray non-SOCKS
-local inbound protocols, local SOCKS inbound authentication, sniffing, and
-non-raw transport settings also fail explicitly because the Aerion client
-listener is plain no-auth SOCKS over TCP.
+fail explicitly until Aerion exposes equivalent TLS controls. Xray local
+inbound protocols other than `socks` / `tun`, local SOCKS inbound
+authentication, sniffing, and non-raw transport settings also fail explicitly
+because the Aerion config runner exposes plain no-auth SOCKS and TUN listeners.
 Unsupported sing-box top-level config options such as `log` / `dns` /
 `experimental` fail explicitly for the same reason.
 sing-box TLS engine/version/cipher/curve overrides, SNI suppression, certificate
@@ -331,12 +335,13 @@ unsupported VLESS transport fields, Hysteria2 obfs fields, and disabled
 `multiplex` blocks that still carry settings fail explicitly too. sing-box
 local inbound protocols other than `socks` / `mixed` / `tun`, plus local
 `socks` / `mixed` inbound options, fail explicitly for the same reason.
-Inbound-only sing-box JSON can also run AnyTLS, Shadowsocks, Trojan, VMess,
-Hysteria2, TUIC, Naive, and VLESS server profiles, including Naive TCP-only /
-HTTP/3-only listener networks and VLESS raw, TLS, or REALITY inbound TLS
-settings.
-Inbound-only Xray JSON can run Shadowsocks, Hysteria2, Trojan, VLESS, and VMess
-server profiles, with VLESS raw, TLS, or REALITY stream security.
+Inbound-only sing-box JSON can also run AnyTLS, Mieru, Shadowsocks, Trojan,
+VMess, Hysteria2, TUIC, Naive, and VLESS server profiles, including Naive
+TCP-only / HTTP/3-only listener networks and VLESS raw, TLS, or REALITY inbound
+TLS settings.
+Inbound-only Xray JSON can run AnyTLS, Mieru, Shadowsocks, Hysteria2, Trojan,
+VLESS, and VMess server profiles, with VLESS raw, TLS, or REALITY stream
+security.
 
 ## Run Hysteria2
 

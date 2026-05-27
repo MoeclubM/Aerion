@@ -1,6 +1,9 @@
+use crate::client::ClientConfig;
 use crate::config_compat::mihomo::OneOrManyStrings;
 use crate::http_connect::HttpProxyClientConfig;
 use crate::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
+use crate::mieru::{MieruClientConfig, MieruServerConfig, MieruTransport, MieruUser};
+use crate::padding::PaddingScheme;
 use crate::reality::{RealityClientConfig, RealityServerConfig};
 use crate::router::RouteClientConfig;
 use crate::routing::{
@@ -8,7 +11,9 @@ use crate::routing::{
 };
 use crate::shadowsocks::{ShadowsocksClientConfig, ShadowsocksServerConfig};
 use crate::socks::SocksProxyClientConfig;
+use crate::server::ServerConfig;
 use crate::trojan::{TrojanClientConfig, TrojanServerConfig};
+use crate::tun::{TunConfig, socks_proxy_url};
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless::{VlessClientConfig, VlessServerConfig};
 use crate::vless_transport::{VlessTransportConfig, VlessTransportKind};
@@ -1074,10 +1079,12 @@ impl XrayRealitySettings {
 
 #[derive(Clone, Debug)]
 pub enum XrayClientConfig {
+    AnyTls(ClientConfig),
     Route(RouteClientConfig),
     HttpProxy(HttpProxyClientConfig),
     Shadowsocks(ShadowsocksClientConfig),
     SocksProxy(SocksProxyClientConfig),
+    Mieru(MieruClientConfig),
     Vless(VlessClientConfig),
     Vmess(VmessClientConfig),
     Trojan(TrojanClientConfig),
@@ -1085,8 +1092,10 @@ pub enum XrayClientConfig {
 }
 
 pub enum XrayServerConfig {
+    AnyTls(ServerConfig),
     Shadowsocks(ShadowsocksServerConfig),
     Hysteria2(Hysteria2ServerConfig),
+    Mieru(MieruServerConfig),
     Trojan(TrojanServerConfig),
     Vless(VlessServerConfig),
     Vmess(VmessServerConfig),
@@ -1114,8 +1123,8 @@ impl XrayConfig {
         for inbound in &self.inbounds {
             let protocol = inbound.protocol.trim();
             ensure!(
-                protocol.eq_ignore_ascii_case("socks"),
-                "xray inbound {} protocol {protocol} is not a local SOCKS listener; Aerion config runner exposes a SOCKS listener only",
+                protocol.eq_ignore_ascii_case("socks") || protocol.eq_ignore_ascii_case("tun"),
+                "xray inbound {} protocol {protocol} is not a local SOCKS/TUN listener; Aerion config runner exposes SOCKS and TUN listeners only",
                 inbound.name()
             );
         }
@@ -1135,6 +1144,119 @@ impl XrayConfig {
         let port = inbound.port.context("xray socks inbound is missing port")?;
         let host = inbound.listen.as_deref().unwrap_or("0.0.0.0");
         Ok(Some(SocketAddr::new(parse_listen_ip("xray", host)?, port)))
+    }
+
+    pub fn tun_enabled(&self) -> bool {
+        self.inbounds
+            .iter()
+            .any(|inbound| inbound.protocol.eq_ignore_ascii_case("tun"))
+    }
+
+    pub fn tun_config(&self, proxy_listen: SocketAddr) -> Result<Option<TunConfig>> {
+        let Some(inbound) = self
+            .inbounds
+            .iter()
+            .find(|inbound| inbound.protocol.eq_ignore_ascii_case("tun"))
+        else {
+            return Ok(None);
+        };
+        ensure_no_extra_fields(&format!("xray TUN inbound {}", inbound.name()), &inbound.extra)?;
+        inbound
+            .stream_settings
+            .reject_local_socks_listener_fields(&format!("xray TUN inbound {}", inbound.name()))?;
+        let settings = &inbound.settings;
+        ensure!(
+            settings.version.is_none()
+                && settings.clients.is_empty()
+                && settings.vnext.is_empty()
+                && settings.servers.is_empty()
+                && settings.fallbacks.is_empty()
+                && settings.port.is_none()
+                && settings.id.is_none()
+                && settings.password.is_none()
+                && settings.auth.is_none()
+                && settings.user.is_none()
+                && settings.pass.is_none()
+                && settings.headers.is_empty()
+                && settings.network.is_none()
+                && settings.domain_strategy.is_none()
+                && settings.redirect.is_none()
+                && settings.user_level.is_none()
+                && settings.response.is_none()
+                && settings.flow.is_none()
+                && settings.packet_encoding.is_none()
+                && settings.security.is_none()
+                && settings.method.is_none()
+                && settings.decryption.is_none()
+                && settings.alter_id.is_none(),
+            "xray TUN inbound {} sets proxy protocol settings; TUN only accepts interface settings",
+            inbound.name()
+        );
+        let mut config = TunConfig::new(socks_proxy_url(proxy_listen));
+        if let Some(name) = xray_extra_string(&settings.extra, "interfaceName")
+            .or_else(|| xray_extra_string(&settings.extra, "interface_name"))
+            .or_else(|| xray_extra_string(&settings.extra, "device"))
+        {
+            config.tun_name = Some(name);
+        }
+        if let Some(mtu) = xray_extra_u16(&settings.extra, "mtu") {
+            config.mtu = mtu;
+        }
+        if let Some(auto_route) = xray_extra_bool(&settings.extra, "autoRoute")
+            .or_else(|| xray_extra_bool(&settings.extra, "auto_route"))
+        {
+            config.setup = auto_route;
+        }
+        config.bypass = xray_route_value_strings(
+            settings
+                .extra
+                .get("routeExcludeAddress")
+                .or_else(|| settings.extra.get("route_exclude_address")),
+        )?;
+        let allowed = [
+            "interfaceName",
+            "interface_name",
+            "device",
+            "mtu",
+            "autoRoute",
+            "auto_route",
+            "routeExcludeAddress",
+            "route_exclude_address",
+            "address",
+            "addresses",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        if settings
+            .address
+            .as_deref()
+            .map(|address| address.contains(':'))
+            .unwrap_or(false)
+        {
+            config.ipv6 = true;
+        }
+        for value in xray_route_value_strings(settings.extra.get("address"))? {
+            if value.contains(':') {
+                config.ipv6 = true;
+            }
+        }
+        for value in xray_route_value_strings(settings.extra.get("addresses"))? {
+            if value.contains(':') {
+                config.ipv6 = true;
+            }
+        }
+        let unsupported = settings
+            .extra
+            .keys()
+            .filter(|key| !allowed.contains(key.as_str()))
+            .collect::<Vec<_>>();
+        ensure!(
+            unsupported.is_empty(),
+            "xray TUN inbound {} settings has unsupported fields {:?}",
+            inbound.name(),
+            unsupported
+        );
+        Ok(Some(config))
     }
 
     pub fn route_table(&self) -> Result<RouteTable> {
@@ -1387,6 +1509,10 @@ impl XrayInbound {
         self.settings.reject_unsupported_extra_fields(&owner)?;
         self.stream_settings.reject_unsupported_fields(&owner)?;
         match self.protocol.trim().to_ascii_lowercase().as_str() {
+            "anytls" | "any-tls" => Ok(XrayServerConfig::AnyTls(
+                self.to_anytls_server_config()
+                    .with_context(|| format!("convert xray AnyTLS inbound {}", self.name()))?,
+            )),
             "shadowsocks" | "ss" => Ok(XrayServerConfig::Shadowsocks(
                 self.to_shadowsocks_server_config()
                     .with_context(|| format!("convert xray Shadowsocks inbound {}", self.name()))?,
@@ -1394,6 +1520,10 @@ impl XrayInbound {
             "hysteria" | "hysteria2" | "hy2" => Ok(XrayServerConfig::Hysteria2(
                 self.to_hysteria2_server_config()
                     .with_context(|| format!("convert xray Hysteria2 inbound {}", self.name()))?,
+            )),
+            "mieru" => Ok(XrayServerConfig::Mieru(
+                self.to_mieru_server_config()
+                    .with_context(|| format!("convert xray Mieru inbound {}", self.name()))?,
             )),
             "trojan" => Ok(XrayServerConfig::Trojan(
                 self.to_trojan_server_config()
@@ -1479,6 +1609,128 @@ impl XrayInbound {
             tcp,
             udp,
             udp_over_tcp: false,
+        })
+    }
+
+    fn to_anytls_server_config(&self) -> Result<ServerConfig> {
+        ensure_tcp_network("xray", self.name(), &self.stream_settings.network)?;
+        let stream_security = self.stream_settings.security.trim();
+        ensure!(
+            stream_security.is_empty() || stream_security.eq_ignore_ascii_case("tls"),
+            "xray AnyTLS inbound {} uses stream security {}; AnyTLS requires TLS",
+            self.name(),
+            stream_security
+        );
+        let certificate = xray_first_server_certificate(
+            self.stream_settings.tls_settings.as_ref(),
+            "AnyTLS",
+            self.name(),
+        )?;
+        let (cert_path, key_path, certificates, key) =
+            xray_tls_server_identity(certificate, "AnyTLS", self.name())?;
+        let password = self
+            .settings
+            .password
+            .clone()
+            .or_else(|| {
+                self.settings
+                    .clients
+                    .first()
+                    .and_then(|user| user.password.clone().or(user.id.clone()))
+            })
+            .with_context(|| format!("xray AnyTLS inbound {} is missing password", self.name()))?;
+        let users = self
+            .settings
+            .clients
+            .iter()
+            .skip(1)
+            .filter_map(|user| user.password.clone().or(user.id.clone()))
+            .collect();
+        Ok(ServerConfig {
+            listen: SocketAddr::new(
+                parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
+                self.port
+                    .with_context(|| format!("xray AnyTLS inbound {} is missing port", self.name()))?,
+            ),
+            password,
+            users,
+            cert_path,
+            key_path,
+            certificates,
+            key,
+            padding_scheme: PaddingScheme::default_lines(),
+            heartbeat_interval_secs: 30,
+        })
+    }
+
+    fn to_mieru_server_config(&self) -> Result<MieruServerConfig> {
+        ensure_tcp_network("xray", self.name(), &self.stream_settings.network)?;
+        let stream_security = self.stream_settings.security.trim();
+        ensure!(
+            stream_security.is_empty() || stream_security.eq_ignore_ascii_case("none"),
+            "xray Mieru inbound {} uses stream security {}; Mieru uses its own transport crypto",
+            self.name(),
+            stream_security
+        );
+        let primary = self
+            .settings
+            .clients
+            .first()
+            .cloned()
+            .unwrap_or_else(|| XrayUser {
+                id: self.settings.user.clone(),
+                password: self.settings.password.clone(),
+                auth: self.settings.auth.clone(),
+                method: None,
+                encryption: None,
+                flow: None,
+                packet_encoding: None,
+                security: None,
+                alter_id: None,
+                extra: Map::new(),
+            });
+        let password = primary
+            .password
+            .or(primary.auth)
+            .or(self.settings.password.clone())
+            .with_context(|| format!("xray Mieru inbound {} is missing password", self.name()))?;
+        let username = primary
+            .id
+            .or(self.settings.user.clone())
+            .unwrap_or_else(|| password.clone());
+        let users = self
+            .settings
+            .clients
+            .iter()
+            .skip(1)
+            .map(|user| {
+                let password = user.password.clone().or(user.auth.clone()).with_context(|| {
+                    format!("xray Mieru inbound {} user is missing password", self.name())
+                })?;
+                Ok(MieruUser::password(
+                    user.id.clone().unwrap_or_else(|| password.clone()),
+                    password,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(MieruServerConfig {
+            listen: SocketAddr::new(
+                parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
+                self.port
+                    .with_context(|| format!("xray Mieru inbound {} is missing port", self.name()))?,
+            ),
+            username,
+            password,
+            users,
+            mtu: 1500,
+            user_hint_mandatory: false,
+            transport: MieruTransport::parse(
+                self.settings
+                    .network
+                    .as_deref()
+                    .unwrap_or(&self.stream_settings.network),
+            )?,
+            traffic_pattern: None,
         })
     }
 
@@ -2012,6 +2264,9 @@ impl XrayOutbound {
         self.settings.reject_unsupported_extra_fields(&owner)?;
         self.stream_settings.reject_unsupported_fields(&owner)?;
         match self.protocol.trim().to_ascii_lowercase().as_str() {
+            "anytls" | "any-tls" => Ok(XrayClientConfig::AnyTls(
+                self.to_anytls_client_config(listen)?,
+            )),
             "freedom" => Ok(XrayClientConfig::Route(
                 self.to_route_client_config(listen, RouteDecision::Direct)?,
             )),
@@ -2038,6 +2293,9 @@ impl XrayOutbound {
             )),
             "hysteria" | "hysteria2" | "hy2" => Ok(XrayClientConfig::Hysteria2(
                 self.to_hysteria2_client_config(listen)?,
+            )),
+            "mieru" => Ok(XrayClientConfig::Mieru(
+                self.to_mieru_client_config(listen)?,
             )),
             other => bail!("unsupported xray outbound protocol {other}"),
         }
@@ -2079,6 +2337,82 @@ impl XrayOutbound {
         );
         ensure_empty_route_settings(&self.settings, &self.protocol, self.name())?;
         Ok(RouteClientConfig { listen, default })
+    }
+
+    fn to_anytls_client_config(&self, listen: SocketAddr) -> Result<ClientConfig> {
+        ensure_xray_mux_disabled(
+            &format!("xray AnyTLS outbound {}", self.name()),
+            self.mux.as_ref(),
+            "Aerion AnyTLS client does not use Xray mux",
+        )?;
+        ensure_tcp_network("xray", self.name(), &self.stream_settings.network)?;
+        let stream_security = self.stream_settings.security.trim();
+        ensure!(
+            stream_security.is_empty() || stream_security.eq_ignore_ascii_case("tls"),
+            "xray AnyTLS outbound {} uses stream security {}; AnyTLS requires TLS",
+            self.name(),
+            stream_security
+        );
+        let server = self.first_trojan_server()?;
+        let tls = self.stream_settings.tls_settings.as_ref();
+        let (ca_cert_paths, ca_certificates) = xray_tls_client_roots(tls)?;
+        Ok(ClientConfig {
+            listen,
+            server_host: server.address.clone(),
+            server_port: server.port,
+            password: server.password.or(self.settings.password.clone()).with_context(|| {
+                format!("xray AnyTLS outbound {} is missing password", self.name())
+            })?,
+            sni: sni_or_server(
+                tls.and_then(|settings| settings.server_name.as_deref()),
+                &server.address,
+                self.name(),
+            ),
+            insecure: tls.map(|settings| settings.allow_insecure).unwrap_or(false),
+            client_fingerprint: tls.and_then(|settings| settings.fingerprint),
+            ca_cert_paths,
+            ca_certificates,
+            disable_system_roots: xray_disable_system_roots(tls, true),
+            pinned_cert_sha256: xray_pinned_cert_sha256(tls, true),
+            padding_scheme: PaddingScheme::default_lines(),
+            heartbeat_interval_secs: 30,
+        })
+    }
+
+    fn to_mieru_client_config(&self, listen: SocketAddr) -> Result<MieruClientConfig> {
+        ensure_xray_mux_disabled(
+            &format!("xray Mieru outbound {}", self.name()),
+            self.mux.as_ref(),
+            "Aerion Mieru client does not use Xray mux",
+        )?;
+        ensure_tcp_network("xray", self.name(), &self.stream_settings.network)?;
+        let stream_security = self.stream_settings.security.trim();
+        ensure!(
+            stream_security.is_empty() || stream_security.eq_ignore_ascii_case("none"),
+            "xray Mieru outbound {} uses stream security {}; Mieru uses its own transport crypto",
+            self.name(),
+            stream_security
+        );
+        let server = self.first_trojan_server()?;
+        let password = server.password.or(self.settings.password.clone()).with_context(|| {
+            format!("xray Mieru outbound {} is missing password", self.name())
+        })?;
+        Ok(MieruClientConfig {
+            listen,
+            server_host: server.address,
+            server_port: server.port,
+            username: self.settings.user.clone().unwrap_or_else(|| password.clone()),
+            password,
+            hashed_password: None,
+            mtu: 1500,
+            transport: MieruTransport::parse(
+                self.settings
+                    .network
+                    .as_deref()
+                    .unwrap_or(&self.stream_settings.network),
+            )?,
+            traffic_pattern: None,
+        })
     }
 
     fn to_http_client_config(&self, listen: SocketAddr) -> Result<HttpProxyClientConfig> {
@@ -3429,6 +3763,25 @@ fn xray_route_value_strings(value: Option<&Value>) -> Result<Vec<String>> {
     }
 }
 
+fn xray_extra_string(extra: &Map<String, Value>, key: &str) -> Option<String> {
+    extra
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn xray_extra_u16(extra: &Map<String, Value>, key: &str) -> Option<u16> {
+    extra
+        .get(key)
+        .and_then(|value| value.as_u64().and_then(|value| u16::try_from(value).ok()))
+}
+
+fn xray_extra_bool(extra: &Map<String, Value>, key: &str) -> Option<bool> {
+    extra.get(key).and_then(Value::as_bool)
+}
+
 fn sni_or_server(value: Option<&str>, server: &str, name: &str) -> String {
     value
         .map(str::trim)
@@ -3560,6 +3913,41 @@ mod tests {
         assert_eq!(vless.sni, "www.example.com");
         assert_eq!(vless.client_fingerprint, Some(UtlsFingerprint::Chrome));
         assert!(vless.reality.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn compiles_xray_tun_inbound() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [{
+    "protocol": "tun",
+    "tag": "tun-in",
+    "settings": {
+      "interfaceName": "utun9",
+      "mtu": 9000,
+      "autoRoute": true,
+      "routeExcludeAddress": ["10.0.0.0/8"],
+      "addresses": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"]
+    }
+  }],
+  "outbounds": [{
+    "tag": "direct",
+    "protocol": "freedom"
+  }]
+}
+"#;
+        let config: XrayConfig = serde_json::from_str(json)?;
+        assert!(config.tun_enabled());
+        let tun = config
+            .tun_config("127.0.0.1:7890".parse()?)?
+            .context("tun config")?;
+        assert_eq!(tun.proxy_url, "socks5://127.0.0.1:7890");
+        assert_eq!(tun.tun_name.as_deref(), Some("utun9"));
+        assert_eq!(tun.mtu, 9000);
+        assert_eq!(tun.bypass, vec!["10.0.0.0/8"]);
+        assert!(tun.setup);
+        assert!(tun.ipv6);
         Ok(())
     }
 

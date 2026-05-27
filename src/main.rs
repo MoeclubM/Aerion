@@ -300,9 +300,13 @@ async fn main() -> Result<()> {
             config.tun_name = tun;
             config.tun_fd = tun_fd;
             config.close_fd_on_drop = close_fd_on_drop;
-            config.setup = setup;
+            if setup {
+                config.setup = true;
+            }
             config.mtu = mtu;
-            config.packet_information = packet_information;
+            if packet_information {
+                config.packet_information = true;
+            }
             config.dns = dns;
             config.dns_addr = dns_addr;
             config.virtual_dns_pool = virtual_dns_pool;
@@ -611,6 +615,7 @@ impl From<SingBoxClientConfig> for RunnableClientConfig {
             SingBoxClientConfig::AnyTls(config) => Self::AnyTls(config),
             SingBoxClientConfig::HttpProxy(config) => Self::HttpProxy(config),
             SingBoxClientConfig::Hysteria2(config) => Self::Hysteria2(config),
+            SingBoxClientConfig::Mieru(config) => Self::Mieru(config),
             SingBoxClientConfig::Naive(config) => Self::Naive(config),
             SingBoxClientConfig::Route(config) => Self::Route(config),
             SingBoxClientConfig::Shadowsocks(config) => Self::Shadowsocks(config),
@@ -626,8 +631,10 @@ impl From<SingBoxClientConfig> for RunnableClientConfig {
 impl From<XrayClientConfig> for RunnableClientConfig {
     fn from(config: XrayClientConfig) -> Self {
         match config {
+            XrayClientConfig::AnyTls(config) => Self::AnyTls(config),
             XrayClientConfig::HttpProxy(config) => Self::HttpProxy(config),
             XrayClientConfig::Hysteria2(config) => Self::Hysteria2(config),
+            XrayClientConfig::Mieru(config) => Self::Mieru(config),
             XrayClientConfig::Route(config) => Self::Route(config),
             XrayClientConfig::Shadowsocks(config) => Self::Shadowsocks(config),
             XrayClientConfig::SocksProxy(config) => Self::SocksProxy(config),
@@ -677,6 +684,23 @@ async fn run_file_config(
             }
             if profile.is_none() && !config.routing.rules.is_empty() {
                 return run_xray_route_config(config, listen).await;
+            }
+            if config.tun_enabled() {
+                let listen = listen
+                    .or(config.local_socks_listen()?)
+                    .unwrap_or("127.0.0.1:0".parse()?);
+                let listener = bind_client_listener("xray", listen).await?;
+                let listen = listener.local_addr()?;
+                let outbound = select_xray_outbound(&config.outbounds, profile)?;
+                let tun = config
+                    .tun_config(listen)?
+                    .context("xray TUN inbound was found but no TUN config was produced")?;
+                return run_client_config_with_tun(
+                    listener,
+                    outbound.to_client_config(listen)?.into(),
+                    tun,
+                )
+                .await;
             }
             let listen = listen
                 .or(config.local_socks_listen()?)
@@ -822,8 +846,10 @@ async fn run_xray_route_config(
     let routes = config.route_table()?;
     let listen = listen
         .or(config.local_socks_listen()?)
-        .context("xray route config has no socks inbound; pass --listen")?;
+        .or_else(|| config.tun_enabled().then(ephemeral_loopback))
+        .context("xray route config has no socks/tun inbound; pass --listen")?;
     let router_listener = bind_client_listener("xray route", listen).await?;
+    let router_listen = router_listener.local_addr()?;
     let (outbound_tx, outbound_rx) = mpsc::channel(8);
     let mut upstreams = BTreeMap::new();
     for tag in route_proxy_tags(&routes) {
@@ -838,10 +864,19 @@ async fn run_xray_route_config(
         spawn_route_outbound(tag.clone(), listener, runnable, outbound_tx.clone());
         upstreams.insert(tag, upstream);
     }
+    let tun = if config.tun_enabled() {
+        Some(
+            config
+                .tun_config(router_listen)?
+                .context("xray TUN inbound was found but no TUN config was produced")?,
+        )
+    } else {
+        None
+    };
     run_route_stack(
         router_listener,
         RouteProxyConfig { routes, upstreams },
-        None,
+        tun,
         outbound_rx,
     )
     .await
@@ -1531,6 +1566,7 @@ async fn run_singbox_server_config(config: SingBoxServerConfig) -> Result<()> {
     match config {
         SingBoxServerConfig::AnyTls(config) => run_server(config).await,
         SingBoxServerConfig::Hysteria2(config) => run_hysteria2_server(config).await,
+        SingBoxServerConfig::Mieru(config) => run_mieru_server(config).await,
         SingBoxServerConfig::Naive(config) => run_naive_server(config).await,
         SingBoxServerConfig::Shadowsocks(config) => run_shadowsocks_server(config).await,
         SingBoxServerConfig::Trojan(config) => run_trojan_server(config).await,
@@ -1542,8 +1578,10 @@ async fn run_singbox_server_config(config: SingBoxServerConfig) -> Result<()> {
 
 async fn run_xray_server_config(config: XrayServerConfig) -> Result<()> {
     match config {
+        XrayServerConfig::AnyTls(config) => run_server(config).await,
         XrayServerConfig::Shadowsocks(config) => run_shadowsocks_server(config).await,
         XrayServerConfig::Hysteria2(config) => run_hysteria2_server(config).await,
+        XrayServerConfig::Mieru(config) => run_mieru_server(config).await,
         XrayServerConfig::Trojan(config) => run_trojan_server(config).await,
         XrayServerConfig::Vless(config) => run_vless_server(config).await,
         XrayServerConfig::Vmess(config) => run_vmess_server(config).await,

@@ -2,6 +2,9 @@ use crate::client::ClientConfig;
 use crate::config_compat::mihomo::OneOrManyStrings;
 use crate::http_connect::HttpProxyClientConfig;
 use crate::hysteria2::{Hysteria2ClientConfig, Hysteria2ServerConfig};
+use crate::mieru::{
+    MieruClientConfig, MieruServerConfig, MieruTrafficPattern, MieruTransport, MieruUser,
+};
 use crate::naive::{NaiveClientConfig, NaiveServerConfig, default_naive_quic_congestion_control};
 use crate::padding::PaddingScheme;
 use crate::reality::{RealityClientConfig, RealityServerConfig};
@@ -395,6 +398,31 @@ pub struct SingBoxAnyTlsUser {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxMieruInbound {
+    #[serde(default)]
+    pub users: Vec<SingBoxMieruUser>,
+    #[serde(default = "default_tcp")]
+    pub transport: String,
+    #[serde(default)]
+    pub mtu: usize,
+    #[serde(default, rename = "user_hint_mandatory")]
+    pub user_hint_mandatory: bool,
+    #[serde(default, rename = "traffic_pattern")]
+    pub traffic_pattern: Option<String>,
+    #[serde(default, rename = "nonce_pattern")]
+    pub nonce_pattern: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxMieruUser {
+    #[serde(default)]
+    pub username: Option<String>,
+    pub password: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct SingBoxHysteria2Inbound {
     #[serde(default)]
     pub password: Option<String>,
@@ -621,6 +649,26 @@ pub struct SingBoxAnyTlsOutbound {
     pub password: String,
     #[serde(default)]
     pub tls: Option<SingBoxTlsOptions>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SingBoxMieruOutbound {
+    pub server: String,
+    #[serde(rename = "server_port")]
+    pub server_port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    pub password: String,
+    #[serde(default = "default_tcp")]
+    pub transport: String,
+    #[serde(default)]
+    pub mtu: usize,
+    #[serde(default, rename = "traffic_pattern")]
+    pub traffic_pattern: Option<String>,
+    #[serde(default, rename = "nonce_pattern")]
+    pub nonce_pattern: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -869,6 +917,7 @@ pub enum SingBoxClientConfig {
     Vmess(VmessClientConfig),
     Trojan(TrojanClientConfig),
     Hysteria2(Hysteria2ClientConfig),
+    Mieru(MieruClientConfig),
     AnyTls(ClientConfig),
     Naive(NaiveClientConfig),
     Tuic(TuicClientConfig),
@@ -877,6 +926,7 @@ pub enum SingBoxClientConfig {
 pub enum SingBoxServerConfig {
     AnyTls(ServerConfig),
     Hysteria2(Hysteria2ServerConfig),
+    Mieru(MieruServerConfig),
     Naive(NaiveServerConfig),
     Shadowsocks(ShadowsocksServerConfig),
     Trojan(TrojanServerConfig),
@@ -1794,6 +1844,13 @@ impl SingBoxInbound {
                     self.listen_port,
                 )?,
             )),
+            "mieru" => Ok(SingBoxServerConfig::Mieru(
+                self.decode::<SingBoxMieruInbound>()?.to_server_config(
+                    self.name(),
+                    self.listen.as_deref(),
+                    self.listen_port,
+                )?,
+            )),
             "shadowsocks" | "ss" => Ok(SingBoxServerConfig::Shadowsocks(
                 self.decode::<SingBoxShadowsocksInbound>()?
                     .to_server_config(self.name(), self.listen.as_deref(), self.listen_port)?,
@@ -2071,6 +2128,57 @@ impl SingBoxAnyTlsInbound {
                 self.padding_scheme.clone()
             },
             heartbeat_interval_secs: 30,
+        })
+    }
+}
+
+impl SingBoxMieruInbound {
+    pub fn to_server_config(
+        &self,
+        name: &str,
+        listen: Option<&str>,
+        listen_port: Option<u16>,
+    ) -> Result<MieruServerConfig> {
+        ensure_no_extra_fields(&format!("sing-box Mieru inbound {name}"), &self.extra)?;
+        let primary = self
+            .users
+            .first()
+            .with_context(|| format!("sing-box Mieru inbound {name} is missing users"))?;
+        let users = self
+            .users
+            .iter()
+            .skip(1)
+            .map(|user| {
+                MieruUser::password(
+                    user.username
+                        .as_deref()
+                        .unwrap_or(&user.password)
+                        .to_string(),
+                    user.password.clone(),
+                )
+            })
+            .collect();
+        Ok(MieruServerConfig {
+            listen: SocketAddr::new(
+                parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
+                listen_port.with_context(|| {
+                    format!("sing-box Mieru inbound {name} is missing listen_port")
+                })?,
+            ),
+            username: primary
+                .username
+                .clone()
+                .unwrap_or_else(|| primary.password.clone()),
+            password: primary.password.clone(),
+            users,
+            mtu: self.mtu,
+            user_hint_mandatory: self.user_hint_mandatory,
+            transport: MieruTransport::parse(&self.transport)?,
+            traffic_pattern: MieruTrafficPattern::parse_pair(
+                self.traffic_pattern.as_deref(),
+                self.nonce_pattern.as_deref(),
+            )
+            .with_context(|| format!("parse sing-box Mieru inbound {name} traffic pattern"))?,
         })
     }
 }
@@ -2499,6 +2607,10 @@ impl SingBoxOutbound {
             )),
             "hysteria2" | "hy2" => Ok(SingBoxClientConfig::Hysteria2(
                 self.decode::<SingBoxHysteria2Outbound>()?
+                    .to_client_config(self.name(), listen)?,
+            )),
+            "mieru" => Ok(SingBoxClientConfig::Mieru(
+                self.decode::<SingBoxMieruOutbound>()?
                     .to_client_config(self.name(), listen)?,
             )),
             "anytls" => Ok(SingBoxClientConfig::AnyTls(
@@ -3017,6 +3129,30 @@ impl SingBoxAnyTlsOutbound {
             pinned_cert_sha256: Vec::new(),
             padding_scheme: PaddingScheme::default_lines(),
             heartbeat_interval_secs: 30,
+        })
+    }
+}
+
+impl SingBoxMieruOutbound {
+    pub fn to_client_config(&self, name: &str, listen: SocketAddr) -> Result<MieruClientConfig> {
+        ensure_no_extra_fields(&format!("sing-box Mieru outbound {name}"), &self.extra)?;
+        Ok(MieruClientConfig {
+            listen,
+            server_host: self.server.clone(),
+            server_port: self.server_port,
+            username: self
+                .username
+                .clone()
+                .unwrap_or_else(|| self.password.clone()),
+            password: self.password.clone(),
+            hashed_password: None,
+            mtu: self.mtu,
+            transport: MieruTransport::parse(&self.transport)?,
+            traffic_pattern: MieruTrafficPattern::parse_pair(
+                self.traffic_pattern.as_deref(),
+                self.nonce_pattern.as_deref(),
+            )
+            .with_context(|| format!("parse sing-box Mieru outbound {name} traffic pattern"))?,
         })
     }
 }
@@ -3888,6 +4024,10 @@ fn parse_listen_ip(format: &str, value: &str) -> Result<IpAddr> {
 
 fn default_vmess_security() -> String {
     "auto".to_string()
+}
+
+fn default_tcp() -> String {
+    "tcp".to_string()
 }
 
 pub fn deserialize_optional_u64_string<'de, D>(
@@ -4845,6 +4985,41 @@ mod tests {
         assert_eq!(anytls.cert_path, PathBuf::from("server.crt"));
         assert_eq!(anytls.key_path, PathBuf::from("server.key"));
         assert_eq!(anytls.padding_scheme, vec!["stop=8".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn converts_mieru_inbound_to_server_config() -> Result<()> {
+        let json = r#"
+{
+  "inbounds": [
+    {
+      "type": "mieru",
+      "tag": "mieru",
+      "listen": "127.0.0.1",
+      "listen_port": 8964,
+      "users": [
+        { "username": "default", "password": "primary-pass" },
+        { "username": "alice", "password": "alice-pass" }
+      ],
+      "transport": "udp",
+      "mtu": 1400,
+      "user_hint_mandatory": true
+    }
+  ]
+}
+"#;
+        let config: SingBoxConfig = serde_json::from_str(json)?;
+        let SingBoxServerConfig::Mieru(mieru) = config.inbounds[0].to_server_config()? else {
+            bail!("expected Mieru")
+        };
+        assert_eq!(mieru.listen, "127.0.0.1:8964".parse()?);
+        assert_eq!(mieru.username, "default");
+        assert_eq!(mieru.password, "primary-pass");
+        assert_eq!(mieru.users.len(), 1);
+        assert_eq!(mieru.mtu, 1400);
+        assert!(mieru.user_hint_mandatory);
+        assert_eq!(mieru.transport, MieruTransport::Udp);
         Ok(())
     }
 
