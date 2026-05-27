@@ -4039,7 +4039,7 @@ mod tests {
         let http_error = config
             .local_socks_listen()
             .expect_err("local HTTP inbound must not be ignored");
-        assert!(http_error.to_string().contains("local SOCKS listener"));
+        assert!(http_error.to_string().contains("local SOCKS/TUN listener"));
         assert!(http_error.to_string().contains("http"));
         Ok(())
     }
