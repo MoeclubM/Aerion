@@ -1031,16 +1031,6 @@ async fn handle_mieru_socks_client(mut local: TcpStream, config: MieruClientConf
     let request = read_socks_request_raw(&mut local).await?;
     let command = request[1];
     let mut session = dial_mieru_session(&config).await?;
-    session.write_all(&greeting).await?;
-    let mut remote_greeting = [0u8; 2];
-    session
-        .read_exact(&mut remote_greeting)
-        .await
-        .context("read remote SOCKS greeting response")?;
-    ensure!(
-        remote_greeting == [SOCKS_VERSION, SOCKS_NO_AUTH],
-        "remote Mieru SOCKS server rejected no-auth method"
-    );
     session.write_all(&request).await?;
     let response = read_socks_response_raw(&mut session).await?;
     match command {
@@ -2118,7 +2108,6 @@ async fn handle_mieru_server_socks_session(
     mut session: MieruSession,
     core_session: CoreSession,
 ) -> Result<()> {
-    read_socks_greeting_and_reply(&mut session).await?;
     match read_socks_request(&mut session).await? {
         SocksRequest::Connect(target) => {
             let mut remote = connect_target(&target).await?;
@@ -2216,22 +2205,6 @@ where
     Ok(())
 }
 
-async fn read_socks_greeting_and_reply<S>(stream: &mut S) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let greeting = read_socks_greeting(stream).await?;
-    if greeting[2..].contains(&SOCKS_NO_AUTH) {
-        stream.write_all(&[SOCKS_VERSION, SOCKS_NO_AUTH]).await?;
-        Ok(())
-    } else {
-        stream
-            .write_all(&[SOCKS_VERSION, SOCKS_NO_ACCEPTABLE])
-            .await?;
-        bail!("SOCKS client did not offer no-auth method")
-    }
-}
-
 async fn read_socks_greeting<R>(reader: &mut R) -> Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
@@ -2256,6 +2229,10 @@ where
     S: AsyncRead + Unpin,
 {
     let request = read_socks_request_raw(stream).await?;
+    parse_socks_request(request)
+}
+
+fn parse_socks_request(request: Vec<u8>) -> Result<SocksRequest> {
     let target = parse_socks_target_from_request(&request)?;
     match request[1] {
         SOCKS_CMD_CONNECT => Ok(SocksRequest::Connect(target)),
