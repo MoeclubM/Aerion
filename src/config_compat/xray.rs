@@ -9,9 +9,9 @@ use crate::router::RouteClientConfig;
 use crate::routing::{
     DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
 };
+use crate::server::ServerConfig;
 use crate::shadowsocks::{ShadowsocksClientConfig, ShadowsocksServerConfig};
 use crate::socks::SocksProxyClientConfig;
-use crate::server::ServerConfig;
 use crate::trojan::{TrojanClientConfig, TrojanServerConfig};
 use crate::tun::{TunConfig, socks_proxy_url};
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
@@ -1160,7 +1160,10 @@ impl XrayConfig {
         else {
             return Ok(None);
         };
-        ensure_no_extra_fields(&format!("xray TUN inbound {}", inbound.name()), &inbound.extra)?;
+        ensure_no_extra_fields(
+            &format!("xray TUN inbound {}", inbound.name()),
+            &inbound.extra,
+        )?;
         inbound
             .stream_settings
             .reject_local_socks_listener_fields(&format!("xray TUN inbound {}", inbound.name()))?;
@@ -1649,8 +1652,9 @@ impl XrayInbound {
         Ok(ServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
-                self.port
-                    .with_context(|| format!("xray AnyTLS inbound {} is missing port", self.name()))?,
+                self.port.with_context(|| {
+                    format!("xray AnyTLS inbound {} is missing port", self.name())
+                })?,
             ),
             password,
             users,
@@ -1704,9 +1708,16 @@ impl XrayInbound {
             .iter()
             .skip(1)
             .map(|user| {
-                let password = user.password.clone().or(user.auth.clone()).with_context(|| {
-                    format!("xray Mieru inbound {} user is missing password", self.name())
-                })?;
+                let password = user
+                    .password
+                    .clone()
+                    .or(user.auth.clone())
+                    .with_context(|| {
+                        format!(
+                            "xray Mieru inbound {} user is missing password",
+                            self.name()
+                        )
+                    })?;
                 Ok(MieruUser::password(
                     user.id.clone().unwrap_or_else(|| password.clone()),
                     password,
@@ -1716,8 +1727,9 @@ impl XrayInbound {
         Ok(MieruServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
-                self.port
-                    .with_context(|| format!("xray Mieru inbound {} is missing port", self.name()))?,
+                self.port.with_context(|| {
+                    format!("xray Mieru inbound {} is missing port", self.name())
+                })?,
             ),
             username,
             password,
@@ -2360,9 +2372,12 @@ impl XrayOutbound {
             listen,
             server_host: server.address.clone(),
             server_port: server.port,
-            password: server.password.or(self.settings.password.clone()).with_context(|| {
-                format!("xray AnyTLS outbound {} is missing password", self.name())
-            })?,
+            password: server
+                .password
+                .or(self.settings.password.clone())
+                .with_context(|| {
+                    format!("xray AnyTLS outbound {} is missing password", self.name())
+                })?,
             sni: sni_or_server(
                 tls.and_then(|settings| settings.server_name.as_deref()),
                 &server.address,
@@ -2394,14 +2409,19 @@ impl XrayOutbound {
             stream_security
         );
         let server = self.first_trojan_server()?;
-        let password = server.password.or(self.settings.password.clone()).with_context(|| {
-            format!("xray Mieru outbound {} is missing password", self.name())
-        })?;
+        let password = server
+            .password
+            .or(self.settings.password.clone())
+            .with_context(|| format!("xray Mieru outbound {} is missing password", self.name()))?;
         Ok(MieruClientConfig {
             listen,
             server_host: server.address,
             server_port: server.port,
-            username: self.settings.user.clone().unwrap_or_else(|| password.clone()),
+            username: self
+                .settings
+                .user
+                .clone()
+                .unwrap_or_else(|| password.clone()),
             password,
             hashed_password: None,
             mtu: 1500,
