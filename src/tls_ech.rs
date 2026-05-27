@@ -326,8 +326,8 @@ pub mod boring_backend {
             !entry.private_key.is_empty() && !entry.config.is_empty(),
             "ECH key entry is missing private key or config"
         );
-        let hpke_key = HpkeKey::dhkem_p256_sha256(&entry.private_key)
-            .context("parse ECH HPKE private key")?;
+        let hpke_key =
+            HpkeKey::dhkem_p256_sha256(&entry.private_key).context("parse ECH HPKE private key")?;
         keys.add_key(is_retry_config, &entry.config, hpke_key)
             .context("register ECH config and private key")?;
         Ok(())
