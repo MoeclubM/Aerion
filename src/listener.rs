@@ -69,9 +69,7 @@ pub fn is_accept_cancelled(error: &std::io::Error) -> bool {
         || message.contains("operation was aborted")
 }
 
-pub async fn accept_client(
-    listener: &TcpListener,
-) -> Result<(TcpStream, SocketAddr), AcceptError> {
+pub async fn accept_client(listener: &TcpListener) -> Result<(TcpStream, SocketAddr), AcceptError> {
     listener.accept().await.map_err(AcceptError::from)
 }
 

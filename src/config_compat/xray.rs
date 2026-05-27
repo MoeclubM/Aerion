@@ -10,10 +10,10 @@ use crate::routing::{
     DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
 };
 use crate::server::ServerConfig;
-use crate::tls::TlsEchServerKeys;
-use crate::tls_ech::tls_ech_from_compat_reference;
 use crate::shadowsocks::{ShadowsocksClientConfig, ShadowsocksServerConfig};
 use crate::socks::SocksProxyClientConfig;
+use crate::tls::TlsEchServerKeys;
+use crate::tls_ech::tls_ech_from_compat_reference;
 use crate::trojan::{TrojanClientConfig, TrojanServerConfig};
 use crate::tun::{TunConfig, socks_proxy_url};
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
@@ -2161,6 +2161,8 @@ impl XrayInbound {
             ech,
         })
     }
+
+    fn to_vmess_server_config(&self) -> Result<VmessServerConfig> {
         ensure_raw_or_tls_stream_security(
             "xray VMess",
             self.name(),

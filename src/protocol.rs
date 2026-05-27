@@ -89,7 +89,8 @@ where
     }
 
     pub async fn write_frame(&mut self, cmd: u8, stream_id: u32, payload: &[u8]) -> Result<()> {
-        self.write_frame_with_flush(cmd, stream_id, payload, true).await
+        self.write_frame_with_flush(cmd, stream_id, payload, true)
+            .await
     }
 
     pub async fn write_frame_with_flush(

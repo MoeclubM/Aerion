@@ -244,7 +244,12 @@ async fn connect_vmess_transport(config: &VmessClientConfig) -> Result<VmessTran
                 )
             })?;
     if !config.tls {
-        return vless_transport::apply_client_transport(tcp, &config.transport, &config.server_host).await;
+        return vless_transport::apply_client_transport(
+            tcp,
+            &config.transport,
+            &config.server_host,
+        )
+        .await;
     }
     let mut client_config = Arc::unwrap_or_clone(
         tls::client_config_with_fingerprint_and_custom_root_material_options(

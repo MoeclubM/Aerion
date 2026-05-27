@@ -1,19 +1,19 @@
 use crate::core::{CoreSession, ProxyCore, relay_bidirectional_counted};
 use crate::protocol::{ProxyTarget, parse_uuid, resolve_target_addr, target_name};
 use crate::tls::{ServerTlsAcceptor, ServerTlsMaterial, TlsEchServerKeys};
+use crate::{
+    reality, reality_tls_client, socket_protect, socks, tls, uot, utls, vless_mux, vless_transport,
+    vless_vision, vless_xudp,
+};
 use anyhow::{Context, Result, bail, ensure};
 use rustls::pki_types::ServerName;
-use crate::{
-    reality, reality_tls_client, socket_protect, socks, tls, uot, utls, vless_mux,
-    vless_transport, vless_vision, vless_xudp,
-};
 use std::collections::HashMap;
-use tokio::sync::Mutex;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::Mutex;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use vless_transport::VlessTransportConfig;
 
@@ -122,7 +122,10 @@ pub async fn run_vless_server(config: VlessServerConfig) -> Result<()> {
 pub async fn run_vless_server_with_core(config: VlessServerConfig, core: ProxyCore) -> Result<()> {
     ensure!(
         !(config.reality.is_some()
-            && config.ech.as_ref().is_some_and(TlsEchServerKeys::is_configured)),
+            && config
+                .ech
+                .as_ref()
+                .is_some_and(TlsEchServerKeys::is_configured)),
         "VLESS REALITY and TLS ECH are mutually exclusive server modes"
     );
     let listener = TcpListener::bind(config.listen)
@@ -420,10 +423,20 @@ async fn connect_vless_server(config: &VlessClientConfig) -> Result<BoxedVlessSt
         let stream = reality_tls_client::connect(tcp, reality, &config.sni, fingerprint, alpn)
             .await
             .context("REALITY connect to VLESS server")?;
-        return vless_transport::apply_client_transport(stream, &config.transport, &config.server_host).await;
+        return vless_transport::apply_client_transport(
+            stream,
+            &config.transport,
+            &config.server_host,
+        )
+        .await;
     }
     if !config.tls {
-        return vless_transport::apply_client_transport(tcp, &config.transport, &config.server_host).await;
+        return vless_transport::apply_client_transport(
+            tcp,
+            &config.transport,
+            &config.server_host,
+        )
+        .await;
     }
     let mut client_config = Arc::unwrap_or_clone(
         tls::client_config_with_fingerprint_and_custom_root_material_options(
@@ -528,7 +541,6 @@ async fn handle_vless_client(
         other => bail!("unsupported VLESS command {other:#x}"),
     }
 }
-
 
 async fn relay_vision_server_counted<S>(
     stream: S,

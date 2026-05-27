@@ -66,11 +66,7 @@ pub async fn connect_tcp_host_port(host: &str, port: u16) -> Result<TcpStream> {
     }
     let mut racers = JoinSet::new();
     for addr in addrs {
-        racers.spawn(async move {
-            connect_tcp_addr(addr)
-                .await
-                .map_err(|error| (addr, error))
-        });
+        racers.spawn(async move { connect_tcp_addr(addr).await.map_err(|error| (addr, error)) });
     }
     let mut last_error = None;
     while let Some(result) = racers.join_next().await {
@@ -87,7 +83,8 @@ pub async fn connect_tcp_host_port(host: &str, port: u16) -> Result<TcpStream> {
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("TCP peer resolved to no addresses: {host}:{port}")))
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("TCP peer resolved to no addresses: {host}:{port}")))
 }
 
 pub async fn connect_tcp_addr(addr: SocketAddr) -> Result<TcpStream> {

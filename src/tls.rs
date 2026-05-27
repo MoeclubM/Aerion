@@ -1,7 +1,6 @@
 use crate::tls_ech::{TlsEchServerKeys, ensure_server_ech_available};
 use crate::utls::UtlsFingerprint;
 use anyhow::{Context, Result, bail, ensure};
-use std::path::PathBuf;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{
@@ -12,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, Read};
+use std::path::PathBuf;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -34,7 +34,12 @@ pub struct ServerTlsMaterial {
 
 impl ServerTlsMaterial {
     pub fn ensure_supported(&self) -> Result<()> {
-        if self.ech.as_ref().is_some_and(TlsEchServerKeys::is_configured) && self.early_data {
+        if self
+            .ech
+            .as_ref()
+            .is_some_and(TlsEchServerKeys::is_configured)
+            && self.early_data
+        {
             bail!(
                 "TLS early data is incompatible with server ECH on {}; disable one of them",
                 self.label
@@ -61,10 +66,7 @@ impl Clone for ServerTlsAcceptor {
 }
 
 impl ServerTlsAcceptor {
-    pub async fn accept(
-        &self,
-        stream: tokio::net::TcpStream,
-    ) -> Result<ServerTlsStream> {
+    pub async fn accept(&self, stream: tokio::net::TcpStream) -> Result<ServerTlsStream> {
         match self {
             Self::Rustls(acceptor) => {
                 let stream = acceptor
@@ -150,7 +152,11 @@ impl tokio::io::AsyncWrite for ServerTlsStream {
 
 pub fn build_server_tls_acceptor(material: &ServerTlsMaterial) -> Result<ServerTlsAcceptor> {
     material.ensure_supported()?;
-    if material.ech.as_ref().is_some_and(TlsEchServerKeys::is_configured) {
+    if material
+        .ech
+        .as_ref()
+        .is_some_and(TlsEchServerKeys::is_configured)
+    {
         #[cfg(feature = "boring-ech")]
         {
             return Ok(ServerTlsAcceptor::Boring(

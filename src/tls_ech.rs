@@ -171,7 +171,10 @@ pub fn tls_ech_from_singbox_value(value: &serde_json::Value) -> Result<Option<Tl
         .or_else(|| value.get("keyPath"))
         .and_then(serde_json::Value::as_str)
     {
-        ensure!(!path.trim().is_empty(), "sing-box tls.ech.key_path is empty");
+        ensure!(
+            !path.trim().is_empty(),
+            "sing-box tls.ech.key_path is empty"
+        );
         return Ok(Some(tls_ech_from_path(path)));
     }
     if value
@@ -192,9 +195,9 @@ pub mod boring_backend {
     use super::{EchServerKeyEntry, TlsEchServerKeys};
     use anyhow::{Context, Result, ensure};
     use boring::hpke::HpkeKey;
+    use boring::pkey::PKey;
     use boring::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod, SslVerifyMode};
     use boring::x509::X509;
-    use boring::pkey::PKey;
     use std::path::Path;
     use std::sync::Arc;
     use tokio_boring::SslStream;
@@ -316,8 +319,8 @@ pub mod boring_backend {
             !entry.private_key.is_empty() && !entry.config.is_empty(),
             "ECH key entry is missing private key or config"
         );
-        let hpke_key = HpkeKey::from_private_key(&entry.private_key)
-            .context("parse ECH HPKE private key")?;
+        let hpke_key =
+            HpkeKey::from_private_key(&entry.private_key).context("parse ECH HPKE private key")?;
         keys.add(is_retry_config, &entry.config, &hpke_key)
             .context("register ECH config and private key")?;
         Ok(())
