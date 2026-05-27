@@ -1,4 +1,5 @@
 use crate::core::{CoreSession, ProxyCore};
+use crate::listener;
 use crate::padding::PaddingScheme;
 use crate::protocol::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
@@ -66,18 +67,63 @@ pub async fn run_client_listener(
             config.disable_system_roots,
             &config.pinned_cert_sha256,
         )?;
-    let session = ClientSession::connect(&config, tls_config).await?;
+    let shared = Arc::new(SharedClientSession::new(config, tls_config));
     tracing::info!("client listening on socks5://{}", listener.local_addr()?);
     loop {
-        let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
-        let session = session.clone();
-        let config = config.clone();
+        let (stream, peer) = match listener::accept_client(&listener).await {
+            Ok(v) => v,
+            Err(listener::AcceptError::Cancelled) => return Ok(()),
+            Err(listener::AcceptError::Io(error)) => {
+                return Err(error).context("accept SOCKS client");
+            }
+        };
+        let shared = shared.clone();
+        let config = shared.config.clone();
         let core = core.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_socks_client(stream, session, config, core, peer).await {
+            if let Err(error) = handle_socks_client(stream, shared, config, core, peer).await {
                 tracing::warn!("SOCKS client {peer} failed: {error:?}");
             }
         });
+    }
+}
+
+struct SharedClientSession {
+    config: ClientConfig,
+    tls_config: Arc<rustls::ClientConfig>,
+    session: Mutex<Option<ClientSession>>,
+}
+
+impl SharedClientSession {
+    fn new(config: ClientConfig, tls_config: Arc<rustls::ClientConfig>) -> Self {
+        Self {
+            config,
+            tls_config,
+            session: Mutex::new(None),
+        }
+    }
+
+    async fn get_or_connect(&self) -> Result<ClientSession> {
+        loop {
+            {
+                let guard = self.session.lock().await;
+                if let Some(session) = guard.as_ref() {
+                    if session.is_alive().await {
+                        return Ok(session.clone());
+                    }
+                }
+            }
+            let mut guard = self.session.lock().await;
+            if let Some(session) = guard.as_ref() {
+                if session.is_alive().await {
+                    return Ok(session.clone());
+                }
+                guard.take();
+            }
+            let session = ClientSession::connect(&self.config, self.tls_config.clone()).await?;
+            guard.replace(session.clone());
+            return Ok(session);
+        }
     }
 }
 
@@ -103,6 +149,10 @@ struct ClientStream {
 }
 
 impl ClientSession {
+    async fn is_alive(&self) -> bool {
+        self.closed.lock().await.is_none()
+    }
+
     async fn connect(config: &ClientConfig, tls_config: Arc<rustls::ClientConfig>) -> Result<Self> {
         let tcp =
             socket_protect::connect_tcp_host_port(config.server_host.as_str(), config.server_port)
@@ -224,11 +274,12 @@ impl ClientStream {
 
 async fn handle_socks_client(
     mut local: TcpStream,
-    session: ClientSession,
+    shared: Arc<SharedClientSession>,
     config: ClientConfig,
     core: Option<ProxyCore>,
     peer: SocketAddr,
 ) -> Result<()> {
+    let session = shared.get_or_connect().await?;
     match socks::read_request(&mut local).await? {
         SocksRequest::Connect(target) => {
             let stream = match session.open_stream(target.clone(), Vec::new()).await {

@@ -1,4 +1,5 @@
 use crate::core::{CoreSession, CoreUser, ProxyCore};
+use crate::listener;
 use crate::protocol::{ProxyTarget, target_name};
 use crate::{socket_protect, socks, tls};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -232,23 +233,63 @@ pub async fn run_tuic_client_listener(
     listener: TcpListener,
     config: TuicClientConfig,
 ) -> Result<()> {
-    let client = TuicClient::connect(&config).await?;
+    let shared = Arc::new(SharedTuicClient::new(config));
     tracing::info!(
         "TUIC client listening on socks5://{}",
         listener.local_addr()?
     );
     loop {
-        let (stream, peer) = listener
-            .accept()
-            .await
-            .context("accept TUIC SOCKS client")?;
-        let client = client.clone();
-        let udp_enabled = config.udp;
+        let (stream, peer) = match listener::accept_client(&listener).await {
+            Ok(v) => v,
+            Err(listener::AcceptError::Cancelled) => return Ok(()),
+            Err(listener::AcceptError::Io(error)) => {
+                return Err(error).context("accept TUIC SOCKS client");
+            }
+        };
+        let shared = shared.clone();
+        let udp_enabled = shared.config.udp;
         tokio::spawn(async move {
-            if let Err(error) = handle_tuic_socks_client(stream, client, udp_enabled).await {
+            if let Err(error) = handle_tuic_socks_client(stream, shared, udp_enabled).await {
                 tracing::warn!("TUIC SOCKS client {peer} failed: {error:?}");
             }
         });
+    }
+}
+
+struct SharedTuicClient {
+    config: TuicClientConfig,
+    client: Mutex<Option<TuicClient>>,
+}
+
+impl SharedTuicClient {
+    fn new(config: TuicClientConfig) -> Self {
+        Self {
+            config,
+            client: Mutex::new(None),
+        }
+    }
+
+    async fn get_or_connect(&self) -> Result<TuicClient> {
+        loop {
+            {
+                let guard = self.client.lock().await;
+                if let Some(client) = guard.as_ref() {
+                    if client.is_alive() {
+                        return Ok(client.clone());
+                    }
+                }
+            }
+            let mut guard = self.client.lock().await;
+            if let Some(client) = guard.as_ref() {
+                if client.is_alive() {
+                    return Ok(client.clone());
+                }
+                guard.take();
+            }
+            let client = TuicClient::connect(&self.config).await?;
+            guard.replace(client.clone());
+            return Ok(client);
+        }
     }
 }
 
@@ -343,6 +384,10 @@ impl TuicClient {
         Ok(Self { inner })
     }
 
+    fn is_alive(&self) -> bool {
+        self.inner.connection.close_reason().is_none()
+    }
+
     async fn open_tcp(
         &self,
         target: &ProxyTarget,
@@ -397,9 +442,10 @@ impl TuicClient {
 
 async fn handle_tuic_socks_client(
     mut local: TcpStream,
-    client: TuicClient,
+    shared: Arc<SharedTuicClient>,
     udp_enabled: bool,
 ) -> Result<()> {
+    let client = shared.get_or_connect().await?;
     match socks::read_request(&mut local).await? {
         socks::SocksRequest::Connect(target) => {
             let stream = match client.open_tcp(&target).await {

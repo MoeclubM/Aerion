@@ -1,4 +1,5 @@
 use crate::core::{CoreSession, CoreUserLimits, ProxyCore};
+use crate::listener;
 use crate::protocol::{ProxyTarget, target_name};
 use crate::{socket_protect, socks, tls, uot};
 use anyhow::{Context, Result, bail, ensure};
@@ -371,6 +372,10 @@ impl Hysteria2Client {
         Ok(client)
     }
 
+    fn is_alive(&self) -> bool {
+        self.inner.connection.close_reason().is_none()
+    }
+
     pub async fn open_tcp(&self, target: ProxyTarget) -> Result<Hysteria2TcpStream> {
         let address = target_name(&target);
         let (mut send, mut recv) = self
@@ -581,19 +586,62 @@ pub async fn run_hysteria2_client_listener(
     listener: TcpListener,
     config: Hysteria2ClientConfig,
 ) -> Result<()> {
-    let session = Hysteria2Client::connect(config).await?;
+    let shared = Arc::new(SharedHysteria2Client::new(config));
     tracing::info!(
         "Hysteria2 client listening on socks5://{}",
         listener.local_addr()?
     );
     loop {
-        let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
-        let session = session.clone();
+        let (stream, peer) = match listener::accept_client(&listener).await {
+            Ok(v) => v,
+            Err(listener::AcceptError::Cancelled) => return Ok(()),
+            Err(listener::AcceptError::Io(error)) => {
+                return Err(error).context("accept SOCKS client");
+            }
+        };
+        let shared = shared.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_hy2_socks_client(stream, session).await {
+            if let Err(error) = handle_hy2_socks_client(stream, shared).await {
                 tracing::warn!("Hysteria2 SOCKS client {peer} failed: {error:?}");
             }
         });
+    }
+}
+
+struct SharedHysteria2Client {
+    config: Hysteria2ClientConfig,
+    client: Mutex<Option<Hysteria2Client>>,
+}
+
+impl SharedHysteria2Client {
+    fn new(config: Hysteria2ClientConfig) -> Self {
+        Self {
+            config,
+            client: Mutex::new(None),
+        }
+    }
+
+    async fn get_or_connect(&self) -> Result<Hysteria2Client> {
+        loop {
+            {
+                let guard = self.client.lock().await;
+                if let Some(client) = guard.as_ref() {
+                    if client.is_alive() {
+                        return Ok(client.clone());
+                    }
+                }
+            }
+            let mut guard = self.client.lock().await;
+            if let Some(client) = guard.as_ref() {
+                if client.is_alive() {
+                    return Ok(client.clone());
+                }
+                guard.take();
+            }
+            let client = Hysteria2Client::connect(self.config.clone()).await?;
+            guard.replace(client.clone());
+            return Ok(client);
+        }
     }
 }
 
@@ -638,7 +686,11 @@ pub async fn run_hysteria2_server_with_core(
     Ok(())
 }
 
-async fn handle_hy2_socks_client(mut local: TcpStream, session: Hysteria2Client) -> Result<()> {
+async fn handle_hy2_socks_client(
+    mut local: TcpStream,
+    shared: Arc<SharedHysteria2Client>,
+) -> Result<()> {
+    let session = shared.get_or_connect().await?;
     match socks::read_request(&mut local).await? {
         socks::SocksRequest::Connect(target) => {
             let stream = match session.open_tcp(target.clone()).await {

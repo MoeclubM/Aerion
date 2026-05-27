@@ -8,6 +8,7 @@ use crate::reality::RealityClientConfig;
 use crate::router::RouteClientConfig;
 use crate::routing::{
     DomainMatcher, IpCidr, PortRange, RouteDecision, RouteNetwork, RouteRule, RouteTable,
+    route_set_name,
 };
 use crate::shadowsocks::ShadowsocksClientConfig;
 use crate::socks::SocksProxyClientConfig;
@@ -962,12 +963,21 @@ impl MihomoConfig {
     }
 
     pub fn route_table(&self) -> Result<RouteTable> {
+        self.route_table_with_assets(None)
+    }
+
+    pub fn route_table_with_assets(&self, assets_dir: Option<&Path>) -> Result<RouteTable> {
         self.reject_unsupported_top_level_fields()?;
         let mut table = RouteTable::default();
         for (index, rule) in self.rules.iter().enumerate() {
             table
                 .rules
                 .extend(self.parse_mihomo_route_rules(rule, index)?);
+        }
+        if let Some(dir) = assets_dir {
+            load_mihomo_route_assets(&mut table, dir)?;
+        } else {
+            ensure_mihomo_route_assets(&table, None)?;
         }
         Ok(table)
     }
@@ -2599,10 +2609,10 @@ fn parse_mihomo_route_rule_parts(
         "DOMAIN-KEYWORD" => rule.domains.push(DomainMatcher::keyword(parts[1])),
         "DOMAIN-WILDCARD" => rule.domains.push(DomainMatcher::wildcard(parts[1])?),
         "DOMAIN-REGEX" => rule.domains.push(DomainMatcher::regex(parts[1])?),
-        "GEOSITE" => bail!("{location} GEOSITE requires geosite rule-set data"),
+        "GEOSITE" => rule.add_geosite_set(parts[1]),
         "IP-CIDR" | "IP-CIDR6" => rule.ip_cidrs.push(IpCidr::parse(parts[1])?),
         "GEOIP" if parts[1].eq_ignore_ascii_case("private") => rule.ip_is_private = true,
-        "GEOIP" => bail!("{location} GEOIP requires geoip rule-set data"),
+        "GEOIP" => rule.add_geoip_set(parts[1]),
         "DST-PORT" => rule.ports.push(PortRange::parse(parts[1])?),
         "NETWORK" => rule.networks.push(RouteNetwork::parse(parts[1])?),
         "MATCH" | "FINAL" => {}
@@ -2681,6 +2691,81 @@ fn clean_mihomo_rule_provider_lines(lines: &[String]) -> Vec<String> {
 fn mihomo_text_rule_provider_line(line: &str) -> Option<&str> {
     let line = line.split('#').next().unwrap_or_default().trim();
     (!line.is_empty()).then_some(line)
+}
+
+fn collect_mihomo_route_asset_sets(table: &RouteTable) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut geoip = BTreeSet::new();
+    let mut geosite = BTreeSet::new();
+    for rule in &table.rules {
+        geoip.extend(rule.geoip_sets.iter().cloned());
+        geosite.extend(rule.geosite_sets.iter().cloned());
+    }
+    (geoip, geosite)
+}
+
+pub fn load_mihomo_route_assets(table: &mut RouteTable, dir: &Path) -> Result<()> {
+    let (geoip, geosite) = collect_mihomo_route_asset_sets(table);
+    for name in geoip {
+        if table.geoip_sets.contains_key(&name) {
+            continue;
+        }
+        let path = mihomo_route_asset_path(dir, &name, "geoip");
+        table.load_geoip_set_file(&name, path)?;
+    }
+    for name in geosite {
+        if table.geosite_sets.contains_key(&name) {
+            continue;
+        }
+        let path = mihomo_route_asset_path(dir, &name, "geosite");
+        table.load_geosite_set_file(&name, path)?;
+    }
+    ensure_mihomo_route_assets(table, Some(dir))
+}
+
+fn ensure_mihomo_route_assets(table: &RouteTable, dir: Option<&Path>) -> Result<()> {
+    let (geoip, geosite) = collect_mihomo_route_asset_sets(table);
+    for name in geoip {
+        ensure!(
+            table.geoip_sets.contains_key(&name),
+            "mihomo route rule references geoip set {name}{}",
+            mihomo_route_asset_hint(dir, &name, "geoip")
+        );
+    }
+    for name in geosite {
+        ensure!(
+            table.geosite_sets.contains_key(&name),
+            "mihomo route rule references geosite set {name}{}",
+            mihomo_route_asset_hint(dir, &name, "geosite")
+        );
+    }
+    Ok(())
+}
+
+fn mihomo_route_asset_path(dir: &Path, name: &str, kind: &str) -> PathBuf {
+    let normalized = route_set_name(name);
+    for candidate in [
+        dir.join(format!("{normalized}.txt")),
+        dir.join(format!("{normalized}.list")),
+        dir.join(kind).join(format!("{normalized}.txt")),
+        dir.join(kind).join(format!("{normalized}.list")),
+    ] {
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    dir.join(format!("{normalized}.txt"))
+}
+
+fn mihomo_route_asset_hint(dir: Option<&Path>, name: &str, kind: &str) -> String {
+    let normalized = route_set_name(name);
+    match dir {
+        Some(dir) => format!(
+            "; place CIDR/domain lines in {}/{normalized}.txt or {}/{kind}/{normalized}.txt",
+            dir.display(),
+            dir.display()
+        ),
+        None => format!("; provide route {kind} data for {normalized} via route_table_with_assets"),
+    }
 }
 
 fn default_true() -> bool {
@@ -3058,8 +3143,8 @@ rules:
         let config: MihomoConfig = serde_yaml::from_str(geo_yaml)?;
         let error = config
             .route_table()
-            .expect_err("direct GEOSITE must fail without data");
-        assert!(error.to_string().contains("geosite rule-set data"));
+            .expect_err("GEOSITE requires geosite route-set data");
+        assert!(error.to_string().contains("geosite set category-ads-all"));
 
         let geoip_yaml = r#"
 proxies: []
@@ -3069,8 +3154,8 @@ rules:
         let config: MihomoConfig = serde_yaml::from_str(geoip_yaml)?;
         let error = config
             .route_table()
-            .expect_err("direct GEOIP must fail without data");
-        assert!(error.to_string().contains("geoip rule-set data"));
+            .expect_err("GEOIP requires geoip route-set data");
+        assert!(error.to_string().contains("geoip set cn"));
         Ok(())
     }
 

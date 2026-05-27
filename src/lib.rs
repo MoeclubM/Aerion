@@ -40,7 +40,9 @@ mod vmess_body;
 
 pub use client::{ClientConfig, run_client, run_client_listener};
 pub use client_hello::{BuiltClientHello, ClientHelloParams, build_client_hello};
-pub use config_compat::mihomo::{MihomoClientConfig, MihomoConfig, MihomoProxy};
+pub use config_compat::mihomo::{
+    MihomoClientConfig, MihomoConfig, MihomoProxy, load_mihomo_route_assets,
+};
 pub use config_compat::singbox::{
     SingBoxClientConfig, SingBoxConfig, SingBoxOutbound, SingBoxServerConfig,
 };
