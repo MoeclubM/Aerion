@@ -100,20 +100,25 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
     ) -> Poll<std::io::Result<()>> {
-        while self.pending_pos < self.pending_write.len() {
-            let start = self.pending_pos;
-            let written =
-                ready!(Pin::new(&mut self.writer).poll_write(cx, &self.pending_write[start..],))?;
+        let Self {
+            writer,
+            pending_write,
+            pending_pos,
+            ..
+        } = &mut *self;
+        while *pending_pos < pending_write.len() {
+            let start = *pending_pos;
+            let written = ready!(Pin::new(&mut *writer).poll_write(cx, &pending_write[start..]))?;
             if written == 0 {
                 return Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "write xhttp chunk",
                 )));
             }
-            self.pending_pos += written;
+            *pending_pos += written;
         }
-        self.pending_write.clear();
-        self.pending_pos = 0;
+        pending_write.clear();
+        *pending_pos = 0;
         Poll::Ready(Ok(()))
     }
 }

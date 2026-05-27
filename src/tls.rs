@@ -1,4 +1,4 @@
-use crate::tls_ech::{TlsEchServerKeys, ensure_server_ech_available};
+use crate::tls_ech::ensure_server_ech_available;
 use crate::utls::UtlsFingerprint;
 use anyhow::{Context, Result, bail, ensure};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -11,7 +11,6 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::PathBuf;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

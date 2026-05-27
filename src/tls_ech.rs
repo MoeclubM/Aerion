@@ -133,6 +133,13 @@ pub fn tls_ech_from_path(path: impl AsRef<Path>) -> TlsEchServerKeys {
     }
 }
 
+pub fn tls_ech_from_inline(inline: impl Into<String>) -> TlsEchServerKeys {
+    TlsEchServerKeys {
+        path: None,
+        inline: Some(inline.into()),
+    }
+}
+
 pub fn tls_ech_from_compat_reference(value: &str) -> TlsEchServerKeys {
     let value = value.trim();
     if value.contains("BEGIN ECH KEYS") || looks_like_base64(value) {
