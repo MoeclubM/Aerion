@@ -61,6 +61,7 @@ async fn socks_client_reaches_tcp_target_through_aerion_server() -> Result<()> {
             key: None,
             padding_scheme: PaddingScheme::default_lines(),
             heartbeat_interval_secs: 30,
+            ech: None,
         },
     ));
 
@@ -143,6 +144,7 @@ async fn anytls_server_accepts_auth_and_settings_in_tls_early_data() -> Result<(
             key: None,
             padding_scheme: PaddingScheme::default_lines(),
             heartbeat_interval_secs: 30,
+            ech: None,
         },
     ));
 
@@ -195,6 +197,7 @@ async fn socks_udp_associate_reaches_udp_target_through_uot() -> Result<()> {
             key: None,
             padding_scheme: PaddingScheme::default_lines(),
             heartbeat_interval_secs: 30,
+            ech: None,
         },
     ));
 
@@ -1057,6 +1060,7 @@ async fn socks_client_reaches_tcp_target_through_vless_server() -> Result<()> {
         flow: String::new(),
         reality: None,
         transport: VlessTransportConfig::tcp(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1140,6 +1144,7 @@ async fn socks_client_reaches_tcp_target_through_vless_websocket() -> Result<()>
         flow: String::new(),
         reality: None,
         transport: transport.clone(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1224,6 +1229,7 @@ async fn socks_client_reaches_tcp_target_through_vless_httpupgrade() -> Result<(
         flow: String::new(),
         reality: None,
         transport: transport.clone(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1307,6 +1313,7 @@ async fn socks_client_reaches_tcp_target_through_vless_http2() -> Result<()> {
         flow: String::new(),
         reality: None,
         transport: transport.clone(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1390,6 +1397,7 @@ async fn socks_client_reaches_tcp_target_through_vless_grpc() -> Result<()> {
         flow: String::new(),
         reality: None,
         transport: transport.clone(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1478,6 +1486,7 @@ async fn socks_client_reaches_tcp_target_through_vless_xhttp() -> Result<()> {
         flow: String::new(),
         reality: None,
         transport: transport.clone(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1567,6 +1576,7 @@ async fn socks_client_reaches_tcp_target_through_vless_reality() -> Result<()> {
             alpn_protocols: Vec::new(),
         }),
         transport: VlessTransportConfig::tcp(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1652,6 +1662,7 @@ async fn socks_client_reaches_tcp_target_through_vless_vision() -> Result<()> {
         flow: "xtls-rprx-vision".to_string(),
         reality: None,
         transport: VlessTransportConfig::tcp(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1734,6 +1745,7 @@ async fn socks_client_reaches_tcp_target_through_vless_mux() -> Result<()> {
         flow: String::new(),
         reality: None,
         transport: VlessTransportConfig::tcp(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1815,6 +1827,7 @@ async fn socks_udp_associate_reaches_udp_target_through_vless_xudp() -> Result<(
         flow: String::new(),
         reality: None,
         transport: VlessTransportConfig::tcp(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
