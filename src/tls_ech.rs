@@ -233,7 +233,7 @@ pub mod boring_backend {
         alpn_protocols: &[Vec<u8>],
         ech: &Option<TlsEchServerKeys>,
     ) -> Result<Arc<BoringTlsAcceptor>> {
-        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())
+        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
             .with_context(|| format!("create BoringSSL acceptor for {label}"))?;
         builder.set_verify(SslVerifyMode::NONE);
         install_identity(
@@ -306,19 +306,19 @@ pub mod boring_backend {
 
     fn install_ech_keys(builder: &mut SslAcceptorBuilder, ech: &TlsEchServerKeys) -> Result<()> {
         let entries = ech.load_entries()?;
-        let mut keys = boring::ssl::SslEchKeys::new().context("allocate SslEchKeys")?;
+        let mut keys = boring::ssl::SslEchKeys::builder().context("allocate SslEchKeys")?;
         for (index, entry) in entries.iter().enumerate() {
             add_ech_entry(&mut keys, entry, index == 0)
                 .with_context(|| format!("add ECH server key entry {}", index + 1))?;
         }
         builder
-            .set_ech_keys(&keys)
+            .set_ech_keys(&keys.build())
             .context("register ECH server keys on TLS context")?;
         Ok(())
     }
 
     fn add_ech_entry(
-        keys: &mut boring::ssl::SslEchKeys,
+        keys: &mut boring::ssl::SslEchKeysBuilder,
         entry: &EchServerKeyEntry,
         is_retry_config: bool,
     ) -> Result<()> {
@@ -326,9 +326,9 @@ pub mod boring_backend {
             !entry.private_key.is_empty() && !entry.config.is_empty(),
             "ECH key entry is missing private key or config"
         );
-        let hpke_key =
-            HpkeKey::from_private_key(&entry.private_key).context("parse ECH HPKE private key")?;
-        keys.add(is_retry_config, &entry.config, &hpke_key)
+        let hpke_key = HpkeKey::dhkem_p256_sha256(&entry.private_key)
+            .context("parse ECH HPKE private key")?;
+        keys.add_key(is_retry_config, &entry.config, hpke_key)
             .context("register ECH config and private key")?;
         Ok(())
     }
