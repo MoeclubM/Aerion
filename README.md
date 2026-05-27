@@ -318,9 +318,11 @@ top-level profile options such as `log` / `dns` / `api`, unknown outbound
 profile, `settings`, stream transport, REALITY/finalmask, mux, and
 `streamSettings` fields, fail explicitly instead of being ignored. Xray TLS
 version/cipher/curve policy overrides, separate peer-name verification,
-server-side unknown-SNI rejection, session resumption, key logging, ECH fields,
-unsupported certificate loading options, and unknown `tlsSettings` fields also
-fail explicitly until Aerion exposes equivalent TLS controls. Xray local
+server-side unknown-SNI rejection, session resumption, key logging, and unsupported
+certificate loading options fail explicitly until Aerion exposes equivalent TLS
+controls. Xray `echServerKeys` / sing-box inbound `tls.ech` are supported on TLS
+inbounds when built with the default `server-ech` feature (BoringSSL); client
+`echConfigList` remains unsupported. Xray local
 inbound protocols other than `socks` / `tun`, local SOCKS inbound
 authentication, sniffing, and non-raw transport settings also fail explicitly
 because the Aerion config runner exposes plain no-auth SOCKS and TUN listeners.

@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = []
+default = ["server-ech"]
 # Server-side TLS ECH via BoringSSL (rustls/ring does not support server ECH yet).
-boring-ech = ["dep:boring", "dep:tokio-boring"]
+# Mobile/library consumers should use `default-features = false` when cross-compiling.
+server-ech = ["dep:boring", "dep:tokio-boring"]
 
 [dependencies]
 anyhow = "1.0.102"

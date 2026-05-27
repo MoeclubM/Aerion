@@ -1,7 +1,7 @@
 //! TLS Encrypted Client Hello (ECH) server key parsing and optional BoringSSL backend.
 //!
 //! rustls 0.23 (ring) does not expose server-side ECH yet. When `ech_server_keys` is configured,
-//! Aerion requires the `boring-ech` Cargo feature, which links BoringSSL via the `boring` crate.
+//! Aerion uses BoringSSL via the `server-ech` feature (enabled by default on desktop builds).
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
@@ -48,14 +48,14 @@ impl TlsEchServerKeys {
 
 pub fn ensure_server_ech_available(ech: &Option<TlsEchServerKeys>) -> Result<()> {
     if ech.as_ref().is_some_and(TlsEchServerKeys::is_configured) {
-        #[cfg(not(feature = "boring-ech"))]
+        #[cfg(not(feature = "server-ech"))]
         {
             bail!(
-                "TLS ECH server keys are configured but Aerion was built without the `boring-ech` feature; \
-                 rustls does not support server ECH yet — rebuild with `--features boring-ech`"
+                "TLS ECH server keys are configured but Aerion was built without the `server-ech` feature; \
+                 rustls does not support server ECH yet — rebuild with `--features server-ech`"
             );
         }
-        #[cfg(feature = "boring-ech")]
+        #[cfg(feature = "server-ech")]
         {
             ech.as_ref()
                 .expect("checked above")
@@ -197,7 +197,7 @@ pub fn tls_ech_from_singbox_value(value: &serde_json::Value) -> Result<Option<Tl
     bail!("sing-box tls.ech is enabled but missing key material")
 }
 
-#[cfg(feature = "boring-ech")]
+#[cfg(feature = "server-ech")]
 pub mod boring_backend {
     use super::{EchServerKeyEntry, TlsEchServerKeys};
     use anyhow::{Context, Result, ensure};
@@ -357,5 +357,43 @@ mod tests {
     #[test]
     fn rejects_empty_ech_keys() {
         assert!(parse_xray_ech_keys(&[]).is_err());
+    }
+
+    #[test]
+    fn ensure_server_ech_available_without_config() -> Result<()> {
+        ensure_server_ech_available(&None)?;
+        ensure_server_ech_available(&Some(TlsEchServerKeys::default()))?;
+        Ok(())
+    }
+
+    #[test]
+    fn decode_inline_base64_ech_keys() -> Result<()> {
+        let private_key = vec![0x11; 32];
+        let config = vec![0x22; 48];
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&(private_key.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&private_key);
+        raw.extend_from_slice(&(config.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&config);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let decoded = decode_ech_keys_text(&encoded)?;
+        assert_eq!(decoded, raw);
+        Ok(())
+    }
+
+    #[cfg(feature = "server-ech")]
+    #[test]
+    fn ensure_server_ech_available_loads_inline_keys() -> Result<()> {
+        let private_key = vec![0x11; 32];
+        let config = vec![0x22; 48];
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&(private_key.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&private_key);
+        raw.extend_from_slice(&(config.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&config);
+        let inline = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let ech = Some(tls_ech_from_inline(inline));
+        ensure_server_ech_available(&ech)?;
+        Ok(())
     }
 }

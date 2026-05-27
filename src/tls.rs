@@ -50,7 +50,7 @@ impl ServerTlsMaterial {
 
 pub enum ServerTlsAcceptor {
     Rustls(tokio_rustls::TlsAcceptor),
-    #[cfg(feature = "boring-ech")]
+    #[cfg(feature = "server-ech")]
     Boring(std::sync::Arc<crate::tls_ech::boring_backend::BoringTlsAcceptor>),
 }
 
@@ -58,7 +58,7 @@ impl Clone for ServerTlsAcceptor {
     fn clone(&self) -> Self {
         match self {
             Self::Rustls(acceptor) => Self::Rustls(acceptor.clone()),
-            #[cfg(feature = "boring-ech")]
+            #[cfg(feature = "server-ech")]
             Self::Boring(acceptor) => Self::Boring(acceptor.clone()),
         }
     }
@@ -74,7 +74,7 @@ impl ServerTlsAcceptor {
                     .context("accept rustls client")?;
                 Ok(ServerTlsStream::Rustls(stream))
             }
-            #[cfg(feature = "boring-ech")]
+            #[cfg(feature = "server-ech")]
             Self::Boring(acceptor) => {
                 let stream = acceptor.accept(stream).await?;
                 Ok(ServerTlsStream::Boring(stream))
@@ -85,7 +85,7 @@ impl ServerTlsAcceptor {
 
 pub enum ServerTlsStream {
     Rustls(tokio_rustls::server::TlsStream<tokio::net::TcpStream>),
-    #[cfg(feature = "boring-ech")]
+    #[cfg(feature = "server-ech")]
     Boring(tokio_boring::SslStream<tokio::net::TcpStream>),
 }
 
@@ -93,7 +93,7 @@ impl ServerTlsStream {
     pub fn rustls_early_data(&mut self) -> Option<impl Read + '_> {
         match self {
             Self::Rustls(stream) => stream.get_mut().1.early_data(),
-            #[cfg(feature = "boring-ech")]
+            #[cfg(feature = "server-ech")]
             Self::Boring(_) => None,
         }
     }
@@ -107,7 +107,7 @@ impl tokio::io::AsyncRead for ServerTlsStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         match &mut *self {
             Self::Rustls(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
-            #[cfg(feature = "boring-ech")]
+            #[cfg(feature = "server-ech")]
             Self::Boring(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
         }
     }
@@ -121,7 +121,7 @@ impl tokio::io::AsyncWrite for ServerTlsStream {
     ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
         match &mut *self {
             Self::Rustls(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
-            #[cfg(feature = "boring-ech")]
+            #[cfg(feature = "server-ech")]
             Self::Boring(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
         }
     }
@@ -132,7 +132,7 @@ impl tokio::io::AsyncWrite for ServerTlsStream {
     ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
         match &mut *self {
             Self::Rustls(stream) => std::pin::Pin::new(stream).poll_flush(cx),
-            #[cfg(feature = "boring-ech")]
+            #[cfg(feature = "server-ech")]
             Self::Boring(stream) => std::pin::Pin::new(stream).poll_flush(cx),
         }
     }
@@ -143,7 +143,7 @@ impl tokio::io::AsyncWrite for ServerTlsStream {
     ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
         match &mut *self {
             Self::Rustls(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
-            #[cfg(feature = "boring-ech")]
+            #[cfg(feature = "server-ech")]
             Self::Boring(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
         }
     }
@@ -156,7 +156,7 @@ pub fn build_server_tls_acceptor(material: &ServerTlsMaterial) -> Result<ServerT
         .as_ref()
         .is_some_and(TlsEchServerKeys::is_configured)
     {
-        #[cfg(feature = "boring-ech")]
+        #[cfg(feature = "server-ech")]
         {
             return Ok(ServerTlsAcceptor::Boring(
                 crate::tls_ech::boring_backend::build_boring_acceptor(
@@ -170,10 +170,10 @@ pub fn build_server_tls_acceptor(material: &ServerTlsMaterial) -> Result<ServerT
                 )?,
             ));
         }
-        #[cfg(not(feature = "boring-ech"))]
+        #[cfg(not(feature = "server-ech"))]
         {
             bail!(
-                "TLS ECH server keys are configured for {} but Aerion was built without the `boring-ech` feature",
+                "TLS ECH server keys are configured for {} but Aerion was built without the `server-ech` feature",
                 material.label
             );
         }
