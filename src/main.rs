@@ -1357,6 +1357,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
         .await;
     }
     if is_vmess(&server.protocol) {
+        let ech = native_ech_server_keys(&server);
         let tls = server.tls.unwrap_or_else(|| {
             server.cert.is_some()
                 || server.key.is_some()
@@ -1374,11 +1375,6 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
         } else {
             (None, None, Vec::new(), None)
         };
-        let ech = if tls {
-            native_ech_server_keys(&server)
-        } else {
-            None
-        };
         return run_vmess_server(VmessServerConfig {
             listen: server.listen,
             user_id: native_user_id(server.user_id, &server.username, "VMess server")?,
@@ -1394,7 +1390,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
                 server.host,
                 server.headers,
             )?,
-            ech,
+            ech: if tls { ech } else { None },
         })
         .await;
     }
