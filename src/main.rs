@@ -1308,6 +1308,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
         .await;
     }
     if is_vless(&server.protocol) {
+        let ech = native_ech_server_keys(&server);
         let tls = server.reality_private_key.is_none() && server.tls.unwrap_or(true);
         let (cert_path, key_path) = if !tls {
             (PathBuf::new(), PathBuf::new())
@@ -1339,7 +1340,6 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             .transpose()?;
         let certificates = if tls { server.certificates } else { Vec::new() };
         let key = if tls { server.key_pem } else { None };
-        let ech = native_ech_server_keys(&server);
         return run_vless_server(VlessServerConfig {
             listen: server.listen,
             user_id: native_user_id(server.user_id, &server.username, "VLESS server")?,
