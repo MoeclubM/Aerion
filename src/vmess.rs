@@ -1,5 +1,6 @@
 use crate::core::{CoreSession, ProxyCore};
 use crate::protocol::{ProxyTarget, parse_uuid, resolve_target_addr, target_name};
+use crate::tls::{ServerTlsAcceptor, ServerTlsMaterial, TlsEchServerKeys};
 use crate::vless_transport::VlessTransportConfig;
 use crate::vmess_body::{BodyConfig, BodyReader, BodyWriter, RequestOptions, SecurityType};
 use crate::{socket_protect, socks, tls, uot, utls, vless_transport, vless_xudp};
@@ -20,7 +21,7 @@ use tokio::io::WriteHalf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_rustls::TlsConnector;
 
 const VERSION: u8 = 0x01;
 const CMD_TCP: u8 = 0x01;
@@ -73,6 +74,7 @@ pub struct VmessServerConfig {
     pub certificates: Vec<String>,
     pub key: Option<String>,
     pub transport: VlessTransportConfig,
+    pub ech: Option<TlsEchServerKeys>,
 }
 
 type VmessTransport = vless_transport::BoxedTransportStream;
@@ -172,15 +174,16 @@ pub async fn run_vmess_server_with_core(config: VmessServerConfig, core: ProxyCo
         .with_context(|| format!("bind VMess server on {}", config.listen))?;
     let users = vmess_users(&config.user_id, &config.users)?;
     let acceptor = if config.tls {
-        let mut server_config = Arc::unwrap_or_clone(tls::server_config_from_material(
-            config.cert_path.as_deref().and_then(tls::present_path),
-            config.key_path.as_deref().and_then(tls::present_path),
-            &config.certificates,
-            config.key.as_deref(),
-            "VMess server TLS",
-        )?);
-        server_config.alpn_protocols = config.transport.alpn_protocols();
-        Some(TlsAcceptor::from(Arc::new(server_config)))
+        Some(tls::build_server_tls_acceptor(&ServerTlsMaterial {
+            cert_path: config.cert_path.clone(),
+            key_path: config.key_path.clone(),
+            certificates: config.certificates.clone(),
+            key: config.key.clone(),
+            label: "VMess server TLS".to_string(),
+            alpn_protocols: config.transport.alpn_protocols(),
+            early_data: false,
+            ech: config.ech.clone(),
+        })?)
     } else {
         None
     };
@@ -282,7 +285,7 @@ async fn connect_vmess_transport(config: &VmessClientConfig) -> Result<VmessTran
 
 async fn accept_vmess_transport(
     stream: TcpStream,
-    acceptor: Option<TlsAcceptor>,
+    acceptor: Option<ServerTlsAcceptor>,
 ) -> Result<VmessTransport> {
     match acceptor {
         Some(acceptor) => Ok(Box::new(

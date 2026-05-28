@@ -1,6 +1,7 @@
 use crate::core::{CoreSession, ProxyCore, relay_bidirectional_counted};
 use crate::protocol::{ProxyTarget, resolve_target_addr, target_name};
 use crate::socket_protect;
+use crate::tls::{ServerTlsAcceptor, ServerTlsMaterial, TlsEchServerKeys};
 use crate::vless_transport::VlessTransportConfig;
 use crate::{socks, tls, uot, utls, vless_transport};
 use anyhow::{Context, Result, bail, ensure};
@@ -14,7 +15,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_rustls::TlsConnector;
 
 const CMD_CONNECT: u8 = 0x01;
 const CMD_UDP_ASSOCIATE: u8 = 0x03;
@@ -50,6 +51,7 @@ pub struct TrojanServerConfig {
     pub certificates: Vec<String>,
     pub key: Option<String>,
     pub transport: VlessTransportConfig,
+    pub ech: Option<TlsEchServerKeys>,
 }
 
 type TrojanTransport = vless_transport::BoxedTransportStream;
@@ -111,18 +113,16 @@ pub async fn run_trojan_server_with_core(
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind Trojan server on {}", config.listen))?;
-    let mut server_config = Arc::unwrap_or_clone(tls::server_config_from_material(
-        tls::present_path(&config.cert_path),
-        tls::present_path(&config.key_path),
-        &config.certificates,
-        config.key.as_deref(),
-        "Trojan server TLS",
-    )?);
-    let alpn = config.transport.alpn_protocols();
-    if !alpn.is_empty() {
-        server_config.alpn_protocols = alpn;
-    }
-    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let acceptor = tls::build_server_tls_acceptor(&ServerTlsMaterial {
+        cert_path: tls::present_path(&config.cert_path).map(PathBuf::from),
+        key_path: tls::present_path(&config.key_path).map(PathBuf::from),
+        certificates: config.certificates.clone(),
+        key: config.key.clone(),
+        label: "Trojan server TLS".to_string(),
+        alpn_protocols: config.transport.alpn_protocols(),
+        early_data: false,
+        ech: config.ech.clone(),
+    })?;
     let auth = trojan_auth_map(&config.password, &config.users);
     let transport = config.transport.clone();
     tracing::info!("Trojan server listening on {}", listener.local_addr()?);
@@ -304,7 +304,7 @@ async fn connect_trojan_server(config: &TrojanClientConfig) -> Result<TrojanTran
 
 async fn handle_trojan_client(
     stream: TcpStream,
-    acceptor: TlsAcceptor,
+    acceptor: ServerTlsAcceptor,
     auth: HashMap<[u8; TROJAN_AUTH_LEN], String>,
     core: ProxyCore,
     peer: SocketAddr,

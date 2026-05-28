@@ -1288,6 +1288,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
     }
     if is_trojan(&server.protocol) {
         let (cert_path, key_path) = native_tls_paths(&server, "Trojan")?;
+        let ech = native_ech_server_keys(&server);
         return run_trojan_server(TrojanServerConfig {
             listen: server.listen,
             password: server.password,
@@ -1302,6 +1303,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
                 server.host,
                 server.headers,
             )?,
+            ech,
         })
         .await;
     }
@@ -1337,10 +1339,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             .transpose()?;
         let certificates = if tls { server.certificates } else { Vec::new() };
         let key = if tls { server.key_pem } else { None };
-        let ech = server
-            .ech_server_keys
-            .as_deref()
-            .map(aerion::tls_ech::tls_ech_from_compat_reference);
+        let ech = native_ech_server_keys(&server);
         return run_vless_server(VlessServerConfig {
             listen: server.listen,
             user_id: native_user_id(server.user_id, &server.username, "VLESS server")?,
@@ -1375,6 +1374,11 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
         } else {
             (None, None, Vec::new(), None)
         };
+        let ech = if tls {
+            native_ech_server_keys(&server)
+        } else {
+            None
+        };
         return run_vmess_server(VmessServerConfig {
             listen: server.listen,
             user_id: native_user_id(server.user_id, &server.username, "VMess server")?,
@@ -1390,15 +1394,13 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
                 server.host,
                 server.headers,
             )?,
+            ech,
         })
         .await;
     }
     ensure_supported_protocol(&server.protocol)?;
     let (cert_path, key_path) = native_tls_paths(&server, "AnyTLS")?;
-    let ech = server
-        .ech_server_keys
-        .as_deref()
-        .map(aerion::tls_ech::tls_ech_from_compat_reference);
+    let ech = native_ech_server_keys(&server);
     run_server(ServerConfig {
         listen: server.listen,
         password: server.password,
@@ -1436,6 +1438,13 @@ fn native_tls_paths(server: &ServerFileConfig, protocol: &str) -> Result<(PathBu
         }
     };
     Ok((cert_path, key_path))
+}
+
+fn native_ech_server_keys(server: &ServerFileConfig) -> Option<aerion::TlsEchServerKeys> {
+    server
+        .ech_server_keys
+        .as_deref()
+        .map(aerion::tls_ech::tls_ech_from_compat_reference)
 }
 
 async fn run_client_config(config: RunnableClientConfig) -> Result<()> {

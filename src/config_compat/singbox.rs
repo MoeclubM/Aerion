@@ -2434,6 +2434,13 @@ impl SingBoxTrojanInbound {
             .with_context(|| format!("sing-box Trojan inbound {name} is missing users"))?;
         let (cert_path, key_path, certificates, key) =
             singbox_tls_server_identity(&self.tls, "Trojan", name)?;
+        let ech = self
+            .tls
+            .ech
+            .as_ref()
+            .map(tls_ech_from_singbox_value)
+            .transpose()?
+            .flatten();
         Ok(TrojanServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
@@ -2453,6 +2460,7 @@ impl SingBoxTrojanInbound {
             certificates,
             key,
             transport,
+            ech,
         })
     }
 }
@@ -2509,6 +2517,12 @@ impl SingBoxVmessInbound {
             ensure_vless_alpn("sing-box", name, &transport, tls.alpn.as_ref())?;
             let (cert_path, key_path, certificates, key) =
                 singbox_tls_server_identity(tls, "VMess", name)?;
+            let ech = tls
+                .ech
+                .as_ref()
+                .map(tls_ech_from_singbox_value)
+                .transpose()?
+                .flatten();
             Ok(VmessServerConfig {
                 listen: SocketAddr::new(
                     parse_listen_ip("sing-box", listen.unwrap_or("0.0.0.0"))?,
@@ -2524,6 +2538,7 @@ impl SingBoxVmessInbound {
                 certificates,
                 key,
                 transport,
+                ech,
             })
         } else {
             if let Some(tls) = &self.tls {
@@ -2545,6 +2560,7 @@ impl SingBoxVmessInbound {
                 certificates: Vec::new(),
                 key: None,
                 transport,
+                ech: None,
             })
         }
     }
@@ -5177,7 +5193,8 @@ mod tests {
       "tls": {
         "enabled": true,
         "certificate_path": ["server.crt"],
-        "key_path": "server.key"
+        "key_path": "server.key",
+        "ech": { "key_path": "trojan-ech.keys" }
       },
       "transport": {
         "type": "ws",
@@ -5198,6 +5215,7 @@ mod tests {
         assert_eq!(trojan.key_path, PathBuf::from("server.key"));
         assert_eq!(trojan.transport.kind, VlessTransportKind::WebSocket);
         assert_eq!(trojan.transport.path, "/trojan");
+        assert!(trojan.ech.is_some());
         Ok(())
     }
 
@@ -5219,7 +5237,8 @@ mod tests {
         "enabled": true,
         "certificate_path": "server.crt",
         "key_path": "server.key",
-        "alpn": ["h2"]
+        "alpn": ["h2"],
+        "ech": { "key_path": "vmess-ech.keys" }
       },
       "transport": {
         "type": "http",
@@ -5244,6 +5263,7 @@ mod tests {
         );
         assert_eq!(vmess.transport.kind, VlessTransportKind::Http2);
         assert_eq!(vmess.transport.path, "/vmess");
+        assert!(vmess.ech.is_some());
         Ok(())
     }
 

@@ -1995,6 +1995,7 @@ impl XrayInbound {
             .context("xray Trojan inbound is missing settings.clients")?;
         let (cert_path, key_path, certificates, key) =
             xray_tls_server_identity(certificate, "Trojan", self.name())?;
+        let ech = xray_tls_ech_server_keys(self.stream_settings.tls_settings.as_ref())?;
         Ok(TrojanServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
@@ -2022,6 +2023,7 @@ impl XrayInbound {
             certificates,
             key,
             transport,
+            ech,
         })
     }
 
@@ -2248,6 +2250,11 @@ impl XrayInbound {
         } else {
             (None, None, Vec::new(), None)
         };
+        let ech = if tls_enabled {
+            xray_tls_ech_server_keys(self.stream_settings.tls_settings.as_ref())?
+        } else {
+            None
+        };
         Ok(VmessServerConfig {
             listen: SocketAddr::new(
                 parse_listen_ip("xray", self.listen.as_deref().unwrap_or("0.0.0.0"))?,
@@ -2263,6 +2270,7 @@ impl XrayInbound {
             certificates,
             key,
             transport,
+            ech,
         })
     }
 }
@@ -4714,7 +4722,8 @@ mod tests {
       "network": "ws",
       "security": "tls",
       "tlsSettings": {
-        "certificates": [{ "certificateFile": "server.crt", "keyFile": "server.key" }]
+        "certificates": [{ "certificateFile": "server.crt", "keyFile": "server.key" }],
+        "echServerKeys": "ech-vmess.keys"
       },
       "wsSettings": { "path": "/vmess" }
     }
@@ -4736,6 +4745,7 @@ mod tests {
         );
         assert_eq!(vmess.transport.kind, VlessTransportKind::WebSocket);
         assert_eq!(vmess.transport.path, "/vmess");
+        assert!(vmess.ech.is_some());
         Ok(())
     }
 
@@ -4758,7 +4768,8 @@ mod tests {
       "network": "ws",
       "security": "tls",
       "tlsSettings": {
-        "certificates": [{ "certificateFile": "server.crt", "keyFile": "server.key" }]
+        "certificates": [{ "certificateFile": "server.crt", "keyFile": "server.key" }],
+        "echServerKeys": "ech-trojan.keys"
       },
       "wsSettings": { "path": "/trojan" }
     }
@@ -4776,6 +4787,7 @@ mod tests {
         assert_eq!(trojan.key_path, PathBuf::from("server.key"));
         assert_eq!(trojan.transport.kind, VlessTransportKind::WebSocket);
         assert_eq!(trojan.transport.path, "/trojan");
+        assert!(trojan.ech.is_some());
         Ok(())
     }
 

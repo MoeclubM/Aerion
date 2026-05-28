@@ -909,6 +909,7 @@ async fn socks_client_reaches_tcp_target_through_trojan_server() -> Result<()> {
         certificates: Vec::new(),
         key: None,
         transport: VlessTransportConfig::tcp(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -983,6 +984,7 @@ async fn socks_client_reaches_tcp_target_through_trojan_websocket_server() -> Re
         certificates: Vec::new(),
         key: None,
         transport: transport.clone(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1914,6 +1916,7 @@ async fn socks_client_reaches_tcp_target_through_vmess_server() -> Result<()> {
         certificates: Vec::new(),
         key: None,
         transport: VlessTransportConfig::tcp(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1983,6 +1986,7 @@ async fn socks_client_reaches_tcp_target_through_vmess_websocket() -> Result<()>
         certificates: Vec::new(),
         key: None,
         transport: transport.clone(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -2060,6 +2064,7 @@ async fn socks_client_reaches_tcp_target_through_vmess_tls_server() -> Result<()
         certificates: Vec::new(),
         key: None,
         transport: VlessTransportConfig::tcp(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -2127,6 +2132,7 @@ async fn socks_udp_associate_reaches_udp_target_through_vmess_server() -> Result
         certificates: Vec::new(),
         key: None,
         transport: VlessTransportConfig::tcp(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -2212,6 +2218,7 @@ async fn socks_udp_associate_reaches_udp_target_through_vmess_packetaddr() -> Re
         certificates: Vec::new(),
         key: None,
         transport: VlessTransportConfig::tcp(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -2300,6 +2307,7 @@ async fn socks_udp_associate_reaches_udp_target_through_vmess_xudp() -> Result<(
         certificates: Vec::new(),
         key: None,
         transport: VlessTransportConfig::tcp(),
+        ech: None,
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
