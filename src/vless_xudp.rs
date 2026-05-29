@@ -324,7 +324,7 @@ async fn target_socket_addr_cached(
     if let Some(addr) = cache.get(&key).copied() {
         return Ok(addr);
     }
-    let ProxyTarget::Domain(host, port) = target else {
+    let ProxyTarget::Domain(_host, _port) = target else {
         unreachable!("IP target returned above")
     };
     let addr = resolve_target_addr(target).await?;

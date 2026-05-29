@@ -715,8 +715,8 @@ async fn relay_hy2_tcp(
 ) -> Result<()> {
     let (mut local_reader, local_writer) = local.into_split();
     let Hysteria2TcpStream {
-        send: mut send,
-        recv: mut recv,
+        mut send,
+        mut recv,
         ..
     } = stream;
     let uplink = async {

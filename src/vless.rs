@@ -184,7 +184,7 @@ pub async fn run_vless_server_with_core(config: VlessServerConfig, core: ProxyCo
 }
 
 async fn handle_vless_socks_with_core(
-    mut stream: TcpStream,
+    stream: TcpStream,
     config: VlessClientConfig,
     core: Option<ProxyCore>,
     peer: SocketAddr,

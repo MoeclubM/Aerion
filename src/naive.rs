@@ -200,7 +200,7 @@ async fn handle_naive_server_tcp(
     acceptor: tokio_rustls::TlsAcceptor,
     runtime: NaiveServerRuntime,
 ) -> Result<()> {
-    let mut tls = acceptor.accept(stream).await.context("accept Naive TLS")?;
+    let tls = acceptor.accept(stream).await.context("accept Naive TLS")?;
     if tls.get_ref().1.alpn_protocol() == Some(NAIVE_H2_ALPN) {
         return handle_naive_h2_connection(tls, peer, runtime).await;
     }
@@ -237,7 +237,7 @@ async fn handle_naive_http1_connection(
             .context("write Naive HTTP/1.1 UOT response")?;
         return relay_naive_http1_uot(tls, pending, target, session).await;
     }
-    let mut remote = connect_proxy_target(&target).await?;
+    let remote = connect_proxy_target(&target).await?;
     tls.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await
         .context("write Naive HTTP/1.1 CONNECT response")?;

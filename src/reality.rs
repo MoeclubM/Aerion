@@ -1,5 +1,5 @@
 use crate::client_hello::{
-    BuiltClientHello, ClientHelloParams, build_client_hello, encode_tls_record,
+    BuiltClientHello, ClientHelloParams, build_client_hello,
 };
 use crate::utls::UtlsFingerprint;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -766,6 +766,7 @@ fn unix_time_u32() -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client_hello::encode_tls_record;
     use aes_gcm::aead::Aead;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};

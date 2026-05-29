@@ -40,17 +40,10 @@ const REALITY_PIPE_CAPACITY: usize = 64 * 1024;
 type HmacSha512 = Hmac<Sha512>;
 
 pub struct RealityTlsClientStream {
-    selected_alpn_protocol: Option<Vec<u8>>,
     reader: DuplexStream,
     writer: DuplexStream,
     read_task: JoinHandle<Result<()>>,
     write_task: JoinHandle<Result<()>>,
-}
-
-impl RealityTlsClientStream {
-    pub fn selected_alpn_protocol(&self) -> Option<&[u8]> {
-        self.selected_alpn_protocol.as_deref()
-    }
 }
 
 impl Drop for RealityTlsClientStream {
@@ -134,7 +127,7 @@ pub async fn connect(
     let mut handshake_writer = RecordCipher::new(suite, &client_handshake_secret)
         .context("create REALITY handshake writer")?;
 
-    let selected_alpn_protocol = read_server_handshake_messages(
+    read_server_handshake_messages(
         &mut stream,
         &mut handshake_reader,
         suite,
@@ -176,7 +169,6 @@ pub async fn connect(
         .context("create REALITY application writer")?;
     Ok(spawn_reality_stream(
         stream,
-        selected_alpn_protocol,
         reader_cipher,
         writer_cipher,
     ))
@@ -184,7 +176,6 @@ pub async fn connect(
 
 fn spawn_reality_stream(
     stream: TcpStream,
-    selected_alpn_protocol: Option<Vec<u8>>,
     reader_cipher: RecordCipher,
     writer_cipher: RecordCipher,
 ) -> RealityTlsClientStream {
@@ -199,7 +190,6 @@ fn spawn_reality_stream(
         pump_outbound(stream_writer, outbound_source, writer_cipher, control_rx).await
     });
     RealityTlsClientStream {
-        selected_alpn_protocol,
         reader,
         writer,
         read_task,
@@ -428,9 +418,8 @@ async fn read_server_handshake_messages(
     auth_key: &[u8; 32],
     transcript: &mut TranscriptHash,
     server_handshake_secret: &[u8],
-) -> Result<Option<Vec<u8>>> {
+) -> Result<()> {
     let mut buffer = Vec::new();
-    let mut selected_alpn_protocol = None;
     let mut certificate_public_key = None;
     loop {
         let Some(mut record) = read_tls_record(stream).await? else {
@@ -456,7 +445,8 @@ async fn read_server_handshake_messages(
                 while let Some(message) = take_handshake_message(&mut buffer)? {
                     match message[0] {
                         TLS_HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS => {
-                            selected_alpn_protocol = parse_encrypted_extensions(&message)
+                            // Parsed for validation; the negotiated ALPN is not consumed.
+                            parse_encrypted_extensions(&message)
                                 .context("parse REALITY EncryptedExtensions")?;
                             transcript.update(&message);
                         }
@@ -489,7 +479,7 @@ async fn read_server_handshake_messages(
                             )
                             .context("verify REALITY server Finished")?;
                             transcript.update(&message);
-                            return Ok(selected_alpn_protocol);
+                            return Ok(());
                         }
                         other => bail!("unexpected REALITY server handshake message type {other}"),
                     }

@@ -178,7 +178,6 @@ enum MieruAnyWriter {
 
 #[derive(Debug)]
 pub struct MieruSession {
-    id: u32,
     inbound: mpsc::UnboundedReceiver<Vec<u8>>,
     outbound: mpsc::UnboundedSender<SessionCommand>,
     read_buffer: Vec<u8>,
@@ -643,12 +642,10 @@ impl MieruAnyWriter {
 
 impl MieruSession {
     fn new(
-        id: u32,
         inbound: mpsc::UnboundedReceiver<Vec<u8>>,
         outbound: mpsc::UnboundedSender<SessionCommand>,
     ) -> Self {
         Self {
-            id,
             inbound,
             outbound,
             read_buffer: Vec::new(),
@@ -1297,7 +1294,7 @@ impl ClientUnderlay {
             self.reliable,
             mtu,
         ));
-        Ok(MieruSession::new(session_id, inbound_rx, outbound_tx))
+        Ok(MieruSession::new(inbound_rx, outbound_tx))
     }
 }
 
@@ -1614,7 +1611,7 @@ async fn handle_server_segment(
             }
             route_session_segment(&sessions, segment, reliable.then_some(ACK_SERVER_TO_CLIENT))
                 .await?;
-            let session = MieruSession::new(session_id, inbound_rx, outbound_tx);
+            let session = MieruSession::new(inbound_rx, outbound_tx);
             tokio::spawn(async move {
                 if let Err(error) = handle_mieru_server_socks_session(session, core_session).await {
                     tracing::warn!("Mieru session {session_id} failed: {error:?}");
