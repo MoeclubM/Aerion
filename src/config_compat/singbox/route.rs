@@ -750,4 +750,3 @@ fn merge_singbox_and_route_rule(
     target.ports.extend(rule.ports);
     Ok(())
 }
-

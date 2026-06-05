@@ -58,7 +58,12 @@ impl SingBoxTlsOptions {
         Ok(())
     }
 
-    pub(super) fn reject_unsupported_fields(&self, protocol: &str, name: &str, direction: &str) -> Result<()> {
+    pub(super) fn reject_unsupported_fields(
+        &self,
+        protocol: &str,
+        name: &str,
+        direction: &str,
+    ) -> Result<()> {
         ensure!(
             self.extra.is_empty(),
             "sing-box {protocol} {direction} {name} tls has unsupported fields {:?}",
@@ -276,4 +281,3 @@ impl SingBoxRealityHandshake {
         Ok(())
     }
 }
-

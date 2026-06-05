@@ -235,4 +235,3 @@ impl XrayBalancer {
         Ok(matches.remove(0))
     }
 }
-

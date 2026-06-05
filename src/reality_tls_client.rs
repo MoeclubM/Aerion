@@ -167,11 +167,7 @@ pub async fn connect(
         .context("create REALITY application reader")?;
     let writer_cipher = RecordCipher::new(suite, &client_application_secret)
         .context("create REALITY application writer")?;
-    Ok(spawn_reality_stream(
-        stream,
-        reader_cipher,
-        writer_cipher,
-    ))
+    Ok(spawn_reality_stream(stream, reader_cipher, writer_cipher))
 }
 
 fn spawn_reality_stream(

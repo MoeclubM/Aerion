@@ -74,7 +74,10 @@ pub(super) fn split_mihomo_logical_rule<'a>(
     Ok((kind, payload, action))
 }
 
-pub(super) fn mihomo_logical_children<'a>(payload: &'a str, location: &str) -> Result<Vec<&'a str>> {
+pub(super) fn mihomo_logical_children<'a>(
+    payload: &'a str,
+    location: &str,
+) -> Result<Vec<&'a str>> {
     let payload = payload.trim();
     ensure!(
         payload.starts_with('(') && payload.ends_with(')'),
@@ -340,7 +343,9 @@ pub(super) fn mihomo_text_rule_provider_line(line: &str) -> Option<&str> {
     (!line.is_empty()).then_some(line)
 }
 
-pub(super) fn collect_mihomo_route_asset_sets(table: &RouteTable) -> (BTreeSet<String>, BTreeSet<String>) {
+pub(super) fn collect_mihomo_route_asset_sets(
+    table: &RouteTable,
+) -> (BTreeSet<String>, BTreeSet<String>) {
     let mut geoip = BTreeSet::new();
     let mut geosite = BTreeSet::new();
     for rule in &table.rules {
@@ -414,4 +419,3 @@ pub(super) fn mihomo_route_asset_hint(dir: Option<&Path>, name: &str, kind: &str
         None => format!("; provide route {kind} data for {normalized} via route_table_with_assets"),
     }
 }
-

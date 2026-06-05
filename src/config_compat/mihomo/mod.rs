@@ -1115,7 +1115,6 @@ impl MihomoTunConfig {
     }
 }
 
-
 mod proxy;
 mod route;
 
@@ -1428,7 +1427,6 @@ where
         None => Ok(None),
     }
 }
-
 
 #[cfg(test)]
 mod tests;

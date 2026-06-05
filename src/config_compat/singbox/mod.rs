@@ -1073,7 +1073,6 @@ impl SingBoxConfig {
     }
 }
 
-
 mod inbound;
 mod outbound;
 mod route;

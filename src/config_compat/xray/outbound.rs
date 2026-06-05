@@ -996,4 +996,3 @@ impl XrayOutbound {
         VlessTransportConfig::from_network(&self.stream_settings.network, None, None, Vec::new())
     }
 }
-

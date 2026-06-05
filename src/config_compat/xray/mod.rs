@@ -1272,7 +1272,6 @@ impl XrayConfig {
     }
 }
 
-
 mod inbound;
 mod outbound;
 mod route;

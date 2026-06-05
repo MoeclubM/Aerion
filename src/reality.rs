@@ -1,6 +1,4 @@
-use crate::client_hello::{
-    BuiltClientHello, ClientHelloParams, build_client_hello,
-};
+use crate::client_hello::{BuiltClientHello, ClientHelloParams, build_client_hello};
 use crate::utls::UtlsFingerprint;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
