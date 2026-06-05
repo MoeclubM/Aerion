@@ -445,9 +445,15 @@ async fn handle_tuic_socks_client(
     shared: Arc<SharedTuicClient>,
     udp_enabled: bool,
 ) -> Result<()> {
-    let client = shared.get_or_connect().await?;
     match socks::read_request(&mut local).await? {
         socks::SocksRequest::Connect(target) => {
+            let client = match shared.get_or_connect().await {
+                Ok(client) => client,
+                Err(error) => {
+                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    return Err(error);
+                }
+            };
             let stream = match client.open_tcp(&target).await {
                 Ok(stream) => stream,
                 Err(error) => {
@@ -461,6 +467,13 @@ async fn handle_tuic_socks_client(
         }
         socks::SocksRequest::UdpAssociate => {
             ensure!(udp_enabled, "TUIC UDP is disabled by config");
+            let client = match shared.get_or_connect().await {
+                Ok(client) => client,
+                Err(error) => {
+                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    return Err(error);
+                }
+            };
             handle_tuic_udp_associate(local, client).await
         }
     }

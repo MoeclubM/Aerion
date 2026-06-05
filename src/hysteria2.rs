@@ -690,9 +690,15 @@ async fn handle_hy2_socks_client(
     mut local: TcpStream,
     shared: Arc<SharedHysteria2Client>,
 ) -> Result<()> {
-    let session = shared.get_or_connect().await?;
     match socks::read_request(&mut local).await? {
         socks::SocksRequest::Connect(target) => {
+            let session = match shared.get_or_connect().await {
+                Ok(session) => session,
+                Err(error) => {
+                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    return Err(error);
+                }
+            };
             let stream = match session.open_tcp(target.clone()).await {
                 Ok(stream) => stream,
                 Err(error) => {
@@ -704,7 +710,16 @@ async fn handle_hy2_socks_client(
             tracing::info!("Hysteria2 proxying {}", target_name(&target));
             relay_hy2_tcp(local, stream, session).await
         }
-        socks::SocksRequest::UdpAssociate => handle_hy2_udp_associate(local, session).await,
+        socks::SocksRequest::UdpAssociate => {
+            let session = match shared.get_or_connect().await {
+                Ok(session) => session,
+                Err(error) => {
+                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    return Err(error);
+                }
+            };
+            handle_hy2_udp_associate(local, session).await
+        }
     }
 }
 
