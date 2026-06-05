@@ -58,7 +58,8 @@ pub use http_connect::{
 };
 pub use hysteria2::{
     Hysteria2ClientConfig, Hysteria2ServerConfig, run_hysteria2_client,
-    run_hysteria2_client_listener, run_hysteria2_server, run_hysteria2_server_with_core,
+    run_hysteria2_client_listener, run_hysteria2_server, run_hysteria2_server_socket_with_core,
+    run_hysteria2_server_with_core,
 };
 pub use ios_packet_flow::{
     IOS_PACKET_FLOW_IPV4_PROTOCOL, IOS_PACKET_FLOW_IPV6_PROTOCOL, IosPacketFlowPacket,
@@ -70,7 +71,8 @@ pub use log_bridge::{LogBridge, LogBridgeLayer, LogEntry};
 pub use mieru::{
     MieruClientConfig, MieruNoncePattern, MieruNonceType, MieruServerConfig, MieruTcpFragment,
     MieruTrafficPattern, MieruTransport, MieruUser, parse_mieru_user, run_mieru_client,
-    run_mieru_client_listener, run_mieru_server, run_mieru_server_with_core,
+    run_mieru_client_listener, run_mieru_packet_server_socket_with_core, run_mieru_server,
+    run_mieru_server_listener_with_core, run_mieru_server_with_core,
 };
 pub use naive::{
     NaiveClientConfig, NaiveServerConfig, run_naive_client, run_naive_client_listener,

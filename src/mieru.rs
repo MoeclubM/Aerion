@@ -1009,14 +1009,29 @@ pub async fn run_mieru_server(config: MieruServerConfig) -> Result<()> {
 }
 
 pub async fn run_mieru_server_with_core(config: MieruServerConfig, core: ProxyCore) -> Result<()> {
-    let users = config.effective_users();
-    ensure!(!users.is_empty(), "Mieru server has no configured users");
     if config.transport == MieruTransport::Udp {
-        return run_mieru_packet_server(config, core, users).await;
+        let socket = UdpSocket::bind(config.listen)
+            .await
+            .with_context(|| format!("bind Mieru UDP server on {}", config.listen))?;
+        return run_mieru_packet_server_socket_with_core(socket, config, core).await;
     }
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind Mieru server on {}", config.listen))?;
+    run_mieru_server_listener_with_core(listener, config, core).await
+}
+
+pub async fn run_mieru_server_listener_with_core(
+    listener: TcpListener,
+    config: MieruServerConfig,
+    core: ProxyCore,
+) -> Result<()> {
+    let users = config.effective_users();
+    ensure!(!users.is_empty(), "Mieru server has no configured users");
+    ensure!(
+        config.transport != MieruTransport::Udp,
+        "Mieru TCP listener requires TCP transport"
+    );
     tracing::info!("Mieru server listening on {}", listener.local_addr()?);
     loop {
         let (stream, peer) = listener.accept().await.context("accept Mieru client")?;
@@ -1042,6 +1057,20 @@ pub async fn run_mieru_server_with_core(config: MieruServerConfig, core: ProxyCo
             }
         });
     }
+}
+
+pub async fn run_mieru_packet_server_socket_with_core(
+    socket: UdpSocket,
+    config: MieruServerConfig,
+    core: ProxyCore,
+) -> Result<()> {
+    let users = config.effective_users();
+    ensure!(!users.is_empty(), "Mieru server has no configured users");
+    ensure!(
+        config.transport == MieruTransport::Udp,
+        "Mieru UDP socket requires UDP transport"
+    );
+    run_mieru_packet_server(config, core, users, socket).await
 }
 
 pub fn parse_mieru_user(value: &str) -> Result<MieruUser> {
@@ -1500,17 +1529,14 @@ async fn run_mieru_packet_server(
     config: MieruServerConfig,
     core: ProxyCore,
     users: Vec<MieruUserSecret>,
+    socket: UdpSocket,
 ) -> Result<()> {
     let mtu = config.mtu();
     ensure!(
         mtu > PACKET_OVERHEAD,
         "Mieru UDP packet MTU must be larger than {PACKET_OVERHEAD}"
     );
-    let socket = Arc::new(
-        UdpSocket::bind(config.listen)
-            .await
-            .with_context(|| format!("bind Mieru UDP server on {}", config.listen))?,
-    );
+    let socket = Arc::new(socket);
     tracing::info!("Mieru UDP server listening on {}", socket.local_addr()?);
     let sessions = Arc::new(Mutex::new(HashMap::new()));
     let mut buffer = vec![0u8; u16::MAX as usize];

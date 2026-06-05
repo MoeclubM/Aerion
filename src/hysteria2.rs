@@ -663,7 +663,16 @@ pub async fn run_hysteria2_server_with_core(
     config: Hysteria2ServerConfig,
     core: ProxyCore,
 ) -> Result<()> {
-    let endpoint = build_server_endpoint(&config)?;
+    let socket = bind_server_udp_socket(config.listen)?;
+    run_hysteria2_server_socket_with_core(socket, config, core).await
+}
+
+pub async fn run_hysteria2_server_socket_with_core(
+    socket: std::net::UdpSocket,
+    config: Hysteria2ServerConfig,
+    core: ProxyCore,
+) -> Result<()> {
+    let endpoint = build_server_endpoint(socket, &config)?;
     tracing::info!("Hysteria2 server listening on {}", endpoint.local_addr()?);
     while let Some(incoming) = endpoint.accept().await {
         let passwords = auth_passwords(&config.password, &config.users);
@@ -1312,7 +1321,10 @@ fn build_client_endpoint(config: &Hysteria2ClientConfig, bind_ipv6: bool) -> Res
     Ok(endpoint)
 }
 
-fn build_server_endpoint(config: &Hysteria2ServerConfig) -> Result<Endpoint> {
+fn build_server_endpoint(
+    socket: std::net::UdpSocket,
+    config: &Hysteria2ServerConfig,
+) -> Result<Endpoint> {
     let (certs, key) = tls::server_identity(
         tls::present_path(&config.cert_path),
         tls::present_path(&config.key_path),
@@ -1335,7 +1347,6 @@ fn build_server_endpoint(config: &Hysteria2ServerConfig) -> Result<Endpoint> {
         QuicServerConfig::try_from(tls_config).context("build Hysteria2 QUIC TLS server config")?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     server_config.transport_config(Arc::new(hy2_transport_config(&config.congestion_control)?));
-    let socket = bind_server_udp_socket(config.listen)?;
     if let Some(obfs) = salamander_config(config.obfs.as_deref(), config.obfs_password.as_deref())?
     {
         let socket = SalamanderUdpSocket::new(socket, obfs)
