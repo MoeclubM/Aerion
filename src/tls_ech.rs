@@ -199,7 +199,7 @@ pub fn tls_ech_from_singbox_value(value: &serde_json::Value) -> Result<Option<Tl
 
 #[cfg(feature = "server-ech")]
 pub mod boring_backend {
-    use super::{EchServerKeyEntry, TlsEchServerKeys};
+    use super::TlsEchServerKeys;
     use anyhow::{Context, Result, ensure};
     use boring::hpke::HpkeKey;
     use boring::pkey::PKey;

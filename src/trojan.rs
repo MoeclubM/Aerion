@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
@@ -143,7 +142,7 @@ pub async fn run_trojan_server_with_core(
 }
 
 async fn handle_trojan_socks_with_core(
-    mut stream: TcpStream,
+    stream: TcpStream,
     config: TrojanClientConfig,
     core: Option<ProxyCore>,
     peer: SocketAddr,
@@ -163,7 +162,7 @@ async fn handle_trojan_socks_with_core(
             relay_bidirectional_counted(&mut stream, &mut server, session, "Trojan").await
         }
         socks::SocksRequest::UdpAssociate => {
-            let bind_ip = match stream.local_addr()?.ip() {
+            let _bind_ip = match stream.local_addr()?.ip() {
                 IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
                 ip => ip,
             };

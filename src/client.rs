@@ -279,9 +279,15 @@ async fn handle_socks_client(
     core: Option<ProxyCore>,
     peer: SocketAddr,
 ) -> Result<()> {
-    let session = shared.get_or_connect().await?;
     match socks::read_request(&mut local).await? {
         SocksRequest::Connect(target) => {
+            let session = match shared.get_or_connect().await {
+                Ok(session) => session,
+                Err(error) => {
+                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    return Err(error);
+                }
+            };
             let stream = match session.open_stream(target.clone(), Vec::new()).await {
                 Ok(stream) => stream,
                 Err(error) => {
@@ -299,6 +305,13 @@ async fn handle_socks_client(
             relay_tcp_counted(local, stream, core_session).await
         }
         SocksRequest::UdpAssociate => {
+            let session = match shared.get_or_connect().await {
+                Ok(session) => session,
+                Err(error) => {
+                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    return Err(error);
+                }
+            };
             handle_udp_associate_counted(local, session, config, core, peer).await
         }
     }

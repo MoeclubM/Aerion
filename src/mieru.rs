@@ -178,7 +178,6 @@ enum MieruAnyWriter {
 
 #[derive(Debug)]
 pub struct MieruSession {
-    id: u32,
     inbound: mpsc::UnboundedReceiver<Vec<u8>>,
     outbound: mpsc::UnboundedSender<SessionCommand>,
     read_buffer: Vec<u8>,
@@ -251,6 +250,12 @@ struct ClientUnderlay {
     writer: Arc<Mutex<MieruAnyWriter>>,
     sessions: MieruSessionMap,
     reliable: bool,
+    closed: Arc<Mutex<Option<String>>>,
+}
+
+struct SharedMieruClientSession {
+    config: MieruClientConfig,
+    underlay: Mutex<Option<ClientUnderlay>>,
 }
 
 #[derive(Clone)]
@@ -497,6 +502,38 @@ impl MieruServerConfig {
     }
 }
 
+impl SharedMieruClientSession {
+    fn new(config: MieruClientConfig) -> Self {
+        Self {
+            config,
+            underlay: Mutex::new(None),
+        }
+    }
+
+    async fn get_or_connect(&self) -> Result<ClientUnderlay> {
+        {
+            let guard = self.underlay.lock().await;
+            if let Some(underlay) = guard.as_ref() {
+                if underlay.is_alive().await {
+                    return Ok(underlay.clone());
+                }
+            }
+        }
+
+        let mut guard = self.underlay.lock().await;
+        if let Some(underlay) = guard.as_ref() {
+            if underlay.is_alive().await {
+                return Ok(underlay.clone());
+            }
+            guard.take();
+        }
+
+        let underlay = connect_mieru_underlay(&self.config).await?;
+        guard.replace(underlay.clone());
+        Ok(underlay)
+    }
+}
+
 impl MieruStreamWriter {
     fn new(
         inner: OwnedWriteHalf,
@@ -605,12 +642,10 @@ impl MieruAnyWriter {
 
 impl MieruSession {
     fn new(
-        id: u32,
         inbound: mpsc::UnboundedReceiver<Vec<u8>>,
         outbound: mpsc::UnboundedSender<SessionCommand>,
     ) -> Self {
         Self {
-            id,
             inbound,
             outbound,
             read_buffer: Vec::new(),
@@ -951,11 +986,12 @@ pub async fn run_mieru_client_listener(
         "Mieru client listening on socks5://{}",
         listener.local_addr()?
     );
+    let shared = Arc::new(SharedMieruClientSession::new(config));
     loop {
         let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
-        let config = config.clone();
+        let shared = shared.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_mieru_socks_client(stream, config).await {
+            if let Err(error) = handle_mieru_socks_client(stream, shared).await {
                 tracing::warn!("Mieru SOCKS client {peer} failed: {error:?}");
             }
         });
@@ -973,17 +1009,33 @@ pub async fn run_mieru_server(config: MieruServerConfig) -> Result<()> {
 }
 
 pub async fn run_mieru_server_with_core(config: MieruServerConfig, core: ProxyCore) -> Result<()> {
-    let users = config.effective_users();
-    ensure!(!users.is_empty(), "Mieru server has no configured users");
     if config.transport == MieruTransport::Udp {
-        return run_mieru_packet_server(config, core, users).await;
+        let socket = UdpSocket::bind(config.listen)
+            .await
+            .with_context(|| format!("bind Mieru UDP server on {}", config.listen))?;
+        return run_mieru_packet_server_socket_with_core(socket, config, core).await;
     }
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind Mieru server on {}", config.listen))?;
+    run_mieru_server_listener_with_core(listener, config, core).await
+}
+
+pub async fn run_mieru_server_listener_with_core(
+    listener: TcpListener,
+    config: MieruServerConfig,
+    core: ProxyCore,
+) -> Result<()> {
+    let users = config.effective_users();
+    ensure!(!users.is_empty(), "Mieru server has no configured users");
+    ensure!(
+        config.transport != MieruTransport::Udp,
+        "Mieru TCP listener requires TCP transport"
+    );
     tracing::info!("Mieru server listening on {}", listener.local_addr()?);
     loop {
         let (stream, peer) = listener.accept().await.context("accept Mieru client")?;
+        let _ = stream.set_nodelay(true);
         let users = users.clone();
         let core = core.clone();
         let mtu = config.mtu();
@@ -1007,6 +1059,20 @@ pub async fn run_mieru_server_with_core(config: MieruServerConfig, core: ProxyCo
     }
 }
 
+pub async fn run_mieru_packet_server_socket_with_core(
+    socket: UdpSocket,
+    config: MieruServerConfig,
+    core: ProxyCore,
+) -> Result<()> {
+    let users = config.effective_users();
+    ensure!(!users.is_empty(), "Mieru server has no configured users");
+    ensure!(
+        config.transport == MieruTransport::Udp,
+        "Mieru UDP socket requires UDP transport"
+    );
+    run_mieru_packet_server(config, core, users, socket).await
+}
+
 pub fn parse_mieru_user(value: &str) -> Result<MieruUser> {
     let value = value.trim();
     ensure!(!value.is_empty(), "Mieru user entry is empty");
@@ -1018,7 +1084,10 @@ pub fn parse_mieru_user(value: &str) -> Result<MieruUser> {
     Ok(MieruUser::password(value, value))
 }
 
-async fn handle_mieru_socks_client(mut local: TcpStream, config: MieruClientConfig) -> Result<()> {
+async fn handle_mieru_socks_client(
+    mut local: TcpStream,
+    shared: Arc<SharedMieruClientSession>,
+) -> Result<()> {
     let greeting = read_socks_greeting(&mut local).await?;
     if !greeting[2..].contains(&SOCKS_NO_AUTH) {
         local
@@ -1030,7 +1099,8 @@ async fn handle_mieru_socks_client(mut local: TcpStream, config: MieruClientConf
 
     let request = read_socks_request_raw(&mut local).await?;
     let command = request[1];
-    let mut session = dial_mieru_session(&config).await?;
+    let underlay = shared.get_or_connect().await?;
+    let mut session = underlay.open_session(shared.config.mtu()).await?;
     session.write_all(&request).await?;
     let response = read_socks_response_raw(&mut session).await?;
     match command {
@@ -1120,11 +1190,6 @@ async fn handle_mieru_client_udp(
     }
 }
 
-async fn dial_mieru_session(config: &MieruClientConfig) -> Result<MieruSession> {
-    let underlay = connect_mieru_underlay(config).await?;
-    underlay.open_session(config.mtu()).await
-}
-
 async fn connect_mieru_underlay(config: &MieruClientConfig) -> Result<ClientUnderlay> {
     if config.transport == MieruTransport::Udp {
         return connect_mieru_packet_underlay(config).await;
@@ -1149,16 +1214,19 @@ async fn connect_mieru_underlay(config: &MieruClientConfig) -> Result<ClientUnde
         traffic_pattern,
     ))));
     let sessions = Arc::new(Mutex::new(HashMap::new()));
+    let closed = Arc::new(Mutex::new(None));
     tokio::spawn(run_mieru_client_read_loop(
         reader,
         recv,
         writer.clone(),
         sessions.clone(),
+        closed.clone(),
     ));
     Ok(ClientUnderlay {
         writer,
         sessions,
         reliable: false,
+        closed,
     })
 }
 
@@ -1205,22 +1273,32 @@ async fn connect_mieru_packet_underlay(config: &MieruClientConfig) -> Result<Cli
         mtu,
     ))));
     let sessions = Arc::new(Mutex::new(HashMap::new()));
+    let closed = Arc::new(Mutex::new(None));
     tokio::spawn(run_mieru_packet_client_read_loop(
         socket,
         server_addr,
         recv,
         writer.clone(),
         sessions.clone(),
+        closed.clone(),
     ));
     Ok(ClientUnderlay {
         writer,
         sessions,
         reliable: true,
+        closed,
     })
 }
 
 impl ClientUnderlay {
+    async fn is_alive(&self) -> bool {
+        self.closed.lock().await.is_none()
+    }
+
     async fn open_session(&self, mtu: usize) -> Result<MieruSession> {
+        if let Some(error) = self.closed.lock().await.clone() {
+            bail!("Mieru underlay is closed: {error}");
+        }
         let mut session_id = random_u32()?;
         while session_id == 0 || self.sessions.lock().await.contains_key(&session_id) {
             session_id = random_u32()?;
@@ -1239,13 +1317,13 @@ impl ClientUnderlay {
         tokio::spawn(run_mieru_session_output(
             session_id,
             true,
-            true,
+            false,
             self.writer.clone(),
             outbound_rx,
             self.reliable,
             mtu,
         ));
-        Ok(MieruSession::new(session_id, inbound_rx, outbound_tx))
+        Ok(MieruSession::new(inbound_rx, outbound_tx))
     }
 }
 
@@ -1284,6 +1362,7 @@ async fn run_mieru_client_read_loop(
     mut recv: MieruCipher,
     writer: Arc<Mutex<MieruAnyWriter>>,
     sessions: MieruSessionMap,
+    closed: Arc<Mutex<Option<String>>>,
 ) {
     let result: Result<()> = async {
         let mut first_read = true;
@@ -1321,7 +1400,10 @@ async fn run_mieru_client_read_loop(
     }
     .await;
     if let Err(error) = result {
-        tracing::debug!("Mieru client read loop stopped: {error:?}");
+        let message = format!("{error:?}");
+        *closed.lock().await = Some(message.clone());
+        sessions.lock().await.clear();
+        tracing::debug!("Mieru client read loop stopped: {message}");
     }
 }
 
@@ -1392,6 +1474,7 @@ async fn run_mieru_packet_client_read_loop(
     mut recv: MieruCipher,
     writer: Arc<Mutex<MieruAnyWriter>>,
     sessions: MieruSessionMap,
+    closed: Arc<Mutex<Option<String>>>,
 ) {
     let result: Result<()> = async {
         let mut buffer = vec![0u8; u16::MAX as usize];
@@ -1435,7 +1518,10 @@ async fn run_mieru_packet_client_read_loop(
     }
     .await;
     if let Err(error) = result {
-        tracing::debug!("Mieru UDP client read loop stopped: {error:?}");
+        let message = format!("{error:?}");
+        *closed.lock().await = Some(message.clone());
+        sessions.lock().await.clear();
+        tracing::debug!("Mieru UDP client read loop stopped: {message}");
     }
 }
 
@@ -1443,17 +1529,14 @@ async fn run_mieru_packet_server(
     config: MieruServerConfig,
     core: ProxyCore,
     users: Vec<MieruUserSecret>,
+    socket: UdpSocket,
 ) -> Result<()> {
     let mtu = config.mtu();
     ensure!(
         mtu > PACKET_OVERHEAD,
         "Mieru UDP packet MTU must be larger than {PACKET_OVERHEAD}"
     );
-    let socket = Arc::new(
-        UdpSocket::bind(config.listen)
-            .await
-            .with_context(|| format!("bind Mieru UDP server on {}", config.listen))?,
-    );
+    let socket = Arc::new(socket);
     tracing::info!("Mieru UDP server listening on {}", socket.local_addr()?);
     let sessions = Arc::new(Mutex::new(HashMap::new()));
     let mut buffer = vec![0u8; u16::MAX as usize];
@@ -1554,7 +1637,7 @@ async fn handle_server_segment(
             }
             route_session_segment(&sessions, segment, reliable.then_some(ACK_SERVER_TO_CLIENT))
                 .await?;
-            let session = MieruSession::new(session_id, inbound_rx, outbound_tx);
+            let session = MieruSession::new(inbound_rx, outbound_tx);
             tokio::spawn(async move {
                 if let Err(error) = handle_mieru_server_socks_session(session, core_session).await {
                     tracing::warn!("Mieru session {session_id} failed: {error:?}");
@@ -1616,7 +1699,18 @@ async fn run_mieru_session_output(
                     };
                     match command {
                         SessionCommand::Data(payload) => {
+                            let max_chunk = if reliable {
+                                mtu.checked_sub(PACKET_OVERHEAD)
+                                    .filter(|size| *size > 0)
+                                    .context("Mieru UDP packet MTU is too small")?
+                                    .min(MAX_PDU)
+                            } else {
+                                MAX_PDU
+                            };
                             if is_client && !opened {
+                                let can_send_as_open_payload =
+                                    payload.len() <= MAX_SESSION_OPEN_PAYLOAD
+                                        && payload.len() <= max_chunk;
                                 let segment = MieruSegment {
                                     metadata: MieruMetadata::Session(MieruSessionMetadata {
                                         protocol: OPEN_SESSION_REQUEST,
@@ -1626,20 +1720,20 @@ async fn run_mieru_session_output(
                                         payload_len: 0,
                                         suffix_len: 0,
                                     }),
-                                    payload: Vec::new(),
+                                    payload: if can_send_as_open_payload {
+                                        payload.clone()
+                                    } else {
+                                        Vec::new()
+                                    },
                                 };
-                                write_output_segment(&writer, segment, reliable, &mut unacked).await?;
+                                write_output_segment(&writer, segment, reliable, &mut unacked)
+                                    .await?;
                                 next_seq = next_seq.wrapping_add(1);
                                 opened = true;
+                                if can_send_as_open_payload {
+                                    continue;
+                                }
                             }
-                            let max_chunk = if reliable {
-                                mtu.checked_sub(PACKET_OVERHEAD)
-                                    .filter(|size| *size > 0)
-                                    .context("Mieru UDP packet MTU is too small")?
-                                    .min(MAX_PDU)
-                            } else {
-                                MAX_PDU
-                            };
                             for chunk in payload.chunks(max_chunk) {
                                 let protocol = if is_client {
                                     DATA_CLIENT_TO_SERVER
@@ -2111,6 +2205,7 @@ async fn handle_mieru_server_socks_session(
     match read_socks_request(&mut session).await? {
         SocksRequest::Connect(target) => {
             let mut remote = socket_protect::connect_proxy_target(&target).await?;
+            let _ = remote.set_nodelay(true);
             let bind = remote.local_addr().unwrap_or_else(|_| unspecified_v4());
             write_socks_reply_with_bind(&mut session, 0, bind).await?;
             tracing::info!("Mieru opened {}", target_name(&target));

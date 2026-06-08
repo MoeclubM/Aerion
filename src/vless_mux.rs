@@ -94,18 +94,6 @@ where
     result
 }
 
-pub async fn relay_single_tcp_client<S, L>(
-    mux_stream: S,
-    local: L,
-    target: ProxyTarget,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-    L: AsyncRead + AsyncWrite + Unpin,
-{
-    relay_single_tcp_client_counted(mux_stream, local, target, CoreSession::disabled()).await
-}
-
 pub async fn relay_single_tcp_client_counted<S, L>(
     mut mux_stream: S,
     local: L,

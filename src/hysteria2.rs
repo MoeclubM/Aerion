@@ -663,7 +663,16 @@ pub async fn run_hysteria2_server_with_core(
     config: Hysteria2ServerConfig,
     core: ProxyCore,
 ) -> Result<()> {
-    let endpoint = build_server_endpoint(&config)?;
+    let socket = bind_server_udp_socket(config.listen)?;
+    run_hysteria2_server_socket_with_core(socket, config, core).await
+}
+
+pub async fn run_hysteria2_server_socket_with_core(
+    socket: std::net::UdpSocket,
+    config: Hysteria2ServerConfig,
+    core: ProxyCore,
+) -> Result<()> {
+    let endpoint = build_server_endpoint(socket, &config)?;
     tracing::info!("Hysteria2 server listening on {}", endpoint.local_addr()?);
     while let Some(incoming) = endpoint.accept().await {
         let passwords = auth_passwords(&config.password, &config.users);
@@ -690,9 +699,15 @@ async fn handle_hy2_socks_client(
     mut local: TcpStream,
     shared: Arc<SharedHysteria2Client>,
 ) -> Result<()> {
-    let session = shared.get_or_connect().await?;
     match socks::read_request(&mut local).await? {
         socks::SocksRequest::Connect(target) => {
+            let session = match shared.get_or_connect().await {
+                Ok(session) => session,
+                Err(error) => {
+                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    return Err(error);
+                }
+            };
             let stream = match session.open_tcp(target.clone()).await {
                 Ok(stream) => stream,
                 Err(error) => {
@@ -704,7 +719,16 @@ async fn handle_hy2_socks_client(
             tracing::info!("Hysteria2 proxying {}", target_name(&target));
             relay_hy2_tcp(local, stream, session).await
         }
-        socks::SocksRequest::UdpAssociate => handle_hy2_udp_associate(local, session).await,
+        socks::SocksRequest::UdpAssociate => {
+            let session = match shared.get_or_connect().await {
+                Ok(session) => session,
+                Err(error) => {
+                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    return Err(error);
+                }
+            };
+            handle_hy2_udp_associate(local, session).await
+        }
     }
 }
 
@@ -715,9 +739,7 @@ async fn relay_hy2_tcp(
 ) -> Result<()> {
     let (mut local_reader, local_writer) = local.into_split();
     let Hysteria2TcpStream {
-        send: mut send,
-        recv: mut recv,
-        ..
+        mut send, mut recv, ..
     } = stream;
     let uplink = async {
         let mut buffer = vec![0u8; 32 * 1024];
@@ -1299,7 +1321,10 @@ fn build_client_endpoint(config: &Hysteria2ClientConfig, bind_ipv6: bool) -> Res
     Ok(endpoint)
 }
 
-fn build_server_endpoint(config: &Hysteria2ServerConfig) -> Result<Endpoint> {
+fn build_server_endpoint(
+    socket: std::net::UdpSocket,
+    config: &Hysteria2ServerConfig,
+) -> Result<Endpoint> {
     let (certs, key) = tls::server_identity(
         tls::present_path(&config.cert_path),
         tls::present_path(&config.key_path),
@@ -1322,7 +1347,6 @@ fn build_server_endpoint(config: &Hysteria2ServerConfig) -> Result<Endpoint> {
         QuicServerConfig::try_from(tls_config).context("build Hysteria2 QUIC TLS server config")?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     server_config.transport_config(Arc::new(hy2_transport_config(&config.congestion_control)?));
-    let socket = bind_server_udp_socket(config.listen)?;
     if let Some(obfs) = salamander_config(config.obfs.as_deref(), config.obfs_password.as_deref())?
     {
         let socket = SalamanderUdpSocket::new(socket, obfs)

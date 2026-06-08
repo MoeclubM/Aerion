@@ -10,9 +10,9 @@ use aerion::{
     TrojanClientConfig, TrojanServerConfig, UtlsFingerprint, VlessClientConfig, VlessServerConfig,
     VmessClientConfig, VmessServerConfig, run_client_listener, run_hysteria2_client_listener,
     run_hysteria2_server, run_mieru_client_listener, run_mieru_server, run_naive_client_listener,
-    run_naive_server, run_server_listener, run_shadowsocks_client_listener, run_shadowsocks_server,
-    run_trojan_client_listener, run_trojan_server, run_vless_client_listener, run_vless_server,
-    run_vmess_client_listener, run_vmess_server, tls,
+    run_naive_server, run_server_listener, run_shadowsocks_client_listener,
+    run_shadowsocks_server_with_core, run_trojan_client_listener, run_trojan_server,
+    run_vless_client_listener, run_vless_server, run_vmess_client_listener, run_vmess_server, tls,
 };
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -267,16 +267,20 @@ async fn socks_udp_associate_reaches_udp_target_through_shadowsocks_uot() -> Res
         Ok::<(), anyhow::Error>(())
     });
 
+    let core = aerion::ProxyCore::from_credentials("test-password", &[]);
     let server_addr = unused_tcp_addr()?;
-    let server_task = tokio::spawn(run_shadowsocks_server(ShadowsocksServerConfig {
-        listen: server_addr,
-        method: "aes-128-gcm".to_string(),
-        password: "test-password".to_string(),
-        users: Vec::new(),
-        tcp: true,
-        udp: false,
-        udp_over_tcp: true,
-    }));
+    let server_task = tokio::spawn(run_shadowsocks_server_with_core(
+        ShadowsocksServerConfig {
+            listen: server_addr,
+            method: "aes-128-gcm".to_string(),
+            password: "test-password".to_string(),
+            users: Vec::new(),
+            tcp: true,
+            udp: false,
+            udp_over_tcp: true,
+        },
+        core.clone(),
+    ));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
     let client_addr = client_listener.local_addr()?;
@@ -303,14 +307,29 @@ async fn socks_udp_associate_reaches_udp_target_through_shadowsocks_uot() -> Res
         write_socks_udp_associate(&mut control).await?;
         let udp_bind = read_socks_reply_addr(&mut control).await?;
         let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
-        udp.send_to(&socks_udp_packet(udp_echo_addr, b"hello ss uot")?, udp_bind)
+        let payload = b"hello ss uot";
+        udp.send_to(&socks_udp_packet(udp_echo_addr, payload)?, udp_bind)
             .await?;
         let mut response = [0u8; 256];
         let (read, _) = udp.recv_from(&mut response).await?;
-        let payload = socks_udp_payload(&response[..read])?;
+        let response_payload = socks_udp_payload(&response[..read])?;
         anyhow::ensure!(
-            payload == b"hello ss uot",
+            response_payload == payload,
             "Shadowsocks UOT payload mismatch"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let snapshots = core.snapshot().await;
+        let snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.user_id == "default")
+            .context("missing Shadowsocks UOT core default user snapshot")?;
+        anyhow::ensure!(
+            snapshot.upload_bytes >= payload.len() as u64,
+            "Shadowsocks UOT core upload was not recorded"
+        );
+        anyhow::ensure!(
+            snapshot.download_bytes >= payload.len() as u64,
+            "Shadowsocks UOT core download was not recorded"
         );
         Ok::<(), anyhow::Error>(())
     })
@@ -324,6 +343,81 @@ async fn socks_udp_associate_reaches_udp_target_through_shadowsocks_uot() -> Res
         udp_echo_task.await??;
     } else {
         udp_echo_task.abort();
+    }
+    result
+}
+
+#[tokio::test]
+async fn shadowsocks_server_with_core_records_tcp_traffic() -> Result<()> {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let echo_addr = echo_listener.local_addr()?;
+    let echo_task = tokio::spawn(async move {
+        let (mut stream, _) = echo_listener.accept().await?;
+        let mut buffer = [0u8; 64];
+        let read = stream.read(&mut buffer).await?;
+        stream.write_all(&buffer[..read]).await?;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let core = aerion::ProxyCore::from_credentials("test-password", &[]);
+    let server_addr = unused_tcp_addr()?;
+    let server_task = tokio::spawn(run_shadowsocks_server_with_core(
+        ShadowsocksServerConfig {
+            listen: server_addr,
+            method: "aes-128-gcm".to_string(),
+            password: "test-password".to_string(),
+            users: Vec::new(),
+            tcp: true,
+            udp: false,
+            udp_over_tcp: false,
+        },
+        core.clone(),
+    ));
+
+    let client_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let client_addr = client_listener.local_addr()?;
+    let client_task = tokio::spawn(run_shadowsocks_client_listener(
+        client_listener,
+        ShadowsocksClientConfig {
+            listen: client_addr,
+            server_host: "127.0.0.1".to_string(),
+            server_port: server_addr.port(),
+            method: "aes-128-gcm".to_string(),
+            password: "test-password".to_string(),
+            udp: false,
+            udp_over_tcp: false,
+        },
+    ));
+
+    let payload = b"hello ss core";
+    let result = timeout(Duration::from_secs(5), async {
+        socks_echo(client_addr, echo_addr, payload).await?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let snapshots = core.snapshot().await;
+        let snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.user_id == "default")
+            .context("missing Shadowsocks core default user snapshot")?;
+        anyhow::ensure!(
+            snapshot.upload_bytes >= payload.len() as u64,
+            "Shadowsocks core upload was not recorded"
+        );
+        anyhow::ensure!(
+            snapshot.download_bytes >= payload.len() as u64,
+            "Shadowsocks core download was not recorded"
+        );
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("Shadowsocks core accounting test timed out")
+    .and_then(|inner| inner);
+
+    client_task.abort();
+    server_task.abort();
+    if result.is_ok() {
+        echo_task.await??;
+    } else {
+        echo_task.abort();
     }
     result
 }

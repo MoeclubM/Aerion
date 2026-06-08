@@ -5,7 +5,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc};
-use tokio::time::{Duration, Instant};
+
+mod events;
+mod limiter;
+
+use events::CoreEventBus;
+use limiter::ByteRateLimiter;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoreUser {
@@ -93,7 +98,7 @@ struct CoreInner {
 #[derive(Debug)]
 struct UserState {
     id: String,
-    credential: RwLock<String>,
+    credentials: RwLock<HashSet<String>>,
     upload: AtomicU64,
     download: AtomicU64,
     online: AtomicU64,
@@ -117,17 +122,6 @@ pub struct CoreSession {
     inner: Option<Arc<ActiveSession>>,
 }
 
-#[derive(Debug)]
-struct ByteRateLimiter {
-    bytes_per_second: AtomicU64,
-    next: Mutex<Instant>,
-}
-
-#[derive(Default)]
-struct CoreEventBus {
-    subscribers: Mutex<Vec<mpsc::UnboundedSender<CoreEvent>>>,
-}
-
 struct SessionControl {
     cancelled: AtomicBool,
     notify: Notify,
@@ -147,38 +141,6 @@ impl Default for CoreInner {
             session_seq: AtomicU64::new(0),
             events: Arc::new(CoreEventBus::default()),
         }
-    }
-}
-
-impl CoreEventBus {
-    fn subscribe(&self) -> mpsc::UnboundedReceiver<CoreEvent> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.subscribers
-            .lock()
-            .expect("core event subscribers lock poisoned")
-            .push(tx);
-        rx
-    }
-
-    fn send(&self, event: CoreEvent) {
-        self.subscribers
-            .lock()
-            .expect("core event subscribers lock poisoned")
-            .retain(|subscriber| subscriber.send(event.clone()).is_ok());
-    }
-}
-
-impl std::fmt::Debug for CoreEventBus {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let subscribers = self
-            .subscribers
-            .lock()
-            .expect("core event subscribers lock poisoned")
-            .len();
-        formatter
-            .debug_struct("CoreEventBus")
-            .field("subscribers", &subscribers)
-            .finish()
     }
 }
 
@@ -260,7 +222,11 @@ impl ProxyCore {
 
     pub fn replace_users(&self, users: Vec<CoreUser>) -> Result<()> {
         let mut credentials = HashSet::new();
-        for user in &users {
+        let mut users_by_id = HashMap::<String, CoreUser>::new();
+        let mut credentials_by_id = HashMap::<String, HashSet<String>>::new();
+        let mut credential_map = HashMap::new();
+        let mut event_user_ids = Vec::new();
+        for user in users {
             ensure!(!user.id.trim().is_empty(), "core user id is empty");
             ensure!(
                 !user.credential.trim().is_empty(),
@@ -271,6 +237,23 @@ impl ProxyCore {
                 "duplicate core credential for user {}",
                 user.id
             );
+            credential_map.insert(user.credential.clone(), user.id.clone());
+            credentials_by_id
+                .entry(user.id.clone())
+                .or_default()
+                .insert(user.credential.clone());
+            if let Some(existing) = users_by_id.get(&user.id) {
+                ensure!(
+                    existing.limits() == user.limits(),
+                    "conflicting core limits for user {}",
+                    user.id
+                );
+            } else {
+                if !event_user_ids.contains(&user.id) {
+                    event_user_ids.push(user.id.clone());
+                }
+                users_by_id.insert(user.id.clone(), user);
+            }
         }
 
         let current_users = self
@@ -280,20 +263,20 @@ impl ProxyCore {
             .expect("core users lock poisoned")
             .clone();
         let mut user_map = HashMap::new();
-        let mut credential_map = HashMap::new();
-        let mut active_ids = HashSet::new();
-        let mut event_user_ids = Vec::new();
-        for user in users {
-            active_ids.insert(user.id.clone());
-            if !event_user_ids.contains(&user.id) {
-                event_user_ids.push(user.id.clone());
-            }
-            credential_map.insert(user.credential.clone(), user.id.clone());
+        let active_ids = users_by_id.keys().cloned().collect::<HashSet<_>>();
+        for (id, user) in users_by_id {
+            let credentials = credentials_by_id
+                .remove(&id)
+                .expect("core user credentials must be grouped");
             let state = if let Some(existing) = current_users.get(&user.id) {
-                existing.apply_user_update(&user);
+                existing.apply_user_update(&user, credentials);
                 existing.clone()
             } else {
-                Arc::new(UserState::new(&user, self.inner.events.clone()))
+                Arc::new(UserState::new(
+                    &user,
+                    credentials,
+                    self.inner.events.clone(),
+                ))
             };
             user_map.insert(user.id.clone(), state);
         }
@@ -511,10 +494,10 @@ impl Drop for ActiveSession {
 }
 
 impl UserState {
-    fn new(user: &CoreUser, events: Arc<CoreEventBus>) -> Self {
+    fn new(user: &CoreUser, credentials: HashSet<String>, events: Arc<CoreEventBus>) -> Self {
         Self {
             id: user.id.clone(),
-            credential: RwLock::new(user.credential.clone()),
+            credentials: RwLock::new(credentials),
             upload: AtomicU64::new(0),
             download: AtomicU64::new(0),
             online: AtomicU64::new(0),
@@ -527,18 +510,18 @@ impl UserState {
         }
     }
 
-    fn apply_user_update(&self, user: &CoreUser) {
-        let old_credential = self
-            .credential
+    fn apply_user_update(&self, user: &CoreUser, credentials: HashSet<String>) {
+        let old_credentials = self
+            .credentials
             .read()
-            .expect("core credential lock poisoned")
+            .expect("core credentials lock poisoned")
             .clone();
-        if old_credential != user.credential {
+        if old_credentials != credentials {
             self.cancel_sessions();
             *self
-                .credential
+                .credentials
                 .write()
-                .expect("core credential lock poisoned") = user.credential.clone();
+                .expect("core credentials lock poisoned") = credentials;
         }
         let limits = user.limits();
         *self.limits.write().expect("core limits lock poisoned") = limits;
@@ -656,7 +639,7 @@ impl UserState {
         control.ensure_active()?;
         let upload = self.upload.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
         let download = self.download.load(Ordering::Relaxed);
-        self.events.send(CoreEvent::TrafficRecorded {
+        self.events.dispatch(|| CoreEvent::TrafficRecorded {
             user_id: self.id.clone(),
             session_id,
             direction: TrafficDirection::Upload,
@@ -682,7 +665,7 @@ impl UserState {
         control.ensure_active()?;
         let download = self.download.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
         let upload = self.upload.load(Ordering::Relaxed);
-        self.events.send(CoreEvent::TrafficRecorded {
+        self.events.dispatch(|| CoreEvent::TrafficRecorded {
             user_id: self.id.clone(),
             session_id,
             direction: TrafficDirection::Download,
@@ -741,45 +724,6 @@ impl UserState {
     }
 }
 
-impl ByteRateLimiter {
-    fn new(bytes_per_second: Option<u64>) -> Self {
-        Self {
-            bytes_per_second: AtomicU64::new(rate_value(bytes_per_second)),
-            next: Mutex::new(Instant::now()),
-        }
-    }
-
-    fn set_rate(&self, bytes_per_second: Option<u64>) {
-        let bytes_per_second = rate_value(bytes_per_second);
-        let previous = self
-            .bytes_per_second
-            .swap(bytes_per_second, Ordering::Relaxed);
-        if previous != bytes_per_second {
-            *self.next.lock().expect("core limiter lock poisoned") = Instant::now();
-        }
-    }
-
-    async fn wait(&self, bytes: u64, control: &SessionControl) -> Result<()> {
-        let rate = self.bytes_per_second.load(Ordering::Relaxed);
-        if bytes == 0 || rate == 0 {
-            return Ok(());
-        }
-        let wait_until = {
-            let mut next = self.next.lock().expect("core limiter lock poisoned");
-            let now = Instant::now();
-            if *next < now {
-                *next = now;
-            }
-            *next += Duration::from_secs_f64(bytes as f64 / rate as f64);
-            *next
-        };
-        tokio::select! {
-            _ = control.cancelled() => bail!("core session cancelled"),
-            _ = tokio::time::sleep_until(wait_until) => Ok(()),
-        }
-    }
-}
-
 impl SessionControl {
     fn new() -> Self {
         Self {
@@ -818,10 +762,6 @@ impl std::fmt::Debug for SessionControl {
             .field("cancelled", &self.is_cancelled())
             .finish()
     }
-}
-
-fn rate_value(bytes_per_second: Option<u64>) -> u64 {
-    bytes_per_second.filter(|rate| *rate > 0).unwrap_or(0)
 }
 
 fn normalize_ip(ip: IpAddr) -> String {
@@ -1017,6 +957,25 @@ mod tests {
         ])?;
         assert_eq!(core.authenticate("secret-a").await?.user_id(), "u1");
         assert_eq!(core.authenticate("secret-b").await?.user_id(), "u1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_users_preserves_sessions_for_unchanged_multiple_credentials() -> Result<()> {
+        let core = ProxyCore::new(vec![
+            CoreUser::password("u1", "secret-a"),
+            CoreUser::password("u1", "secret-b"),
+        ])?;
+        let session = core.authenticate("secret-a").await?;
+        session.record_upload(10).await?;
+        core.replace_users(vec![
+            CoreUser::password("u1", "secret-a"),
+            CoreUser::password("u1", "secret-b"),
+        ])?;
+        assert!(!session.is_cancelled());
+        session.record_upload(1).await?;
+        assert_eq!(core.authenticate("secret-b").await?.user_id(), "u1");
+        assert_eq!(core.snapshot().await[0].upload_bytes, 11);
         Ok(())
     }
 }
