@@ -18,6 +18,7 @@ use tokio::time::Instant;
 
 mod crypto;
 mod pattern;
+mod socks;
 
 use crypto::{
     MieruCipher, check_user_from_hint, current_mieru_key, hash_mieru_password,
@@ -25,6 +26,12 @@ use crypto::{
 };
 use pattern::write_with_possible_fragment;
 pub use pattern::{MieruNoncePattern, MieruNonceType, MieruTcpFragment, MieruTrafficPattern};
+use socks::{
+    SOCKS_CMD_CONNECT, SOCKS_CMD_UDP_ASSOCIATE, SOCKS_NO_ACCEPTABLE, SOCKS_NO_AUTH, SOCKS_VERSION,
+    SocksRequest, read_packet_over_stream, read_socks_greeting, read_socks_request,
+    read_socks_request_raw, read_socks_response_raw, write_packet_over_stream,
+    write_socks_reply_with_bind,
+};
 
 const DEFAULT_MTU: usize = 1500;
 const METADATA_LEN: usize = 32;
@@ -52,15 +59,6 @@ const DATA_SERVER_TO_CLIENT: u8 = 7;
 const ACK_CLIENT_TO_SERVER: u8 = 8;
 const ACK_SERVER_TO_CLIENT: u8 = 9;
 const STATUS_OK: u8 = 0;
-
-const SOCKS_VERSION: u8 = 0x05;
-const SOCKS_NO_AUTH: u8 = 0x00;
-const SOCKS_NO_ACCEPTABLE: u8 = 0xff;
-const SOCKS_CMD_CONNECT: u8 = 0x01;
-const SOCKS_CMD_UDP_ASSOCIATE: u8 = 0x03;
-const SOCKS_ATYP_IPV4: u8 = 0x01;
-const SOCKS_ATYP_DOMAIN: u8 = 0x03;
-const SOCKS_ATYP_IPV6: u8 = 0x04;
 
 #[derive(Clone, Debug)]
 pub struct MieruUser {
@@ -1932,194 +1930,6 @@ async fn handle_mieru_server_udp(
         result = udp_to_remote => result,
         result = remote_to_udp => result,
     }
-}
-
-async fn read_socks_greeting<R>(reader: &mut R) -> Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut header = [0u8; 2];
-    reader.read_exact(&mut header).await?;
-    ensure!(header[0] == SOCKS_VERSION, "unsupported SOCKS version");
-    let mut methods = vec![0u8; header[1] as usize];
-    reader.read_exact(&mut methods).await?;
-    let mut out = header.to_vec();
-    out.extend_from_slice(&methods);
-    Ok(out)
-}
-
-enum SocksRequest {
-    Connect(ProxyTarget),
-    UdpAssociate,
-}
-
-async fn read_socks_request<S>(stream: &mut S) -> Result<SocksRequest>
-where
-    S: AsyncRead + Unpin,
-{
-    let request = read_socks_request_raw(stream).await?;
-    parse_socks_request(request)
-}
-
-fn parse_socks_request(request: Vec<u8>) -> Result<SocksRequest> {
-    let target = parse_socks_target_from_request(&request)?;
-    match request[1] {
-        SOCKS_CMD_CONNECT => Ok(SocksRequest::Connect(target)),
-        SOCKS_CMD_UDP_ASSOCIATE => Ok(SocksRequest::UdpAssociate),
-        other => bail!("unsupported SOCKS command {other:#x}"),
-    }
-}
-
-async fn read_socks_request_raw<R>(reader: &mut R) -> Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut header = [0u8; 4];
-    reader.read_exact(&mut header).await?;
-    ensure!(header[0] == SOCKS_VERSION, "invalid SOCKS request version");
-    let mut out = header.to_vec();
-    read_socks_address_raw(reader, header[3], &mut out).await?;
-    Ok(out)
-}
-
-async fn read_socks_response_raw<R>(reader: &mut R) -> Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut header = [0u8; 4];
-    reader.read_exact(&mut header).await?;
-    ensure!(header[0] == SOCKS_VERSION, "invalid SOCKS response version");
-    let mut out = header.to_vec();
-    read_socks_address_raw(reader, header[3], &mut out).await?;
-    Ok(out)
-}
-
-async fn read_socks_address_raw<R>(reader: &mut R, atyp: u8, out: &mut Vec<u8>) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-{
-    match atyp {
-        SOCKS_ATYP_IPV4 => {
-            let mut rest = [0u8; 6];
-            reader.read_exact(&mut rest).await?;
-            out.extend_from_slice(&rest);
-        }
-        SOCKS_ATYP_DOMAIN => {
-            let mut len = [0u8; 1];
-            reader.read_exact(&mut len).await?;
-            out.push(len[0]);
-            let mut rest = vec![0u8; len[0] as usize + 2];
-            reader.read_exact(&mut rest).await?;
-            out.extend_from_slice(&rest);
-        }
-        SOCKS_ATYP_IPV6 => {
-            let mut rest = [0u8; 18];
-            reader.read_exact(&mut rest).await?;
-            out.extend_from_slice(&rest);
-        }
-        other => bail!("unsupported SOCKS address type {other:#x}"),
-    }
-    Ok(())
-}
-
-fn parse_socks_target_from_request(request: &[u8]) -> Result<ProxyTarget> {
-    ensure!(request.len() >= 4, "SOCKS request is too short");
-    parse_socks_address(&request[3..]).map(|(target, _)| target)
-}
-
-fn parse_socks_address(packet: &[u8]) -> Result<(ProxyTarget, &[u8])> {
-    ensure!(!packet.is_empty(), "SOCKS address is empty");
-    match packet[0] {
-        SOCKS_ATYP_IPV4 => {
-            ensure!(packet.len() >= 7, "SOCKS IPv4 address is too short");
-            let ip = Ipv4Addr::new(packet[1], packet[2], packet[3], packet[4]);
-            let port = u16::from_be_bytes([packet[5], packet[6]]);
-            Ok((
-                ProxyTarget::Ip(SocketAddr::new(IpAddr::V4(ip), port)),
-                &packet[7..],
-            ))
-        }
-        SOCKS_ATYP_DOMAIN => {
-            ensure!(packet.len() >= 2, "SOCKS domain address is too short");
-            let length = packet[1] as usize;
-            let port_offset = 2 + length;
-            ensure!(packet.len() >= port_offset + 2, "SOCKS domain missing port");
-            let host = String::from_utf8(packet[2..port_offset].to_vec())?;
-            let port = u16::from_be_bytes([packet[port_offset], packet[port_offset + 1]]);
-            Ok((ProxyTarget::Domain(host, port), &packet[port_offset + 2..]))
-        }
-        SOCKS_ATYP_IPV6 => {
-            ensure!(packet.len() >= 19, "SOCKS IPv6 address is too short");
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&packet[1..17]);
-            let port = u16::from_be_bytes([packet[17], packet[18]]);
-            Ok((
-                ProxyTarget::Ip(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port)),
-                &packet[19..],
-            ))
-        }
-        other => bail!("unsupported SOCKS address type {other:#x}"),
-    }
-}
-
-async fn write_socks_reply_with_bind<W>(writer: &mut W, code: u8, bind: SocketAddr) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let mut response = vec![SOCKS_VERSION, code, 0];
-    match bind {
-        SocketAddr::V4(addr) => {
-            response.push(SOCKS_ATYP_IPV4);
-            response.extend_from_slice(&addr.ip().octets());
-            response.extend_from_slice(&addr.port().to_be_bytes());
-        }
-        SocketAddr::V6(addr) => {
-            response.push(SOCKS_ATYP_IPV6);
-            response.extend_from_slice(&addr.ip().octets());
-            response.extend_from_slice(&addr.port().to_be_bytes());
-        }
-    }
-    writer.write_all(&response).await?;
-    Ok(())
-}
-
-async fn read_packet_over_stream<R>(reader: &mut R, payload: &mut [u8]) -> Result<usize>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut prefix = [0u8; 1];
-    reader.read_exact(&mut prefix).await?;
-    ensure!(prefix[0] == 0x00, "invalid packet-over-stream prefix");
-    let mut length = [0u8; 2];
-    reader.read_exact(&mut length).await?;
-    let length = u16::from_be_bytes(length) as usize;
-    ensure!(
-        payload.len() >= length,
-        "packet-over-stream output buffer is too small"
-    );
-    reader.read_exact(&mut payload[..length]).await?;
-    let mut suffix = [0u8; 1];
-    reader.read_exact(&mut suffix).await?;
-    ensure!(suffix[0] == 0xff, "invalid packet-over-stream suffix");
-    Ok(length)
-}
-
-async fn write_packet_over_stream<W>(writer: &mut W, payload: &[u8]) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    ensure!(
-        payload.len() <= u16::MAX as usize,
-        "packet-over-stream payload is too large"
-    );
-    writer.write_all(&[0x00]).await?;
-    writer
-        .write_all(&(payload.len() as u16).to_be_bytes())
-        .await?;
-    writer.write_all(payload).await?;
-    writer.write_all(&[0xff]).await?;
-    writer.flush().await?;
-    Ok(())
 }
 
 fn unspecified_v4() -> SocketAddr {
