@@ -1,6 +1,7 @@
 use crate::core::{CoreSession, CoreUserLimits, ProxyCore};
 use crate::listener;
 use crate::protocol::{ProxyTarget, resolve_target_addr, target_name};
+use crate::quic::{self, QuicCongestion};
 use crate::{socket_protect, socks, tls, uot};
 use anyhow::{Context, Result, bail, ensure};
 use blake2::Blake2bVar;
@@ -8,7 +9,7 @@ use blake2::digest::{Update, VariableOutput};
 use bytes::Bytes;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::udp::{RecvMeta, Transmit};
-use quinn::{AsyncUdpSocket, Endpoint, IdleTimeout, UdpPoller, VarInt};
+use quinn::{AsyncUdpSocket, Endpoint, UdpPoller, VarInt};
 use rustls::RootCertStore;
 use std::collections::HashMap;
 use std::fmt;
@@ -1369,23 +1370,24 @@ fn build_server_endpoint(
 }
 
 fn hy2_transport_config(congestion_control: &str) -> Result<quinn::TransportConfig> {
-    let mut transport_config = quinn::TransportConfig::default();
-    let idle_timeout =
-        IdleTimeout::try_from(DEFAULT_QUIC_IDLE_TIMEOUT).context("build Hysteria2 idle timeout")?;
+    let mut transport_config = quic::transport_config_with_idle_timeout(
+        DEFAULT_QUIC_IDLE_TIMEOUT,
+        "build Hysteria2 idle timeout",
+    )?;
     transport_config
         .stream_receive_window(VarInt::from_u32(HY2_STREAM_RECEIVE_WINDOW))
         .receive_window(VarInt::from_u32(HY2_CONN_RECEIVE_WINDOW))
         .send_window(u64::from(HY2_CONN_RECEIVE_WINDOW))
-        .max_idle_timeout(Some(idle_timeout))
         .datagram_receive_buffer_size(Some(HY2_DATAGRAM_BUFFER_SIZE))
-        .datagram_send_buffer_size(HY2_DATAGRAM_BUFFER_SIZE)
-        .congestion_controller_factory(
-            match congestion_control.trim().to_ascii_lowercase().as_str() {
-                "" | "bbr" => Arc::new(quinn::congestion::BbrConfig::default()),
-                "reno" | "newreno" => Arc::new(quinn::congestion::NewRenoConfig::default()),
-                other => bail!("unsupported Hysteria2 congestion_control {other}"),
-            },
-        );
+        .datagram_send_buffer_size(HY2_DATAGRAM_BUFFER_SIZE);
+    quic::apply_congestion_controller(
+        &mut transport_config,
+        congestion_control,
+        QuicCongestion::Bbr,
+        quic::BBR_RENO_CONGESTION_CONTROLS,
+        "Hysteria2",
+        "congestion_control",
+    )?;
     Ok(transport_config)
 }
 

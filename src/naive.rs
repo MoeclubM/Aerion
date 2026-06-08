@@ -1,5 +1,6 @@
 use crate::core::{CoreSession, CoreUser, ProxyCore};
 use crate::protocol::{ProxyTarget, target_name};
+use crate::quic::{self, QuicCongestion};
 use crate::{socket_protect, socks, tls, uot};
 use anyhow::{Context, Result, bail, ensure};
 use bytes::{Buf, Bytes};
@@ -884,20 +885,18 @@ fn build_naive_server_endpoint(config: &NaiveServerConfig) -> Result<quinn::Endp
 }
 
 fn naive_quic_transport_config(congestion_control: &str) -> Result<quinn::TransportConfig> {
-    let idle_timeout = quinn::IdleTimeout::try_from(NAIVE_QUIC_IDLE_TIMEOUT)
-        .context("build Naive H3 idle timeout")?;
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(idle_timeout));
-    transport.congestion_controller_factory(
-        match congestion_control.trim().to_ascii_lowercase().as_str() {
-            "" | "bbr" => Arc::new(quinn::congestion::BbrConfig::default()),
-            "cubic" => Arc::new(quinn::congestion::CubicConfig::default()),
-            "reno" | "newreno" | "new_reno" => {
-                Arc::new(quinn::congestion::NewRenoConfig::default())
-            }
-            other => bail!("unsupported Naive quic_congestion_control {other}"),
-        },
-    );
+    let mut transport = quic::transport_config_with_idle_timeout(
+        NAIVE_QUIC_IDLE_TIMEOUT,
+        "build Naive H3 idle timeout",
+    )?;
+    quic::apply_congestion_controller(
+        &mut transport,
+        congestion_control,
+        QuicCongestion::Bbr,
+        quic::BBR_CUBIC_RENO_CONGESTION_CONTROLS,
+        "Naive",
+        "quic_congestion_control",
+    )?;
     Ok(transport)
 }
 

@@ -12,6 +12,7 @@ pub mod mieru;
 pub mod naive;
 pub mod padding;
 pub mod protocol;
+mod quic;
 pub mod reality;
 mod reality_tls_client;
 pub mod router;

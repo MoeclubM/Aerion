@@ -1,11 +1,12 @@
 use crate::core::{CoreSession, CoreUser, ProxyCore};
 use crate::listener;
 use crate::protocol::{ProxyTarget, parse_uuid, resolve_target_addr, target_name};
+use crate::quic::{self, QuicCongestion};
 use crate::{socket_protect, socks, tls};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use bytes::Bytes;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{Endpoint, IdleTimeout, VarInt};
+use quinn::{Endpoint, VarInt};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -1653,28 +1654,26 @@ fn build_server_endpoint(config: &TuicServerConfig) -> Result<Endpoint> {
 }
 
 fn tuic_transport_config(congestion_control: &str) -> Result<quinn::TransportConfig> {
-    let mut transport_config = quinn::TransportConfig::default();
-    let idle_timeout =
-        IdleTimeout::try_from(DEFAULT_QUIC_IDLE_TIMEOUT).context("build TUIC idle timeout")?;
+    let mut transport_config = quic::transport_config_with_idle_timeout(
+        DEFAULT_QUIC_IDLE_TIMEOUT,
+        "build TUIC idle timeout",
+    )?;
     transport_config
         .stream_receive_window(VarInt::from_u32(TUIC_STREAM_RECEIVE_WINDOW))
         .receive_window(VarInt::from_u32(TUIC_CONN_RECEIVE_WINDOW))
         .send_window(u64::from(TUIC_CONN_RECEIVE_WINDOW))
         .max_concurrent_bidi_streams(VarInt::from_u32(TUIC_MAX_INCOMING_STREAMS))
         .max_concurrent_uni_streams(VarInt::from_u32(TUIC_MAX_INCOMING_STREAMS))
-        .max_idle_timeout(Some(idle_timeout))
         .datagram_receive_buffer_size(Some(TUIC_DATAGRAM_BUFFER_SIZE))
-        .datagram_send_buffer_size(TUIC_DATAGRAM_BUFFER_SIZE)
-        .congestion_controller_factory(
-            match congestion_control.trim().to_ascii_lowercase().as_str() {
-                "" | "cubic" => Arc::new(quinn::congestion::CubicConfig::default()),
-                "bbr" => Arc::new(quinn::congestion::BbrConfig::default()),
-                "reno" | "newreno" | "new_reno" => {
-                    Arc::new(quinn::congestion::NewRenoConfig::default())
-                }
-                other => bail!("unsupported TUIC congestion_control {other}"),
-            },
-        );
+        .datagram_send_buffer_size(TUIC_DATAGRAM_BUFFER_SIZE);
+    quic::apply_congestion_controller(
+        &mut transport_config,
+        congestion_control,
+        QuicCongestion::Cubic,
+        quic::BBR_CUBIC_RENO_CONGESTION_CONTROLS,
+        "TUIC",
+        "congestion_control",
+    )?;
     Ok(transport_config)
 }
 
