@@ -94,7 +94,7 @@ pub use routing::{
 pub use server::{ServerConfig, run_server, run_server_listener, run_server_listener_with_core};
 pub use shadowsocks::{
     ShadowsocksClientConfig, ShadowsocksServerConfig, run_shadowsocks_client,
-    run_shadowsocks_client_listener, run_shadowsocks_server,
+    run_shadowsocks_client_listener, run_shadowsocks_server, run_shadowsocks_server_with_core,
 };
 pub use socks::{SocksProxyClientConfig, run_socks_proxy_client, run_socks_proxy_client_listener};
 pub use tls::TlsEchServerKeys;
