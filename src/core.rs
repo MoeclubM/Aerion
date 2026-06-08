@@ -1,11 +1,16 @@
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc};
-use tokio::time::{Duration, Instant};
+
+mod events;
+mod limiter;
+
+use events::CoreEventBus;
+use limiter::ByteRateLimiter;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoreUser {
@@ -117,20 +122,6 @@ pub struct CoreSession {
     inner: Option<Arc<ActiveSession>>,
 }
 
-#[derive(Debug)]
-struct ByteRateLimiter {
-    bytes_per_second: AtomicU64,
-    next: Mutex<Instant>,
-}
-
-#[derive(Default)]
-struct CoreEventBus {
-    subscribers: Mutex<Vec<mpsc::UnboundedSender<CoreEvent>>>,
-    /// Cached subscriber count so hot-path callers can skip event construction
-    /// (and the subscribers lock) entirely when nobody is listening.
-    subscriber_count: AtomicUsize,
-}
-
 struct SessionControl {
     cancelled: AtomicBool,
     notify: Notify,
@@ -150,54 +141,6 @@ impl Default for CoreInner {
             session_seq: AtomicU64::new(0),
             events: Arc::new(CoreEventBus::default()),
         }
-    }
-}
-
-impl CoreEventBus {
-    fn subscribe(&self) -> mpsc::UnboundedReceiver<CoreEvent> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let mut subscribers = self
-            .subscribers
-            .lock()
-            .expect("core event subscribers lock poisoned");
-        subscribers.push(tx);
-        self.subscriber_count
-            .store(subscribers.len(), Ordering::Relaxed);
-        rx
-    }
-
-    fn send(&self, event: CoreEvent) {
-        let mut subscribers = self
-            .subscribers
-            .lock()
-            .expect("core event subscribers lock poisoned");
-        subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
-        self.subscriber_count
-            .store(subscribers.len(), Ordering::Relaxed);
-    }
-
-    /// Deliver an event only when at least one subscriber is attached, building
-    /// it lazily. On the per-chunk traffic hot path this avoids cloning the
-    /// user id and locking the subscribers mutex when no one is listening.
-    fn dispatch(&self, make: impl FnOnce() -> CoreEvent) {
-        if self.subscriber_count.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        self.send(make());
-    }
-}
-
-impl std::fmt::Debug for CoreEventBus {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let subscribers = self
-            .subscribers
-            .lock()
-            .expect("core event subscribers lock poisoned")
-            .len();
-        formatter
-            .debug_struct("CoreEventBus")
-            .field("subscribers", &subscribers)
-            .finish()
     }
 }
 
@@ -781,45 +724,6 @@ impl UserState {
     }
 }
 
-impl ByteRateLimiter {
-    fn new(bytes_per_second: Option<u64>) -> Self {
-        Self {
-            bytes_per_second: AtomicU64::new(rate_value(bytes_per_second)),
-            next: Mutex::new(Instant::now()),
-        }
-    }
-
-    fn set_rate(&self, bytes_per_second: Option<u64>) {
-        let bytes_per_second = rate_value(bytes_per_second);
-        let previous = self
-            .bytes_per_second
-            .swap(bytes_per_second, Ordering::Relaxed);
-        if previous != bytes_per_second {
-            *self.next.lock().expect("core limiter lock poisoned") = Instant::now();
-        }
-    }
-
-    async fn wait(&self, bytes: u64, control: &SessionControl) -> Result<()> {
-        let rate = self.bytes_per_second.load(Ordering::Relaxed);
-        if bytes == 0 || rate == 0 {
-            return Ok(());
-        }
-        let wait_until = {
-            let mut next = self.next.lock().expect("core limiter lock poisoned");
-            let now = Instant::now();
-            if *next < now {
-                *next = now;
-            }
-            *next += Duration::from_secs_f64(bytes as f64 / rate as f64);
-            *next
-        };
-        tokio::select! {
-            _ = control.cancelled() => bail!("core session cancelled"),
-            _ = tokio::time::sleep_until(wait_until) => Ok(()),
-        }
-    }
-}
-
 impl SessionControl {
     fn new() -> Self {
         Self {
@@ -858,10 +762,6 @@ impl std::fmt::Debug for SessionControl {
             .field("cancelled", &self.is_cancelled())
             .finish()
     }
-}
-
-fn rate_value(bytes_per_second: Option<u64>) -> u64 {
-    bytes_per_second.filter(|rate| *rate > 0).unwrap_or(0)
 }
 
 fn normalize_ip(ip: IpAddr) -> String {
