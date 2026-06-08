@@ -91,10 +91,15 @@ impl AsyncWrite for EarlyDataTlsStream {
 }
 
 pub async fn run_server(config: ServerConfig) -> Result<()> {
+    let core = ProxyCore::from_credentials(&config.password, &config.users);
+    run_server_with_core(config, core).await
+}
+
+pub async fn run_server_with_core(config: ServerConfig, core: ProxyCore) -> Result<()> {
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind Aerion server on {}", config.listen))?;
-    run_server_listener(listener, config).await
+    run_server_listener_with_core(listener, config, core).await
 }
 
 pub async fn run_server_listener(listener: TcpListener, config: ServerConfig) -> Result<()> {
