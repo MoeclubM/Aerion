@@ -222,7 +222,7 @@ impl ProxyCore {
 
     pub fn replace_users(&self, users: Vec<CoreUser>) -> Result<()> {
         let mut credentials = HashSet::new();
-        let mut users_by_id = HashMap::<String, CoreUser>::new();
+        let mut users_by_id: HashMap<String, CoreUser> = HashMap::new();
         let mut credentials_by_id = HashMap::<String, HashSet<String>>::new();
         let mut credential_map = HashMap::new();
         let mut event_user_ids = Vec::new();
