@@ -3,7 +3,6 @@ use crate::http_connect::HttpProxyClientConfig;
 use crate::hysteria2::Hysteria2ClientConfig;
 use crate::mieru::{MieruClientConfig, MieruTrafficPattern, MieruTransport};
 use crate::naive::{NaiveClientConfig, default_naive_quic_congestion_control};
-use crate::nodeexpand::{NodeExpandClientConfig, NodeExpandEndpoint};
 use crate::padding::PaddingScheme;
 use crate::reality::RealityClientConfig;
 use crate::router::RouteClientConfig;
@@ -145,7 +144,6 @@ pub enum MihomoProxy {
     Trojan(MihomoTrojanProxy),
     Hysteria2(MihomoHysteria2Proxy),
     AnyTls(MihomoAnyTlsProxy),
-    NodeExpand(MihomoNodeExpandProxy),
     Mieru(MihomoMieruProxy),
     Naive(MihomoNaiveProxy),
     Tuic(MihomoTuicProxy),
@@ -181,9 +179,6 @@ impl<'de> Deserialize<'de> for MihomoProxy {
             }
             "anytls" | "any-tls" => {
                 decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::AnyTls)
-            }
-            "nodeexpand" | "node-expand" | "node_expand" | "aerion-mp" => {
-                decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::NodeExpand)
             }
             "mieru" => decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::Mieru),
             "naive" | "naive+https" | "naive+quic" => {
@@ -591,50 +586,6 @@ pub struct MihomoAnyTlsProxy {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct MihomoNodeExpandProxy {
-    pub name: String,
-    #[serde(default)]
-    pub server: Option<String>,
-    #[serde(default)]
-    pub port: Option<u16>,
-    #[serde(default)]
-    pub endpoints: Vec<MihomoNodeExpandEndpoint>,
-    #[serde(default)]
-    pub password: Option<String>,
-    #[serde(default)]
-    pub uuid: Option<String>,
-    #[serde(default = "default_true")]
-    pub udp: bool,
-    #[serde(default, rename = "padding-scheme", alias = "padding_scheme")]
-    pub padding_scheme: Vec<String>,
-    #[serde(
-        default,
-        rename = "heartbeat-interval-secs",
-        alias = "heartbeat_interval_secs",
-        alias = "heartbeat-interval"
-    )]
-    pub heartbeat_interval_secs: Option<u64>,
-    #[serde(flatten)]
-    pub fields: BTreeMap<String, Value>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-pub struct MihomoNodeExpandEndpoint {
-    #[serde(default)]
-    pub host: Option<String>,
-    #[serde(default)]
-    pub server_host: Option<String>,
-    #[serde(default)]
-    pub server: Option<String>,
-    #[serde(default)]
-    pub port: Option<u16>,
-    #[serde(default)]
-    pub server_port: Option<u16>,
-    #[serde(flatten)]
-    pub fields: BTreeMap<String, Value>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct MihomoNaiveProxy {
     pub name: String,
     pub server: String,
@@ -868,7 +819,6 @@ pub enum MihomoClientConfig {
     Trojan(TrojanClientConfig),
     Hysteria2(Hysteria2ClientConfig),
     AnyTls(ClientConfig),
-    NodeExpand(NodeExpandClientConfig),
     Mieru(MieruClientConfig),
     Naive(NaiveClientConfig),
     Tuic(TuicClientConfig),
