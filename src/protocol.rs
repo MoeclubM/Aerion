@@ -17,7 +17,7 @@ pub const CMD_HEART_RESPONSE: u8 = 9;
 pub const CMD_SERVER_SETTINGS: u8 = 10;
 pub const MAX_FRAME_PAYLOAD_LEN: usize = u16::MAX as usize;
 
-const FRAME_HEADER_LEN: usize = 7;
+pub(crate) const FRAME_HEADER_LEN: usize = 7;
 const CLIENT_NAME: &str = "aerion/0.1.0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -309,7 +309,7 @@ pub fn parse_settings(bytes: &[u8]) -> std::collections::HashMap<String, String>
         .collect()
 }
 
-fn encode_frame(cmd: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_frame(cmd: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
     frame.push(cmd);
     frame.extend_from_slice(&stream_id.to_be_bytes());

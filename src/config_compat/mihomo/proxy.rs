@@ -14,6 +14,7 @@ impl MihomoProxy {
             Self::Trojan(proxy) => &proxy.name,
             Self::Hysteria2(proxy) => &proxy.name,
             Self::AnyTls(proxy) => &proxy.name,
+            Self::NodeExpand(proxy) => &proxy.name,
             Self::Mieru(proxy) => &proxy.name,
             Self::Naive(proxy) => &proxy.name,
             Self::Tuic(proxy) => &proxy.name,
@@ -35,6 +36,9 @@ impl MihomoProxy {
                 MihomoClientConfig::Hysteria2(proxy.to_client_config(listen)?)
             }
             Self::AnyTls(proxy) => MihomoClientConfig::AnyTls(proxy.to_client_config(listen)?),
+            Self::NodeExpand(proxy) => {
+                MihomoClientConfig::NodeExpand(proxy.to_client_config(listen)?)
+            }
             Self::Mieru(proxy) => MihomoClientConfig::Mieru(proxy.to_client_config(listen)?),
             Self::Naive(proxy) => MihomoClientConfig::Naive(proxy.to_client_config(listen)?),
             Self::Tuic(proxy) => MihomoClientConfig::Tuic(proxy.to_client_config(listen)?),
@@ -332,6 +336,13 @@ impl MihomoUnsupportedProxy {
                     .with_context(|| format!("parse mihomo AnyTLS proxy {}", self.name))?
                     .to_client_config(listen)?,
             ),
+            "nodeexpand" | "node-expand" | "node_expand" | "aerion-mp" => {
+                MihomoClientConfig::NodeExpand(
+                    serde_yaml::from_value::<MihomoNodeExpandProxy>(value)
+                        .with_context(|| format!("parse mihomo NodeExpand proxy {}", self.name))?
+                        .to_client_config(listen)?,
+                )
+            }
             "mieru" => MihomoClientConfig::Mieru(
                 serde_yaml::from_value::<MihomoMieruProxy>(value)
                     .with_context(|| format!("parse mihomo Mieru proxy {}", self.name))?
@@ -758,6 +769,104 @@ impl MihomoAnyTlsProxy {
                 self.padding_scheme.clone()
             },
             heartbeat_interval_secs: 30,
+        })
+    }
+}
+
+impl MihomoNodeExpandProxy {
+    pub fn to_client_config(&self, listen: SocketAddr) -> Result<NodeExpandClientConfig> {
+        ensure_no_proxy_extra_fields(
+            &format!("mihomo NodeExpand proxy {}", self.name),
+            &self.fields,
+        )?;
+        let password = self
+            .password
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                self.uuid
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+            .with_context(|| {
+                format!(
+                    "mihomo NodeExpand proxy {} is missing password or uuid",
+                    self.name
+                )
+            })?;
+        let endpoints = if self.endpoints.is_empty() {
+            let server_host = self
+                .server
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .with_context(|| {
+                    format!(
+                        "mihomo NodeExpand proxy {} is missing endpoints or server",
+                        self.name
+                    )
+                })?;
+            let server_port = self.port.with_context(|| {
+                format!(
+                    "mihomo NodeExpand proxy {} is missing endpoints or port",
+                    self.name
+                )
+            })?;
+            vec![NodeExpandEndpoint {
+                server_host: server_host.to_string(),
+                server_port,
+            }]
+        } else {
+            self.endpoints
+                .iter()
+                .enumerate()
+                .map(|(index, endpoint)| endpoint.to_endpoint(&self.name, index))
+                .collect::<Result<Vec<_>>>()?
+        };
+        Ok(NodeExpandClientConfig {
+            listen,
+            endpoints,
+            password: password.to_string(),
+            padding_scheme: if self.padding_scheme.is_empty() {
+                PaddingScheme::default_lines()
+            } else {
+                self.padding_scheme.clone()
+            },
+            heartbeat_interval_secs: self.heartbeat_interval_secs.unwrap_or(30),
+        })
+    }
+}
+
+impl MihomoNodeExpandEndpoint {
+    fn to_endpoint(&self, name: &str, index: usize) -> Result<NodeExpandEndpoint> {
+        ensure_no_proxy_extra_fields(
+            &format!("mihomo NodeExpand proxy {name} endpoint #{}", index + 1),
+            &self.fields,
+        )?;
+        let host = self
+            .server_host
+            .as_deref()
+            .or(self.host.as_deref())
+            .or(self.server.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .with_context(|| {
+                format!(
+                    "mihomo NodeExpand proxy {name} endpoint #{} is missing host",
+                    index + 1
+                )
+            })?;
+        let port = self.port.or(self.server_port).with_context(|| {
+            format!(
+                "mihomo NodeExpand proxy {name} endpoint #{} is missing port",
+                index + 1
+            )
+        })?;
+        Ok(NodeExpandEndpoint {
+            server_host: host.to_string(),
+            server_port: port,
         })
     }
 }

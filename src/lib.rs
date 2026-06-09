@@ -10,6 +10,7 @@ pub mod listener;
 pub mod log_bridge;
 pub mod mieru;
 pub mod naive;
+pub mod nodeexpand;
 pub mod padding;
 pub mod protocol;
 pub mod reality;
@@ -77,6 +78,11 @@ pub use mieru::{
 pub use naive::{
     NaiveClientConfig, NaiveServerConfig, run_naive_client, run_naive_client_listener,
     run_naive_server, run_naive_server_with_core,
+};
+pub use nodeexpand::{
+    NodeExpandClientConfig, NodeExpandEndpoint, NodeExpandServerConfig, run_nodeexpand_client,
+    run_nodeexpand_client_listener, run_nodeexpand_client_with_core, run_nodeexpand_server,
+    run_nodeexpand_server_listener_with_core, run_nodeexpand_server_with_core,
 };
 pub use reality::{
     BuiltRealityClientHello, RealityClientConfig, RealityServerConfig, build_reality_client_hello,

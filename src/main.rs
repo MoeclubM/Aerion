@@ -11,6 +11,7 @@ use aerion::mieru::{
     MieruClientConfig, MieruServerConfig, MieruTrafficPattern, MieruTransport, parse_mieru_user,
 };
 use aerion::naive::{NaiveClientConfig, NaiveServerConfig};
+use aerion::nodeexpand::{NodeExpandClientConfig, NodeExpandEndpoint, NodeExpandServerConfig};
 use aerion::padding::PaddingScheme;
 use aerion::tuic::{TuicClientConfig, TuicServerConfig, parse_tuic_user};
 use aerion::tun::{
@@ -26,7 +27,8 @@ use aerion::{
     XrayOutbound, XrayServerConfig, run_client, run_client_listener, run_hysteria2_client,
     run_hysteria2_client_listener, run_hysteria2_server, run_mieru_client,
     run_mieru_client_listener, run_mieru_server, run_naive_client, run_naive_client_listener,
-    run_naive_server, run_route_client, run_route_client_listener, run_route_proxy, run_server,
+    run_naive_server, run_nodeexpand_client, run_nodeexpand_client_listener, run_nodeexpand_server,
+    run_route_client, run_route_client_listener, run_route_proxy, run_server,
     run_shadowsocks_client, run_shadowsocks_client_listener, run_shadowsocks_server,
     run_socks_proxy_client, run_socks_proxy_client_listener, run_trojan_client,
     run_trojan_client_listener, run_trojan_server, run_tuic_client, run_tuic_client_listener,
@@ -582,6 +584,7 @@ enum RunnableClientConfig {
     Hysteria2(Hysteria2ClientConfig),
     Mieru(MieruClientConfig),
     Naive(NaiveClientConfig),
+    NodeExpand(NodeExpandClientConfig),
     Route(RouteClientConfig),
     Shadowsocks(ShadowsocksClientConfig),
     SocksProxy(SocksProxyClientConfig),
@@ -599,6 +602,7 @@ impl From<MihomoClientConfig> for RunnableClientConfig {
             MihomoClientConfig::Hysteria2(config) => Self::Hysteria2(config),
             MihomoClientConfig::Mieru(config) => Self::Mieru(config),
             MihomoClientConfig::Naive(config) => Self::Naive(config),
+            MihomoClientConfig::NodeExpand(config) => Self::NodeExpand(config),
             MihomoClientConfig::Route(config) => Self::Route(config),
             MihomoClientConfig::Shadowsocks(config) => Self::Shadowsocks(config),
             MihomoClientConfig::SocksProxy(config) => Self::SocksProxy(config),
@@ -920,6 +924,35 @@ async fn run_native_client(mut client: ClientFileConfig, listen: Option<SocketAd
     if let Some(listen) = listen {
         client.listen = listen;
     }
+    if is_nodeexpand(&client.protocol) {
+        let endpoints = if client.endpoints.is_empty() {
+            let (server_host, server_port) = parse_host_port(&client.server)?;
+            vec![NodeExpandEndpoint {
+                server_host,
+                server_port,
+            }]
+        } else {
+            client
+                .endpoints
+                .iter()
+                .map(|server| {
+                    let (server_host, server_port) = parse_host_port(server)?;
+                    Ok(NodeExpandEndpoint {
+                        server_host,
+                        server_port,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        return run_nodeexpand_client(NodeExpandClientConfig {
+            listen: client.listen,
+            endpoints,
+            password: client.password,
+            padding_scheme: client.padding_scheme,
+            heartbeat_interval_secs: client.heartbeat_interval_secs,
+        })
+        .await;
+    }
     let (server_host, server_port) = parse_host_port(&client.server)?;
     let sni = client.sni.unwrap_or_else(|| server_host.clone());
     if is_hysteria2(&client.protocol) {
@@ -1188,6 +1221,16 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
     if let Some(listen) = listen {
         server.listen = listen;
     }
+    if is_nodeexpand(&server.protocol) {
+        return run_nodeexpand_server(NodeExpandServerConfig {
+            listen: server.listen,
+            password: server.password,
+            users: server.users,
+            padding_scheme: server.padding_scheme,
+            heartbeat_interval_secs: server.heartbeat_interval_secs,
+        })
+        .await;
+    }
     if is_hysteria2(&server.protocol) {
         let (cert_path, key_path) = native_tls_paths(&server, "Hysteria2")?;
         return run_hysteria2_server(Hysteria2ServerConfig {
@@ -1450,6 +1493,7 @@ async fn run_client_config(config: RunnableClientConfig) -> Result<()> {
         RunnableClientConfig::Hysteria2(config) => run_hysteria2_client(config).await,
         RunnableClientConfig::Mieru(config) => run_mieru_client(config).await,
         RunnableClientConfig::Naive(config) => run_naive_client(config).await,
+        RunnableClientConfig::NodeExpand(config) => run_nodeexpand_client(config).await,
         RunnableClientConfig::Route(config) => run_route_client(config).await,
         RunnableClientConfig::Shadowsocks(config) => run_shadowsocks_client(config).await,
         RunnableClientConfig::SocksProxy(config) => run_socks_proxy_client(config).await,
@@ -1480,6 +1524,9 @@ async fn run_client_config_with_listener(
         }
         RunnableClientConfig::Mieru(config) => run_mieru_client_listener(listener, config).await,
         RunnableClientConfig::Naive(config) => run_naive_client_listener(listener, config).await,
+        RunnableClientConfig::NodeExpand(config) => {
+            run_nodeexpand_client_listener(listener, config, None).await
+        }
         RunnableClientConfig::Route(config) => run_route_client_listener(listener, config).await,
         RunnableClientConfig::Shadowsocks(config) => {
             run_shadowsocks_client_listener(listener, config).await
@@ -1778,6 +1825,13 @@ fn is_naive(protocol: &str) -> bool {
         || protocol.eq_ignore_ascii_case("naive+quic")
 }
 
+fn is_nodeexpand(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case("nodeexpand")
+        || protocol.eq_ignore_ascii_case("node-expand")
+        || protocol.eq_ignore_ascii_case("node_expand")
+        || protocol.eq_ignore_ascii_case("aerion-mp")
+}
+
 fn is_shadowsocks(protocol: &str) -> bool {
     protocol.eq_ignore_ascii_case("shadowsocks") || protocol.eq_ignore_ascii_case("ss")
 }
@@ -1832,7 +1886,7 @@ fn native_vless_transport(
 }
 
 fn ensure_supported_protocol(protocol: &str) -> Result<()> {
-    if protocol.eq_ignore_ascii_case("anytls") {
+    if protocol.eq_ignore_ascii_case("anytls") || is_nodeexpand(protocol) {
         Ok(())
     } else {
         bail!("unsupported protocol: {protocol}");

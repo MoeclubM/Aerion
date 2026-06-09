@@ -48,7 +48,10 @@ pub struct ClientFileConfig {
     #[serde(default = "default_protocol")]
     pub protocol: String,
     pub listen: SocketAddr,
+    #[serde(default)]
     pub server: String,
+    #[serde(default, alias = "servers")]
+    pub endpoints: Vec<String>,
     #[serde(default = "default_mieru_username")]
     pub username: String,
     #[serde(default, alias = "uuid", alias = "id", alias = "user-id")]
