@@ -26,13 +26,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, Wr
 use tokio::net::{TcpListener, TcpStream, UdpSocket, tcp::OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, Instant, sleep};
-use x25519_dalek::{PublicKey, StaticSecret};
 
 type HmacSha256 = Hmac<Sha256>;
 
 const HANDSHAKE_NONCE_LEN: usize = 32;
 const HANDSHAKE_TIMESTAMP_LEN: usize = 8;
-const HANDSHAKE_X25519_PUBLIC_KEY_LEN: usize = 32;
 const HANDSHAKE_PADDING_LEN_FIELD_LEN: usize = 2;
 const HANDSHAKE_MIN_PADDING_LEN: usize = 16;
 const HANDSHAKE_MAX_PADDING_LEN: usize = 512;
@@ -43,9 +41,9 @@ const RECORD_TAG_LEN: usize = 16;
 const MAX_RECORD_LEN: usize = u16::MAX as usize;
 const MAX_RECORD_PLAINTEXT_LEN: usize = MAX_RECORD_LEN - RECORD_TAG_LEN;
 const MAX_FRAME_PAYLOAD_LEN: usize = MAX_RECORD_PLAINTEXT_LEN - FRAME_HEADER_LEN;
-const RECORD_NONCE_PREFIX: &[u8; 16] = b"NodeExpandAEADv4";
-const RECORD_AAD_PREFIX: &[u8] = b"nodeexpand-record-v4";
-const RECORD_LENGTH_MASK_PREFIX: &[u8] = b"nodeexpand-record-length-v4";
+const RECORD_NONCE_PREFIX: &[u8; 16] = b"NodeExpandAEADv3";
+const RECORD_AAD_PREFIX: &[u8] = b"nodeexpand-record-v3";
+const RECORD_LENGTH_MASK_PREFIX: &[u8] = b"nodeexpand-record-length-v3";
 const HEARTBEAT_JITTER_MIN_PERCENT: u64 = 70;
 const HEARTBEAT_JITTER_SPAN_PERCENT: u64 = 61;
 
@@ -833,7 +831,7 @@ async fn handle_nodeexpand_client(
                         .await?;
                 }
                 let mut writer = writer.lock().await;
-                writer.write_frame(CMD_SERVER_SETTINGS, 0, b"v=4").await?;
+                writer.write_frame(CMD_SERVER_SETTINGS, 0, b"v=3").await?;
             }
             CMD_WASTE | CMD_SERVER_SETTINGS | CMD_UPDATE_PADDING_SCHEME => {}
             CMD_ALERT => {
@@ -1109,7 +1107,7 @@ where
 
     async fn write_client_settings(&mut self) -> Result<()> {
         let settings = format!(
-            "v=4\nclient=aerion/0.1.0\npadding-md5={}",
+            "v=3\nclient=aerion/0.1.0\npadding-md5={}",
             self.padding.md5()
         );
         self.write_frame(CMD_SETTINGS, 0, settings.as_bytes()).await
@@ -1347,21 +1345,18 @@ async fn client_handshake(stream: &mut TcpStream, password: &str) -> Result<Node
     let mut client_nonce = [0u8; HANDSHAKE_NONCE_LEN];
     getrandom::fill(&mut client_nonce).context("generate NodeExpand client nonce")?;
     let client_timestamp = current_unix_secs()?.to_be_bytes();
-    let client_secret = generate_x25519_secret()?;
-    let client_public = PublicKey::from(&client_secret).to_bytes();
     let client_padding = random_handshake_padding()?;
     let client_padding_len = encode_handshake_padding_len(
-        b"client-handshake-len-v4",
-        &[&client_nonce, &client_timestamp, &client_public],
+        b"client-handshake-len-v3",
+        &[&client_nonce, &client_timestamp],
         client_padding.len(),
     )?;
     let client_tag = handshake_tag(
         password,
         &[
-            b"client-v4",
+            b"client-v3",
             &client_nonce,
             &client_timestamp,
-            &client_public,
             &client_padding_len,
             &client_padding,
         ],
@@ -1374,10 +1369,6 @@ async fn client_handshake(stream: &mut TcpStream, password: &str) -> Result<Node
         .write_all(&client_timestamp)
         .await
         .context("write NodeExpand client timestamp")?;
-    stream
-        .write_all(&client_public)
-        .await
-        .context("write NodeExpand client X25519 public key")?;
     stream
         .write_all(&client_padding_len)
         .await
@@ -1396,7 +1387,6 @@ async fn client_handshake(stream: &mut TcpStream, password: &str) -> Result<Node
         .context("flush NodeExpand client handshake")?;
 
     let mut server_nonce = [0u8; HANDSHAKE_NONCE_LEN];
-    let mut server_public = [0u8; HANDSHAKE_X25519_PUBLIC_KEY_LEN];
     let mut server_padding_len = [0u8; HANDSHAKE_PADDING_LEN_FIELD_LEN];
     let mut server_tag = [0u8; HANDSHAKE_TAG_LEN];
     stream
@@ -1404,22 +1394,12 @@ async fn client_handshake(stream: &mut TcpStream, password: &str) -> Result<Node
         .await
         .context("read NodeExpand server nonce")?;
     stream
-        .read_exact(&mut server_public)
-        .await
-        .context("read NodeExpand server X25519 public key")?;
-    stream
         .read_exact(&mut server_padding_len)
         .await
         .context("read NodeExpand server padding length")?;
     let server_padding_len = decode_handshake_padding_len(
-        b"server-handshake-len-v4",
-        &[
-            &client_nonce,
-            &client_timestamp,
-            &client_public,
-            &server_nonce,
-            &server_public,
-        ],
+        b"server-handshake-len-v3",
+        &[&client_nonce, &client_timestamp, &server_nonce],
         server_padding_len,
     )?;
     let mut server_padding = vec![0u8; server_padding_len];
@@ -1434,21 +1414,13 @@ async fn client_handshake(stream: &mut TcpStream, password: &str) -> Result<Node
     let expected = handshake_tag(
         password,
         &[
-            b"server-v4",
+            b"server-v3",
             &client_nonce,
             &client_timestamp,
-            &client_public,
             &server_nonce,
-            &server_public,
             &encode_handshake_padding_len(
-                b"server-handshake-len-v4",
-                &[
-                    &client_nonce,
-                    &client_timestamp,
-                    &client_public,
-                    &server_nonce,
-                    &server_public,
-                ],
+                b"server-handshake-len-v3",
+                &[&client_nonce, &client_timestamp, &server_nonce],
                 server_padding.len(),
             )?,
             &server_padding,
@@ -1463,11 +1435,6 @@ async fn client_handshake(stream: &mut TcpStream, password: &str) -> Result<Node
         &client_nonce,
         &client_timestamp,
         &server_nonce,
-        &client_public,
-        &server_public,
-        &client_secret
-            .diffie_hellman(&PublicKey::from(server_public))
-            .to_bytes(),
         true,
     )
 }
@@ -1479,7 +1446,6 @@ async fn server_handshake(
 ) -> Result<(String, NodeExpandKeys)> {
     let mut client_nonce = [0u8; HANDSHAKE_NONCE_LEN];
     let mut client_timestamp = [0u8; HANDSHAKE_TIMESTAMP_LEN];
-    let mut client_public = [0u8; HANDSHAKE_X25519_PUBLIC_KEY_LEN];
     let mut client_padding_len = [0u8; HANDSHAKE_PADDING_LEN_FIELD_LEN];
     let mut client_tag = [0u8; HANDSHAKE_TAG_LEN];
     stream
@@ -1491,16 +1457,12 @@ async fn server_handshake(
         .await
         .context("read NodeExpand client timestamp")?;
     stream
-        .read_exact(&mut client_public)
-        .await
-        .context("read NodeExpand client X25519 public key")?;
-    stream
         .read_exact(&mut client_padding_len)
         .await
         .context("read NodeExpand client padding length")?;
     let client_padding_len = decode_handshake_padding_len(
-        b"client-handshake-len-v4",
-        &[&client_nonce, &client_timestamp, &client_public],
+        b"client-handshake-len-v3",
+        &[&client_nonce, &client_timestamp],
         client_padding_len,
     )?;
     let mut client_padding = vec![0u8; client_padding_len];
@@ -1528,13 +1490,12 @@ async fn server_handshake(
         let expected = handshake_tag(
             password,
             &[
-                b"client-v4",
+                b"client-v3",
                 &client_nonce,
                 &client_timestamp,
-                &client_public,
                 &encode_handshake_padding_len(
-                    b"client-handshake-len-v4",
-                    &[&client_nonce, &client_timestamp, &client_public],
+                    b"client-handshake-len-v3",
+                    &[&client_nonce, &client_timestamp],
                     client_padding.len(),
                 )?,
                 &client_padding,
@@ -1550,29 +1511,19 @@ async fn server_handshake(
 
     let mut server_nonce = [0u8; HANDSHAKE_NONCE_LEN];
     getrandom::fill(&mut server_nonce).context("generate NodeExpand server nonce")?;
-    let server_secret = generate_x25519_secret()?;
-    let server_public = PublicKey::from(&server_secret).to_bytes();
     let server_padding = random_handshake_padding()?;
     let server_padding_len = encode_handshake_padding_len(
-        b"server-handshake-len-v4",
-        &[
-            &client_nonce,
-            &client_timestamp,
-            &client_public,
-            &server_nonce,
-            &server_public,
-        ],
+        b"server-handshake-len-v3",
+        &[&client_nonce, &client_timestamp, &server_nonce],
         server_padding.len(),
     )?;
     let server_tag = handshake_tag(
         &credential,
         &[
-            b"server-v4",
+            b"server-v3",
             &client_nonce,
             &client_timestamp,
-            &client_public,
             &server_nonce,
-            &server_public,
             &server_padding_len,
             &server_padding,
         ],
@@ -1581,10 +1532,6 @@ async fn server_handshake(
         .write_all(&server_nonce)
         .await
         .context("write NodeExpand server nonce")?;
-    stream
-        .write_all(&server_public)
-        .await
-        .context("write NodeExpand server X25519 public key")?;
     stream
         .write_all(&server_padding_len)
         .await
@@ -1607,11 +1554,6 @@ async fn server_handshake(
         &client_nonce,
         &client_timestamp,
         &server_nonce,
-        &client_public,
-        &server_public,
-        &server_secret
-            .diffie_hellman(&PublicKey::from(client_public))
-            .to_bytes(),
         false,
     )?;
     Ok((credential, keys))
@@ -1634,43 +1576,25 @@ fn derive_keys(
     client_nonce: &[u8; HANDSHAKE_NONCE_LEN],
     client_timestamp: &[u8; HANDSHAKE_TIMESTAMP_LEN],
     server_nonce: &[u8; HANDSHAKE_NONCE_LEN],
-    client_public: &[u8; HANDSHAKE_X25519_PUBLIC_KEY_LEN],
-    server_public: &[u8; HANDSHAKE_X25519_PUBLIC_KEY_LEN],
-    shared_secret: &[u8; HANDSHAKE_X25519_PUBLIC_KEY_LEN],
     client: bool,
 ) -> Result<NodeExpandKeys> {
-    ensure!(
-        shared_secret.iter().any(|value| *value != 0),
-        "NodeExpand X25519 shared secret is invalid"
-    );
-    let mut salt = Vec::with_capacity(
-        client_nonce.len()
-            + client_timestamp.len()
-            + server_nonce.len()
-            + client_public.len()
-            + server_public.len(),
-    );
+    let mut salt =
+        Vec::with_capacity(client_nonce.len() + client_timestamp.len() + server_nonce.len());
     salt.extend_from_slice(client_nonce);
     salt.extend_from_slice(client_timestamp);
     salt.extend_from_slice(server_nonce);
-    salt.extend_from_slice(client_public);
-    salt.extend_from_slice(server_public);
-    let password = password.trim();
-    let mut input_key_material = Vec::with_capacity(password.len() + shared_secret.len());
-    input_key_material.extend_from_slice(password.as_bytes());
-    input_key_material.extend_from_slice(shared_secret);
-    let hkdf = Hkdf::<Sha256>::new(Some(&salt), &input_key_material);
+    let hkdf = Hkdf::<Sha256>::new(Some(&salt), password.trim().as_bytes());
     let mut c2s = [0u8; 32];
     let mut s2c = [0u8; 32];
     let mut c2s_len = [0u8; 32];
     let mut s2c_len = [0u8; 32];
-    hkdf.expand(b"nodeexpand v4 c2s", &mut c2s)
+    hkdf.expand(b"nodeexpand v3 c2s", &mut c2s)
         .map_err(|_| anyhow::anyhow!("derive NodeExpand client-to-server key"))?;
-    hkdf.expand(b"nodeexpand v4 s2c", &mut s2c)
+    hkdf.expand(b"nodeexpand v3 s2c", &mut s2c)
         .map_err(|_| anyhow::anyhow!("derive NodeExpand server-to-client key"))?;
-    hkdf.expand(b"nodeexpand v4 c2s length", &mut c2s_len)
+    hkdf.expand(b"nodeexpand v3 c2s length", &mut c2s_len)
         .map_err(|_| anyhow::anyhow!("derive NodeExpand client-to-server length key"))?;
-    hkdf.expand(b"nodeexpand v4 s2c length", &mut s2c_len)
+    hkdf.expand(b"nodeexpand v3 s2c length", &mut s2c_len)
         .map_err(|_| anyhow::anyhow!("derive NodeExpand server-to-client length key"))?;
     if client {
         Ok(NodeExpandKeys {
@@ -1737,12 +1661,6 @@ fn record_length_mask(length_key: &[u8; 32], sequence: u64) -> Result<u16> {
     Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
 }
 
-fn generate_x25519_secret() -> Result<StaticSecret> {
-    let mut private_key = [0u8; 32];
-    getrandom::fill(&mut private_key).context("generate NodeExpand X25519 private key")?;
-    Ok(StaticSecret::from(private_key))
-}
-
 fn random_handshake_padding() -> Result<Vec<u8>> {
     let padding_len = random_usize(HANDSHAKE_MIN_PADDING_LEN, HANDSHAKE_MAX_PADDING_LEN)?;
     let mut padding = vec![0u8; padding_len];
@@ -1779,7 +1697,7 @@ fn decode_handshake_padding_len(
 
 fn handshake_padding_len_mask(label: &[u8], parts: &[&[u8]]) -> u16 {
     let mut hasher = Sha256::new();
-    hasher.update(b"nodeexpand-handshake-length-v4");
+    hasher.update(b"nodeexpand-handshake-length-v3");
     hasher.update(label);
     for part in parts {
         hasher.update(part);
