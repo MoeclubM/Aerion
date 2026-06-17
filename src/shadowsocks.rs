@@ -23,6 +23,7 @@ use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -298,6 +299,16 @@ async fn relay_shadowsocks_udp_packet(
         .await
         .with_context(|| format!("send Shadowsocks UDP payload to {target_addr}"))?;
 
+    // SS2022 requires the server to generate its own random server_session_id and
+    // increment server_packet_id per outgoing packet. Reusing the inbound control
+    // (which carries the *client* session id and a 0 server session id) makes
+    // strict clients like sing-shadowsocks2 reject or panic on the response.
+    let mut server_session_id_buf = [0u8; 8];
+    getrandom::fill(&mut server_session_id_buf)
+        .context("generate Shadowsocks UDP server_session_id")?;
+    let server_session_id = u64::from_be_bytes(server_session_id_buf);
+    let server_packet_id = AtomicU64::new(0);
+
     let mut buffer = vec![0u8; MAXIMUM_UDP_PAYLOAD_SIZE];
     while let Ok(read) = timeout(
         SHADOWSOCKS_UDP_SESSION_TIMEOUT,
@@ -307,9 +318,12 @@ async fn relay_shadowsocks_udp_packet(
     {
         let (read, _) = read.context("receive Shadowsocks UDP response")?;
         session.record_download(read).await?;
-        if let Some(control) = control.as_ref() {
+        if let Some(inbound_control) = control.as_ref() {
+            let mut response_control = inbound_control.clone();
+            response_control.server_session_id = server_session_id;
+            response_control.packet_id = server_packet_id.fetch_add(1, Ordering::Relaxed) + 1;
             proxy
-                .send_to_with_ctrl(peer, &target, control, &buffer[..read])
+                .send_to_with_ctrl(peer, &target, &response_control, &buffer[..read])
                 .await
                 .with_context(|| format!("send Shadowsocks UDP response to {peer}"))?;
         } else {
