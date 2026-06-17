@@ -1832,7 +1832,11 @@ fn native_vless_transport(
 }
 
 fn ensure_supported_protocol(protocol: &str) -> Result<()> {
-    if protocol.eq_ignore_ascii_case("anytls") {
+    const SUPPORTED: &[&str] = &[
+        "anytls", "hysteria2", "mieru", "naive",
+        "shadowsocks", "trojan", "tuic", "vless", "vmess",
+    ];
+    if SUPPORTED.iter().any(|s| s.eq_ignore_ascii_case(protocol)) {
         Ok(())
     } else {
         bail!("unsupported protocol: {protocol}");
