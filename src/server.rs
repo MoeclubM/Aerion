@@ -177,6 +177,7 @@ async fn handle_client(
     let writer = Arc::new(Mutex::new(writer));
     let mut received_settings = false;
     let mut pending = HashSet::new();
+    let mut pending_uot: HashMap<u32, (ProxyTarget, Vec<u8>)> = HashMap::new();
     let mut streams: HashMap<u32, mpsc::Sender<Vec<u8>>> = HashMap::new();
     let mut heartbeat = interval(Duration::from_secs(heartbeat_interval_secs));
     heartbeat.tick().await;
@@ -208,7 +209,47 @@ async fn handle_client(
                     streams.remove(&frame.stream_id);
                 }
             }
+            CMD_PSH if pending_uot.contains_key(&frame.stream_id) => {
+                let stream_id = frame.stream_id;
+                let (_, payload) = pending_uot
+                    .get_mut(&stream_id)
+                    .expect("pending UOT stream key exists");
+                payload.extend_from_slice(&frame.payload);
+                if uot::v2_request_complete(payload)? {
+                    let (target, payload) = pending_uot
+                        .remove(&stream_id)
+                        .expect("pending UOT stream key exists");
+                    let mut frame_payload = encode_target(&target)?;
+                    frame_payload.extend_from_slice(&payload);
+                    match open_stream(
+                        Frame {
+                            cmd: CMD_PSH,
+                            stream_id,
+                            payload: frame_payload,
+                        },
+                        writer.clone(),
+                        session.clone(),
+                    )
+                    .await
+                    {
+                        Ok((stream_id, sender)) => {
+                            streams.insert(stream_id, sender);
+                        }
+                        Err(error) => {
+                            tracing::warn!("open stream failed: {error:?}");
+                        }
+                    }
+                }
+            }
             CMD_PSH if pending.remove(&frame.stream_id) => {
+                let (target, initial_payload) = decode_target(&frame.payload)?;
+                if uot::is_magic_target(&target)
+                    && !uot::is_legacy_magic_target(&target)
+                    && !uot::v2_request_complete(initial_payload)?
+                {
+                    pending_uot.insert(frame.stream_id, (target, initial_payload.to_vec()));
+                    continue;
+                }
                 match open_stream(frame, writer.clone(), session.clone()).await {
                     Ok((stream_id, sender)) => {
                         streams.insert(stream_id, sender);
@@ -220,6 +261,7 @@ async fn handle_client(
             }
             CMD_FIN => {
                 streams.remove(&frame.stream_id);
+                pending_uot.remove(&frame.stream_id);
             }
             CMD_HEART_REQUEST => {
                 let mut writer = writer.lock().await;

@@ -60,7 +60,13 @@ pub fn decode_request_for_target<'a>(
     if is_legacy_magic_target(target) {
         return Ok((legacy_associate_request(), payload));
     }
-    Ok((decode_v2_request(payload)?, &[]))
+    let length = v2_request_len(payload)?.context("incomplete UOT request")?;
+    ensure!(payload.len() >= length, "incomplete UOT request");
+    Ok((decode_v2_request(&payload[..length])?, &payload[length..]))
+}
+
+pub fn v2_request_complete(payload: &[u8]) -> Result<bool> {
+    Ok(v2_request_len(payload)?.is_some_and(|length| payload.len() >= length))
 }
 
 pub fn legacy_associate_request() -> UotRequest {
@@ -352,5 +358,24 @@ mod tests {
         let (request, packet) = decode_request_for_target(&target, b"abc").unwrap();
         assert!(!request.is_connect);
         assert_eq!(packet, b"abc");
+    }
+
+    #[test]
+    fn v2_request_can_be_split_and_preserves_initial_packet() {
+        let target = magic_target();
+        let request = encode_v2_associate_request().unwrap();
+        assert!(!v2_request_complete(&request[..3]).unwrap());
+        assert!(v2_request_complete(&request).unwrap());
+
+        let packet = encode_associate_packet(
+            &ProxyTarget::Ip("1.2.3.4:53".parse().unwrap()),
+            b"abc",
+        )
+        .unwrap();
+        let mut payload = request;
+        payload.extend_from_slice(&packet);
+        let (decoded, initial_packet) = decode_request_for_target(&target, &payload).unwrap();
+        assert!(!decoded.is_connect);
+        assert_eq!(initial_packet, packet);
     }
 }
