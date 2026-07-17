@@ -343,9 +343,8 @@ pub(super) fn encode_mieru_packet_segment(
                 "Mieru data payload is too large"
             );
             prefix_padding = random_padding(max_middle_padding_len.min(available_padding))?;
-            suffix_padding = random_padding(
-                max_end_padding_len.min(available_padding - prefix_padding.len()),
-            )?;
+            suffix_padding =
+                random_padding(max_end_padding_len.min(available_padding - prefix_padding.len()))?;
             metadata.payload_len = segment.payload.len() as u16;
             metadata.prefix_len = prefix_padding.len() as u8;
             metadata.suffix_len = suffix_padding.len() as u8;

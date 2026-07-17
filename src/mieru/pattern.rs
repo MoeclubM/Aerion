@@ -244,12 +244,9 @@ fn decode_padding_pattern(mut input: &[u8]) -> Result<MieruPaddingPattern> {
         let wire = key & 0x07;
         match (field, wire) {
             (1, 0) => {
-                max_middle_padding_len =
-                    Some(read_protobuf_varint(&mut input)? as u32 as i32)
+                max_middle_padding_len = Some(read_protobuf_varint(&mut input)? as u32 as i32)
             }
-            (2, 0) => {
-                max_end_padding_len = Some(read_protobuf_varint(&mut input)? as u32 as i32)
-            }
+            (2, 0) => max_end_padding_len = Some(read_protobuf_varint(&mut input)? as u32 as i32),
             _ => skip_protobuf_field(wire, &mut input)?,
         }
     }

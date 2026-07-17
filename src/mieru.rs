@@ -22,10 +22,10 @@ mod socks;
 mod wire;
 
 use crypto::{MieruCipher, current_mieru_key, hash_mieru_password};
-use pattern::{random_padding, write_with_possible_fragment};
 pub use pattern::{
     MieruNoncePattern, MieruNonceType, MieruPaddingPattern, MieruTcpFragment, MieruTrafficPattern,
 };
+use pattern::{random_padding, write_with_possible_fragment};
 use socks::{
     SOCKS_CMD_CONNECT, SOCKS_CMD_UDP_ASSOCIATE, SOCKS_NO_ACCEPTABLE, SOCKS_NO_AUTH, SOCKS_VERSION,
     SocksRequest, read_packet_over_stream, read_socks_greeting, read_socks_request,
@@ -361,13 +361,9 @@ impl MieruStreamWriter {
         }
         data_to_send.extend_from_slice(&suffix_padding);
         if is_session {
-            write_with_possible_fragment(
-                &mut self.inner,
-                &data_to_send,
-                &self.traffic_pattern,
-            )
-            .await
-            .context("write Mieru stream segment")?;
+            write_with_possible_fragment(&mut self.inner, &data_to_send, &self.traffic_pattern)
+                .await
+                .context("write Mieru stream segment")?;
         } else {
             self.inner
                 .write_all(&data_to_send)
