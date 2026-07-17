@@ -367,11 +367,9 @@ mod tests {
         assert!(!v2_request_complete(&request[..3]).unwrap());
         assert!(v2_request_complete(&request).unwrap());
 
-        let packet = encode_associate_packet(
-            &ProxyTarget::Ip("1.2.3.4:53".parse().unwrap()),
-            b"abc",
-        )
-        .unwrap();
+        let packet =
+            encode_associate_packet(&ProxyTarget::Ip("1.2.3.4:53".parse().unwrap()), b"abc")
+                .unwrap();
         let mut payload = request;
         payload.extend_from_slice(&packet);
         let (decoded, initial_packet) = decode_request_for_target(&target, &payload).unwrap();
