@@ -106,6 +106,10 @@ pub fn parse_xray_ech_keys(data: &[u8]) -> Result<Vec<EchServerKeyEntry>> {
             "truncated ECH server keys at offset {offset}"
         );
         let key_length = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+        ensure!(
+            offset + 2 + key_length + 2 <= data.len(),
+            "truncated ECH server key at offset {offset}"
+        );
         let config_length =
             u16::from_be_bytes([data[offset + 2 + key_length], data[offset + 3 + key_length]])
                 as usize;
@@ -347,6 +351,12 @@ mod tests {
     #[test]
     fn rejects_empty_ech_keys() {
         assert!(parse_xray_ech_keys(&[]).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_ech_private_key_without_panicking() {
+        let error = parse_xray_ech_keys(&[0xff, 0xff, 0, 0]).unwrap_err();
+        assert!(error.to_string().contains("truncated ECH server key"));
     }
 
     #[test]

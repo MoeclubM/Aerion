@@ -11,7 +11,7 @@ use crate::socks::{self, SocksRequest};
 use crate::tls;
 use crate::uot;
 use crate::utls::UtlsFingerprint;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use rustls::pki_types::ServerName;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -58,6 +58,11 @@ pub async fn run_client_listener(
     config: ClientConfig,
     core: Option<ProxyCore>,
 ) -> Result<()> {
+    ensure!(
+        config.heartbeat_interval_secs > 0,
+        "AnyTLS heartbeat interval must be positive"
+    );
+    let padding = PaddingScheme::from_lines(config.padding_scheme.clone())?;
     let tls_config =
         tls::client_config_with_fingerprint_and_custom_root_material_early_data_options(
             config.insecure,
@@ -67,7 +72,7 @@ pub async fn run_client_listener(
             config.disable_system_roots,
             &config.pinned_cert_sha256,
         )?;
-    let shared = Arc::new(SharedClientSession::new(config, tls_config));
+    let shared = Arc::new(SharedClientSession::new(config, tls_config, padding));
     tracing::info!("client listening on socks5://{}", listener.local_addr()?);
     loop {
         let (stream, peer) = match listener::accept_client(&listener).await {
@@ -92,14 +97,20 @@ struct SharedClientSession {
     config: ClientConfig,
     tls_config: Arc<rustls::ClientConfig>,
     session: Mutex<Option<ClientSession>>,
+    padding: Arc<Mutex<PaddingScheme>>,
 }
 
 impl SharedClientSession {
-    fn new(config: ClientConfig, tls_config: Arc<rustls::ClientConfig>) -> Self {
+    fn new(
+        config: ClientConfig,
+        tls_config: Arc<rustls::ClientConfig>,
+        padding: PaddingScheme,
+    ) -> Self {
         Self {
             config,
             tls_config,
             session: Mutex::new(None),
+            padding: Arc::new(Mutex::new(padding)),
         }
     }
 
@@ -120,7 +131,14 @@ impl SharedClientSession {
                 }
                 guard.take();
             }
-            let session = ClientSession::connect(&self.config, self.tls_config.clone()).await?;
+            let padding = self.padding.lock().await.clone();
+            let session = ClientSession::connect(
+                &self.config,
+                self.tls_config.clone(),
+                padding,
+                self.padding.clone(),
+            )
+            .await?;
             guard.replace(session.clone());
             return Ok(session);
         }
@@ -153,7 +171,12 @@ impl ClientSession {
         self.closed.lock().await.is_none()
     }
 
-    async fn connect(config: &ClientConfig, tls_config: Arc<rustls::ClientConfig>) -> Result<Self> {
+    async fn connect(
+        config: &ClientConfig,
+        tls_config: Arc<rustls::ClientConfig>,
+        padding: PaddingScheme,
+        shared_padding: Arc<Mutex<PaddingScheme>>,
+    ) -> Result<Self> {
         let tcp =
             socket_protect::connect_tcp_host_port(config.server_host.as_str(), config.server_port)
                 .await
@@ -172,7 +195,6 @@ impl ClientSession {
             .await
             .context("TLS connect to Aerion server")?;
         let (reader, writer) = split(tls_stream);
-        let padding = PaddingScheme::from_lines(config.padding_scheme.clone())?;
         let mut writer = PaddedFrameWriter::new(writer, padding);
         writer.write_auth_preface(&config.password).await?;
         writer.write_client_settings().await?;
@@ -188,6 +210,7 @@ impl ClientSession {
             session.writer.clone(),
             session.streams.clone(),
             session.closed.clone(),
+            shared_padding,
         ));
         tokio::spawn(run_heartbeat(
             session.writer.clone(),
@@ -480,11 +503,12 @@ async fn read_session_frames(
     writer: Arc<Mutex<PaddedFrameWriter<WriteHalf<TlsStream<TcpStream>>>>>,
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>>,
     closed: Arc<Mutex<Option<String>>>,
+    shared_padding: Arc<Mutex<PaddingScheme>>,
 ) {
     let result: Result<()> = async {
         loop {
             let frame = read_frame(&mut reader).await?;
-            handle_session_frame(frame, &writer, &streams).await?;
+            handle_session_frame(frame, &writer, &streams, &shared_padding).await?;
         }
     }
     .await;
@@ -508,6 +532,7 @@ async fn handle_session_frame(
     frame: Frame,
     writer: &Arc<Mutex<PaddedFrameWriter<WriteHalf<TlsStream<TcpStream>>>>>,
     streams: &Arc<Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>>,
+    shared_padding: &Arc<Mutex<PaddingScheme>>,
 ) -> Result<()> {
     match frame.cmd {
         CMD_PSH => {
@@ -538,7 +563,10 @@ async fn handle_session_frame(
         CMD_UPDATE_PADDING_SCHEME => {
             let raw =
                 std::str::from_utf8(&frame.payload).context("decode padding scheme update")?;
+            let padding =
+                PaddingScheme::from_text(raw).context("parse server padding scheme update")?;
             writer.lock().await.update_padding_scheme(raw)?;
+            *shared_padding.lock().await = padding;
         }
         CMD_WASTE | CMD_SETTINGS | CMD_SERVER_SETTINGS | CMD_HEART_RESPONSE => {}
         _ => {}

@@ -264,6 +264,8 @@ pub struct ServerFileConfig {
     pub cc_rx: String,
     #[serde(default = "default_hy2_congestion_control")]
     pub congestion_control: String,
+    #[serde(default = "default_hy2_auth_timeout_secs", alias = "auth-timeout")]
+    pub auth_timeout: u64,
     #[serde(
         default = "default_naive_quic_congestion_control",
         alias = "quic-congestion-control",
@@ -374,6 +376,10 @@ pub fn default_cc_rx() -> String {
 
 pub fn default_hy2_congestion_control() -> String {
     "bbr".to_string()
+}
+
+pub fn default_hy2_auth_timeout_secs() -> u64 {
+    10
 }
 
 pub fn default_tuic_udp_relay_mode() -> String {

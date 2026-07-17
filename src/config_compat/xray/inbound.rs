@@ -450,6 +450,7 @@ impl XrayInbound {
             udp: true,
             cc_rx,
             congestion_control,
+            auth_timeout: crate::hysteria2::DEFAULT_AUTH_TIMEOUT,
         })
     }
 

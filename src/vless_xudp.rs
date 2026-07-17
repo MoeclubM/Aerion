@@ -246,14 +246,15 @@ fn encode_packet_parts(metadata: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn parse_destination_xudp(bytes: &[u8]) -> Result<(ProxyTarget, usize)> {
-    ensure!(!bytes.is_empty(), "missing XUDP address type");
-    match bytes[0] {
+    ensure!(bytes.len() >= 3, "missing XUDP destination");
+    let port = u16::from_be_bytes([bytes[0], bytes[1]]);
+    match bytes[2] {
         ATYP_IPV4 => {
             ensure!(bytes.len() >= 7, "short XUDP IPv4 destination");
             Ok((
                 ProxyTarget::Ip(SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::new(bytes[1], bytes[2], bytes[3], bytes[4])),
-                    u16::from_be_bytes([bytes[5], bytes[6]]),
+                    IpAddr::V4(Ipv4Addr::new(bytes[3], bytes[4], bytes[5], bytes[6])),
+                    port,
                 )),
                 7,
             ))
@@ -261,25 +262,22 @@ fn parse_destination_xudp(bytes: &[u8]) -> Result<(ProxyTarget, usize)> {
         ATYP_IPV6 => {
             ensure!(bytes.len() >= 19, "short XUDP IPv6 destination");
             let mut octets = [0u8; 16];
-            octets.copy_from_slice(&bytes[1..17]);
+            octets.copy_from_slice(&bytes[3..19]);
             Ok((
-                ProxyTarget::Ip(SocketAddr::new(
-                    IpAddr::V6(Ipv6Addr::from(octets)),
-                    u16::from_be_bytes([bytes[17], bytes[18]]),
-                )),
+                ProxyTarget::Ip(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port)),
                 19,
             ))
         }
         ATYP_DOMAIN => {
-            ensure!(bytes.len() >= 2, "short XUDP domain destination");
-            let len = bytes[1] as usize;
-            ensure!(bytes.len() >= 2 + len + 2, "short XUDP domain destination");
+            ensure!(bytes.len() >= 4, "short XUDP domain destination");
+            let len = bytes[3] as usize;
+            ensure!(bytes.len() >= 4 + len, "short XUDP domain destination");
             Ok((
                 ProxyTarget::Domain(
-                    String::from_utf8(bytes[2..2 + len].to_vec()).context("decode XUDP domain")?,
-                    u16::from_be_bytes([bytes[2 + len], bytes[3 + len]]),
+                    String::from_utf8(bytes[4..4 + len].to_vec()).context("decode XUDP domain")?,
+                    port,
                 ),
-                2 + len + 2,
+                4 + len,
             ))
         }
         other => bail!("unsupported XUDP address type {other:#x}"),
@@ -287,6 +285,11 @@ fn parse_destination_xudp(bytes: &[u8]) -> Result<(ProxyTarget, usize)> {
 }
 
 fn write_destination_xudp(buffer: &mut Vec<u8>, destination: &ProxyTarget) -> Result<()> {
+    let port = match destination {
+        ProxyTarget::Ip(addr) => addr.port(),
+        ProxyTarget::Domain(_, port) => *port,
+    };
+    buffer.extend_from_slice(&port.to_be_bytes());
     match destination {
         ProxyTarget::Ip(addr) => match addr.ip() {
             IpAddr::V4(ip) => {
@@ -305,11 +308,6 @@ fn write_destination_xudp(buffer: &mut Vec<u8>, destination: &ProxyTarget) -> Re
             buffer.extend_from_slice(host.as_bytes());
         }
     }
-    let port = match destination {
-        ProxyTarget::Ip(addr) => addr.port(),
-        ProxyTarget::Domain(_, port) => *port,
-    };
-    buffer.extend_from_slice(&port.to_be_bytes());
     Ok(())
 }
 
@@ -377,6 +375,10 @@ mod tests {
     fn decodes_in_memory_xudp_packet_chunk() -> Result<()> {
         let target = ProxyTarget::Domain("example.com".to_string(), 53);
         let bytes = encode_client_packet(&target, b"abc", true)?;
+        assert_eq!(
+            &bytes[..22],
+            b"\x00\x14\x00\x00\x01\x01\x02\x00\x35\x02\x0bexample.com"
+        );
         let (destination, payload) = decode_packet_chunk(&bytes, &mut None)?.context("packet")?;
         assert_eq!(destination, target);
         assert_eq!(payload, b"abc");

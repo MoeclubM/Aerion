@@ -305,6 +305,7 @@ mod tests {
                 max_len: 0,
                 custom_prefixes: vec![vec![0x41, 0x42, 0x43]],
             }),
+            padding: None,
         };
         let key = current_mieru_key(&hash_mieru_password(b"secret", b"user"))?;
         let mut cipher = MieruCipher::new(key, false, "user".to_string(), Some(&pattern));

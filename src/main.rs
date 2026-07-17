@@ -185,6 +185,8 @@ enum Command {
         cc_rx: String,
         #[arg(long = "congestion-control", default_value = "bbr")]
         congestion_control: String,
+        #[arg(long = "auth-timeout", default_value_t = 10)]
+        auth_timeout: u64,
     },
     MieruClient {
         #[arg(long, default_value = "127.0.0.1:1080")]
@@ -439,6 +441,7 @@ async fn main() -> Result<()> {
             udp,
             cc_rx,
             congestion_control,
+            auth_timeout,
         } => {
             run_hysteria2_server(Hysteria2ServerConfig {
                 listen,
@@ -454,6 +457,7 @@ async fn main() -> Result<()> {
                 udp,
                 cc_rx,
                 congestion_control,
+                auth_timeout: std::time::Duration::from_secs(auth_timeout),
             })
             .await
         }
@@ -1204,6 +1208,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
             udp: server.udp,
             cc_rx: server.cc_rx,
             congestion_control: server.congestion_control,
+            auth_timeout: std::time::Duration::from_secs(server.auth_timeout),
         })
         .await;
     }
@@ -1833,8 +1838,15 @@ fn native_vless_transport(
 
 fn ensure_supported_protocol(protocol: &str) -> Result<()> {
     const SUPPORTED: &[&str] = &[
-        "anytls", "hysteria2", "mieru", "naive",
-        "shadowsocks", "trojan", "tuic", "vless", "vmess",
+        "anytls",
+        "hysteria2",
+        "mieru",
+        "naive",
+        "shadowsocks",
+        "trojan",
+        "tuic",
+        "vless",
+        "vmess",
     ];
     if SUPPORTED.iter().any(|s| s.eq_ignore_ascii_case(protocol)) {
         Ok(())

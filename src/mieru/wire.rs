@@ -1,5 +1,5 @@
 use super::crypto::{MieruCipher, check_user_from_hint, mieru_keys_for_password};
-use super::pattern::MieruTrafficPattern;
+use super::pattern::{MieruTrafficPattern, random_padding};
 use super::{MieruUserSecret, NONCE_LEN};
 use anyhow::{Context, Result, bail, ensure};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -303,24 +303,52 @@ pub(super) fn encode_mieru_packet_segment(
     cipher: &mut MieruCipher,
     mut segment: MieruSegment,
     mtu: usize,
+    traffic_pattern: Option<&MieruTrafficPattern>,
 ) -> Result<Vec<u8>> {
+    let payload_wire_len = if segment.payload.is_empty() {
+        0
+    } else {
+        segment.payload.len() + AEAD_OVERHEAD
+    };
+    ensure!(
+        PACKET_METADATA_LEN + payload_wire_len <= mtu,
+        "Mieru UDP packet payload exceeds MTU {mtu}"
+    );
+    let padding = traffic_pattern.and_then(|pattern| pattern.padding.as_ref());
+    let max_middle_padding_len = padding
+        .and_then(|padding| padding.max_middle_padding_len)
+        .unwrap_or(255)
+        .clamp(0, 255) as usize;
+    let max_end_padding_len = padding
+        .and_then(|padding| padding.max_end_padding_len)
+        .unwrap_or(255)
+        .clamp(0, 255) as usize;
+    let available_padding = mtu - PACKET_METADATA_LEN - payload_wire_len;
+    let prefix_padding;
+    let suffix_padding;
     match &mut segment.metadata {
         MieruMetadata::Session(metadata) => {
             ensure!(
                 segment.payload.len() <= u16::MAX as usize,
                 "Mieru session payload is too large"
             );
+            prefix_padding = Vec::new();
+            suffix_padding = random_padding(max_end_padding_len.min(available_padding))?;
             metadata.payload_len = segment.payload.len() as u16;
-            metadata.suffix_len = 0;
+            metadata.suffix_len = suffix_padding.len() as u8;
         }
         MieruMetadata::DataAck(metadata) => {
             ensure!(
                 segment.payload.len() <= u16::MAX as usize,
                 "Mieru data payload is too large"
             );
+            prefix_padding = random_padding(max_middle_padding_len.min(available_padding))?;
+            suffix_padding = random_padding(
+                max_end_padding_len.min(available_padding - prefix_padding.len()),
+            )?;
             metadata.payload_len = segment.payload.len() as u16;
-            metadata.prefix_len = 0;
-            metadata.suffix_len = 0;
+            metadata.prefix_len = prefix_padding.len() as u8;
+            metadata.suffix_len = suffix_padding.len() as u8;
         }
     }
     let encrypted_metadata = cipher.encrypt(&segment.metadata.marshal()?)?;
@@ -330,10 +358,12 @@ pub(super) fn encode_mieru_packet_segment(
     );
     let nonce = encrypted_metadata[..NONCE_LEN].to_vec();
     let mut packet = encrypted_metadata;
+    packet.extend_from_slice(&prefix_padding);
     if !segment.payload.is_empty() {
         let encrypted_payload = cipher.encrypt_with_nonce(&segment.payload, &nonce)?;
         packet.extend_from_slice(&encrypted_payload);
     }
+    packet.extend_from_slice(&suffix_padding);
     ensure!(
         packet.len() <= mtu,
         "Mieru UDP packet length {} exceeds MTU {}",

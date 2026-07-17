@@ -14,6 +14,7 @@ const COMMON_64_SET: &[u8; 64] =
 pub struct MieruTrafficPattern {
     pub tcp_fragment: Option<MieruTcpFragment>,
     pub nonce: Option<MieruNoncePattern>,
+    pub padding: Option<MieruPaddingPattern>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,12 +40,19 @@ pub struct MieruNoncePattern {
     pub custom_prefixes: Vec<Vec<u8>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MieruPaddingPattern {
+    pub max_middle_padding_len: Option<i32>,
+    pub max_end_padding_len: Option<i32>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct RawTrafficPattern {
     seed: Option<i32>,
     unlock_all: Option<bool>,
     tcp_fragment: Option<RawTcpFragment>,
     nonce: Option<RawNoncePattern>,
+    padding: Option<MieruPaddingPattern>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -85,6 +93,7 @@ impl MieruTrafficPattern {
                     pattern = Some(Self {
                         tcp_fragment: None,
                         nonce: Some(nonce),
+                        padding: None,
                     });
                 }
             }
@@ -107,6 +116,7 @@ impl RawTrafficPattern {
                     .unwrap_or_default()
                     .into_effective(seed, unlock_all)?,
             ),
+            padding: self.padding,
         })
     }
 
@@ -215,10 +225,58 @@ fn decode_traffic_pattern(value: &str) -> Result<RawTrafficPattern> {
             (4, 2) => {
                 pattern.nonce = Some(decode_nonce_pattern_bytes(read_protobuf_len(&mut input)?)?)
             }
+            (5, 2) => {
+                pattern.padding = Some(decode_padding_pattern(read_protobuf_len(&mut input)?)?)
+            }
+            (6, 2) => decode_low_entropy_pattern(read_protobuf_len(&mut input)?)?,
             _ => skip_protobuf_field(wire, &mut input)?,
         }
     }
     Ok(pattern)
+}
+
+fn decode_padding_pattern(mut input: &[u8]) -> Result<MieruPaddingPattern> {
+    let mut max_middle_padding_len = None;
+    let mut max_end_padding_len = None;
+    while !input.is_empty() {
+        let key = read_protobuf_varint(&mut input)?;
+        let field = key >> 3;
+        let wire = key & 0x07;
+        match (field, wire) {
+            (1, 0) => {
+                max_middle_padding_len =
+                    Some(read_protobuf_varint(&mut input)? as u32 as i32)
+            }
+            (2, 0) => {
+                max_end_padding_len = Some(read_protobuf_varint(&mut input)? as u32 as i32)
+            }
+            _ => skip_protobuf_field(wire, &mut input)?,
+        }
+    }
+    Ok(MieruPaddingPattern {
+        max_middle_padding_len,
+        max_end_padding_len,
+    })
+}
+
+fn decode_low_entropy_pattern(mut input: &[u8]) -> Result<()> {
+    while !input.is_empty() {
+        let key = read_protobuf_varint(&mut input)?;
+        let field = key >> 3;
+        let wire = key & 0x07;
+        match (field, wire) {
+            (1, 0) => {
+                let mode = read_protobuf_varint(&mut input)?;
+                ensure!(mode <= 4, "unsupported Mieru low-entropy mode {mode}");
+                ensure!(
+                    mode == 0,
+                    "Mieru low-entropy traffic pattern is not implemented by the upstream data path"
+                );
+            }
+            _ => skip_protobuf_field(wire, &mut input)?,
+        }
+    }
+    Ok(())
 }
 
 fn decode_tcp_fragment(mut input: &[u8]) -> Result<RawTcpFragment> {
@@ -437,7 +495,40 @@ fn nonce_rewrite_len(pattern: &MieruNoncePattern) -> Result<usize> {
 }
 
 fn random_usize_below(n: usize) -> Result<usize> {
+    ensure!(n > 0, "Mieru random upper bound must be positive");
     let mut bytes = [0u8; 8];
     getrandom::fill(&mut bytes).context("generate Mieru traffic-pattern randomness")?;
     Ok((u64::from_be_bytes(bytes) as usize) % n)
+}
+
+pub(super) fn random_padding(max_len: usize) -> Result<Vec<u8>> {
+    let len = random_usize_below(max_len + 1)?;
+    let mut padding = vec![0u8; len];
+    getrandom::fill(&mut padding).context("generate Mieru padding")?;
+    Ok(padding)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_padding_pattern() -> Result<()> {
+        let pattern = MieruTrafficPattern::parse_pair(Some("KgQIAxAE"), None)?
+            .context("missing traffic pattern")?;
+        assert_eq!(
+            pattern.padding,
+            Some(MieruPaddingPattern {
+                max_middle_padding_len: Some(3),
+                max_end_padding_len: Some(4),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_nonzero_low_entropy_pattern() {
+        let error = MieruTrafficPattern::parse_pair(Some("MgIIAQ=="), None).unwrap_err();
+        assert!(error.to_string().contains("low-entropy"));
+    }
 }

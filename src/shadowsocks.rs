@@ -316,19 +316,20 @@ async fn relay_shadowsocks_udp_packet(
     )
     .await
     {
-        let (read, _) = read.context("receive Shadowsocks UDP response")?;
+        let (read, source) = read.context("receive Shadowsocks UDP response")?;
+        let source = ShadowsocksAddress::SocketAddress(source);
         session.record_download(read).await?;
         if let Some(inbound_control) = control.as_ref() {
             let mut response_control = inbound_control.clone();
             response_control.server_session_id = server_session_id;
             response_control.packet_id = server_packet_id.fetch_add(1, Ordering::Relaxed) + 1;
             proxy
-                .send_to_with_ctrl(peer, &target, &response_control, &buffer[..read])
+                .send_to_with_ctrl(peer, &source, &response_control, &buffer[..read])
                 .await
                 .with_context(|| format!("send Shadowsocks UDP response to {peer}"))?;
         } else {
             proxy
-                .send_to(peer, &target, &buffer[..read])
+                .send_to(peer, &source, &buffer[..read])
                 .await
                 .with_context(|| format!("send Shadowsocks UDP response to {peer}"))?;
         }

@@ -9,7 +9,7 @@ use crate::protocol::{
 use crate::socket_protect;
 use crate::tls::{self, ServerTlsAcceptor, ServerTlsMaterial, ServerTlsStream, TlsEchServerKeys};
 use crate::uot;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::SocketAddr;
@@ -112,6 +112,10 @@ pub async fn run_server_listener_with_core(
     config: ServerConfig,
     core: ProxyCore,
 ) -> Result<()> {
+    ensure!(
+        config.heartbeat_interval_secs > 0,
+        "AnyTLS heartbeat interval must be positive"
+    );
     let tls_config = tls::build_server_tls_acceptor(&ServerTlsMaterial {
         cert_path: tls::present_path(&config.cert_path).map(PathBuf::from),
         key_path: tls::present_path(&config.key_path).map(PathBuf::from),

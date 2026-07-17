@@ -19,6 +19,7 @@ Aerion now provides these server/client protocol stacks:
   - native UDP datagrams with session/packet/fragment fields
   - Salamander obfs for client and server
   - BBR / NewReno congestion control selection
+  - configurable server authentication timeout
   - single password plus optional multi-user credential list
 - Mieru:
   - TCP stream underlay with Mieru v3 metadata framing
@@ -29,7 +30,10 @@ Aerion now provides these server/client protocol stacks:
   - SOCKS5 CONNECT over Mieru sessions
   - SOCKS5 UDP ASSOCIATE through Mieru packet-over-stream framing
   - multi-user server authentication and traffic accounting through `ProxyCore`
-  - base64 protobuf traffic-pattern TCP fragmentation and nonce-pattern shaping
+  - base64 protobuf traffic-pattern TCP fragmentation, nonce shaping, and
+    middle/end padding on TCP and UDP underlays
+  - nonzero low-entropy traffic patterns fail explicitly because the current
+    upstream Mieru data path does not apply that configuration yet
 - Naive:
   - local SOCKS5 CONNECT client over HTTPS proxy CONNECT
   - HTTPS proxy CONNECT server
@@ -95,7 +99,7 @@ Aerion now provides these server/client protocol stacks:
 - uTLS / config compatibility helpers:
   - `UtlsFingerprint` maps mihomo names such as `chrome`, `firefox`,
     `safari`, `ios`, `android`, `edge`, `360`, `qq`, and randomized profiles
-    to the corresponding Go `uTLS` ClientHello IDs
+    to Xray's current pinned Go `uTLS` ClientHello IDs
   - `build_client_hello` can emit raw TLS 1.3 ClientHello records for
     Chrome/Firefox/Safari/iOS/Android/Edge/360/QQ/randomized profiles, including
     GREASE, cipher list, supported groups, signature algorithms, key_share,

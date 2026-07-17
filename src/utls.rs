@@ -53,14 +53,14 @@ impl UtlsFingerprint {
 
     pub fn as_utls_client_hello_id(self) -> &'static str {
         match self {
-            Self::Chrome => "HelloChrome_Auto",
-            Self::Firefox => "HelloFirefox_Auto",
-            Self::Safari => "HelloSafari_Auto",
-            Self::Ios => "HelloIOS_Auto",
+            Self::Chrome => "HelloChrome_133",
+            Self::Firefox => "HelloFirefox_148",
+            Self::Safari => "HelloSafari_26_3",
+            Self::Ios => "HelloIOS_14",
             Self::Android => "HelloAndroid_11_OkHttp",
-            Self::Edge => "HelloEdge_Auto",
-            Self::Qihoo360 => "Hello360_Auto",
-            Self::Qq => "HelloQQ_Auto",
+            Self::Edge => "HelloEdge_106",
+            Self::Qihoo360 => "Hello360_11_0",
+            Self::Qq => "HelloQQ_11_1",
             Self::Random | Self::Randomized => "HelloRandomized",
             Self::RandomizedAlpn => "HelloRandomizedALPN",
             Self::RandomizedNoAlpn => "HelloRandomizedNoALPN",
@@ -203,6 +203,14 @@ mod tests {
         assert_eq!(
             UtlsFingerprint::Android.as_utls_client_hello_id(),
             "HelloAndroid_11_OkHttp"
+        );
+        assert_eq!(
+            UtlsFingerprint::Chrome.as_utls_client_hello_id(),
+            "HelloChrome_133"
+        );
+        assert_eq!(
+            UtlsFingerprint::Firefox.as_utls_client_hello_id(),
+            "HelloFirefox_148"
         );
         assert_eq!(
             UtlsFingerprint::Chrome.rustls_alpn_protocols(),

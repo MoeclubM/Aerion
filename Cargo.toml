@@ -10,45 +10,45 @@ default = ["server-ech"]
 server-ech = ["dep:boring", "dep:tokio-boring"]
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 aes = "0.8"
 aes-gcm = "0.10"
 base64 = "0.22"
 blake2 = "0.10"
-bytes = "1.11"
+bytes = "1.12.1"
 cipher = "0.4"
 chacha20poly1305 = "0.10"
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6.2", features = ["derive"] }
 ed25519-dalek = "2"
 getrandom = "0.3"
-h2 = "0.4.14"
+h2 = "0.4.15"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 hex = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
-http = "1.4"
+http = "1.4.2"
 md-5 = "0.10"
-quinn = "0.11.9"
+quinn = "0.11.11"
 rcgen = "0.13"
-rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 serde_yaml = "0.9.34"
 sha2 = "0.10"
 sha1 = "0.10"
 shadowsocks = { version = "1.24.0", default-features = false, features = ["aead-cipher", "aead-cipher-extra", "aead-cipher-2022", "aead-cipher-2022-extra", "stream-cipher"] }
-tokio = { version = "1.52", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.52.4", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["early-data"] }
 toml = "0.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
-webpki-roots = "1.0.7"
+webpki-roots = "1.0.8"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 tun2proxy = { version = "0.7.21", default-features = false }
 tproxy-config = { version = "7.0.7", default-features = false }
-regex = "1.12"
+regex = "1.13.1"
 boring = { version = "5.1", optional = true }
 tokio-boring = { version = "5.0", optional = true }
 

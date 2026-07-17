@@ -459,6 +459,7 @@ async fn socks_client_reaches_tcp_target_through_hysteria2_server() -> Result<()
         udp: true,
         cc_rx: "0".to_string(),
         congestion_control: "bbr".to_string(),
+        auth_timeout: std::time::Duration::from_secs(10),
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -554,6 +555,7 @@ async fn socks_udp_associate_reaches_udp_target_through_hysteria2_datagrams() ->
         udp: true,
         cc_rx: "0".to_string(),
         congestion_control: "bbr".to_string(),
+        auth_timeout: std::time::Duration::from_secs(10),
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;

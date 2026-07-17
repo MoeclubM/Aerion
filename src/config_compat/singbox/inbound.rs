@@ -471,6 +471,7 @@ impl SingBoxHysteria2Inbound {
                 .map(|mbps| mbps.saturating_mul(125_000).to_string())
                 .unwrap_or_else(|| "0".to_string()),
             congestion_control: "bbr".to_string(),
+            auth_timeout: crate::hysteria2::DEFAULT_AUTH_TIMEOUT,
         })
     }
 }

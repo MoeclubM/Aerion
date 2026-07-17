@@ -26,6 +26,7 @@ key = "server.key"
 udp = true
 cc_rx = "0"
 congestion_control = "bbr"
+auth_timeout = 10
 # obfs = "salamander"
 # obfs_password = "change-me-obfs"
 

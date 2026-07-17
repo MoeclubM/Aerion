@@ -22,8 +22,10 @@ mod socks;
 mod wire;
 
 use crypto::{MieruCipher, current_mieru_key, hash_mieru_password};
-use pattern::write_with_possible_fragment;
-pub use pattern::{MieruNoncePattern, MieruNonceType, MieruTcpFragment, MieruTrafficPattern};
+use pattern::{random_padding, write_with_possible_fragment};
+pub use pattern::{
+    MieruNoncePattern, MieruNonceType, MieruPaddingPattern, MieruTcpFragment, MieruTrafficPattern,
+};
 use socks::{
     SOCKS_CMD_CONNECT, SOCKS_CMD_UDP_ASSOCIATE, SOCKS_NO_ACCEPTABLE, SOCKS_NO_AUTH, SOCKS_VERSION,
     SocksRequest, read_packet_over_stream, read_socks_greeting, read_socks_request,
@@ -103,6 +105,7 @@ struct MieruPacketWriter {
     peer: SocketAddr,
     cipher: MieruCipher,
     mtu: usize,
+    traffic_pattern: Option<MieruTrafficPattern>,
 }
 
 enum MieruAnyWriter {
@@ -311,38 +314,65 @@ impl MieruStreamWriter {
             .cipher
             .as_mut()
             .context("Mieru stream send cipher is not initialized")?;
+        let padding = self
+            .traffic_pattern
+            .as_ref()
+            .and_then(|pattern| pattern.padding.as_ref());
+        let max_middle_padding_len = padding
+            .and_then(|padding| padding.max_middle_padding_len)
+            .unwrap_or(255)
+            .clamp(0, 255) as usize;
+        let max_end_padding_len = padding
+            .and_then(|padding| padding.max_end_padding_len)
+            .unwrap_or(255)
+            .clamp(0, 255) as usize;
+        let is_session = matches!(&segment.metadata, MieruMetadata::Session(_));
+        let prefix_padding;
+        let suffix_padding;
         match &mut segment.metadata {
             MieruMetadata::Session(metadata) => {
                 ensure!(
                     segment.payload.len() <= u16::MAX as usize,
                     "Mieru session payload is too large"
                 );
+                prefix_padding = Vec::new();
+                suffix_padding = random_padding(max_end_padding_len)?;
                 metadata.payload_len = segment.payload.len() as u16;
-                metadata.suffix_len = 0;
+                metadata.suffix_len = suffix_padding.len() as u8;
             }
             MieruMetadata::DataAck(metadata) => {
                 ensure!(
                     segment.payload.len() <= u16::MAX as usize,
                     "Mieru data payload is too large"
                 );
+                prefix_padding = random_padding(max_middle_padding_len)?;
+                suffix_padding = random_padding(max_end_padding_len)?;
                 metadata.payload_len = segment.payload.len() as u16;
-                metadata.prefix_len = 0;
-                metadata.suffix_len = 0;
+                metadata.prefix_len = prefix_padding.len() as u8;
+                metadata.suffix_len = suffix_padding.len() as u8;
             }
         }
         let encrypted_metadata = cipher.encrypt(&segment.metadata.marshal()?)?;
-        write_with_possible_fragment(&mut self.inner, &encrypted_metadata, &self.traffic_pattern)
-            .await
-            .context("write Mieru encrypted metadata")?;
+        let mut data_to_send = encrypted_metadata;
+        data_to_send.extend_from_slice(&prefix_padding);
         if !segment.payload.is_empty() {
             let encrypted_payload = cipher.encrypt(&segment.payload)?;
+            data_to_send.extend_from_slice(&encrypted_payload);
+        }
+        data_to_send.extend_from_slice(&suffix_padding);
+        if is_session {
             write_with_possible_fragment(
                 &mut self.inner,
-                &encrypted_payload,
+                &data_to_send,
                 &self.traffic_pattern,
             )
             .await
-            .context("write Mieru encrypted payload")?;
+            .context("write Mieru stream segment")?;
+        } else {
+            self.inner
+                .write_all(&data_to_send)
+                .await
+                .context("write Mieru stream segment")?;
         }
         self.inner.flush().await.context("flush Mieru segment")
     }
@@ -353,17 +383,29 @@ impl MieruStreamWriter {
 }
 
 impl MieruPacketWriter {
-    fn new(socket: Arc<UdpSocket>, peer: SocketAddr, cipher: MieruCipher, mtu: usize) -> Self {
+    fn new(
+        socket: Arc<UdpSocket>,
+        peer: SocketAddr,
+        cipher: MieruCipher,
+        mtu: usize,
+        traffic_pattern: Option<MieruTrafficPattern>,
+    ) -> Self {
         Self {
             socket,
             peer,
             cipher,
             mtu,
+            traffic_pattern,
         }
     }
 
     async fn write_segment(&mut self, segment: MieruSegment) -> Result<()> {
-        let packet = encode_mieru_packet_segment(&mut self.cipher, segment, self.mtu)?;
+        let packet = encode_mieru_packet_segment(
+            &mut self.cipher,
+            segment,
+            self.mtu,
+            self.traffic_pattern.as_ref(),
+        )?;
         self.socket
             .send_to(&packet, self.peer)
             .await
@@ -784,6 +826,7 @@ async fn connect_mieru_packet_underlay(config: &MieruClientConfig) -> Result<Cli
         server_addr,
         send,
         mtu,
+        config.traffic_pattern.clone(),
     ))));
     let sessions = Arc::new(Mutex::new(HashMap::new()));
     let closed = Arc::new(Mutex::new(None));
@@ -1075,6 +1118,7 @@ async fn run_mieru_packet_server(
             peer,
             cipher,
             mtu,
+            config.traffic_pattern.clone(),
         ))));
         handle_server_segment(
             segment,

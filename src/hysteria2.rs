@@ -32,7 +32,7 @@ const AUTH_URI: &str = "https://hysteria/auth";
 const AUTH_PATH: &str = "/auth";
 const AUTH_HOST: &str = "hysteria";
 const HY2_TCP_REQUEST_ID: u64 = 0x401;
-const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HY2_STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 const HY2_CONN_RECEIVE_WINDOW: u32 = 20 * 1024 * 1024;
@@ -82,6 +82,7 @@ pub struct Hysteria2ServerConfig {
     pub udp: bool,
     pub cc_rx: String,
     pub congestion_control: String,
+    pub auth_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -679,12 +680,14 @@ pub async fn run_hysteria2_server_socket_with_core(
         let passwords = auth_passwords(&config.password, &config.users);
         let cc_rx = config.cc_rx.clone();
         let udp = config.udp;
+        let auth_timeout = config.auth_timeout;
         let core = core.clone();
         tokio::spawn(async move {
             match incoming.await {
                 Ok(connection) => {
                     if let Err(error) =
-                        handle_hy2_connection(connection, passwords, cc_rx, udp, core).await
+                        handle_hy2_connection(connection, passwords, cc_rx, udp, auth_timeout, core)
+                            .await
                     {
                         tracing::warn!("Hysteria2 connection failed: {error:?}");
                     }
@@ -872,10 +875,18 @@ async fn handle_hy2_connection(
     passwords: Vec<String>,
     cc_rx: String,
     udp_enabled: bool,
+    auth_timeout: Duration,
     core: ProxyCore,
 ) -> Result<()> {
-    let (mut h3, session) =
-        authenticate_server(&connection, &passwords, &cc_rx, udp_enabled, &core).await?;
+    let (mut h3, session) = authenticate_server(
+        &connection,
+        &passwords,
+        &cc_rx,
+        udp_enabled,
+        auth_timeout,
+        &core,
+    )
+    .await?;
     let _keep_h3_alive = &mut h3;
     if udp_enabled {
         tokio::spawn(handle_server_udp_datagrams(
@@ -907,6 +918,7 @@ async fn authenticate_server(
     passwords: &[String],
     cc_rx: &str,
     udp_enabled: bool,
+    auth_timeout: Duration,
     core: &ProxyCore,
 ) -> Result<(
     h3::server::Connection<h3_quinn::Connection, Bytes>,
@@ -916,7 +928,7 @@ async fn authenticate_server(
         .build(h3_quinn::Connection::new(connection.clone()))
         .await
         .context("initialize Hysteria2 HTTP/3 server")?;
-    let timeout = tokio::time::sleep(DEFAULT_AUTH_TIMEOUT);
+    let timeout = tokio::time::sleep(auth_timeout);
     tokio::pin!(timeout);
     loop {
         let resolver = tokio::select! {
