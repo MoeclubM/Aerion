@@ -3,8 +3,8 @@ use crate::padding::PaddingScheme;
 use crate::protocol::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
     CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, Frame, ProxyTarget,
-    decode_target, parse_settings, read_auth_preface_user, read_frame, resolve_target_addr,
-    target_name, write_frame, write_payload_chunks,
+    decode_target, encode_target, parse_settings, read_auth_preface_user, read_frame,
+    resolve_target_addr, target_name, write_frame, write_payload_chunks,
 };
 use crate::socket_protect;
 use crate::tls::{self, ServerTlsAcceptor, ServerTlsMaterial, ServerTlsStream, TlsEchServerKeys};
