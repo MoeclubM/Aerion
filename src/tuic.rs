@@ -990,9 +990,7 @@ async fn handle_server_packet_bytes(
     )
     .await?;
     session.record_upload(packet.payload.len()).await?;
-    udp_session
-        .socket
-        .send_to(&packet.payload, target)
+    socket_protect::send_to_dual_stack(&udp_session.socket, &packet.payload, target)
         .await
         .with_context(|| format!("send TUIC UDP payload to {target}"))?;
     Ok(())

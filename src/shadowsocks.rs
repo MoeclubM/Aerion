@@ -325,9 +325,7 @@ async fn relay_shadowsocks_udp_packet(
     )
     .await?;
     session.record_upload(payload.len()).await?;
-    entry
-        .socket
-        .send_to(&payload, target_addr)
+    socket_protect::send_to_dual_stack(&entry.socket, &payload, target_addr)
         .await
         .with_context(|| format!("send Shadowsocks UDP payload to {target_addr}"))?;
     Ok(())

@@ -71,8 +71,7 @@ where
             let target =
                 target_socket_addr_cached(&packet.destination, &mut destination_cache).await?;
             session.record_upload(packet.payload.len()).await?;
-            socket
-                .send_to(&packet.payload, target)
+            socket_protect::send_to_dual_stack(&socket, &packet.payload, target)
                 .await
                 .with_context(|| format!("send XUDP payload to {target}"))?;
         }

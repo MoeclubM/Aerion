@@ -1155,7 +1155,9 @@ async fn handle_server_udp_datagrams(
             tracing::warn!(?error, "Hysteria2 UDP upload limit rejected packet");
             continue;
         }
-        if let Err(error) = session.socket.send_to(&message.payload, target_addr).await {
+        if let Err(error) =
+            socket_protect::send_to_dual_stack(&session.socket, &message.payload, target_addr).await
+        {
             tracing::warn!(?error, target = %target_addr, "send Hysteria2 UDP payload failed");
         }
         *session

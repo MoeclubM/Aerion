@@ -1547,7 +1547,7 @@ async fn handle_mieru_server_udp(
                 let (target, payload) = uot::parse_socks_udp_packet(&buffer[..read])?;
                 let target = resolve_target_addr(&target).await?;
                 core_session.record_upload(payload.len()).await?;
-                udp.send_to(payload, target).await?;
+                socket_protect::send_to_dual_stack(&udp, payload, target).await?;
             }
             #[allow(unreachable_code)]
             Ok::<(), anyhow::Error>(())

@@ -406,7 +406,7 @@ async fn open_uot_stream(
         .context("bind AnyTLS UOT UDP socket")?;
     if request.is_connect {
         let target = resolve_target_addr(&request.destination).await?;
-        udp.connect(target)
+        socket_protect::connect_dual_stack(&udp, target)
             .await
             .with_context(|| format!("connect UDP socket to {target}"))?;
     }
@@ -452,10 +452,10 @@ async fn open_uot_stream(
                         }
                     } else {
                         let target = resolve_target_addr(&target).await?;
-                        let sent = uplink_udp
-                            .send_to(&payload, target)
-                            .await
-                            .with_context(|| format!("send UDP payload to {target}"))?;
+                        let sent =
+                            socket_protect::send_to_dual_stack(&uplink_udp, &payload, target)
+                                .await
+                                .with_context(|| format!("send UDP payload to {target}"))?;
                         if sent != payload.len() {
                             bail!("short UDP send: expected {}, wrote {}", payload.len(), sent);
                         }

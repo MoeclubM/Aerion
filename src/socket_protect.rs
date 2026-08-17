@@ -1,7 +1,7 @@
 use crate::protocol::ProxyTarget;
 use anyhow::{Context, Result, bail};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinSet;
@@ -134,6 +134,31 @@ pub async fn bind_dual_stack_udp() -> Result<UdpSocket> {
     #[cfg(unix)]
     protect_socket_fd(std::os::fd::AsRawFd::as_raw_fd(&socket))?;
     UdpSocket::from_std(socket.into()).context("create tokio dual-stack UDP socket")
+}
+
+pub fn dual_stack_dest(local: SocketAddr, dest: SocketAddr) -> SocketAddr {
+    match (local.ip(), dest) {
+        (IpAddr::V6(_), SocketAddr::V4(v4)) => {
+            SocketAddr::from((v4.ip().to_ipv6_mapped(), v4.port()))
+        }
+        _ => dest,
+    }
+}
+
+pub async fn send_to_dual_stack(
+    socket: &UdpSocket,
+    buf: &[u8],
+    dest: SocketAddr,
+) -> std::io::Result<usize> {
+    socket
+        .send_to(buf, dual_stack_dest(socket.local_addr()?, dest))
+        .await
+}
+
+pub async fn connect_dual_stack(socket: &UdpSocket, dest: SocketAddr) -> std::io::Result<()> {
+    socket
+        .connect(dual_stack_dest(socket.local_addr()?, dest))
+        .await
 }
 
 pub fn bind_udp_std(addr: SocketAddr) -> Result<std::net::UdpSocket> {

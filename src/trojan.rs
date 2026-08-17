@@ -455,7 +455,7 @@ where
             while let Some(packet) = read_trojan_udp_packet(&mut reader).await? {
                 let target = resolve_target_addr(&packet.target).await?;
                 session.record_upload(packet.payload.len()).await?;
-                udp.send_to(&packet.payload, target)
+                socket_protect::send_to_dual_stack(&udp, &packet.payload, target)
                     .await
                     .with_context(|| format!("send Trojan UDP payload to {target}"))?;
             }
