@@ -335,8 +335,13 @@ pub fn encode_target(target: &ProxyTarget) -> Result<Vec<u8>> {
                 encoded.extend_from_slice(&addr.port().to_be_bytes());
             }
             IpAddr::V6(ip) => {
-                encoded.push(0x04);
-                encoded.extend_from_slice(&ip.octets());
+                if let Some(v4) = ip.to_ipv4_mapped() {
+                    encoded.push(0x01);
+                    encoded.extend_from_slice(&v4.octets());
+                } else {
+                    encoded.push(0x04);
+                    encoded.extend_from_slice(&ip.octets());
+                }
                 encoded.extend_from_slice(&addr.port().to_be_bytes());
             }
         },
@@ -435,6 +440,16 @@ mod tests {
         let encoded = encode_target(&target).unwrap();
         let (decoded, tail) = decode_target(&encoded).unwrap();
         assert_eq!(decoded, target);
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn encodes_ipv4_mapped_ipv6_as_ipv4() {
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:8080".parse().unwrap();
+        let encoded = encode_target(&ProxyTarget::Ip(mapped)).unwrap();
+        assert_eq!(encoded[0], 0x01);
+        let (decoded, tail) = decode_target(&encoded).unwrap();
+        assert_eq!(decoded, ProxyTarget::Ip("127.0.0.1:8080".parse().unwrap()));
         assert!(tail.is_empty());
     }
 }
