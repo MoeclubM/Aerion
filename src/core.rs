@@ -188,7 +188,6 @@ impl ProxyCore {
     ) -> Self {
         let mut seen = HashSet::new();
         let mut entries = Vec::new();
-        let password = password.trim();
         if !password.is_empty() && seen.insert(password.to_string()) {
             let mut user = CoreUser::password("default", password);
             user.upload_limit_bps = limits.upload_limit_bps;
@@ -199,7 +198,7 @@ impl ProxyCore {
             entries.push(user);
         }
         for user in users {
-            let credential = user.trim();
+            let credential = user.as_str();
             if credential.is_empty() || !seen.insert(credential.to_string()) {
                 continue;
             }

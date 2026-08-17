@@ -387,9 +387,12 @@ mod tests {
     fn decodes_in_memory_xudp_packet_chunk() -> Result<()> {
         let target = ProxyTarget::Domain("example.com".to_string(), 53);
         let bytes = encode_client_packet(&target, b"abc", true, &[0u8; 8])?;
-        assert_eq!(bytes[2], 0x1c);
+        let metadata_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+        assert_eq!(metadata_len, 28);
+        assert_eq!(&bytes[2..4], &[0, 0]);
         assert_eq!(bytes[4], STATUS_NEW);
-        assert_eq!(&bytes[5..7], &[0x00, 0x01]);
+        assert_eq!(bytes[5], 0x01);
+        assert_eq!(bytes[6], NETWORK_UDP);
         let (destination, payload) = decode_packet_chunk(&bytes, &mut None)?.context("packet")?;
         assert_eq!(destination, target);
         assert_eq!(payload, b"abc");
