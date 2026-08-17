@@ -25,6 +25,7 @@ use tokio_rustls::TlsConnector;
 
 const AUTH_ID_REPLAY_TTL: Duration = Duration::from_secs(120);
 const SESSION_HISTORY_TTL: Duration = Duration::from_secs(180);
+const VERSION: u8 = 0x01;
 
 struct VmessReplayFilter {
     auth_ids: std::sync::Mutex<HashMap<[u8; 16], Instant>>,
