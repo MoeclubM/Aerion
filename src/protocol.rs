@@ -325,23 +325,29 @@ fn encode_frame(cmd: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
+pub fn canonicalize_socket_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => v6
+            .ip()
+            .to_ipv4_mapped()
+            .map(|v4| SocketAddr::from((v4, v6.port())))
+            .unwrap_or(addr),
+        other => other,
+    }
+}
+
 pub fn encode_target(target: &ProxyTarget) -> Result<Vec<u8>> {
     let mut encoded = Vec::new();
     match target {
-        ProxyTarget::Ip(addr) => match addr.ip() {
+        ProxyTarget::Ip(addr) => match canonicalize_socket_addr(*addr).ip() {
             IpAddr::V4(ip) => {
                 encoded.push(0x01);
                 encoded.extend_from_slice(&ip.octets());
                 encoded.extend_from_slice(&addr.port().to_be_bytes());
             }
             IpAddr::V6(ip) => {
-                if let Some(v4) = ip.to_ipv4_mapped() {
-                    encoded.push(0x01);
-                    encoded.extend_from_slice(&v4.octets());
-                } else {
-                    encoded.push(0x04);
-                    encoded.extend_from_slice(&ip.octets());
-                }
+                encoded.push(0x04);
+                encoded.extend_from_slice(&ip.octets());
                 encoded.extend_from_slice(&addr.port().to_be_bytes());
             }
         },

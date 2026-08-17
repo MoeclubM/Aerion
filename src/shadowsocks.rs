@@ -506,10 +506,11 @@ async fn handle_shadowsocks_udp_associate(
                 let (target, payload) = uot::parse_socks_udp_packet(&local_buffer[..read])?;
                 let target = shadowsocks_address(&target);
                 proxy.send(&target, payload).await.context("send Shadowsocks UDP packet")?;
-                peers.insert(target, peer);
+                peers.insert(canonicalize_ss_address(target), peer);
             }
             read = proxy.recv(&mut remote_buffer) => {
                 let (read, target, _) = read.context("receive Shadowsocks UDP packet")?;
+                let target = canonicalize_ss_address(target);
                 let peer = peers
                     .get(&target)
                     .with_context(|| format!("SOCKS UDP peer for {target} is not known"))?;
@@ -815,10 +816,21 @@ async fn resolve_shadowsocks_address(target: &ShadowsocksAddress) -> Result<Sock
 
 fn shadowsocks_address(target: &ProxyTarget) -> ShadowsocksAddress {
     match target {
-        ProxyTarget::Ip(addr) => ShadowsocksAddress::SocketAddress(*addr),
+        ProxyTarget::Ip(addr) => {
+            ShadowsocksAddress::SocketAddress(crate::protocol::canonicalize_socket_addr(*addr))
+        }
         ProxyTarget::Domain(host, port) => {
             ShadowsocksAddress::DomainNameAddress(host.clone(), *port)
         }
+    }
+}
+
+fn canonicalize_ss_address(addr: ShadowsocksAddress) -> ShadowsocksAddress {
+    match addr {
+        ShadowsocksAddress::SocketAddress(socket) => {
+            ShadowsocksAddress::SocketAddress(crate::protocol::canonicalize_socket_addr(socket))
+        }
+        other => other,
     }
 }
 
