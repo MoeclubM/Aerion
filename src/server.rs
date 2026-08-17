@@ -22,6 +22,9 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, interval};
 
+const MAX_PENDING_UOT: usize = 256;
+const MAX_UOT_BUFFER: usize = 64 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub listen: SocketAddr,
@@ -123,7 +126,7 @@ pub async fn run_server_listener_with_core(
         key: config.key.clone(),
         label: "AnyTLS server TLS".to_string(),
         alpn_protocols: Vec::new(),
-        early_data: true,
+        early_data: false,
         ech: config.ech.clone(),
     })?;
     let acceptor = tls_config;
@@ -132,7 +135,6 @@ pub async fn run_server_listener_with_core(
     loop {
         let (stream, peer) = listener.accept().await.context("accept Aerion client")?;
         let acceptor = acceptor.clone();
-        let passwords = auth_passwords(&config.password, &config.users);
         let padding = padding.clone();
         let core = core.clone();
         let heartbeat_interval_secs = config.heartbeat_interval_secs;
@@ -140,7 +142,6 @@ pub async fn run_server_listener_with_core(
             if let Err(error) = handle_client(
                 stream,
                 acceptor,
-                passwords,
                 padding,
                 core,
                 heartbeat_interval_secs,
@@ -157,7 +158,6 @@ pub async fn run_server_listener_with_core(
 async fn handle_client(
     stream: TcpStream,
     acceptor: ServerTlsAcceptor,
-    passwords: Vec<String>,
     padding: PaddingScheme,
     core: ProxyCore,
     heartbeat_interval_secs: u64,
@@ -170,6 +170,7 @@ async fn handle_client(
             .context("read TLS early data")?;
     }
     let mut tls_stream = EarlyDataTlsStream::new(tls_stream, early_data);
+    let passwords = core.known_credentials();
     let password_refs = passwords.iter().map(String::as_str).collect::<Vec<_>>();
     let credential = read_auth_preface_user(&mut tls_stream, &password_refs).await?;
     let session = core.authenticate_from(&credential, peer).await?;
@@ -214,6 +215,10 @@ async fn handle_client(
                 let (_, payload) = pending_uot
                     .get_mut(&stream_id)
                     .expect("pending UOT stream key exists");
+                ensure!(
+                    payload.len() + frame.payload.len() <= MAX_UOT_BUFFER,
+                    "pending UOT buffer exceeded"
+                );
                 payload.extend_from_slice(&frame.payload);
                 if uot::v2_request_complete(payload)? {
                     let (target, payload) = pending_uot
@@ -248,6 +253,10 @@ async fn handle_client(
                     && !uot::v2_request_complete(initial_payload)?
                 {
                     pending_uot.insert(frame.stream_id, (target, initial_payload.to_vec()));
+                    ensure!(
+                        pending_uot.len() <= MAX_PENDING_UOT,
+                        "pending UOT stream map exceeded"
+                    );
                     continue;
                 }
                 match open_stream(frame, writer.clone(), session.clone()).await {
@@ -290,15 +299,6 @@ async fn handle_client(
             _ => {}
         }
     }
-}
-
-fn auth_passwords(password: &str, users: &[String]) -> Vec<String> {
-    std::iter::once(password)
-        .chain(users.iter().map(String::as_str))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 async fn open_stream(
@@ -401,10 +401,9 @@ async fn open_uot_stream(
     session: CoreSession,
 ) -> Result<(u32, mpsc::Sender<Vec<u8>>)> {
     let (request, initial_packet) = uot::decode_request_for_target(target, initial_payload)?;
-    let udp = match &request.destination {
-        ProxyTarget::Ip(addr) if addr.is_ipv6() => UdpSocket::bind("[::]:0").await?,
-        _ => UdpSocket::bind("0.0.0.0:0").await?,
-    };
+    let udp = socket_protect::bind_dual_stack_udp()
+        .await
+        .context("bind AnyTLS UOT UDP socket")?;
     if request.is_connect {
         let target = resolve_target_addr(&request.destination).await?;
         udp.connect(target)
@@ -418,6 +417,7 @@ async fn open_uot_stream(
     let udp = Arc::new(udp);
     let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(32);
     tracing::info!("opened UOT stream {stream_id}");
+    let is_connect = request.is_connect;
 
     if !initial_packet.is_empty() {
         sender
@@ -427,31 +427,38 @@ async fn open_uot_stream(
     }
 
     let uplink_udp = udp.clone();
-    let is_connect = request.is_connect;
+    let request = Arc::new(request);
     let uplink_session = session.clone();
     tokio::spawn(async move {
         let result = async {
+            let mut pending = Vec::new();
             while let Some(packet) = receiver.recv().await {
-                if is_connect {
-                    let payload = uot::decode_connect_packet(&packet)?;
+                ensure!(
+                    pending.len() + packet.len() <= MAX_UOT_BUFFER,
+                    "pending UOT buffer exceeded"
+                );
+                pending.extend_from_slice(&packet);
+                while let Some((target, payload, connected)) =
+                    uot::take_stream_packet(&request, &mut pending)?
+                {
                     uplink_session.record_upload(payload.len()).await?;
-                    let sent = uplink_udp
-                        .send(payload)
-                        .await
-                        .context("send connected UDP payload")?;
-                    if sent != payload.len() {
-                        bail!("short UDP send: expected {}, wrote {}", payload.len(), sent);
-                    }
-                } else {
-                    let (target, payload) = uot::decode_associate_packet(&packet)?;
-                    let target = resolve_target_addr(&target).await?;
-                    uplink_session.record_upload(payload.len()).await?;
-                    let sent = uplink_udp
-                        .send_to(payload, target)
-                        .await
-                        .with_context(|| format!("send UDP payload to {target}"))?;
-                    if sent != payload.len() {
-                        bail!("short UDP send: expected {}, wrote {}", payload.len(), sent);
+                    if connected {
+                        let sent = uplink_udp
+                            .send(&payload)
+                            .await
+                            .context("send connected UDP payload")?;
+                        if sent != payload.len() {
+                            bail!("short UDP send: expected {}, wrote {}", payload.len(), sent);
+                        }
+                    } else {
+                        let target = resolve_target_addr(&target).await?;
+                        let sent = uplink_udp
+                            .send_to(&payload, target)
+                            .await
+                            .with_context(|| format!("send UDP payload to {target}"))?;
+                        if sent != payload.len() {
+                            bail!("short UDP send: expected {}, wrote {}", payload.len(), sent);
+                        }
                     }
                 }
             }

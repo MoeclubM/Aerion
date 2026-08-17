@@ -527,6 +527,7 @@ impl XrayInbound {
             key,
             transport,
             ech,
+            fallback: TrojanServerConfig::default_fallback(),
         })
     }
 

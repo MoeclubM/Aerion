@@ -85,6 +85,7 @@ enum NaiveTunnel {
     Http1 {
         stream: tokio_rustls::client::TlsStream<TcpStream>,
         pending: Vec<u8>,
+        padding_enabled: bool,
     },
     Http2 {
         send: h2::SendStream<Bytes>,
@@ -111,6 +112,14 @@ pub async fn run_naive_client_listener(
     listener: TcpListener,
     config: NaiveClientConfig,
 ) -> Result<()> {
+    run_naive_client_listener_with_core(listener, config, None).await
+}
+
+pub async fn run_naive_client_listener_with_core(
+    listener: TcpListener,
+    config: NaiveClientConfig,
+    core: Option<ProxyCore>,
+) -> Result<()> {
     tracing::info!("Naive client listening on socks5://{}", config.listen);
     loop {
         let (stream, peer) = listener
@@ -118,8 +127,9 @@ pub async fn run_naive_client_listener(
             .await
             .context("accept Naive SOCKS client")?;
         let config = config.clone();
+        let core = core.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_naive_socks_client(stream, config).await {
+            if let Err(error) = handle_naive_socks_client(stream, config, core, peer).await {
                 tracing::warn!("Naive SOCKS client {peer} failed: {error:?}");
             }
         });
@@ -213,7 +223,8 @@ async fn handle_naive_http1_connection(
     peer: SocketAddr,
     runtime: NaiveServerRuntime,
 ) -> Result<()> {
-    let (target, authorization, pending) = read_naive_http1_connect(&mut tls).await?;
+    let (target, authorization, pending, client_padding) =
+        read_naive_http1_connect(&mut tls).await?;
     let credential = if runtime.credentials.is_empty() {
         None
     } else {
@@ -228,22 +239,30 @@ async fn handle_naive_http1_connection(
         Some(credential)
     };
     let session = naive_core_session(&runtime, credential.as_deref(), peer).await?;
+    let padding_enabled = client_padding;
+    let mut response = String::from("HTTP/1.1 200 Connection Established\r\n");
+    if padding_enabled {
+        response.push_str("Padding: ");
+        response.push_str(&naive_response_padding_header()?);
+        response.push_str("\r\n");
+    }
+    response.push_str("\r\n");
     if uot::is_magic_target(&target) {
         ensure!(
             runtime.udp_over_tcp,
             "Naive HTTP/1.1 UDP-over-TCP is disabled by server config"
         );
-        tls.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        tls.write_all(response.as_bytes())
             .await
             .context("write Naive HTTP/1.1 UOT response")?;
-        return relay_naive_http1_uot(tls, pending, target, session).await;
+        return relay_naive_http1_uot(tls, pending, target, session, padding_enabled).await;
     }
     let remote = connect_proxy_target(&target).await?;
-    tls.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+    tls.write_all(response.as_bytes())
         .await
         .context("write Naive HTTP/1.1 CONNECT response")?;
     tracing::info!("Naive serving HTTP/1.1 {}", target_name(&target));
-    relay_naive_http1_server_tcp(tls, pending, remote, session).await
+    relay_naive_http1_server_tcp(tls, pending, remote, session, padding_enabled).await
 }
 
 async fn handle_naive_h2_connection(
@@ -408,7 +427,7 @@ where
 
 async fn read_naive_http1_connect(
     stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
-) -> Result<(ProxyTarget, Option<String>, Vec<u8>)> {
+) -> Result<(ProxyTarget, Option<String>, Vec<u8>, bool)> {
     let mut request = Vec::new();
     let mut buffer = [0u8; 1024];
     loop {
@@ -434,10 +453,14 @@ async fn read_naive_http1_connect(
                 "Naive HTTP/1.1 request is not CONNECT"
             );
             let mut authorization = None;
+            let mut padding = false;
             for line in lines {
                 if let Some((name, value)) = line.split_once(':') {
                     if name.trim().eq_ignore_ascii_case("proxy-authorization") {
                         authorization = Some(value.trim().to_string());
+                    }
+                    if name.trim().eq_ignore_ascii_case("padding") {
+                        padding = true;
                     }
                 }
             }
@@ -445,6 +468,7 @@ async fn read_naive_http1_connect(
                 parse_authority(authority)?,
                 authorization,
                 request[end + 4..].to_vec(),
+                padding,
             ));
         }
     }
@@ -574,7 +598,18 @@ where
     Ok(())
 }
 
-async fn handle_naive_socks_client(mut local: TcpStream, config: NaiveClientConfig) -> Result<()> {
+async fn handle_naive_socks_client(
+    mut local: TcpStream,
+    config: NaiveClientConfig,
+    core: Option<ProxyCore>,
+    peer: SocketAddr,
+) -> Result<()> {
+    let credential = format!("{}:{}", config.username, config.password);
+    let _session = if let Some(core) = core.as_ref() {
+        Some(core.authenticate_from(&credential, peer).await?)
+    } else {
+        None
+    };
     match socks::read_request(&mut local).await? {
         socks::SocksRequest::Connect(target) => {
             let tunnel = match open_naive_tunnel(&config, &target).await {
@@ -695,6 +730,7 @@ async fn open_naive_http1_tunnel(
             return Ok(NaiveTunnel::Http1 {
                 stream: tls,
                 pending,
+                padding_enabled: header_has_padding(&header),
             });
         }
     }
@@ -905,11 +941,12 @@ async fn relay_naive_http1_server_tcp(
     mut pending: Vec<u8>,
     remote: TcpStream,
     session: Option<CoreSession>,
+    padding_enabled: bool,
 ) -> Result<()> {
     let (mut inbound_reader, mut inbound_writer) = tokio::io::split(stream);
     let (mut remote_reader, mut remote_writer) = remote.into_split();
     let upload = async {
-        let mut state = NaiveReadState::default();
+        let (mut state, _) = naive_states(padding_enabled);
         let mut buffer = vec![0u8; 16 * 1024];
         loop {
             let read =
@@ -930,7 +967,7 @@ async fn relay_naive_http1_server_tcp(
         }
     };
     let download = async {
-        let mut state = NaiveWriteState::default();
+        let (_, mut state) = naive_states(padding_enabled);
         let mut buffer = vec![0u8; 16 * 1024];
         loop {
             let read = remote_reader
@@ -1062,15 +1099,16 @@ async fn relay_naive_http1_uot(
     pending: Vec<u8>,
     target: ProxyTarget,
     session: Option<CoreSession>,
+    padding_enabled: bool,
 ) -> Result<()> {
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let mut read_state = NaiveReadState::default();
+    let (mut read_state, _) = naive_states(padding_enabled);
     let mut naive_pending = pending;
     let (request, mut raw_pending) =
         read_uot_request_h1(&mut reader, &mut naive_pending, &mut read_state, &target).await?;
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
     let writer_task = tokio::spawn(async move {
-        let mut write_state = NaiveWriteState::default();
+        let (_, mut write_state) = naive_states(padding_enabled);
         while let Some(packet) = rx.recv().await {
             write_naive_h1_data(&mut writer, &mut write_state, &packet).await?;
         }
@@ -1424,9 +1462,11 @@ async fn resolve_proxy_target_addr(target: &ProxyTarget) -> Result<SocketAddr> {
 
 async fn relay_naive_tcp(local: TcpStream, tunnel: NaiveTunnel) -> Result<()> {
     match tunnel {
-        NaiveTunnel::Http1 { stream, pending } => {
-            relay_naive_http1_tcp(local, stream, pending).await
-        }
+        NaiveTunnel::Http1 {
+            stream,
+            pending,
+            padding_enabled,
+        } => relay_naive_http1_tcp(local, stream, pending, padding_enabled).await,
         NaiveTunnel::Http2 { send, recv, driver } => {
             let result = relay_naive_http2_tcp(local, send, recv).await;
             driver.abort();
@@ -1452,11 +1492,12 @@ async fn relay_naive_http1_tcp(
     local: TcpStream,
     stream: tokio_rustls::client::TlsStream<TcpStream>,
     pending: Vec<u8>,
+    padding_enabled: bool,
 ) -> Result<()> {
     let (mut local_reader, mut local_writer) = local.into_split();
     let (mut remote_reader, mut remote_writer) = tokio::io::split(stream);
     let upload = async {
-        let mut state = NaiveWriteState::default();
+        let (_, mut state) = naive_states(padding_enabled);
         let mut buffer = vec![0u8; 16 * 1024];
         loop {
             let read = local_reader
@@ -1474,7 +1515,7 @@ async fn relay_naive_http1_tcp(
         }
     };
     let download = async {
-        let mut state = NaiveReadState::default();
+        let (mut state, _) = naive_states(padding_enabled);
         let mut pending = pending;
         let mut buffer = vec![0u8; 16 * 1024];
         loop {
@@ -1608,9 +1649,11 @@ async fn handle_naive_udp_associate(
     socks::write_reply_with_bind(&mut control, 0x00, udp.local_addr()?).await?;
     let tunnel = open_naive_tunnel(&config, &uot::magic_target()).await?;
     match tunnel {
-        NaiveTunnel::Http1 { stream, pending } => {
-            handle_naive_udp_h1(control, udp, stream, pending).await
-        }
+        NaiveTunnel::Http1 {
+            stream,
+            pending,
+            padding_enabled,
+        } => handle_naive_udp_h1(control, udp, stream, pending, padding_enabled).await,
         NaiveTunnel::Http2 { send, recv, driver } => {
             let result = handle_naive_udp_h2(control, udp, send, recv).await;
             driver.abort();
@@ -1637,9 +1680,10 @@ async fn handle_naive_udp_h1(
     udp: Arc<UdpSocket>,
     stream: tokio_rustls::client::TlsStream<TcpStream>,
     pending: Vec<u8>,
+    padding_enabled: bool,
 ) -> Result<()> {
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let mut write_state = NaiveWriteState::default();
+    let (_, mut write_state) = naive_states(padding_enabled);
     write_naive_h1_data(
         &mut writer,
         &mut write_state,
@@ -1668,7 +1712,7 @@ async fn handle_naive_udp_h1(
         async move {
             let mut naive_pending = pending;
             let mut raw_pending = Vec::new();
-            let mut read_state = NaiveReadState::default();
+            let (mut read_state, _) = naive_states(padding_enabled);
             let mut peer = None;
             loop {
                 tokio::select! {
@@ -2343,18 +2387,49 @@ fn uot_packet_len(packet: &[u8]) -> Result<Option<usize>> {
 }
 
 fn naive_padding_header() -> Result<String> {
+    naive_padding_header_in(16, 16)
+}
+
+fn naive_response_padding_header() -> Result<String> {
+    naive_padding_header_in(30, 32)
+}
+
+fn naive_padding_header_in(min: usize, span: usize) -> Result<String> {
     let symbols = b"!#$()+<>?@[]^`{}";
-    let padding_len = usize::from(random_byte()? % 32) + 30;
+    let padding_len = min + usize::from(random_byte()? % span as u8);
     let mut output = String::with_capacity(padding_len);
     let mut random = [0u8; 16];
     getrandom::fill(&mut random).context("generate Naive padding header")?;
-    for index in 0..16 {
+    for index in 0..16.min(padding_len) {
         output.push(symbols[usize::from(random[index] & 0x0f)] as char);
     }
-    for _ in 16..padding_len {
+    for _ in output.len()..padding_len {
         output.push('~');
     }
     Ok(output)
+}
+
+fn header_has_padding(header: &str) -> bool {
+    header.lines().any(|line| {
+        line.split_once(':')
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("padding"))
+    })
+}
+
+fn naive_states(enabled: bool) -> (NaiveReadState, NaiveWriteState) {
+    if enabled {
+        (NaiveReadState::default(), NaiveWriteState::default())
+    } else {
+        (
+            NaiveReadState {
+                read_padding: NAIVE_PADDING_COUNT,
+                ..Default::default()
+            },
+            NaiveWriteState {
+                write_padding: NAIVE_PADDING_COUNT,
+            },
+        )
+    }
 }
 
 fn random_byte() -> Result<u8> {
@@ -2408,5 +2483,15 @@ mod tests {
                 .contains("unsupported Naive quic_congestion_control bbr2")
         );
         Ok(())
+    }
+
+    #[test]
+    fn padding_header_lengths_match_naiveproxy_ranges() {
+        for _ in 0..32 {
+            let request = naive_padding_header().unwrap();
+            assert!(request.len() >= 16 && request.len() < 32);
+            let response = naive_response_padding_header().unwrap();
+            assert!(response.len() >= 30 && response.len() < 62);
+        }
     }
 }

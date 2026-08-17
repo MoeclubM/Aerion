@@ -33,13 +33,13 @@ const ADDR_NONE: u8 = 0xff;
 
 const TUIC_H3_ALPN: &[u8] = b"h3";
 const DEFAULT_QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const TUIC_STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 const TUIC_CONN_RECEIVE_WINDOW: u32 = 20 * 1024 * 1024;
 const TUIC_MAX_INCOMING_STREAMS: u32 = 1024;
 const TUIC_DATAGRAM_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const TUIC_MAX_UNI_COMMAND: usize = u16::MAX as usize + 512;
 const UDP_FRAGMENT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_UDP_FRAGMENTS: usize = 64;
 const PACKET_COMMAND_FIXED_LEN: usize = 10;
 
 #[derive(Clone, Debug)]
@@ -215,7 +215,6 @@ pub fn parse_tuic_user(value: &str) -> Result<TuicUser> {
     let uuid = uuid.trim();
     let password = password.trim();
     ensure!(!uuid.is_empty(), "TUIC user UUID is empty");
-    ensure!(!password.is_empty(), "TUIC user password is empty");
     parse_uuid(uuid).with_context(|| format!("parse TUIC user UUID {uuid}"))?;
     Ok(TuicUser {
         uuid: uuid.to_string(),
@@ -234,6 +233,14 @@ pub async fn run_tuic_client_listener(
     listener: TcpListener,
     config: TuicClientConfig,
 ) -> Result<()> {
+    run_tuic_client_listener_with_core(listener, config, None).await
+}
+
+pub async fn run_tuic_client_listener_with_core(
+    listener: TcpListener,
+    config: TuicClientConfig,
+    core: Option<ProxyCore>,
+) -> Result<()> {
     let shared = Arc::new(SharedTuicClient::new(config));
     tracing::info!(
         "TUIC client listening on socks5://{}",
@@ -249,8 +256,11 @@ pub async fn run_tuic_client_listener(
         };
         let shared = shared.clone();
         let udp_enabled = shared.config.udp;
+        let core = core.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_tuic_socks_client(stream, shared, udp_enabled).await {
+            if let Err(error) =
+                handle_tuic_socks_client(stream, shared, udp_enabled, core, peer).await
+            {
                 tracing::warn!("TUIC SOCKS client {peer} failed: {error:?}");
             }
         });
@@ -356,8 +366,15 @@ impl TuicClient {
         let udp_fragments = Mutex::new(HashMap::new());
         let datagram_connection = connection.clone();
         let uni_connection = connection.clone();
-        let heartbeat_connection = connection.clone();
         let heartbeat_interval = heartbeat_interval(config.heartbeat_interval_secs);
+        let heartbeat_connection = connection.clone();
+        let heartbeat_handle = if let Some(heartbeat_interval) = heartbeat_interval {
+            tokio::spawn(async move {
+                run_tuic_heartbeat(heartbeat_connection, heartbeat_interval).await
+            })
+        } else {
+            tokio::spawn(async {})
+        };
 
         let inner = Arc::new_cyclic(move |weak: &std::sync::Weak<TuicClientInner>| {
             let datagram_weak = weak.clone();
@@ -376,9 +393,7 @@ impl TuicClient {
                 uni_handle: tokio::spawn(async move {
                     run_client_uni_dispatch(uni_connection, uni_weak).await
                 }),
-                heartbeat_handle: tokio::spawn(async move {
-                    run_tuic_heartbeat(heartbeat_connection, heartbeat_interval).await
-                }),
+                heartbeat_handle,
             }
         });
 
@@ -445,7 +460,14 @@ async fn handle_tuic_socks_client(
     mut local: TcpStream,
     shared: Arc<SharedTuicClient>,
     udp_enabled: bool,
+    core: Option<ProxyCore>,
+    peer: SocketAddr,
 ) -> Result<()> {
+    let _session = if let Some(core) = core.as_ref() {
+        Some(core.authenticate_from(&shared.config.uuid, peer).await?)
+    } else {
+        None
+    };
     match socks::read_request(&mut local).await? {
         socks::SocksRequest::Connect(target) => {
             let client = match shared.get_or_connect().await {
@@ -908,6 +930,10 @@ async fn handle_server_command_bytes(
             Ok(())
         }
         CMD_PACKET => {
+            let _ = parse_packet_command(bytes)?;
+            if auth.wait_session().await.is_err() {
+                return Ok(());
+            }
             handle_server_packet_bytes(
                 connection,
                 bytes,
@@ -924,8 +950,11 @@ async fn handle_server_command_bytes(
                 bytes.len() == 4,
                 "TUIC dissociate command length is invalid"
             );
-            let assoc_id = u16::from_be_bytes([bytes[2], bytes[3]]);
-            udp_sessions.lock().await.remove(&assoc_id);
+            let _assoc_id = u16::from_be_bytes([bytes[2], bytes[3]]);
+            if auth.wait_session().await.is_err() {
+                return Ok(());
+            }
+            udp_sessions.lock().await.remove(&_assoc_id);
             Ok(())
         }
         CMD_HEARTBEAT => Ok(()),
@@ -943,13 +972,13 @@ async fn handle_server_packet_bytes(
     mode: TuicUdpRelayMode,
 ) -> Result<()> {
     ensure!(udp_enabled, "TUIC UDP is disabled by server config");
+    let session = auth.wait_session().await?;
     let packet = parse_packet_command(bytes)?;
     let mut fragments = udp_fragments.lock().await;
     let packet = push_fragment(&mut fragments, packet)?;
     let Some(packet) = packet else {
         return Ok(());
     };
-    let session = auth.wait_session().await?;
     let target = resolve_target_addr(&packet.target).await?;
     let udp_session = get_server_udp_session(
         connection,
@@ -1078,22 +1107,14 @@ async fn get_server_udp_session(
     sessions: &ServerUdpSessions,
     assoc_id: u16,
     mode: TuicUdpRelayMode,
-    bind_ipv6: bool,
+    _bind_ipv6: bool,
     core: CoreSession,
 ) -> Result<Arc<ServerUdpSession>> {
-    if let Some(session) = sessions.lock().await.get(&assoc_id).cloned() {
+    let mut sessions = sessions.lock().await;
+    if let Some(session) = sessions.get(&assoc_id).cloned() {
         return Ok(session);
     }
-    let socket = Arc::new(match mode {
-        TuicUdpRelayMode::Native | TuicUdpRelayMode::Quic => {
-            let ip = if bind_ipv6 {
-                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
-            } else {
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-            };
-            socket_protect::bind_udp(SocketAddr::new(ip, 0)).await?
-        }
-    });
+    let socket = Arc::new(socket_protect::bind_dual_stack_udp().await?);
     let response_socket = socket.clone();
     let response_connection = connection.clone();
     let response_core = core.clone();
@@ -1114,7 +1135,7 @@ async fn get_server_udp_session(
         socket,
         response_handle: StdMutex::new(response_handle),
     });
-    sessions.lock().await.insert(assoc_id, session.clone());
+    sessions.insert(assoc_id, session.clone());
     Ok(session)
 }
 
@@ -1340,6 +1361,11 @@ fn push_fragment(
     }
     let now = Instant::now();
     fragments.retain(|_, buffer| now.duration_since(buffer.created_at) <= UDP_FRAGMENT_TIMEOUT);
+    ensure!(
+        fragments.len() < MAX_UDP_FRAGMENTS
+            || fragments.contains_key(&(packet.assoc_id, packet.packet_id)),
+        "TUIC fragment map exceeded"
+    );
     let key = (packet.assoc_id, packet.packet_id);
     let buffer = fragments.entry(key).or_insert_with(|| TuicFragmentBuffer {
         target: None,
@@ -1691,11 +1717,11 @@ fn alpn_protocols(values: &[String]) -> Vec<Vec<u8>> {
     }
 }
 
-fn heartbeat_interval(seconds: u64) -> Duration {
+fn heartbeat_interval(seconds: u64) -> Option<Duration> {
     if seconds == 0 {
-        DEFAULT_HEARTBEAT_INTERVAL
+        None
     } else {
-        Duration::from_secs(seconds)
+        Some(Duration::from_secs(seconds))
     }
 }
 
@@ -1762,6 +1788,30 @@ mod tests {
         let error =
             push_fragment(&mut fragments, packet).expect_err("duplicate fragment must fail");
         assert!(error.to_string().contains("duplicate packet fragment"));
+        Ok(())
+    }
+
+    #[test]
+    fn heartbeat_zero_disables_interval() {
+        assert!(heartbeat_interval(0).is_none());
+        assert_eq!(heartbeat_interval(10), Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn fragment_map_is_capped() -> Result<()> {
+        let target = ProxyTarget::Domain("example.com".to_string(), 53);
+        let mut fragments = HashMap::new();
+        for packet_id in 0..=MAX_UDP_FRAGMENTS as u16 {
+            let frame = encode_packet_command(7, packet_id, 2, 0, Some(&target), b"p")?;
+            let packet = parse_packet_command(&frame)?;
+            if packet_id < MAX_UDP_FRAGMENTS as u16 {
+                assert!(push_fragment(&mut fragments, packet)?.is_none());
+            } else {
+                let error =
+                    push_fragment(&mut fragments, packet).expect_err("fragment map must be capped");
+                assert!(error.to_string().contains("fragment map exceeded"));
+            }
+        }
         Ok(())
     }
 }

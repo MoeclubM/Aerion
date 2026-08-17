@@ -1,5 +1,5 @@
 use crate::core::{CoreSession, ProxyCore, relay_bidirectional_counted};
-use crate::protocol::{ProxyTarget, resolve_target_addr, target_name};
+use crate::protocol::{ProxyTarget, constant_time_eq, resolve_target_addr, target_name};
 use crate::socket_protect;
 use crate::tls::{ServerTlsAcceptor, ServerTlsMaterial, TlsEchServerKeys};
 use crate::vless_transport::VlessTransportConfig;
@@ -7,11 +7,12 @@ use crate::{socks, tls, uot, utls, vless_transport};
 use anyhow::{Context, Result, bail, ensure};
 use rustls::pki_types::ServerName;
 use sha2::{Digest, Sha224};
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::task::{Context as TaskContext, Poll, ready};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
 use tokio_rustls::TlsConnector;
@@ -51,6 +52,13 @@ pub struct TrojanServerConfig {
     pub key: Option<String>,
     pub transport: VlessTransportConfig,
     pub ech: Option<TlsEchServerKeys>,
+    pub fallback: SocketAddr,
+}
+
+impl TrojanServerConfig {
+    pub fn default_fallback() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80)
+    }
 }
 
 type TrojanTransport = vless_transport::BoxedTransportStream;
@@ -122,18 +130,17 @@ pub async fn run_trojan_server_with_core(
         early_data: false,
         ech: config.ech.clone(),
     })?;
-    let auth = trojan_auth_map(&config.password, &config.users);
     let transport = config.transport.clone();
+    let fallback = config.fallback;
     tracing::info!("Trojan server listening on {}", listener.local_addr()?);
     loop {
         let (stream, peer) = listener.accept().await.context("accept Trojan client")?;
         let acceptor = acceptor.clone();
-        let auth = auth.clone();
         let core = core.clone();
         let transport = transport.clone();
         tokio::spawn(async move {
             if let Err(error) =
-                handle_trojan_client(stream, acceptor, auth, core, peer, transport).await
+                handle_trojan_client(stream, acceptor, core, peer, transport, fallback).await
             {
                 tracing::warn!("Trojan client {peer} failed: {error:?}");
             }
@@ -304,28 +311,138 @@ async fn connect_trojan_server(config: &TrojanClientConfig) -> Result<TrojanTran
 async fn handle_trojan_client(
     stream: TcpStream,
     acceptor: ServerTlsAcceptor,
-    auth: HashMap<[u8; TROJAN_AUTH_LEN], String>,
     core: ProxyCore,
     peer: SocketAddr,
     transport: VlessTransportConfig,
+    fallback: SocketAddr,
 ) -> Result<()> {
     let stream = acceptor.accept(stream).await.context("accept Trojan TLS")?;
-    let mut stream = vless_transport::apply_server_transport(stream, &transport).await?;
-    let credential = read_trojan_auth(&mut stream, &auth).await?;
-    let session = core.authenticate_from(&credential, peer).await?;
-    match read_trojan_request(&mut stream).await? {
-        TrojanRequest::Connect(target) => {
-            let mut remote = socket_protect::connect_proxy_target(&target).await?;
-            tracing::info!("Trojan opened {}", target_name(&target));
-            relay_bidirectional_counted(&mut stream, &mut remote, session, "Trojan").await
+    let stream = vless_transport::apply_server_transport(stream, &transport).await?;
+    let mut stream = CapturingStream::new(stream);
+    match read_authenticated_trojan_request(&mut stream, &core).await {
+        Ok((credential, request)) => {
+            let session = core.authenticate_from(&credential, peer).await?;
+            match request {
+                TrojanRequest::Connect(target) => {
+                    let mut remote = socket_protect::connect_proxy_target(&target).await?;
+                    tracing::info!("Trojan opened {}", target_name(&target));
+                    relay_bidirectional_counted(&mut stream, &mut remote, session, "Trojan").await
+                }
+                TrojanRequest::UdpAssociate => relay_trojan_udp(stream, session).await,
+            }
         }
-        TrojanRequest::UdpAssociate => relay_trojan_udp(stream, session).await,
+        Err(error) => {
+            tracing::debug!("Trojan falling back after handshake failure: {error:?}");
+            relay_trojan_fallback(stream, fallback).await
+        }
     }
 }
 
-async fn relay_trojan_udp(stream: TrojanTransport, session: CoreSession) -> Result<()> {
+async fn read_authenticated_trojan_request<S>(
+    stream: &mut S,
+    core: &ProxyCore,
+) -> Result<(String, TrojanRequest)>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut auth_hex = [0u8; TROJAN_AUTH_LEN];
+    stream
+        .read_exact(&mut auth_hex)
+        .await
+        .context("read Trojan auth")?;
+    let credential = lookup_trojan_credential(core, &auth_hex)
+        .ok_or_else(|| anyhow::anyhow!("Trojan authentication failed"))?;
+    read_crlf(stream).await?;
+    Ok((credential, read_trojan_request(stream).await?))
+}
+
+async fn relay_trojan_fallback<S>(
+    mut stream: CapturingStream<S>,
+    fallback: SocketAddr,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut remote = TcpStream::connect(fallback)
+        .await
+        .with_context(|| format!("connect Trojan fallback {fallback}"))?;
+    remote
+        .write_all(&stream.take_captured())
+        .await
+        .context("write Trojan fallback prefix")?;
+    let (mut client_reader, mut client_writer) = tokio::io::split(stream);
+    let (mut fallback_reader, mut fallback_writer) = remote.into_split();
+    tokio::try_join!(
+        tokio::io::copy(&mut client_reader, &mut fallback_writer),
+        tokio::io::copy(&mut fallback_reader, &mut client_writer),
+    )?;
+    Ok(())
+}
+
+struct CapturingStream<S> {
+    inner: S,
+    captured: Vec<u8>,
+}
+
+impl<S> CapturingStream<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            captured: Vec::new(),
+        }
+    }
+
+    fn take_captured(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.captured)
+    }
+}
+
+impl<S> AsyncRead for CapturingStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let filled = buf.filled().len();
+        ready!(Pin::new(&mut self.inner).poll_read(cx, buf))?;
+        self.captured.extend_from_slice(&buf.filled()[filled..]);
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S> AsyncWrite for CapturingStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+async fn relay_trojan_udp<S>(stream: S, session: CoreSession) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let udp = Arc::new(
-        UdpSocket::bind("0.0.0.0:0")
+        socket_protect::bind_dual_stack_udp()
             .await
             .context("bind Trojan UDP")?,
     );
@@ -390,24 +507,6 @@ where
     write_trojan_address(writer, target).await?;
     writer.write_all(b"\r\n").await?;
     writer.flush().await.context("flush Trojan request")
-}
-
-async fn read_trojan_auth<R>(
-    reader: &mut R,
-    auth: &HashMap<[u8; TROJAN_AUTH_LEN], String>,
-) -> Result<String>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut auth_hex = [0u8; TROJAN_AUTH_LEN];
-    reader
-        .read_exact(&mut auth_hex)
-        .await
-        .context("read Trojan auth")?;
-    read_crlf(reader).await?;
-    auth.get(&auth_hex)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("Trojan authentication failed"))
 }
 
 async fn read_trojan_request<R>(reader: &mut R) -> Result<TrojanRequest>
@@ -546,7 +645,8 @@ where
                 .await
                 .context("read Trojan domain")?;
             ProxyTarget::Domain(
-                String::from_utf8(host).context("decode Trojan domain")?,
+                String::from_utf8(host)
+                    .map_err(|_| anyhow::anyhow!("Trojan domain address is not valid UTF-8"))?,
                 read_port(reader).await?,
             )
         }
@@ -583,21 +683,34 @@ where
 }
 
 fn trojan_auth(password: &str) -> String {
-    hex::encode(Sha224::digest(password.trim().as_bytes()))
+    hex::encode(Sha224::digest(password.as_bytes()))
 }
 
-fn trojan_auth_map(password: &str, users: &[String]) -> HashMap<[u8; TROJAN_AUTH_LEN], String> {
-    let mut map = HashMap::new();
-    for credential in std::iter::once(password).chain(users.iter().map(String::as_str)) {
-        let credential = credential.trim();
-        if credential.is_empty() {
-            continue;
-        }
-        let mut auth = [0u8; TROJAN_AUTH_LEN];
-        auth.copy_from_slice(trojan_auth(credential).as_bytes());
-        map.insert(auth, credential.to_string());
+fn trojan_auth_hex(password: &str) -> [u8; TROJAN_AUTH_LEN] {
+    let encoded = trojan_auth(password);
+    let mut auth = [0u8; TROJAN_AUTH_LEN];
+    auth.copy_from_slice(encoded.as_bytes());
+    auth
+}
+
+fn ascii_lower_copy(bytes: &[u8; TROJAN_AUTH_LEN]) -> [u8; TROJAN_AUTH_LEN] {
+    let mut lowered = *bytes;
+    for byte in &mut lowered {
+        *byte = byte.to_ascii_lowercase();
     }
-    map
+    lowered
+}
+
+fn lookup_trojan_credential(core: &ProxyCore, wire: &[u8; TROJAN_AUTH_LEN]) -> Option<String> {
+    let wire = ascii_lower_copy(wire);
+    let mut found = None;
+    for credential in core.known_credentials() {
+        let expected = ascii_lower_copy(&trojan_auth_hex(&credential));
+        if constant_time_eq(&wire, &expected) {
+            found = Some(credential);
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -614,5 +727,32 @@ mod tests {
         assert_eq!(decoded.target, target);
         assert_eq!(decoded.payload, b"abc");
         Ok(())
+    }
+
+    #[test]
+    fn password_hash_uses_raw_bytes_and_accepts_hex_case() {
+        let core = ProxyCore::from_credentials(" secret", &[]);
+        let lower = trojan_auth_hex(" secret");
+        let mut upper = lower;
+        for byte in &mut upper {
+            *byte = byte.to_ascii_uppercase();
+        }
+        assert_eq!(
+            lookup_trojan_credential(&core, &lower).as_deref(),
+            Some(" secret")
+        );
+        assert_eq!(
+            lookup_trojan_credential(&core, &upper).as_deref(),
+            Some(" secret")
+        );
+        assert!(lookup_trojan_credential(&core, &trojan_auth_hex("secret")).is_none());
+    }
+
+    #[test]
+    fn default_fallback_is_localhost_http() {
+        assert_eq!(
+            TrojanServerConfig::default_fallback(),
+            "127.0.0.1:80".parse().unwrap()
+        );
     }
 }

@@ -42,6 +42,9 @@ pub(crate) fn apply_congestion_controller(
     field: &str,
 ) -> Result<()> {
     let normalized = value.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "gecko" | "brutal") {
+        bail!("Hysteria2 {normalized} congestion control is not implemented");
+    }
     let selected = if normalized.is_empty() {
         default
     } else if let Some((_, selected)) = supported.iter().find(|(name, _)| *name == normalized) {

@@ -447,9 +447,6 @@ impl<W: AsyncWrite + Unpin> BodyWriter<W> {
     }
 
     pub async fn write_packet_plain(&mut self, data: &[u8]) -> Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
         ensure!(!self.finished, "VMess body writer already finished");
         ensure!(
             !self.state.raw_mode(),

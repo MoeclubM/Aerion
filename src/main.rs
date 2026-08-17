@@ -1309,6 +1309,7 @@ async fn run_native_server(mut server: ServerFileConfig, listen: Option<SocketAd
                 server.headers,
             )?,
             ech,
+            fallback: TrojanServerConfig::default_fallback(),
         })
         .await;
     }

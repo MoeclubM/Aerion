@@ -376,4 +376,27 @@ mod tests {
         assert!(!decoded.is_connect);
         assert_eq!(initial_packet, packet);
     }
+
+    #[test]
+    fn reassembles_stream_packets_from_pending_buffer() {
+        let target = ProxyTarget::Ip("1.2.3.4:53".parse().unwrap());
+        let request = UotRequest {
+            is_connect: false,
+            destination: target.clone(),
+        };
+        let packet = encode_associate_packet(&target, b"hello").unwrap();
+        let mut pending = packet[..3].to_vec();
+        assert!(
+            take_stream_packet(&request, &mut pending)
+                .unwrap()
+                .is_none()
+        );
+        pending.extend_from_slice(&packet[3..]);
+        let (decoded, payload, _) = take_stream_packet(&request, &mut pending)
+            .unwrap()
+            .expect("complete packet");
+        assert_eq!(decoded, target);
+        assert_eq!(payload, b"hello");
+        assert!(pending.is_empty());
+    }
 }

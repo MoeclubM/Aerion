@@ -120,7 +120,7 @@ async fn socks_client_reaches_tcp_target_through_aerion_server() -> Result<()> {
 }
 
 #[tokio::test]
-async fn anytls_server_accepts_auth_and_settings_in_tls_early_data() -> Result<()> {
+async fn anytls_server_rejects_tls_early_data() -> Result<()> {
     tls::init_crypto();
 
     let temp = tempfile::tempdir()?;
@@ -157,7 +157,7 @@ async fn anytls_server_accepts_auth_and_settings_in_tls_early_data() -> Result<(
     let second = open_anytls_control_session(tls_config, server_addr, "test-password")
         .await
         .context("second AnyTLS TLS session")?;
-    anyhow::ensure!(second, "resumed AnyTLS session did not accept 0-RTT");
+    anyhow::ensure!(!second, "AnyTLS server must not accept TLS 1.3 0-RTT");
 
     server_task.abort();
     Ok(())
@@ -1006,6 +1006,7 @@ async fn socks_client_reaches_tcp_target_through_trojan_server() -> Result<()> {
         key: None,
         transport: VlessTransportConfig::tcp(),
         ech: None,
+        fallback: TrojanServerConfig::default_fallback(),
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1081,6 +1082,7 @@ async fn socks_client_reaches_tcp_target_through_trojan_websocket_server() -> Re
         key: None,
         transport: transport.clone(),
         ech: None,
+        fallback: TrojanServerConfig::default_fallback(),
     }));
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1672,6 +1674,9 @@ async fn socks_client_reaches_tcp_target_through_vless_reality() -> Result<()> {
             private_key: server_private.to_bytes(),
             short_ids: vec![short_id],
             alpn_protocols: Vec::new(),
+            max_time_diff_secs: 0,
+            max_client_version: Some([0, 0, 0, 1]),
+            fallback_limit: Default::default(),
         }),
         transport: VlessTransportConfig::tcp(),
         ech: None,

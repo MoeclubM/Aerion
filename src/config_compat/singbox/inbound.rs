@@ -648,6 +648,7 @@ impl SingBoxTrojanInbound {
             key,
             transport,
             ech,
+            fallback: crate::trojan::TrojanServerConfig::default_fallback(),
         })
     }
 }

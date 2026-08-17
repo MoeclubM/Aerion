@@ -16,6 +16,7 @@ const OPCODE_BINARY: u8 = 0x2;
 const OPCODE_CLOSE: u8 = 0x8;
 const OPCODE_PING: u8 = 0x9;
 const OPCODE_PONG: u8 = 0xa;
+const MAX_WEBSOCKET_FRAME: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 enum WebSocketRole {
@@ -67,6 +68,7 @@ where
         "VLESS WebSocket server returned non-101 response: {}",
         response.lines().next().unwrap_or_default()
     );
+    vless_http::ensure_upgrade_headers(&response, "websocket")?;
     let accept = vless_http::header_value(&response, "Sec-WebSocket-Accept")
         .context("VLESS WebSocket response missing Sec-WebSocket-Accept")?;
     ensure!(
@@ -85,6 +87,7 @@ where
 {
     let request = vless_http::read_http_head(&mut stream).await?;
     vless_http::ensure_request_path(&request, &transport.path)?;
+    vless_http::ensure_upgrade_headers(&request, "websocket")?;
     let key = vless_http::header_value(&request, "Sec-WebSocket-Key")
         .context("VLESS WebSocket request missing Sec-WebSocket-Key")?;
     let response = format!(
@@ -286,6 +289,10 @@ where
             .context("read WebSocket frame 64-bit length")?;
         len = u64::from_be_bytes(bytes);
     }
+    ensure!(
+        len as usize <= MAX_WEBSOCKET_FRAME,
+        "WebSocket frame length {len} exceeds {MAX_WEBSOCKET_FRAME}"
+    );
     let mut mask = [0u8; 4];
     if masked {
         reader
@@ -309,6 +316,11 @@ where
 }
 
 fn build_frame(opcode: u8, payload: &[u8], masked: bool) -> Result<Vec<u8>> {
+    ensure!(
+        payload.len() <= MAX_WEBSOCKET_FRAME,
+        "WebSocket payload length {} exceeds {MAX_WEBSOCKET_FRAME}",
+        payload.len()
+    );
     let mut frame = Vec::with_capacity(payload.len() + 16);
     frame.push(0x80 | opcode);
     let mask_bit = if masked { 0x80 } else { 0 };

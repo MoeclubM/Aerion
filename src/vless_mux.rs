@@ -25,6 +25,9 @@ const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x02;
 const ATYP_IPV6: u8 = 0x03;
 const STREAM_CHUNK_LEN: usize = 8 * 1024;
+const MAX_MUX_SESSIONS: usize = 256;
+const MAX_MUX_METADATA: usize = 4096;
+const MAX_MUX_PAYLOAD: usize = 16 * 1024;
 
 static NEXT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 type Sessions = Arc<Mutex<HashMap<u16, Arc<SessionEntry>>>>;
@@ -239,7 +242,7 @@ where
         }
     };
 
-    insert_session(sessions, frame.session_id, entry.clone());
+    insert_session(sessions, frame.session_id, entry.clone())?;
     if frame.has_data {
         session.record_upload(frame.payload.len()).await?;
         send_frame_to_session(&entry, None, &frame.payload).await?;
@@ -494,6 +497,10 @@ where
         metadata_len >= 4,
         "short VLESS mux metadata length {metadata_len}"
     );
+    ensure!(
+        metadata_len as usize <= MAX_MUX_METADATA,
+        "VLESS mux metadata length {metadata_len} exceeds {MAX_MUX_METADATA}"
+    );
 
     let mut metadata = vec![0u8; metadata_len as usize];
     reader
@@ -528,6 +535,10 @@ where
 
     let payload = if has_data {
         let payload_len = read_u16(reader, "read VLESS mux payload length").await? as usize;
+        ensure!(
+            payload_len <= MAX_MUX_PAYLOAD,
+            "VLESS mux payload length {payload_len} exceeds {MAX_MUX_PAYLOAD}"
+        );
         let mut payload = vec![0u8; payload_len];
         reader
             .read_exact(&mut payload)
@@ -714,11 +725,14 @@ async fn shutdown_session(sessions: &Sessions, session_id: u16) {
     }
 }
 
-fn insert_session(sessions: &Sessions, session_id: u16, session: Arc<SessionEntry>) {
-    sessions
-        .lock()
-        .expect("vless mux session map poisoned")
-        .insert(session_id, session);
+fn insert_session(sessions: &Sessions, session_id: u16, session: Arc<SessionEntry>) -> Result<()> {
+    let mut map = sessions.lock().expect("vless mux session map poisoned");
+    ensure!(
+        map.len() < MAX_MUX_SESSIONS || map.contains_key(&session_id),
+        "VLESS mux session count exceeds {MAX_MUX_SESSIONS}"
+    );
+    map.insert(session_id, session);
+    Ok(())
 }
 
 fn get_session(sessions: &Sessions, session_id: u16) -> Option<Arc<SessionEntry>> {

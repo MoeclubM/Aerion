@@ -1,13 +1,18 @@
-use super::crypto::{MieruCipher, check_user_from_hint, mieru_keys_for_password};
+use super::crypto::{MieruCipher, check_user_from_hint, increment_nonce, mieru_keys_for_password};
 use super::pattern::{MieruTrafficPattern, random_padding};
 use super::{MieruUserSecret, NONCE_LEN};
 use anyhow::{Context, Result, bail, ensure};
-use std::time::{SystemTime, UNIX_EPOCH};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const METADATA_LEN: usize = 32;
 const AEAD_OVERHEAD: usize = 16;
 const PACKET_METADATA_LEN: usize = NONCE_LEN + METADATA_LEN + AEAD_OVERHEAD;
+const REPLAY_CACHE_TTL: Duration = Duration::from_secs(6 * 60);
+const REPLAY_CACHE_MAX: usize = 65_536;
 
 pub(super) const MAX_PDU: usize = 32 * 1024;
 pub(super) const MAX_SESSION_OPEN_PAYLOAD: usize = 1024;
@@ -26,6 +31,34 @@ pub(super) const DATA_SERVER_TO_CLIENT: u8 = 7;
 pub(super) const ACK_CLIENT_TO_SERVER: u8 = 8;
 pub(super) const ACK_SERVER_TO_CLIENT: u8 = 9;
 pub(super) const STATUS_OK: u8 = 0;
+
+pub(super) struct MieruReplayCache {
+    inner: Mutex<HashMap<[u8; 32], Instant>>,
+}
+
+impl MieruReplayCache {
+    pub(super) fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(super) fn check_and_store(&self, ciphertext: &[u8]) -> Result<()> {
+        let digest: [u8; 32] = Sha256::digest(ciphertext).into();
+        let now = Instant::now();
+        let mut inner = self.inner.lock().expect("Mieru replay cache lock poisoned");
+        inner.retain(|_, seen| now.duration_since(*seen) <= REPLAY_CACHE_TTL);
+        ensure!(
+            inner.len() < REPLAY_CACHE_MAX || inner.contains_key(&digest),
+            "Mieru replay cache is full"
+        );
+        ensure!(
+            inner.insert(digest, now).is_none(),
+            "Mieru first-segment replay detected"
+        );
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct MieruSegment {
@@ -174,6 +207,7 @@ pub(super) async fn read_first_server_segment<R>(
     users: &[MieruUserSecret],
     user_hint_mandatory: bool,
     traffic_pattern: Option<&MieruTrafficPattern>,
+    replay: &MieruReplayCache,
 ) -> Result<(MieruCipher, MieruUserSecret, MieruSegment)>
 where
     R: AsyncRead + Unpin,
@@ -213,6 +247,7 @@ where
             let mut stateful = MieruCipher::new(key, true, user.username.clone(), traffic_pattern);
             let plain = stateful.decrypt(&encrypted_metadata)?;
             let metadata = MieruMetadata::parse(&plain)?;
+            replay.check_and_store(&encrypted_metadata)?;
             let payload = read_mieru_payload(reader, &metadata, &mut stateful).await?;
             return Ok((stateful, user, MieruSegment { metadata, payload }));
         }
@@ -355,11 +390,12 @@ pub(super) fn encode_mieru_packet_segment(
         encrypted_metadata.len() == PACKET_METADATA_LEN,
         "invalid Mieru encrypted packet metadata length"
     );
-    let nonce = encrypted_metadata[..NONCE_LEN].to_vec();
+    let nonce = &encrypted_metadata[..NONCE_LEN];
+    let payload_nonce = increment_nonce(nonce)?;
     let mut packet = encrypted_metadata;
     packet.extend_from_slice(&prefix_padding);
     if !segment.payload.is_empty() {
-        let encrypted_payload = cipher.encrypt_with_nonce(&segment.payload, &nonce)?;
+        let encrypted_payload = cipher.encrypt_with_nonce(&segment.payload, &payload_nonce)?;
         packet.extend_from_slice(&encrypted_payload);
     }
     packet.extend_from_slice(&suffix_padding);
@@ -382,10 +418,15 @@ pub(super) fn decode_mieru_packet_segment(
     );
     let encrypted_metadata = &packet[..PACKET_METADATA_LEN];
     let nonce = &encrypted_metadata[..NONCE_LEN];
+    let payload_nonce = increment_nonce(nonce)?;
     let plain = cipher.decrypt(encrypted_metadata)?;
     let metadata = MieruMetadata::parse(&plain)?;
-    let payload =
-        decode_mieru_packet_payload(cipher, &metadata, nonce, &packet[PACKET_METADATA_LEN..])?;
+    let payload = decode_mieru_packet_payload(
+        cipher,
+        &metadata,
+        &payload_nonce,
+        &packet[PACKET_METADATA_LEN..],
+    )?;
     Ok(MieruSegment { metadata, payload })
 }
 
@@ -394,6 +435,7 @@ pub(super) fn decode_mieru_packet_segment_for_server(
     users: &[MieruUserSecret],
     user_hint_mandatory: bool,
     traffic_pattern: Option<&MieruTrafficPattern>,
+    replay: &MieruReplayCache,
 ) -> Result<(MieruSegment, MieruUserSecret, MieruCipher)> {
     ensure!(
         packet.len() >= PACKET_METADATA_LEN,
@@ -423,6 +465,7 @@ pub(super) fn decode_mieru_packet_segment_for_server(
         for key in mieru_keys_for_password(&user.hashed_password)? {
             let mut cipher = MieruCipher::new(key, false, user.username.clone(), traffic_pattern);
             if let Ok(segment) = decode_mieru_packet_segment(&mut cipher, packet) {
+                replay.check_and_store(&packet[..PACKET_METADATA_LEN])?;
                 return Ok((segment, user, cipher));
             }
         }
@@ -481,4 +524,54 @@ fn decode_mieru_packet_payload(
 
 fn unix_minutes() -> Result<u32> {
     Ok((SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() / 60) as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mieru::crypto::{current_mieru_key, hash_mieru_password};
+
+    #[test]
+    fn udp_payload_uses_incremented_nonce() -> Result<()> {
+        let key = current_mieru_key(&hash_mieru_password(b"secret", b"user"))?;
+        let mut send = MieruCipher::new(key, false, "user".to_string(), None);
+        let mut recv = MieruCipher::new(key, false, "user".to_string(), None);
+        let segment = MieruSegment {
+            metadata: MieruMetadata::Session(MieruSessionMetadata {
+                protocol: OPEN_SESSION_REQUEST,
+                session_id: 1,
+                seq: 0,
+                status_code: STATUS_OK,
+                payload_len: 4,
+                suffix_len: 0,
+            }),
+            payload: b"ping".to_vec(),
+        };
+        let packet = encode_mieru_packet_segment(&mut send, segment, 1500, None)?;
+        let decoded = decode_mieru_packet_segment(&mut recv, &packet)?;
+        assert_eq!(decoded.payload, b"ping");
+
+        let nonce = &packet[..NONCE_LEN];
+        let reused = send.encrypt_with_nonce(b"ping", nonce)?;
+        let payload_offset = PACKET_METADATA_LEN;
+        let encrypted_len = 4 + AEAD_OVERHEAD;
+        assert_ne!(
+            &packet[payload_offset..payload_offset + encrypted_len],
+            reused.as_slice(),
+            "payload must not reuse the metadata nonce"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replay_cache_rejects_duplicate_first_segment() -> Result<()> {
+        let cache = MieruReplayCache::new();
+        cache.check_and_store(b"first-segment")?;
+        let error = cache
+            .check_and_store(b"first-segment")
+            .expect_err("duplicate first segment must be rejected");
+        assert!(error.to_string().contains("replay"));
+        cache.check_and_store(b"other-segment")?;
+        Ok(())
+    }
 }

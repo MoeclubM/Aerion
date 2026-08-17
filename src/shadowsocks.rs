@@ -62,6 +62,7 @@ struct ShadowsocksRuntime {
     context: ShadowsocksSharedContext,
     udp: bool,
     udp_over_tcp: bool,
+    password: String,
 }
 
 #[derive(Clone)]
@@ -74,7 +75,16 @@ struct ShadowsocksServerRuntime {
     tcp: bool,
     udp: bool,
     udp_over_tcp: bool,
+    udp_nat: Arc<Mutex<HashMap<(SocketAddr, u64), Arc<SsUdpNat>>>>,
 }
+
+struct SsUdpNat {
+    socket: Arc<UdpSocket>,
+    server_session_id: u64,
+    packet_id: AtomicU64,
+}
+
+const MAX_SS_UDP_NAT: usize = 1024;
 
 pub async fn run_shadowsocks_client(config: ShadowsocksClientConfig) -> Result<()> {
     let listener = TcpListener::bind(config.listen)
@@ -87,6 +97,14 @@ pub async fn run_shadowsocks_client_listener(
     listener: TcpListener,
     config: ShadowsocksClientConfig,
 ) -> Result<()> {
+    run_shadowsocks_client_listener_with_core(listener, config, None).await
+}
+
+pub async fn run_shadowsocks_client_listener_with_core(
+    listener: TcpListener,
+    config: ShadowsocksClientConfig,
+    core: Option<ProxyCore>,
+) -> Result<()> {
     let runtime = ShadowsocksRuntime::from_config(config)?;
     tracing::info!(
         "Shadowsocks client listening on socks5://{}",
@@ -95,8 +113,9 @@ pub async fn run_shadowsocks_client_listener(
     loop {
         let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
         let runtime = runtime.clone();
+        let core = core.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_shadowsocks_socks(stream, runtime).await {
+            if let Err(error) = handle_shadowsocks_socks(stream, runtime, core, peer).await {
                 tracing::warn!("Shadowsocks SOCKS client {peer} failed: {error:?}");
             }
         });
@@ -119,11 +138,12 @@ impl ShadowsocksRuntime {
         Ok(Self {
             server_host: config.server_host,
             server_port: config.server_port,
-            server: ShadowsocksInnerConfig::new(server_addr, config.password, method)
+            server: ShadowsocksInnerConfig::new(server_addr, config.password.clone(), method)
                 .context("build Shadowsocks server config")?,
             context: ShadowsocksContext::new_shared(ServerType::Local),
             udp: config.udp,
             udp_over_tcp: config.udp_over_tcp,
+            password: config.password,
         })
     }
 }
@@ -164,6 +184,7 @@ impl ShadowsocksServerRuntime {
             tcp: config.tcp,
             udp: config.udp,
             udp_over_tcp: config.udp_over_tcp,
+            udp_nat: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -268,9 +289,11 @@ async fn run_shadowsocks_udp_server(runtime: ShadowsocksServerRuntime) -> Result
         let proxy = proxy.clone();
         let session = shadowsocks_udp_core_session(&runtime, peer, control.as_ref()).await?;
         let payload = buffer[..read].to_vec();
+        let nat = runtime.udp_nat.clone();
         tokio::spawn(async move {
             if let Err(error) =
-                relay_shadowsocks_udp_packet(proxy, peer, target, control, payload, session).await
+                relay_shadowsocks_udp_packet(proxy, peer, target, control, payload, session, nat)
+                    .await
             {
                 tracing::warn!("Shadowsocks UDP packet from {peer} failed: {error:?}");
             }
@@ -285,34 +308,91 @@ async fn relay_shadowsocks_udp_packet(
     control: Option<UdpSocketControlData>,
     payload: Vec<u8>,
     session: CoreSession,
+    nat: Arc<Mutex<HashMap<(SocketAddr, u64), Arc<SsUdpNat>>>>,
 ) -> Result<()> {
     let target_addr = resolve_shadowsocks_address(&target).await?;
-    let bind_addr = if target_addr.is_ipv6() {
-        SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
-    } else {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-    };
-    let outbound = socket_protect::bind_udp(bind_addr).await?;
+    let client_session_id = control
+        .as_ref()
+        .map(|control| control.client_session_id)
+        .unwrap_or(0);
+    let entry = get_or_create_ss_udp_nat(
+        nat,
+        proxy.clone(),
+        peer,
+        client_session_id,
+        control.clone(),
+        session.clone(),
+    )
+    .await?;
     session.record_upload(payload.len()).await?;
-    outbound
+    entry
+        .socket
         .send_to(&payload, target_addr)
         .await
         .with_context(|| format!("send Shadowsocks UDP payload to {target_addr}"))?;
+    Ok(())
+}
 
-    // SS2022 requires the server to generate its own random server_session_id and
-    // increment server_packet_id per outgoing packet. Reusing the inbound control
-    // (which carries the *client* session id and a 0 server session id) makes
-    // strict clients like sing-shadowsocks2 reject or panic on the response.
+async fn get_or_create_ss_udp_nat(
+    nat: Arc<Mutex<HashMap<(SocketAddr, u64), Arc<SsUdpNat>>>>,
+    proxy: Arc<ProxySocket<ShadowsocksUdpSocket>>,
+    peer: SocketAddr,
+    client_session_id: u64,
+    control: Option<UdpSocketControlData>,
+    session: CoreSession,
+) -> Result<Arc<SsUdpNat>> {
+    let key = (peer, client_session_id);
+    {
+        let table = nat.lock().await;
+        if let Some(entry) = table.get(&key) {
+            return Ok(entry.clone());
+        }
+        ensure!(
+            table.len() < MAX_SS_UDP_NAT,
+            "Shadowsocks UDP NAT table exceeds {MAX_SS_UDP_NAT} sessions"
+        );
+    }
+    let outbound = socket_protect::bind_dual_stack_udp()
+        .await
+        .context("bind Shadowsocks UDP NAT socket")?;
     let mut server_session_id_buf = [0u8; 8];
     getrandom::fill(&mut server_session_id_buf)
         .context("generate Shadowsocks UDP server_session_id")?;
-    let server_session_id = u64::from_be_bytes(server_session_id_buf);
-    let server_packet_id = AtomicU64::new(0);
+    let entry = Arc::new(SsUdpNat {
+        socket: Arc::new(outbound),
+        server_session_id: u64::from_be_bytes(server_session_id_buf),
+        packet_id: AtomicU64::new(0),
+    });
+    {
+        let mut table = nat.lock().await;
+        if let Some(existing) = table.get(&key) {
+            return Ok(existing.clone());
+        }
+        table.insert(key, entry.clone());
+    }
+    let recv_entry = entry.clone();
+    tokio::spawn(async move {
+        if let Err(error) =
+            relay_shadowsocks_udp_responses(proxy, peer, control, session, recv_entry).await
+        {
+            tracing::debug!("Shadowsocks UDP NAT {peer} closed: {error:?}");
+        }
+        nat.lock().await.remove(&key);
+    });
+    Ok(entry)
+}
 
+async fn relay_shadowsocks_udp_responses(
+    proxy: Arc<ProxySocket<ShadowsocksUdpSocket>>,
+    peer: SocketAddr,
+    control: Option<UdpSocketControlData>,
+    session: CoreSession,
+    entry: Arc<SsUdpNat>,
+) -> Result<()> {
     let mut buffer = vec![0u8; MAXIMUM_UDP_PAYLOAD_SIZE];
     while let Ok(read) = timeout(
         SHADOWSOCKS_UDP_SESSION_TIMEOUT,
-        outbound.recv_from(&mut buffer),
+        entry.socket.recv_from(&mut buffer),
     )
     .await
     {
@@ -321,8 +401,8 @@ async fn relay_shadowsocks_udp_packet(
         session.record_download(read).await?;
         if let Some(inbound_control) = control.as_ref() {
             let mut response_control = inbound_control.clone();
-            response_control.server_session_id = server_session_id;
-            response_control.packet_id = server_packet_id.fetch_add(1, Ordering::Relaxed) + 1;
+            response_control.server_session_id = entry.server_session_id;
+            response_control.packet_id = entry.packet_id.fetch_add(1, Ordering::Relaxed) + 1;
             proxy
                 .send_to_with_ctrl(peer, &source, &response_control, &buffer[..read])
                 .await
@@ -351,7 +431,17 @@ async fn shadowsocks_udp_core_session(
         .await
 }
 
-async fn handle_shadowsocks_socks(mut local: TcpStream, runtime: ShadowsocksRuntime) -> Result<()> {
+async fn handle_shadowsocks_socks(
+    mut local: TcpStream,
+    runtime: ShadowsocksRuntime,
+    core: Option<ProxyCore>,
+    peer: SocketAddr,
+) -> Result<()> {
+    let _session = if let Some(core) = core.as_ref() {
+        Some(core.authenticate_from(&runtime.password, peer).await?)
+    } else {
+        None
+    };
     match socks::read_request(&mut local).await? {
         socks::SocksRequest::Connect(target) => {
             let tcp = socket_protect::connect_tcp_host_port(

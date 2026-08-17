@@ -159,7 +159,6 @@ pub async fn run_vless_server_with_core(config: VlessServerConfig, core: ProxyCo
             })
         })
         .transpose()?;
-    let users = vless_users(&config.user_id, &config.users)?;
     let flow = config.flow.clone();
     let transport = config.transport.clone();
     tracing::info!("VLESS server listening on {}", listener.local_addr()?);
@@ -167,15 +166,12 @@ pub async fn run_vless_server_with_core(config: VlessServerConfig, core: ProxyCo
         let (stream, peer) = listener.accept().await.context("accept VLESS client")?;
         let acceptor = acceptor.clone();
         let reality = reality.clone();
-        let users = users.clone();
         let core = core.clone();
         let flow = flow.clone();
         let transport = transport.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_vless_client(
-                stream, acceptor, reality, users, core, flow, transport, peer,
-            )
-            .await
+            if let Err(error) =
+                handle_vless_client(stream, acceptor, reality, core, flow, transport, peer).await
             {
                 tracing::warn!("VLESS client {peer} failed: {error:?}");
             }
@@ -338,11 +334,14 @@ async fn handle_vless_xudp_associate_counted(
     session: CoreSession,
 ) -> Result<()> {
     let mut server = connect_vless_server(&config).await?;
-    write_vless_request(&mut server, &user, CMD_UDP, &vless_xudp::mux_target(), "").await?;
+    write_vless_request(&mut server, &user, CMD_MUX, &vless_xudp::mux_target(), "").await?;
     read_vless_response_header(&mut server).await?;
     let (mut reader, mut writer) = tokio::io::split(server);
     let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<SocketAddr>(8);
 
+    let mut is_new = true;
+    let mut global_id = [0u8; 8];
+    getrandom::fill(&mut global_id).context("generate XUDP GlobalID")?;
     let udp_to_xudp = {
         let udp = udp.clone();
         let session = session.clone();
@@ -356,7 +355,9 @@ async fn handle_vless_xudp_associate_counted(
                 let _ = client_tx.try_send(peer);
                 let (target, payload) = uot::parse_socks_udp_packet(&buffer[..read])?;
                 session.record_upload(payload.len()).await?;
-                vless_xudp::write_client_packet(&mut writer, &target, payload, true).await?;
+                vless_xudp::write_client_packet(&mut writer, &target, payload, is_new, &global_id)
+                    .await?;
+                is_new = false;
             }
         }
     };
@@ -491,7 +492,6 @@ async fn handle_vless_client(
     stream: TcpStream,
     acceptor: Option<ServerTlsAcceptor>,
     reality: Option<RealityServerState>,
-    users: HashMap<[u8; 16], String>,
     core: ProxyCore,
     allowed_flow: String,
     transport: VlessTransportConfig,
@@ -508,10 +508,9 @@ async fn handle_vless_client(
     } else {
         vless_transport::apply_server_transport(stream, &transport).await?
     };
+    let users = vless_users_from_core(&core)?;
     let request = read_vless_request(&mut stream).await?;
-    let credential = users
-        .get(&request.user)
-        .cloned()
+    let credential = lookup_vless_user(&users, &request.user)
         .ok_or_else(|| anyhow::anyhow!("VLESS authentication failed"))?;
     validate_flow(&request, &allowed_flow)?;
     let session = core.authenticate_from(&credential, peer).await?;
@@ -528,11 +527,7 @@ async fn handle_vless_client(
         }
         CMD_UDP => {
             write_vless_response_header(&mut stream).await?;
-            if vless_xudp::is_mux_target(&request.target) {
-                vless_xudp::relay_server(stream, session).await
-            } else {
-                relay_vless_udp(stream, request.target, session).await
-            }
+            relay_vless_udp(stream, request.target, session).await
         }
         CMD_MUX => {
             write_vless_response_header(&mut stream).await?;
@@ -575,7 +570,7 @@ where
     };
     let downlink = async {
         let mut buffer = vec![0u8; 32 * 1024];
-        let mut first = true;
+        let mut encoder = vless_vision::VisionEncoder::new(user);
         loop {
             let read = remote_reader
                 .read(&mut buffer)
@@ -586,19 +581,11 @@ where
                 return Ok::<(), anyhow::Error>(());
             }
             session.record_download(read).await?;
-            if first {
-                first = false;
-                let encoded = vless_vision::encode_end_frame(&user, &buffer[..read])?;
-                client_writer
-                    .write_all(&encoded)
-                    .await
-                    .context("write VLESS Vision first downlink")?;
-            } else {
-                client_writer
-                    .write_all(&buffer[..read])
-                    .await
-                    .context("write VLESS Vision downlink")?;
-            }
+            let encoded = encoder.encode(&buffer[..read])?;
+            client_writer
+                .write_all(&encoded)
+                .await
+                .context("write VLESS Vision downlink")?;
         }
     };
     tokio::try_join!(uplink, downlink)?;
@@ -617,7 +604,7 @@ async fn relay_vision_client_counted(
     let uplink_session = session.clone();
     let uplink = async {
         let mut buffer = vec![0u8; 32 * 1024];
-        let mut first = true;
+        let mut encoder = vless_vision::VisionEncoder::new(user);
         loop {
             let read = local_reader
                 .read(&mut buffer)
@@ -628,19 +615,11 @@ async fn relay_vision_client_counted(
                 return Ok::<(), anyhow::Error>(());
             }
             uplink_session.record_upload(read).await?;
-            if first {
-                first = false;
-                let encoded = vless_vision::encode_end_frame(&user, &buffer[..read])?;
-                server_writer
-                    .write_all(&encoded)
-                    .await
-                    .context("write first VLESS Vision payload")?;
-            } else {
-                server_writer
-                    .write_all(&buffer[..read])
-                    .await
-                    .context("write VLESS Vision payload")?;
-            }
+            let encoded = encoder.encode(&buffer[..read])?;
+            server_writer
+                .write_all(&encoded)
+                .await
+                .context("write VLESS Vision payload")?;
         }
     };
     let downlink = async {
@@ -899,16 +878,17 @@ fn is_vision_flow(flow: &str) -> bool {
 }
 
 fn validate_flow(request: &VlessRequest, allowed_flow: &str) -> Result<()> {
+    let server_vision = is_vision_flow(allowed_flow);
+    let client_vision = is_vision_flow(&request.flow);
+    if request.command == CMD_TCP && server_vision && request.flow.trim().is_empty() {
+        bail!("VLESS server requires xtls-rprx-vision");
+    }
     if request.flow.trim().is_empty() {
         return Ok(());
     }
+    ensure!(client_vision, "unsupported VLESS flow {}", request.flow);
     ensure!(
-        is_vision_flow(&request.flow),
-        "unsupported VLESS flow {}",
-        request.flow
-    );
-    ensure!(
-        is_vision_flow(allowed_flow),
+        server_vision,
         "VLESS client requested flow {} but server flow is {}",
         request.flow,
         allowed_flow
@@ -986,16 +966,22 @@ fn read_length_delimited<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a 
     Ok(&bytes[start..start + len])
 }
 
-fn vless_users(user_id: &str, users: &[String]) -> Result<HashMap<[u8; 16], String>> {
+fn vless_users_from_core(core: &ProxyCore) -> Result<HashMap<[u8; 16], String>> {
     let mut map = HashMap::new();
-    for credential in std::iter::once(user_id).chain(users.iter().map(String::as_str)) {
-        let credential = credential.trim();
-        if credential.is_empty() {
-            continue;
-        }
-        map.insert(parse_uuid(credential)?, credential.to_string());
+    for credential in core.known_credentials() {
+        map.insert(parse_uuid(&credential)?, credential);
     }
     Ok(map)
+}
+
+fn lookup_vless_user(users: &HashMap<[u8; 16], String>, user: &[u8; 16]) -> Option<String> {
+    let mut found = None;
+    for (id, credential) in users {
+        if crate::protocol::constant_time_eq(id, user) {
+            found = Some(credential.clone());
+        }
+    }
+    found
 }
 
 async fn read_u8<R>(reader: &mut R) -> Result<u8>

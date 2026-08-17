@@ -390,7 +390,9 @@ impl Hysteria2Client {
         encode_varint(HY2_TCP_REQUEST_ID, &mut request)?;
         encode_varint(address.len() as u64, &mut request)?;
         request.extend_from_slice(address.as_bytes());
-        encode_varint(0, &mut request)?;
+        let padding = random_hysteria_padding_bytes()?;
+        encode_varint(padding.len() as u64, &mut request)?;
+        request.extend_from_slice(&padding);
         self.wait_upload(request.len()).await;
         send.write_all(&request)
             .await
@@ -494,6 +496,7 @@ impl Hysteria2Client {
                     continue;
                 }
             };
+            cleanup_udp_fragments(&self.inner.udp_fragments).await;
             let sender = self
                 .inner
                 .udp_sessions
@@ -588,6 +591,14 @@ pub async fn run_hysteria2_client_listener(
     listener: TcpListener,
     config: Hysteria2ClientConfig,
 ) -> Result<()> {
+    run_hysteria2_client_listener_with_core(listener, config, None).await
+}
+
+pub async fn run_hysteria2_client_listener_with_core(
+    listener: TcpListener,
+    config: Hysteria2ClientConfig,
+    core: Option<ProxyCore>,
+) -> Result<()> {
     let shared = Arc::new(SharedHysteria2Client::new(config));
     tracing::info!(
         "Hysteria2 client listening on socks5://{}",
@@ -602,8 +613,9 @@ pub async fn run_hysteria2_client_listener(
             }
         };
         let shared = shared.clone();
+        let core = core.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_hy2_socks_client(stream, shared).await {
+            if let Err(error) = handle_hy2_socks_client(stream, shared, core, peer).await {
                 tracing::warn!("Hysteria2 SOCKS client {peer} failed: {error:?}");
             }
         });
@@ -677,7 +689,7 @@ pub async fn run_hysteria2_server_socket_with_core(
     let endpoint = build_server_endpoint(socket, &config)?;
     tracing::info!("Hysteria2 server listening on {}", endpoint.local_addr()?);
     while let Some(incoming) = endpoint.accept().await {
-        let passwords = auth_passwords(&config.password, &config.users);
+        let passwords = core.known_credentials();
         let cc_rx = config.cc_rx.clone();
         let udp = config.udp;
         let auth_timeout = config.auth_timeout;
@@ -702,7 +714,17 @@ pub async fn run_hysteria2_server_socket_with_core(
 async fn handle_hy2_socks_client(
     mut local: TcpStream,
     shared: Arc<SharedHysteria2Client>,
+    core: Option<ProxyCore>,
+    peer: SocketAddr,
 ) -> Result<()> {
+    let _session = if let Some(core) = core.as_ref() {
+        Some(
+            core.authenticate_from(&shared.config.password, peer)
+                .await?,
+        )
+    } else {
+        None
+    };
     match socks::read_request(&mut local).await? {
         socks::SocksRequest::Connect(target) => {
             let session = match shared.get_or_connect().await {
@@ -940,18 +962,20 @@ async fn authenticate_server(
             .await
             .context("resolve Hysteria2 HTTP/3 request")?;
         if !is_auth_request(&request) {
-            send_h3_status(&mut stream, 404).await?;
+            send_h3_masquerade(&mut stream).await?;
             continue;
         }
         let auth = request
             .headers()
             .get("Hysteria-Auth")
             .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .trim();
-        if !passwords.iter().any(|password| auth == password.trim()) {
-            send_h3_status(&mut stream, 401).await?;
-            bail!("Hysteria2 authentication failed");
+            .unwrap_or_default();
+        if !passwords
+            .iter()
+            .any(|password| crate::protocol::constant_time_eq(auth.as_bytes(), password.as_bytes()))
+        {
+            send_h3_masquerade(&mut stream).await?;
+            continue;
         }
         let session = core
             .authenticate_from(auth, connection.remote_address())
@@ -960,7 +984,7 @@ async fn authenticate_server(
             .status(http::StatusCode::from_u16(233).context("build Hysteria2 auth status")?)
             .header("Hysteria-UDP", if udp_enabled { "true" } else { "false" })
             .header("Hysteria-CC-RX", cc_rx)
-            .header("Hysteria-Padding", "")
+            .header("Hysteria-Padding", random_hysteria_padding()?)
             .body(())
             .context("build Hysteria2 auth response")?;
         stream
@@ -985,26 +1009,47 @@ fn is_auth_request(request: &http::Request<()>) -> bool {
             .unwrap_or(false)
 }
 
-async fn send_h3_status<S>(
-    stream: &mut h3::server::RequestStream<S, Bytes>,
-    status: u16,
-) -> Result<()>
+async fn send_h3_masquerade<S>(stream: &mut h3::server::RequestStream<S, Bytes>) -> Result<()>
 where
     S: h3::quic::BidiStream<Bytes>,
 {
     let response = http::Response::builder()
-        .status(status)
+        .status(http::StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        .header("Hysteria-Padding", random_hysteria_padding()?)
         .body(())
-        .with_context(|| format!("build Hysteria2 HTTP/3 {status} response"))?;
+        .context("build Hysteria2 masquerade response")?;
     stream
         .send_response(response)
         .await
-        .with_context(|| format!("send Hysteria2 HTTP/3 {status} response"))?;
+        .context("send Hysteria2 masquerade response")?;
+    stream
+        .send_data(Bytes::from_static(
+            b"<!doctype html><html><body>OK</body></html>",
+        ))
+        .await
+        .context("send Hysteria2 masquerade body")?;
     stream
         .finish()
         .await
-        .with_context(|| format!("finish Hysteria2 HTTP/3 {status} response"))?;
+        .context("finish Hysteria2 masquerade stream")?;
     Ok(())
+}
+
+fn random_hysteria_padding() -> Result<String> {
+    Ok(String::from_utf8_lossy(&random_hysteria_padding_bytes()?).into_owned())
+}
+
+fn random_hysteria_padding_bytes() -> Result<Vec<u8>> {
+    let mut len = [0u8; 1];
+    getrandom::fill(&mut len).context("generate Hysteria2 padding length")?;
+    let len = 16 + usize::from(len[0] % 48);
+    let mut padding = vec![0u8; len];
+    getrandom::fill(&mut padding).context("generate Hysteria2 padding")?;
+    for byte in &mut padding {
+        *byte = b'A' + (*byte % 26);
+    }
+    Ok(padding)
 }
 
 async fn handle_hy2_tcp_stream(
@@ -1215,7 +1260,7 @@ async fn authenticate_client(
         .uri(AUTH_URI)
         .header("Hysteria-Auth", config.password.trim())
         .header("Hysteria-CC-RX", client_cc_rx(config))
-        .header("Hysteria-Padding", "")
+        .header("Hysteria-Padding", random_hysteria_padding()?)
         .body(())
         .context("build Hysteria2 auth request")?;
     let mut stream = sender
@@ -1403,15 +1448,6 @@ fn hy2_transport_config(congestion_control: &str) -> Result<quinn::TransportConf
     Ok(transport_config)
 }
 
-fn auth_passwords(password: &str, users: &[String]) -> Vec<String> {
-    std::iter::once(password)
-        .chain(users.iter().map(String::as_str))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 fn bind_client_udp_socket(bind_ipv6: bool) -> Result<std::net::UdpSocket> {
     if bind_ipv6 {
         socket_protect::bind_udp_std(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
@@ -1467,16 +1503,10 @@ async fn resolve_host_addr(host: &str, port: u16) -> Result<SocketAddr> {
         .with_context(|| format!("{host}:{port} resolved to no addresses"))
 }
 
-async fn bind_udp_socket_for_target(target: SocketAddr) -> Result<UdpSocket> {
-    if target.is_ipv6() {
-        UdpSocket::bind("[::]:0")
-            .await
-            .context("bind IPv6 Hysteria2 UDP relay socket")
-    } else {
-        UdpSocket::bind("0.0.0.0:0")
-            .await
-            .context("bind IPv4 Hysteria2 UDP relay socket")
-    }
+async fn bind_udp_socket_for_target(_target: SocketAddr) -> Result<UdpSocket> {
+    socket_protect::bind_dual_stack_udp()
+        .await
+        .context("bind Hysteria2 UDP relay socket")
 }
 
 async fn copy_stream<R, W>(
@@ -1581,7 +1611,9 @@ where
     response.push(status);
     encode_varint(message.len() as u64, &mut response)?;
     response.extend_from_slice(message.as_bytes());
-    encode_varint(0, &mut response)?;
+    let padding = random_hysteria_padding_bytes()?;
+    encode_varint(padding.len() as u64, &mut response)?;
+    response.extend_from_slice(&padding);
     writer
         .write_all(&response)
         .await
@@ -1904,5 +1936,14 @@ mod tests {
         assert_ne!(encrypted, payload);
         salamander_xor(b"secret", &salt, &encrypted, &mut decrypted);
         assert_eq!(decrypted, payload);
+    }
+
+    #[test]
+    fn failed_auth_is_not_http_401() {
+        assert_ne!(http::StatusCode::OK.as_u16(), 401);
+        assert_eq!(http::StatusCode::from_u16(233).unwrap().as_u16(), 233);
+        let padding = random_hysteria_padding_bytes().unwrap();
+        assert!(padding.len() >= 16);
+        assert!(padding.iter().all(|byte| byte.is_ascii_alphabetic()));
     }
 }

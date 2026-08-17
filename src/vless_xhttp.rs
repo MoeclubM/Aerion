@@ -9,6 +9,8 @@ use tokio::io::{
 use tokio::sync::mpsc;
 
 const X_PADDING_LEN: usize = 100;
+const MAX_XHTTP_CHUNK: usize = 16 * 1024 * 1024;
+const MAX_XHTTP_LINE: usize = 4096;
 
 #[derive(Clone, Copy)]
 enum XhttpRole {
@@ -266,6 +268,10 @@ where
     let size_text = line.split_once(';').map(|(size, _)| size).unwrap_or(&line);
     let size = usize::from_str_radix(size_text.trim(), 16)
         .with_context(|| format!("invalid XHTTP chunk size {line}"))?;
+    ensure!(
+        size <= MAX_XHTTP_CHUNK,
+        "XHTTP chunk size {size} exceeds {MAX_XHTTP_CHUNK}"
+    );
     if size == 0 {
         loop {
             let Some(trailer) = read_crlf_line(reader).await? else {
@@ -298,7 +304,13 @@ where
     let mut byte = [0u8; 1];
     loop {
         match reader.read_exact(&mut byte).await {
-            Ok(_) => line.push(byte[0]),
+            Ok(_) => {
+                line.push(byte[0]);
+                ensure!(
+                    line.len() <= MAX_XHTTP_LINE,
+                    "XHTTP chunk line exceeds {MAX_XHTTP_LINE} bytes"
+                );
+            }
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof && line.is_empty() => {
                 return Ok(None);
             }

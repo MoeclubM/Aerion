@@ -7,6 +7,8 @@ const COMMAND_PADDING_CONTINUE: u8 = 0;
 const COMMAND_PADDING_END: u8 = 1;
 const COMMAND_PADDING_DIRECT: u8 = 2;
 const VISION_HEADER_LEN: usize = 5;
+const TLS_CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
+const TLS_VERSION_12: u16 = 0x0303;
 
 enum ReadState {
     Initial,
@@ -229,19 +231,102 @@ where
 }
 
 pub fn encode_end_frame(user: &[u8; 16], payload: &[u8]) -> Result<Vec<u8>> {
+    encode_vision_frame(user, true, COMMAND_PADDING_END, payload)
+}
+
+pub fn encode_continue_frame(user: &[u8; 16], write_uuid: bool, payload: &[u8]) -> Result<Vec<u8>> {
+    encode_vision_frame(user, write_uuid, COMMAND_PADDING_CONTINUE, payload)
+}
+
+pub fn encode_direct_frame(user: &[u8; 16], write_uuid: bool, payload: &[u8]) -> Result<Vec<u8>> {
+    encode_vision_frame(user, write_uuid, COMMAND_PADDING_DIRECT, payload)
+}
+
+pub struct VisionEncoder {
+    user: [u8; 16],
+    uuid_written: bool,
+    direct: bool,
+}
+
+impl VisionEncoder {
+    pub fn new(user: [u8; 16]) -> Self {
+        Self {
+            user,
+            uuid_written: false,
+            direct: false,
+        }
+    }
+
+    pub fn encode(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        if self.direct {
+            return Ok(payload.to_vec());
+        }
+        let write_uuid = !self.uuid_written;
+        self.uuid_written = true;
+        if looks_like_tls13_application_data(payload) {
+            self.direct = true;
+            encode_direct_frame(&self.user, write_uuid, payload)
+        } else {
+            encode_continue_frame(&self.user, write_uuid, payload)
+        }
+    }
+}
+
+fn looks_like_tls13_application_data(payload: &[u8]) -> bool {
+    payload.len() >= 5
+        && payload[0] == TLS_CONTENT_TYPE_APPLICATION_DATA
+        && u16::from_be_bytes([payload[1], payload[2]]) == TLS_VERSION_12
+}
+
+fn encode_vision_frame(
+    user: &[u8; 16],
+    write_uuid: bool,
+    command: u8,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
     if payload.len() > u16::MAX as usize {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             "VLESS Vision payload is too large",
         ));
     }
-    let mut encoded = Vec::with_capacity(user.len() + VISION_HEADER_LEN + payload.len());
-    encoded.extend_from_slice(user);
-    encoded.push(COMMAND_PADDING_END);
+    let padding_len = vision_padding_len(payload.len())?;
+    let mut encoded = Vec::with_capacity(
+        usize::from(write_uuid) * user.len() + VISION_HEADER_LEN + payload.len() + padding_len,
+    );
+    if write_uuid {
+        encoded.extend_from_slice(user);
+    }
+    encoded.push(command);
     encoded.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    encoded.extend_from_slice(&0u16.to_be_bytes());
+    encoded.extend_from_slice(&(padding_len as u16).to_be_bytes());
     encoded.extend_from_slice(payload);
+    encoded.resize(encoded.len() + padding_len, 0);
+    let start = encoded.len() - padding_len;
+    getrandom::fill(&mut encoded[start..]).map_err(|error| {
+        Error::new(
+            ErrorKind::Other,
+            format!("generate VLESS Vision padding: {error}"),
+        )
+    })?;
     Ok(encoded)
+}
+
+fn vision_padding_len(content_len: usize) -> Result<usize> {
+    let mut bytes = [0u8; 2];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        Error::new(
+            ErrorKind::Other,
+            format!("generate VLESS Vision padding length: {error}"),
+        )
+    })?;
+    let random = u16::from_ne_bytes(bytes) as usize;
+    let padding = if content_len < 900 {
+        (900 + random % 500).saturating_sub(content_len)
+    } else {
+        (random % 256).max(1)
+    };
+    Ok(padding.min(u16::MAX as usize))
 }
 
 #[cfg(test)]
@@ -276,5 +361,20 @@ mod tests {
             .expect("plain body should pass through");
 
         assert_eq!(decoded, b"plain");
+    }
+
+    #[tokio::test]
+    async fn continue_frames_use_nonzero_padding() {
+        let user = [7u8; 16];
+        let encoded = encode_continue_frame(&user, true, b"hello").expect("encode continue");
+        let padding_len = u16::from_be_bytes([encoded[19], encoded[20]]);
+        assert!(padding_len > 0);
+        let mut reader = VisionReader::new(encoded.as_slice(), user);
+        let mut decoded = Vec::new();
+        reader
+            .read_to_end(&mut decoded)
+            .await
+            .expect("decode continue");
+        assert_eq!(decoded, b"hello");
     }
 }

@@ -1,12 +1,17 @@
+use super::pattern::{MieruNoncePattern, MieruTrafficPattern, apply_nonce_pattern};
+use super::{KEY_ITER, KEY_LEN, KEY_REFRESH_SECS, NONCE_LEN};
 use anyhow::{Context, Result, ensure};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::pattern::{MieruNoncePattern, MieruTrafficPattern, apply_nonce_pattern};
-use super::{KEY_ITER, KEY_LEN, KEY_REFRESH_SECS, NONCE_LEN};
+const PBKDF2_CACHE_MAX: usize = 1024;
+static PBKDF2_CACHE: Mutex<Option<HashMap<([u8; KEY_LEN], [u8; KEY_LEN]), [u8; KEY_LEN]>>> =
+    Mutex::new(None);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -135,12 +140,7 @@ impl MieruCipher {
             .implicit_nonce
             .as_mut()
             .expect("implicit nonce must exist before increment");
-        for byte in nonce.iter_mut().rev() {
-            *byte = byte.wrapping_add(1);
-            if *byte != 0 {
-                break;
-            }
-        }
+        *nonce = increment_nonce(nonce).expect("implicit nonce length is valid");
     }
 
     fn random_nonce(&mut self) -> Result<[u8; NONCE_LEN]> {
@@ -173,12 +173,47 @@ pub(super) fn mieru_keys_for_password(
 ) -> Result<Vec<[u8; KEY_LEN]>> {
     let mut keys = Vec::with_capacity(3);
     for salt in salt_from_time(SystemTime::now())? {
-        let key = pbkdf2_hmac_sha256(hashed_password, &salt, KEY_ITER, KEY_LEN)?;
-        let mut key_array = [0u8; KEY_LEN];
-        key_array.copy_from_slice(&key);
-        keys.push(key_array);
+        keys.push(pbkdf2_cached(hashed_password, &salt)?);
     }
     Ok(keys)
+}
+
+pub(super) fn increment_nonce(nonce: &[u8]) -> Result<[u8; NONCE_LEN]> {
+    ensure!(nonce.len() == NONCE_LEN, "invalid Mieru nonce length");
+    let mut next = [0u8; NONCE_LEN];
+    next.copy_from_slice(nonce);
+    for byte in next.iter_mut().rev() {
+        *byte = byte.wrapping_add(1);
+        if *byte != 0 {
+            break;
+        }
+    }
+    Ok(next)
+}
+
+fn pbkdf2_cached(password: &[u8; KEY_LEN], salt: &[u8; KEY_LEN]) -> Result<[u8; KEY_LEN]> {
+    {
+        let cache = PBKDF2_CACHE
+            .lock()
+            .expect("Mieru PBKDF2 cache lock poisoned");
+        if let Some(cache) = cache.as_ref()
+            && let Some(key) = cache.get(&(*password, *salt))
+        {
+            return Ok(*key);
+        }
+    }
+    let derived = pbkdf2_hmac_sha256(password, salt, KEY_ITER, KEY_LEN)?;
+    let mut key = [0u8; KEY_LEN];
+    key.copy_from_slice(&derived);
+    let mut cache = PBKDF2_CACHE
+        .lock()
+        .expect("Mieru PBKDF2 cache lock poisoned");
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if cache.len() >= PBKDF2_CACHE_MAX {
+        cache.clear();
+    }
+    cache.insert((*password, *salt), key);
+    Ok(key)
 }
 
 fn salt_from_time(time: SystemTime) -> Result<[[u8; KEY_LEN]; 3]> {
@@ -320,6 +355,17 @@ mod tests {
         add_user_hint_to_nonce("alice", &mut nonce);
         assert!(check_user_from_hint(b"alice", &nonce));
         assert!(!check_user_from_hint(b"bob", &nonce));
+        Ok(())
+    }
+
+    #[test]
+    fn increment_nonce_adds_one_from_the_end() -> Result<()> {
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce[NONCE_LEN - 1] = 0xff;
+        nonce[NONCE_LEN - 2] = 0x01;
+        let next = increment_nonce(&nonce)?;
+        assert_eq!(next[NONCE_LEN - 1], 0);
+        assert_eq!(next[NONCE_LEN - 2], 0x02);
         Ok(())
     }
 }

@@ -1,4 +1,5 @@
 use crate::client_hello::{BuiltClientHello, ClientHelloParams, build_client_hello};
+use crate::protocol::constant_time_eq;
 use crate::utls::UtlsFingerprint;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -11,7 +12,7 @@ use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Sha256, Sha512};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -26,6 +27,25 @@ const REALITY_AUTH_PLAIN_LEN: usize = 16;
 
 type HmacSha512 = Hmac<Sha512>;
 
+const REALITY_MAX_CLIENT_VERSION: [u8; 4] = [0, 0, 0, 1];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RealityFallbackLimit {
+    pub after_bytes: u64,
+    pub bytes_per_sec: u64,
+    pub burst_bytes: u64,
+}
+
+impl Default for RealityFallbackLimit {
+    fn default() -> Self {
+        Self {
+            after_bytes: 0,
+            bytes_per_sec: 64 * 1024,
+            burst_bytes: 256 * 1024,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RealityServerConfig {
     pub server_name: String,
@@ -34,6 +54,9 @@ pub struct RealityServerConfig {
     pub private_key: [u8; 32],
     pub short_ids: Vec<[u8; 8]>,
     pub alpn_protocols: Vec<Vec<u8>>,
+    pub max_time_diff_secs: u64,
+    pub max_client_version: Option<[u8; 4]>,
+    pub fallback_limit: RealityFallbackLimit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +120,9 @@ impl RealityServerConfig {
             private_key: parse_reality_key(private_key)?,
             short_ids: parse_short_ids(short_ids)?,
             alpn_protocols,
+            max_time_diff_secs: 0,
+            max_client_version: Some(REALITY_MAX_CLIENT_VERSION),
+            fallback_limit: RealityFallbackLimit::default(),
         })
     }
 }
@@ -312,10 +338,26 @@ pub fn authenticate_client_hello(
     let mut short_id = [0u8; 8];
     short_id.copy_from_slice(&plain[8..16]);
     ensure!(
-        config.short_ids.contains(&short_id),
+        short_id_allowed(&config.short_ids, &short_id),
         "REALITY ClientHello short_id {} does not match configured short_id",
         hex::encode(short_id)
     );
+    if let Some(max_version) = config.max_client_version {
+        ensure!(
+            u32::from_be_bytes(client_version) <= u32::from_be_bytes(max_version),
+            "REALITY client version {:?} is newer than {:?}",
+            client_version,
+            max_version
+        );
+    }
+    if config.max_time_diff_secs > 0 {
+        let now = unix_time_u32()?;
+        let delta = now.abs_diff(client_time);
+        ensure!(
+            u64::from(delta) <= config.max_time_diff_secs,
+            "REALITY client time {client_time} is outside maxTimeDiff window {delta}s"
+        );
+    }
 
     Ok(AuthenticatedClientHello {
         server_name: parsed.server_name,
@@ -337,10 +379,63 @@ pub async fn proxy_fallback(stream: TcpStream, config: &RealityServerConfig) -> 
         })?;
     let (mut client_reader, mut client_writer) = stream.into_split();
     let (mut fallback_reader, mut fallback_writer) = fallback.into_split();
-    let client_to_fallback = tokio::io::copy(&mut client_reader, &mut fallback_writer);
-    let fallback_to_client = tokio::io::copy(&mut fallback_reader, &mut client_writer);
-    tokio::try_join!(client_to_fallback, fallback_to_client)?;
+    tokio::try_join!(
+        copy_limited(
+            &mut client_reader,
+            &mut fallback_writer,
+            &config.fallback_limit
+        ),
+        copy_limited(
+            &mut fallback_reader,
+            &mut client_writer,
+            &config.fallback_limit
+        ),
+    )?;
     Ok(())
+}
+
+async fn copy_limited<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    limit: &RealityFallbackLimit,
+) -> Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut copied = 0u64;
+    let mut buffer = vec![0u8; 16 * 1024];
+    let started = Instant::now();
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            writer.shutdown().await.ok();
+            return Ok(copied);
+        }
+        if limit.bytes_per_sec > 0 && copied >= limit.after_bytes {
+            let elapsed = started.elapsed().as_secs_f64();
+            let allowed = limit.after_bytes
+                + (elapsed * limit.bytes_per_sec as f64) as u64
+                + limit.burst_bytes;
+            let projected = copied + read as u64;
+            if projected > allowed {
+                let extra = projected - allowed;
+                let sleep = Duration::from_secs_f64(extra as f64 / limit.bytes_per_sec as f64);
+                tokio::time::sleep(sleep).await;
+            }
+        }
+        writer.write_all(&buffer[..read]).await?;
+        copied += read as u64;
+    }
+}
+
+fn short_id_allowed(ids: &[[u8; 8]], candidate: &[u8; 8]) -> bool {
+    let mut allowed = false;
+    for id in ids {
+        allowed |= constant_time_eq(id, candidate);
+    }
+    allowed
 }
 
 enum PrefixParse {
@@ -718,11 +813,8 @@ fn parse_reality_key(value: &str) -> Result<[u8; 32]> {
 }
 
 fn parse_short_ids(values: &[String]) -> Result<Vec<[u8; 8]>> {
+    ensure!(!values.is_empty(), "REALITY shortIds must not be empty");
     let mut ids = Vec::new();
-    if values.is_empty() {
-        ids.push([0u8; 8]);
-        return Ok(ids);
-    }
     for value in values {
         ids.push(parse_short_id(value)?);
     }
@@ -795,6 +887,9 @@ mod tests {
             private_key: server_private.to_bytes(),
             short_ids: vec![[0xa1, 0xb2, 0, 0, 0, 0, 0, 0]],
             alpn_protocols: Vec::new(),
+            max_time_diff_secs: 0,
+            max_client_version: None,
+            fallback_limit: RealityFallbackLimit::default(),
         };
         let handshake = build_test_client_hello(
             &config,
@@ -830,6 +925,9 @@ mod tests {
             private_key: server_private.to_bytes(),
             short_ids: vec![[0xa1, 0xb2, 0, 0, 0, 0, 0, 0]],
             alpn_protocols: Vec::new(),
+            max_time_diff_secs: 0,
+            max_client_version: None,
+            fallback_limit: RealityFallbackLimit::default(),
         };
         let client = RealityClientConfig {
             public_key: server_public,
@@ -848,6 +946,46 @@ mod tests {
         assert_eq!(authenticated.client_time, 1_700_000_001);
         assert_eq!(authenticated.auth_key, hello.auth_key);
         assert!(hello.client_hello.ja3.starts_with("771,4865-4866-4867"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_empty_short_ids() {
+        let error = parse_short_ids(&[]).unwrap_err();
+        assert!(error.to_string().contains("shortIds must not be empty"));
+    }
+
+    #[test]
+    fn rejects_client_hello_outside_time_window() -> Result<()> {
+        let mut server_private_bytes = [0u8; 32];
+        getrandom::fill(&mut server_private_bytes)?;
+        let server_private = StaticSecret::from(server_private_bytes);
+        let server_public = PublicKey::from(&server_private).to_bytes();
+        let server = RealityServerConfig {
+            server_name: "reality.example.com".to_string(),
+            server_port: 443,
+            server_names: vec!["reality.example.com".to_string()],
+            private_key: server_private.to_bytes(),
+            short_ids: vec![[0xa1, 0xb2, 0, 0, 0, 0, 0, 0]],
+            alpn_protocols: Vec::new(),
+            max_time_diff_secs: 60,
+            max_client_version: Some([0, 0, 0, 1]),
+            fallback_limit: RealityFallbackLimit::default(),
+        };
+        let client = RealityClientConfig {
+            public_key: server_public,
+            short_id: [0xa1, 0xb2, 0, 0, 0, 0, 0, 0],
+        };
+        let hello = build_reality_client_hello_with_time(
+            &client,
+            "reality.example.com",
+            UtlsFingerprint::Chrome,
+            None,
+            [0, 0, 0, 1],
+            1_700_000_001,
+        )?;
+        let error = authenticate_client_hello(&hello.raw, &server).unwrap_err();
+        assert!(error.to_string().contains("maxTimeDiff"));
         Ok(())
     }
 

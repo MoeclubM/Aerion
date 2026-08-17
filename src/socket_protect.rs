@@ -1,6 +1,7 @@
 use crate::protocol::ProxyTarget;
 use anyhow::{Context, Result, bail};
-use std::net::SocketAddr;
+use socket2::{Domain, Protocol, Socket, Type};
+use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinSet;
@@ -118,6 +119,21 @@ async fn connect_tcp_addr_inner(addr: SocketAddr) -> Result<TcpStream> {
 pub async fn bind_udp(addr: SocketAddr) -> Result<UdpSocket> {
     let socket = bind_udp_std(addr)?;
     UdpSocket::from_std(socket).context("create tokio UDP socket from protected socket")
+}
+
+pub async fn bind_dual_stack_udp() -> Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))
+        .context("create dual-stack UDP socket")?;
+    socket.set_only_v6(false).context("enable dual-stack UDP")?;
+    socket
+        .set_nonblocking(true)
+        .context("set dual-stack UDP socket nonblocking")?;
+    socket
+        .bind(&std::net::SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())
+        .context("bind dual-stack UDP socket")?;
+    #[cfg(unix)]
+    protect_socket_fd(std::os::fd::AsRawFd::as_raw_fd(&socket))?;
+    UdpSocket::from_std(socket.into()).context("create tokio dual-stack UDP socket")
 }
 
 pub fn bind_udp_std(addr: SocketAddr) -> Result<std::net::UdpSocket> {

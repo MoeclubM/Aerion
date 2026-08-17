@@ -10,6 +10,7 @@ use tokio::io::{
 
 const PIPE_CAPACITY: usize = 64 * 1024;
 const COPY_BUFFER_LEN: usize = 16 * 1024;
+const MAX_GRPC_FRAME: usize = 16 * 1024 * 1024;
 
 pub struct H2TransportStream {
     reader: DuplexStream,
@@ -212,8 +213,8 @@ fn ensure_http2_request(
 ) -> Result<()> {
     let path = parts.uri.path();
     ensure!(
-        transport.path == "/" || path.starts_with(&transport.path),
-        "unexpected VLESS HTTP/2 path {path}, expected prefix {}",
+        path == transport.path,
+        "unexpected VLESS HTTP/2 path {path}, expected {}",
         transport.path
     );
     ensure_request_host(parts, transport, "VLESS HTTP/2")
@@ -504,6 +505,10 @@ where
     }
     ensure!(header[0] == 0, "compressed gRPC messages are not supported");
     let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    ensure!(
+        length <= MAX_GRPC_FRAME,
+        "gRPC frame length {length} exceeds {MAX_GRPC_FRAME}"
+    );
     let mut message = vec![0u8; length];
     reader
         .read_exact(&mut message)

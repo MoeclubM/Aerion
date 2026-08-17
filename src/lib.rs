@@ -59,8 +59,8 @@ pub use http_connect::{
 };
 pub use hysteria2::{
     Hysteria2ClientConfig, Hysteria2ServerConfig, run_hysteria2_client,
-    run_hysteria2_client_listener, run_hysteria2_server, run_hysteria2_server_socket_with_core,
-    run_hysteria2_server_with_core,
+    run_hysteria2_client_listener, run_hysteria2_client_listener_with_core, run_hysteria2_server,
+    run_hysteria2_server_socket_with_core, run_hysteria2_server_with_core,
 };
 pub use ios_packet_flow::{
     IOS_PACKET_FLOW_IPV4_PROTOCOL, IOS_PACKET_FLOW_IPV6_PROTOCOL, IosPacketFlowPacket,
@@ -72,16 +72,17 @@ pub use log_bridge::{LogBridge, LogBridgeLayer, LogEntry};
 pub use mieru::{
     MieruClientConfig, MieruNoncePattern, MieruNonceType, MieruPaddingPattern, MieruServerConfig,
     MieruTcpFragment, MieruTrafficPattern, MieruTransport, MieruUser, parse_mieru_user,
-    run_mieru_client, run_mieru_client_listener, run_mieru_packet_server_socket_with_core,
-    run_mieru_server, run_mieru_server_listener_with_core, run_mieru_server_with_core,
+    run_mieru_client, run_mieru_client_listener, run_mieru_client_listener_with_core,
+    run_mieru_packet_server_socket_with_core, run_mieru_server,
+    run_mieru_server_listener_with_core, run_mieru_server_with_core,
 };
 pub use naive::{
     NaiveClientConfig, NaiveServerConfig, run_naive_client, run_naive_client_listener,
-    run_naive_server, run_naive_server_with_core,
+    run_naive_client_listener_with_core, run_naive_server, run_naive_server_with_core,
 };
 pub use reality::{
-    BuiltRealityClientHello, RealityClientConfig, RealityServerConfig, build_reality_client_hello,
-    build_reality_client_hello_with_alpn,
+    BuiltRealityClientHello, RealityClientConfig, RealityFallbackLimit, RealityServerConfig,
+    build_reality_client_hello, build_reality_client_hello_with_alpn,
 };
 pub use router::{
     RouteClientConfig, RouteProxyConfig, RouteProxyState, run_route_client,
@@ -98,7 +99,8 @@ pub use server::{
 };
 pub use shadowsocks::{
     ShadowsocksClientConfig, ShadowsocksServerConfig, run_shadowsocks_client,
-    run_shadowsocks_client_listener, run_shadowsocks_server, run_shadowsocks_server_with_core,
+    run_shadowsocks_client_listener, run_shadowsocks_client_listener_with_core,
+    run_shadowsocks_server, run_shadowsocks_server_with_core,
 };
 pub use socks::{SocksProxyClientConfig, run_socks_proxy_client, run_socks_proxy_client_listener};
 pub use tls::TlsEchServerKeys;
@@ -109,7 +111,8 @@ pub use trojan::{
 };
 pub use tuic::{
     TuicClientConfig, TuicServerConfig, TuicUdpRelayMode, TuicUser, parse_tuic_user,
-    run_tuic_client, run_tuic_client_listener, run_tuic_server, run_tuic_server_with_core,
+    run_tuic_client, run_tuic_client_listener, run_tuic_client_listener_with_core, run_tuic_server,
+    run_tuic_server_with_core,
 };
 pub use tun::{
     DEFAULT_TUN_MTU, TunCancellationToken, TunConfig, TunDnsStrategy, TunRuntime, TunVerbosity,
@@ -122,5 +125,6 @@ pub use vless::{
 };
 pub use vmess::{
     VmessClientConfig, VmessServerConfig, ensure_vmess_packet_encoding, run_vmess_client,
-    run_vmess_client_listener, run_vmess_server, run_vmess_server_with_core,
+    run_vmess_client_listener, run_vmess_client_listener_with_core, run_vmess_server,
+    run_vmess_server_with_core,
 };

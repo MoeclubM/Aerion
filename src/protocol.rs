@@ -37,6 +37,17 @@ pub fn password_hash(password: &str) -> [u8; 32] {
     Sha256::digest(password.as_bytes()).into()
 }
 
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 pub struct PaddedFrameWriter<W> {
     inner: W,
     padding: PaddingScheme,
@@ -74,10 +85,7 @@ where
                 .await
                 .context("write authentication padding")?;
         }
-        self.inner
-            .flush()
-            .await
-            .context("flush authentication preface")
+        Ok(())
     }
 
     pub async fn write_client_settings(&mut self) -> Result<()> {
@@ -85,7 +93,8 @@ where
             "v=2\nclient={CLIENT_NAME}\npadding-md5={}",
             self.padding.md5()
         );
-        self.write_frame(CMD_SETTINGS, 0, settings.as_bytes()).await
+        self.write_frame_with_flush(CMD_SETTINGS, 0, settings.as_bytes(), false)
+            .await
     }
 
     pub async fn write_frame(&mut self, cmd: u8, stream_id: u32, payload: &[u8]) -> Result<()> {
@@ -122,8 +131,6 @@ where
 
     pub fn update_padding_scheme(&mut self, raw: &str) -> Result<()> {
         self.padding = PaddingScheme::from_text(raw).context("parse padding scheme update")?;
-        self.packet_counter = 0;
-        self.send_padding = true;
         Ok(())
     }
 
@@ -234,13 +241,13 @@ where
             .await
             .context("read authentication padding")?;
     }
+    let mut found = None;
     for password in expected_passwords {
-        let password = password.trim();
-        if hash == password_hash(password) {
-            return Ok(password.to_string());
+        if constant_time_eq(&hash, &password_hash(password)) {
+            found = Some((*password).to_string());
         }
     }
-    bail!("authentication failed")
+    found.ok_or_else(|| anyhow::anyhow!("authentication failed"))
 }
 
 pub async fn read_frame<R>(reader: &mut R) -> Result<Frame>

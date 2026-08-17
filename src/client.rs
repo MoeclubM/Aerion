@@ -13,11 +13,12 @@ use crate::uot;
 use crate::utls::UtlsFingerprint;
 use anyhow::{Context, Result, bail, ensure};
 use rustls::pki_types::ServerName;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split};
 use tokio::net::{TcpListener, TcpStream, UdpSocket, tcp::OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc};
@@ -63,15 +64,14 @@ pub async fn run_client_listener(
         "AnyTLS heartbeat interval must be positive"
     );
     let padding = PaddingScheme::from_lines(config.padding_scheme.clone())?;
-    let tls_config =
-        tls::client_config_with_fingerprint_and_custom_root_material_early_data_options(
-            config.insecure,
-            config.client_fingerprint,
-            &config.ca_cert_paths,
-            &config.ca_certificates,
-            config.disable_system_roots,
-            &config.pinned_cert_sha256,
-        )?;
+    let tls_config = tls::client_config_with_fingerprint_and_custom_root_material_options(
+        config.insecure,
+        config.client_fingerprint,
+        &config.ca_cert_paths,
+        &config.ca_certificates,
+        config.disable_system_roots,
+        &config.pinned_cert_sha256,
+    )?;
     let shared = Arc::new(SharedClientSession::new(config, tls_config, padding));
     tracing::info!("client listening on socks5://{}", listener.local_addr()?);
     loop {
@@ -93,11 +93,14 @@ pub async fn run_client_listener(
     }
 }
 
+const MAX_IDLE_SESSIONS: usize = 16;
+const IDLE_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+
 struct SharedClientSession {
     config: ClientConfig,
     tls_config: Arc<rustls::ClientConfig>,
-    session: Mutex<Option<ClientSession>>,
     padding: Arc<Mutex<PaddingScheme>>,
+    idle: Mutex<VecDeque<(ClientSession, Instant)>>,
 }
 
 impl SharedClientSession {
@@ -109,38 +112,41 @@ impl SharedClientSession {
         Self {
             config,
             tls_config,
-            session: Mutex::new(None),
             padding: Arc::new(Mutex::new(padding)),
+            idle: Mutex::new(VecDeque::new()),
         }
     }
 
-    async fn get_or_connect(&self) -> Result<ClientSession> {
-        loop {
-            {
-                let guard = self.session.lock().await;
-                if let Some(session) = guard.as_ref() {
-                    if session.is_alive().await {
-                        return Ok(session.clone());
-                    }
-                }
-            }
-            let mut guard = self.session.lock().await;
-            if let Some(session) = guard.as_ref() {
+    async fn acquire(&self) -> Result<ClientSession> {
+        {
+            let mut idle = self.idle.lock().await;
+            let now = Instant::now();
+            idle.retain(|(_, since)| now.duration_since(*since) < IDLE_SESSION_TIMEOUT);
+            while let Some((session, _)) = idle.pop_front() {
                 if session.is_alive().await {
-                    return Ok(session.clone());
+                    return Ok(session);
                 }
-                guard.take();
             }
-            let padding = self.padding.lock().await.clone();
-            let session = ClientSession::connect(
-                &self.config,
-                self.tls_config.clone(),
-                padding,
-                self.padding.clone(),
-            )
-            .await?;
-            guard.replace(session.clone());
-            return Ok(session);
+        }
+        let padding = self.padding.lock().await.clone();
+        ClientSession::connect(
+            &self.config,
+            self.tls_config.clone(),
+            padding,
+            self.padding.clone(),
+        )
+        .await
+    }
+
+    async fn release(&self, session: ClientSession) {
+        if !session.is_alive().await {
+            return;
+        }
+        let mut idle = self.idle.lock().await;
+        let now = Instant::now();
+        idle.retain(|(_, since)| now.duration_since(*since) < IDLE_SESSION_TIMEOUT);
+        if idle.len() < MAX_IDLE_SESSIONS {
+            idle.push_back((session, Instant::now()));
         }
     }
 }
@@ -151,6 +157,8 @@ struct ClientSession {
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>>,
     next_stream_id: Arc<AtomicU32>,
     closed: Arc<Mutex<Option<String>>>,
+    first_packet: Arc<AtomicBool>,
+    server_v2: Arc<AtomicBool>,
 }
 
 enum StreamEvent {
@@ -164,6 +172,7 @@ struct ClientStream {
     stream_id: u32,
     writer: Arc<Mutex<PaddedFrameWriter<WriteHalf<TlsStream<TcpStream>>>>>,
     events: mpsc::Receiver<StreamEvent>,
+    pending: Option<Vec<u8>>,
 }
 
 impl ClientSession {
@@ -187,7 +196,7 @@ impl ClientSession {
                     )
                 })?;
         let _ = tcp.set_nodelay(true);
-        let connector = TlsConnector::from(tls_config).early_data(true);
+        let connector = TlsConnector::from(tls_config);
         let server_name = ServerName::try_from(config.sni.clone())
             .with_context(|| format!("invalid SNI: {}", config.sni))?;
         let tls_stream = connector
@@ -204,6 +213,8 @@ impl ClientSession {
             streams: Arc::new(Mutex::new(HashMap::new())),
             next_stream_id: Arc::new(AtomicU32::new(1)),
             closed: Arc::new(Mutex::new(None)),
+            first_packet: Arc::new(AtomicBool::new(true)),
+            server_v2: Arc::new(AtomicBool::new(false)),
         };
         tokio::spawn(read_session_frames(
             reader,
@@ -211,6 +222,7 @@ impl ClientSession {
             session.streams.clone(),
             session.closed.clone(),
             shared_padding,
+            session.server_v2.clone(),
         ));
         tokio::spawn(run_heartbeat(
             session.writer.clone(),
@@ -237,14 +249,18 @@ impl ClientSession {
 
         let mut first_payload = encode_target(&target)?;
         first_payload.extend_from_slice(&initial_payload);
+        let first = self.first_packet.swap(false, Ordering::SeqCst);
         {
             let mut writer = self.writer.lock().await;
-            writer.write_frame(CMD_SYN, stream_id, &[]).await?;
+            writer
+                .write_frame_with_flush(CMD_SYN, stream_id, &[], !first)
+                .await?;
             writer
                 .write_payload_chunks(stream_id, &first_payload)
                 .await?;
         }
 
+        let mut pending_payload = None;
         loop {
             let event = events_rx
                 .recv()
@@ -256,6 +272,7 @@ impl ClientSession {
                         stream_id,
                         writer: self.writer.clone(),
                         events: events_rx,
+                        pending: pending_payload,
                     });
                 }
                 StreamEvent::SynAck(payload) => {
@@ -270,7 +287,18 @@ impl ClientSession {
                     self.streams.lock().await.remove(&stream_id);
                     bail!("stream closed before SYNACK");
                 }
-                StreamEvent::Payload(_) => {}
+                StreamEvent::Payload(payload) => {
+                    if self.server_v2.load(Ordering::SeqCst) {
+                        pending_payload = Some(payload);
+                        continue;
+                    }
+                    return Ok(ClientStream {
+                        stream_id,
+                        writer: self.writer.clone(),
+                        events: events_rx,
+                        pending: Some(payload),
+                    });
+                }
             }
         }
     }
@@ -278,6 +306,9 @@ impl ClientSession {
 
 impl ClientStream {
     async fn read_payload(&mut self) -> Result<Option<Vec<u8>>> {
+        if let Some(payload) = self.pending.take() {
+            return Ok(Some(payload));
+        }
         loop {
             let Some(event) = self.events.recv().await else {
                 return Ok(None);
@@ -304,7 +335,7 @@ async fn handle_socks_client(
 ) -> Result<()> {
     match socks::read_request(&mut local).await? {
         SocksRequest::Connect(target) => {
-            let session = match shared.get_or_connect().await {
+            let session = match shared.acquire().await {
                 Ok(session) => session,
                 Err(error) => {
                     let _ = socks::write_reply(&mut local, 0x05).await;
@@ -315,6 +346,7 @@ async fn handle_socks_client(
                 Ok(stream) => stream,
                 Err(error) => {
                     let _ = socks::write_reply(&mut local, 0x05).await;
+                    shared.release(session).await;
                     return Err(error);
                 }
             };
@@ -325,17 +357,22 @@ async fn handle_socks_client(
             };
             socks::write_reply(&mut local, 0x00).await?;
             tracing::info!("proxying {}", target_name(&target));
-            relay_tcp_counted(local, stream, core_session).await
+            let result = relay_tcp_counted(local, stream, core_session).await;
+            shared.release(session).await;
+            result
         }
         SocksRequest::UdpAssociate => {
-            let session = match shared.get_or_connect().await {
+            let session = match shared.acquire().await {
                 Ok(session) => session,
                 Err(error) => {
                     let _ = socks::write_reply(&mut local, 0x05).await;
                     return Err(error);
                 }
             };
-            handle_udp_associate_counted(local, session, config, core, peer).await
+            let result =
+                handle_udp_associate_counted(local, session.clone(), config, core, peer).await;
+            shared.release(session).await;
+            result
         }
     }
 }
@@ -504,11 +541,12 @@ async fn read_session_frames(
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>>,
     closed: Arc<Mutex<Option<String>>>,
     shared_padding: Arc<Mutex<PaddingScheme>>,
+    server_v2: Arc<AtomicBool>,
 ) {
     let result: Result<()> = async {
         loop {
             let frame = read_frame(&mut reader).await?;
-            handle_session_frame(frame, &writer, &streams, &shared_padding).await?;
+            handle_session_frame(frame, &writer, &streams, &shared_padding, &server_v2).await?;
         }
     }
     .await;
@@ -533,6 +571,7 @@ async fn handle_session_frame(
     writer: &Arc<Mutex<PaddedFrameWriter<WriteHalf<TlsStream<TcpStream>>>>>,
     streams: &Arc<Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>>,
     shared_padding: &Arc<Mutex<PaddingScheme>>,
+    server_v2: &Arc<AtomicBool>,
 ) -> Result<()> {
     match frame.cmd {
         CMD_PSH => {
@@ -568,7 +607,10 @@ async fn handle_session_frame(
             writer.lock().await.update_padding_scheme(raw)?;
             *shared_padding.lock().await = padding;
         }
-        CMD_WASTE | CMD_SETTINGS | CMD_SERVER_SETTINGS | CMD_HEART_RESPONSE => {}
+        CMD_SERVER_SETTINGS => {
+            server_v2.store(true, Ordering::SeqCst);
+        }
+        CMD_WASTE | CMD_SETTINGS | CMD_HEART_RESPONSE => {}
         _ => {}
     }
     Ok(())
@@ -591,6 +633,7 @@ async fn run_heartbeat(
     heartbeat_interval_secs: u64,
 ) {
     let mut ticker = interval(Duration::from_secs(heartbeat_interval_secs));
+    ticker.tick().await;
     loop {
         ticker.tick().await;
         if closed.lock().await.is_some() {

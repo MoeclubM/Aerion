@@ -16,14 +16,57 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::WriteHalf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 
-const VERSION: u8 = 0x01;
+const AUTH_ID_REPLAY_TTL: Duration = Duration::from_secs(120);
+const SESSION_HISTORY_TTL: Duration = Duration::from_secs(180);
+
+struct VmessReplayFilter {
+    auth_ids: std::sync::Mutex<HashMap<[u8; 16], Instant>>,
+    sessions: std::sync::Mutex<HashMap<([u8; 16], [u8; 16], [u8; 16]), Instant>>,
+}
+
+impl VmessReplayFilter {
+    fn new() -> Self {
+        Self {
+            auth_ids: std::sync::Mutex::new(HashMap::new()),
+            sessions: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn check_auth_id(&self, auth_id: [u8; 16]) -> Result<()> {
+        let now = Instant::now();
+        let mut guard = self
+            .auth_ids
+            .lock()
+            .expect("VMess auth id replay lock poisoned");
+        guard.retain(|_, seen| now.duration_since(*seen) <= AUTH_ID_REPLAY_TTL);
+        ensure!(
+            guard.insert(auth_id, now).is_none(),
+            "VMess AuthID replay detected"
+        );
+        Ok(())
+    }
+
+    fn check_session(&self, user: [u8; 16], body_key: [u8; 16], body_iv: [u8; 16]) -> Result<()> {
+        let now = Instant::now();
+        let mut guard = self
+            .sessions
+            .lock()
+            .expect("VMess session history lock poisoned");
+        guard.retain(|_, seen| now.duration_since(*seen) <= SESSION_HISTORY_TTL);
+        ensure!(
+            guard.insert((user, body_key, body_iv), now).is_none(),
+            "VMess session replay detected"
+        );
+        Ok(())
+    }
+}
 const CMD_TCP: u8 = 0x01;
 const CMD_UDP: u8 = 0x02;
 const CMD_MUX: u8 = 0x03;
@@ -148,6 +191,14 @@ pub async fn run_vmess_client_listener(
     listener: TcpListener,
     config: VmessClientConfig,
 ) -> Result<()> {
+    run_vmess_client_listener_with_core(listener, config, None).await
+}
+
+pub async fn run_vmess_client_listener_with_core(
+    listener: TcpListener,
+    config: VmessClientConfig,
+    core: Option<ProxyCore>,
+) -> Result<()> {
     tracing::info!(
         "VMess client listening on socks5://{}",
         listener.local_addr()?
@@ -155,8 +206,9 @@ pub async fn run_vmess_client_listener(
     loop {
         let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
         let config = config.clone();
+        let core = core.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_vmess_socks(stream, config).await {
+            if let Err(error) = handle_vmess_socks(stream, config, core, peer).await {
                 tracing::warn!("VMess SOCKS client {peer} failed: {error:?}");
             }
         });
@@ -188,6 +240,7 @@ pub async fn run_vmess_server_with_core(config: VmessServerConfig, core: ProxyCo
         None
     };
     let transport = config.transport.clone();
+    let replay = Arc::new(VmessReplayFilter::new());
     tracing::info!("VMess server listening on {}", listener.local_addr()?);
     loop {
         let (stream, peer) = listener.accept().await.context("accept VMess client")?;
@@ -195,11 +248,12 @@ pub async fn run_vmess_server_with_core(config: VmessServerConfig, core: ProxyCo
         let users = users.clone();
         let core = core.clone();
         let transport = transport.clone();
+        let replay = replay.clone();
         tokio::spawn(async move {
             let result = async {
                 let stream = accept_vmess_transport(stream, acceptor).await?;
                 let stream = vless_transport::apply_server_transport(stream, &transport).await?;
-                handle_vmess_client(stream, users, core, peer).await
+                handle_vmess_client(stream, users, core, peer, replay).await
             }
             .await;
             if let Err(error) = result {
@@ -209,7 +263,17 @@ pub async fn run_vmess_server_with_core(config: VmessServerConfig, core: ProxyCo
     }
 }
 
-async fn handle_vmess_socks(mut local: TcpStream, config: VmessClientConfig) -> Result<()> {
+async fn handle_vmess_socks(
+    mut local: TcpStream,
+    config: VmessClientConfig,
+    core: Option<ProxyCore>,
+    peer: SocketAddr,
+) -> Result<()> {
+    let _session = if let Some(core) = core.as_ref() {
+        Some(core.authenticate_from(&config.user_id, peer).await?)
+    } else {
+        None
+    };
     match socks::read_request(&mut local).await? {
         socks::SocksRequest::Connect(target) => {
             let mut server = connect_vmess_transport(&config).await?;
@@ -300,8 +364,10 @@ async fn handle_vmess_client(
     users: HashMap<[u8; 16], String>,
     core: ProxyCore,
     peer: SocketAddr,
+    replay: Arc<VmessReplayFilter>,
 ) -> Result<()> {
-    let (request, credential) = read_vmess_request(&mut stream, &users).await?;
+    let (request, credential) =
+        read_vmess_request(&mut stream, &users, Some(replay.as_ref())).await?;
     let session = core.authenticate_from(&credential, peer).await?;
     match request.command {
         CMD_TCP => {
@@ -662,6 +728,9 @@ async fn handle_vmess_xudp_associate(
         let peer = peer.clone();
         async move {
             let mut buffer = vec![0u8; u16::MAX as usize + 32];
+            let mut is_new = true;
+            let mut global_id = [0u8; 8];
+            getrandom::fill(&mut global_id).context("generate VMess XUDP GlobalID")?;
             loop {
                 let (read, next_peer) = udp
                     .recv_from(&mut buffer)
@@ -669,7 +738,9 @@ async fn handle_vmess_xudp_associate(
                     .context("receive SOCKS UDP packet")?;
                 *peer.lock().await = Some(next_peer);
                 let (target, payload) = uot::parse_socks_udp_packet(&buffer[..read])?;
-                let packet = vless_xudp::encode_client_packet(&target, payload, true)?;
+                let packet =
+                    vless_xudp::encode_client_packet(&target, payload, is_new, &global_id)?;
+                is_new = false;
                 writer
                     .write_packet_plain(&packet)
                     .await
@@ -993,7 +1064,9 @@ where
     header.push(security.raw_byte());
     header.push(0);
     header.push(command);
-    write_vmess_address_sync(&mut header, target)?;
+    if command != CMD_MUX {
+        write_vmess_address_sync(&mut header, target)?;
+    }
     let checksum = fnv1a32(&header).to_be_bytes();
     header.extend_from_slice(&checksum);
 
@@ -1050,6 +1123,7 @@ where
 async fn read_vmess_request<R>(
     reader: &mut R,
     users: &HashMap<[u8; 16], String>,
+    replay: Option<&VmessReplayFilter>,
 ) -> Result<(VmessRequest, String)>
 where
     R: AsyncRead + Unpin,
@@ -1066,8 +1140,15 @@ where
             .map(|timestamp| (timestamp - now).abs() <= 120)
             .unwrap_or(false)
         {
+            if let Some(replay) = replay {
+                replay.check_auth_id(auth_id)?;
+            }
             let header = open_vmess_aead_header(reader, &cmd_key, &auth_id).await?;
-            return Ok((parse_vmess_header(&header)?, credential.clone()));
+            let request = parse_vmess_header(&header)?;
+            if let Some(replay) = replay {
+                replay.check_session(*user, request.request_body_key, request.request_body_iv)?;
+            }
+            return Ok((request, credential.clone()));
         }
     }
     bail!("VMess authentication failed")
@@ -1174,7 +1255,15 @@ fn parse_vmess_header(header: &[u8]) -> Result<VmessRequest> {
         header[36]
     );
     let command = header[37];
-    let (target, target_len) = read_vmess_address_sync(&header[38..])?;
+    ensure!(
+        !(raw_security == SecurityType::Zero && (command == CMD_UDP || command == CMD_MUX)),
+        "VMess security=zero does not support UDP"
+    );
+    let (target, target_len) = if command == CMD_MUX {
+        (vless_xudp::mux_target(), 0)
+    } else {
+        read_vmess_address_sync(&header[38..])?
+    };
     ensure!(
         header.len() == 38 + target_len + padding_len + 4,
         "invalid VMess padding length"
@@ -1625,13 +1714,45 @@ mod tests {
         )
         .await?;
         let users = HashMap::from([(uuid, UUID.to_string())]);
-        let (request, _) = read_vmess_request(&mut bytes.as_slice(), &users).await?;
+        let (request, _) = read_vmess_request(&mut bytes.as_slice(), &users, None).await?;
         assert_eq!(request.command, CMD_TCP);
         assert_eq!(request.target, target);
         assert_eq!(request.security, SecurityType::None);
         assert_eq!(request.options.bits(), 0);
         let response = encode_vmess_response_header(&keys)?;
         read_vmess_response_header(&mut response.as_slice(), &keys).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mux_request_omits_address() -> Result<()> {
+        let uuid = parse_uuid(UUID)?;
+        let mut bytes = Vec::new();
+        write_vmess_request(
+            &mut bytes,
+            &uuid,
+            CMD_MUX,
+            &vless_xudp::mux_target(),
+            SecurityType::Aes128Gcm,
+            RequestOptions::new(0x01),
+        )
+        .await?;
+        let users = HashMap::from([(uuid, UUID.to_string())]);
+        let (request, _) = read_vmess_request(&mut bytes.as_slice(), &users, None).await?;
+        assert_eq!(request.command, CMD_MUX);
+        assert!(vless_xudp::is_mux_target(&request.target));
+        Ok(())
+    }
+
+    #[test]
+    fn auth_id_replay_is_rejected() -> Result<()> {
+        let filter = VmessReplayFilter::new();
+        let auth_id = [9u8; 16];
+        filter.check_auth_id(auth_id)?;
+        let error = filter
+            .check_auth_id(auth_id)
+            .expect_err("duplicate AuthID must fail");
+        assert!(error.to_string().contains("AuthID replay"));
         Ok(())
     }
 }

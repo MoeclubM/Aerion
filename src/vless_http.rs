@@ -2,6 +2,8 @@ use crate::vless_transport::VlessTransportConfig;
 use anyhow::{Context, Result, bail, ensure};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+const MAX_HTTP_HEAD: usize = 16 * 1024;
+
 pub async fn client_upgrade<S>(
     stream: &mut S,
     transport: &VlessTransportConfig,
@@ -17,6 +19,7 @@ where
         "VLESS HTTPUpgrade server returned non-101 response: {}",
         response.lines().next().unwrap_or_default()
     );
+    ensure_upgrade_headers(&response, "websocket")?;
     Ok(())
 }
 
@@ -26,6 +29,7 @@ where
 {
     let request = read_http_head(stream).await?;
     ensure_request_path(&request, &transport.path)?;
+    ensure_upgrade_headers(&request, "websocket")?;
     stream
         .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
         .await
@@ -81,6 +85,10 @@ where
             .await
             .context("read HTTP upgrade header")?;
         head.push(byte[0]);
+        ensure!(
+            head.len() <= MAX_HTTP_HEAD,
+            "HTTP upgrade header exceeds {MAX_HTTP_HEAD} bytes"
+        );
         if head.ends_with(b"\r\n\r\n") {
             return String::from_utf8(head).context("decode HTTP upgrade header");
         }
@@ -112,6 +120,23 @@ pub fn ensure_request_path(head: &str, expected_path: &str) -> Result<()> {
     ensure!(
         path == expected_path,
         "unexpected HTTP upgrade path {path}, expected {expected_path}"
+    );
+    Ok(())
+}
+
+pub fn ensure_upgrade_headers(head: &str, expected_upgrade: &str) -> Result<()> {
+    let upgrade = header_value(head, "Upgrade").context("HTTP upgrade missing Upgrade header")?;
+    ensure!(
+        upgrade.eq_ignore_ascii_case(expected_upgrade),
+        "unexpected HTTP Upgrade {upgrade}, expected {expected_upgrade}"
+    );
+    let connection =
+        header_value(head, "Connection").context("HTTP upgrade missing Connection header")?;
+    ensure!(
+        connection
+            .split(',')
+            .any(|value| value.trim().eq_ignore_ascii_case("upgrade")),
+        "HTTP Connection header does not include Upgrade"
     );
     Ok(())
 }

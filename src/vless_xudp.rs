@@ -1,5 +1,6 @@
 use crate::core::CoreSession;
 use crate::protocol::{ProxyTarget, resolve_target_addr};
+use crate::socket_protect;
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -12,7 +13,8 @@ pub const MUX_PORT: u16 = 666;
 
 const STATUS_NEW: u8 = 0x01;
 const STATUS_KEEP: u8 = 0x02;
-const STATUS_END: u8 = 0x04;
+const STATUS_END: u8 = 0x03;
+const STATUS_KEEPALIVE: u8 = 0x04;
 const NETWORK_UDP: u8 = 0x02;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x02;
@@ -36,7 +38,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let socket = Arc::new(
-        UdpSocket::bind("0.0.0.0:0")
+        socket_protect::bind_dual_stack_udp()
             .await
             .context("bind XUDP UDP")?,
     );
@@ -85,11 +87,12 @@ pub async fn write_client_packet<W>(
     destination: &ProxyTarget,
     payload: &[u8],
     is_new: bool,
+    global_id: &[u8; 8],
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let encoded = encode_client_packet(destination, payload, is_new)?;
+    let encoded = encode_client_packet(destination, payload, is_new, global_id)?;
     writer
         .write_all(&encoded)
         .await
@@ -100,16 +103,18 @@ pub fn encode_client_packet(
     destination: &ProxyTarget,
     payload: &[u8],
     is_new: bool,
+    global_id: &[u8; 8],
 ) -> Result<Vec<u8>> {
     let mut metadata = vec![
         0u8,
         0u8,
         if is_new { STATUS_NEW } else { STATUS_KEEP },
         0x01,
+        NETWORK_UDP,
     ];
+    write_destination_xudp(&mut metadata, destination)?;
     if is_new {
-        metadata.push(NETWORK_UDP);
-        write_destination_xudp(&mut metadata, destination)?;
+        metadata.extend_from_slice(global_id);
     }
     encode_packet_parts(&metadata, payload)
 }
@@ -206,10 +211,17 @@ fn decode_packet_parts(
         );
         let (destination, consumed) = parse_destination_xudp(&metadata[5..])?;
         let trailing = metadata.len() - 5 - consumed;
-        ensure!(
-            trailing == 0 || trailing == 8,
-            "unsupported XUDP metadata tail length {trailing}"
-        );
+        if status == STATUS_NEW {
+            ensure!(
+                trailing == 8,
+                "XUDP NEW metadata must include 8-byte GlobalID, got {trailing}"
+            );
+        } else {
+            ensure!(
+                trailing == 0,
+                "unsupported XUDP metadata tail length {trailing}"
+            );
+        }
         *current_destination = Some(destination.clone());
         destination
     } else {
@@ -362,7 +374,7 @@ mod tests {
     async fn reads_xudp_new_packet() -> Result<()> {
         let target = ProxyTarget::Domain("example.com".to_string(), 53);
         let mut bytes = Vec::new();
-        write_client_packet(&mut bytes, &target, b"abc", true).await?;
+        write_client_packet(&mut bytes, &target, b"abc", true, &[0u8; 8]).await?;
         let packet = read_packet(&mut bytes.as_slice(), &mut None)
             .await?
             .context("packet")?;
@@ -374,11 +386,29 @@ mod tests {
     #[test]
     fn decodes_in_memory_xudp_packet_chunk() -> Result<()> {
         let target = ProxyTarget::Domain("example.com".to_string(), 53);
-        let bytes = encode_client_packet(&target, b"abc", true)?;
-        assert_eq!(
-            &bytes[..22],
-            b"\x00\x14\x00\x00\x01\x01\x02\x00\x35\x02\x0bexample.com"
-        );
+        let bytes = encode_client_packet(&target, b"abc", true, &[0u8; 8])?;
+        assert_eq!(bytes[2], 0x1c);
+        assert_eq!(bytes[4], STATUS_NEW);
+        assert_eq!(&bytes[5..7], &[0x00, 0x01]);
+        let (destination, payload) = decode_packet_chunk(&bytes, &mut None)?.context("packet")?;
+        assert_eq!(destination, target);
+        assert_eq!(payload, b"abc");
+        Ok(())
+    }
+
+    #[test]
+    fn xudp_end_status_is_0x03() {
+        assert_eq!(STATUS_END, 0x03);
+        assert_eq!(STATUS_KEEPALIVE, 0x04);
+    }
+
+    #[test]
+    fn keep_frame_includes_address_without_global_id() -> Result<()> {
+        let target = ProxyTarget::Domain("example.com".to_string(), 53);
+        let bytes = encode_client_packet(&target, b"abc", false, &[1u8; 8])?;
+        let metadata_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+        assert_eq!(bytes[4], STATUS_KEEP);
+        assert_eq!(metadata_len, 20);
         let (destination, payload) = decode_packet_chunk(&bytes, &mut None)?.context("packet")?;
         assert_eq!(destination, target);
         assert_eq!(payload, b"abc");

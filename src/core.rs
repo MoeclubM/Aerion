@@ -341,6 +341,16 @@ impl ProxyCore {
             .await
     }
 
+    pub fn known_credentials(&self) -> Vec<String> {
+        self.inner
+            .credentials
+            .read()
+            .expect("core credentials lock poisoned")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     async fn open_session_with_source(
         &self,
         user_id: &str,
