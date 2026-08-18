@@ -1234,7 +1234,7 @@ async fn run_mieru_packet_server(
             }
         };
         let session_id = segment.metadata.session_id();
-        let existing = sessions
+        let existing: Option<Arc<Mutex<MieruAnyWriter>>> = sessions
             .lock()
             .await
             .get(&session_id)
