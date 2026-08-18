@@ -1,397 +1,167 @@
 # Aerion
 
-Pure Rust network proxy core with both client and server modes.
+纯 Rust 代理内核，同时提供客户端和服务器。
 
-## Protocols
+[NodeRS](https://github.com/MoeclubM/NodeRS) 用它跑 Xboard 机器节点，[XBClient](https://github.com/MoeclubM/XBClient) 用它做连接、分流和 TUN。也可以单独当命令行工具，直接跑原生 TOML，或 mihomo / Xray / sing-box 配置。
 
-Aerion now provides these server/client protocol stacks:
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
-- AnyTLS-style TLS transport:
-  - SOCKS5 CONNECT and UDP ASSOCIATE
-  - TCP stream multiplexing over one TLS session
-  - UOT v2 / legacy magic address detection
-  - bidirectional heartbeat frames
-  - AnyTLS-compatible padding scheme update negotiation
-  - server-side multi-user credentials through `users`
-- Hysteria2:
-  - QUIC + HTTP/3 authentication (`POST https://hysteria/auth`)
-  - TCP stream request `0x401`
-  - native UDP datagrams with session/packet/fragment fields
-  - Salamander obfs for client and server
-  - BBR / NewReno congestion control selection
-  - configurable server authentication timeout
-  - single password plus optional multi-user credential list
-- Mieru:
-  - TCP stream underlay with Mieru v3 metadata framing
-  - native UDP packet underlay with stateless packet metadata/payload encryption,
-    ordered delivery, ACK frames, and retransmission
-  - XChaCha20-Poly1305 stateful stream encryption
-  - Mieru password hashing, PBKDF2-HMAC-SHA256 time-window keys, nonce user hints
-  - SOCKS5 CONNECT over Mieru sessions
-  - SOCKS5 UDP ASSOCIATE through Mieru packet-over-stream framing
-  - multi-user server authentication and traffic accounting through `ProxyCore`
-  - base64 protobuf traffic-pattern TCP fragmentation, nonce shaping, and
-    middle/end padding on TCP and UDP underlays
-  - nonzero low-entropy traffic patterns fail explicitly because the current
-    upstream Mieru data path does not apply that configuration yet
-- Naive:
-  - local SOCKS5 CONNECT client over HTTPS proxy CONNECT
-  - HTTPS proxy CONNECT server
-  - HTTP/1.1, HTTP/2, and HTTP/3 client/server tunnels
-  - Basic authentication, TLS SNI verification, optional extra headers
-  - UOT-style SOCKS5 UDP ASSOCIATE when UDP-over-TCP is enabled
-  - Naive-compatible randomized padding chunks for tunnel payloads
-- HTTP proxy:
-  - local SOCKS5 CONNECT client over upstream HTTP/1.1 CONNECT proxy
-  - plain HTTP and TLS-wrapped HTTPS proxy upstreams
-  - Basic authentication, TLS SNI verification, optional extra headers
-  - mihomo `http`, sing-box `http`, and Xray `http` outbound profile mapping
-- SOCKS proxy:
-  - local SOCKS5 CONNECT and UDP ASSOCIATE client over upstream SOCKS5 proxy
-  - no-auth and username/password upstream authentication
-  - mihomo `socks5`, sing-box `socks`, and Xray `socks` outbound profile mapping
-- Direct / block route clients:
-  - local SOCKS5 CONNECT and UDP ASSOCIATE with direct outbound routing or explicit block replies
-  - mihomo `direct` / `reject`, sing-box `direct` / `block`, and Xray `freedom` / `blackhole` outbound profile mapping
-- Shadowsocks:
-  - local SOCKS5 CONNECT and UDP ASSOCIATE client
-  - TCP and UDP server relay
-  - TCP relay through the configured Shadowsocks server
-  - UDP relay with the Shadowsocks UDP packet format
-  - SIP003 UDP-over-TCP / UOT relay over the Shadowsocks TCP stream
-  - AEAD, AEAD-2022, AEAD-2022 extra, AEAD extra, and stream ciphers enabled by the bundled `shadowsocks-rust` features
-  - protected outbound sockets through Aerion's Android socket protector hook
-  - SIP003 plugins are not implemented and fail explicitly
-- Trojan:
-  - TLS client/server core
-  - raw TCP, WebSocket, HTTPUpgrade, HTTP/2, gRPC, and XHTTP/SplitHTTP stream-one transports
-  - TCP CONNECT
-  - UDP ASSOCIATE packets over the Trojan TCP stream
-  - multi-user password credentials
-- TUIC:
-  - TUIC v5 over QUIC/TLS with `h3` ALPN
-  - exported-keying-material token authentication from UUID and password
-  - TCP CONNECT over QUIC bidirectional streams
-  - UDP relay through native QUIC datagrams or QUIC unidirectional streams
-  - packet fragmentation/reassembly, dissociate, and heartbeat commands
-  - Cubic / BBR / NewReno congestion control selection
-  - multi-user UUID/password credentials and `ProxyCore` accounting
-- VLESS:
-  - raw TCP, TLS, and REALITY client/server core
-  - TCP / WebSocket / HTTPUpgrade / HTTP/2 / gRPC transports
-  - XHTTP/SplitHTTP stream-one transport over HTTP/1.1
-  - TCP command
-  - basic UDP command over length-prefixed VLESS frames
-  - XTLS Vision frame decoding/encoding for `xtls-rprx-vision`
-  - XUDP packet encoding over VLESS UDP `v1.mux.cool:666`
-  - VLESS Mux frame relay for TCP/UDP sessions
-  - multi-user UUID credentials
-- REALITY:
-  - VLESS server-side REALITY ClientHello authentication
-  - X25519 shared-secret derivation, AES-256-GCM session-id auth, short_id check
-  - dynamic Ed25519 certificate signature derived from the REALITY auth key
-  - rejected ClientHello fallback proxying to the configured camouflage target
-  - reusable custom ClientHello builder for REALITY client auth material:
-    X25519 key_share, encrypted 32-byte session_id, auth_key derivation, and
-    profile-specific extension/cipher ordering tests
-  - client-side REALITY transport with custom TLS 1.3 state machine and
-    transport-specific ALPN override
-- uTLS / config compatibility helpers:
-  - `UtlsFingerprint` maps mihomo names such as `chrome`, `firefox`,
-    `safari`, `ios`, `android`, `edge`, `360`, `qq`, and randomized profiles
-    to Xray's current pinned Go `uTLS` ClientHello IDs
-  - `build_client_hello` can emit raw TLS 1.3 ClientHello records for
-    Chrome/Firefox/Safari/iOS/Android/Edge/360/QQ/randomized profiles, including
-    GREASE, cipher list, supported groups, signature algorithms, key_share,
-    ALPN/no-ALPN, padding, and JA3 string generation
-  - TLS clients apply a uTLS-like rustls profile for browser-style ALPN
-    (`h2`, `http/1.1`) or no-ALPN profiles; exact Go uTLS extension ordering /
-    GREASE / JA3 parity applies to raw generated ClientHello only, not rustls'
-    built-in handshake transcript
-  - config compatibility is stored separately under `src/config_compat/`
-  - `MihomoConfig` parses Clash.Meta / mihomo-style `proxies:` YAML for
-    Shadowsocks, HTTP proxy, VLESS, VMess, Trojan, Hysteria2, AnyTLS, Mieru,
-    Naive, TUIC, direct, and reject core profiles, plus static `select`
-    `proxy-groups`
-  - `XrayConfig` parses Xray JSON / JSONC `inbounds` and `outbounds`
-    profiles with Shadowsocks, HTTP proxy, SOCKS proxy, VLESS, VMess, Trojan,
-    Hysteria2, AnyTLS, Mieru, freedom, blackhole, local TUN inbound, and
-    statically equivalent single-outbound routing balancer selection helpers
-  - `SingBoxConfig` parses sing-box JSON / JSONC `inbounds` and `outbounds`
-    profiles with Shadowsocks, HTTP proxy, VLESS, VMess, Trojan, Hysteria2,
-    AnyTLS, Mieru, Naive, TUIC, direct, block, and local TUN inbound selection
-    helpers
-  - protocol modules expose the bottom-level connection capability; profile
-    selection and service/app policy stay in the integrating client or server
-  - unsupported transport mismatches such as mihomo `smux` fail with explicit
-    errors instead of falling back silently; unknown mihomo proxy fields and
-    unsupported nested `ws-opts` / `grpc-opts` / `xhttp-opts` / `reality-opts`
-    fields also fail explicitly instead of being ignored; unsupported mihomo
-    top-level runtime options such as `log-level`, `mode`, and
-    `external-controller` fail explicitly too; unsupported mihomo `dns` and
-    `tun` nested fields, rule-provider metadata, and rule-provider fields that
-    do not apply to the selected provider type fail explicitly instead of being
-    ignored
-- VMess:
-  - AEAD request/response header
-  - raw TCP/TLS plus TCP / WebSocket / HTTPUpgrade / HTTP/2 / gRPC / XHTTP transports for client/server
-  - TCP command with raw `none` body plus chunked AES-128-GCM /
-    ChaCha20-Poly1305 body security
-  - UDP command over VMess chunk stream, including `packetaddr` and `xudp` packet encoding
-  - client `security` accepts `none`, `aes-128-gcm`, `chacha20-poly1305`,
-    `auto`, or `zero`
-  - multi-user UUID credentials
+## 特性
 
-## Core accounting
+- **一端内核，两端复用**：同一套协议栈同时覆盖入站和出站，面板和客户端不容易各写各的。
+- **协议覆盖面大**：AnyTLS、Hysteria2、Mieru、Naive、Shadowsocks、Trojan、TUIC、VLESS（含 REALITY / Vision）、VMess，以及 HTTP / SOCKS、直连 / 阻断。
+- **配置兼容**：能读取 Clash Meta / mihomo YAML、Xray JSON/JSONC、sing-box JSON/JSONC，以及 Aerion 自己的 TOML。
+- **给面板用的记账**：多用户凭证、在线会话、设备数、速率和流量配额，热更新用户时保留已有计数。
+- **本地入口简单**：客户端暴露 SOCKS5（含 UDP ASSOCIATE），并可挂 TUN，方便桌面和 Android VPN 接入。
+- **配置诚实**：遇到尚未支持的传输、插件或字段会直接报错，不会悄悄换成别的协议。
 
-`src/core.rs` exposes the proxy-kernel interfaces for:
+```text
+Xboard
+  ├─ NodeRS ── Aerion 服务端（用户、限速、证书）
+  └─ XBClient ── Aerion 客户端 + 路由 + TUN
+```
 
-- multi-user credential tables
-- per-user upload/download traffic snapshots
-- per-user online session count
-- per-user online session limits
-- per-user unique source-IP session limits for server runtimes
-- per-user upload/download byte-per-second limits
-- per-user total traffic quota
-- explicit session cancellation for removed or credential-rotated users
-- hot user replacement that preserves existing traffic counters for unchanged user IDs
+## 协议
 
-`run_server_listener_with_core`, `run_hysteria2_server_with_core`,
-`run_mieru_server_with_core`, `run_trojan_server_with_core`,
-`run_tuic_server_with_core`, `run_vless_server_with_core`, and
-`run_vmess_server_with_core` accept a
-`ProxyCore` so upper layers can own user state, statistics, limits, and quota
-policy without adding panel/UI code here.
+| 协议 | 客户端 | 服务端 | TCP | UDP |
+| --- | :---: | :---: | :---: | :---: |
+| AnyTLS | ✓ | ✓ | TLS 多路复用 | UDP over TCP |
+| Hysteria2 | ✓ | ✓ | QUIC | 原生数据报 |
+| Mieru | ✓ | ✓ | 流 underlay | 原生包 underlay |
+| Naive | ✓ | ✓ | HTTP/1.1 · H2 · H3 | UDP over TCP |
+| Shadowsocks | ✓ | ✓ | AEAD / 2022 | SS UDP / UoT |
+| Trojan | ✓ | ✓ | TLS / WS / H2 / gRPC / XHTTP | 流内 UDP |
+| TUIC v5 | ✓ | ✓ | QUIC | 原生或 QUIC 流 |
+| VLESS | ✓ | ✓ | TCP / WS / H2 / gRPC / XHTTP | UDP / XUDP / Mux |
+| VMess | ✓ | ✓ | 同上 | chunk / packetaddr / xudp |
+| HTTP / SOCKS | ✓ | 入站 | CONNECT | SOCKS UDP |
+| 直连 / 阻断 | ✓ | — | ✓ | ✓ |
 
-## Build
+VLESS / Trojan / VMess 支持 raw TCP、WebSocket、HTTPUpgrade、HTTP/2、gRPC 和 XHTTP `stream-one`。VLESS 另支持 REALITY 与 XTLS Vision。Hysteria2 可开 Salamander 与 BBR。更细的字段与已知限制见 [docs](docs/README.md)。
 
-```powershell
+## 快速开始
+
+需要 Rust 工具链。克隆仓库后：
+
+```bash
+git clone https://github.com/MoeclubM/Aerion.git
+cd Aerion
 cargo build --release
 ```
 
-## Run server
+### 用配置文件运行
 
-Prepare a TLS certificate and key, then:
+仓库里带了示例，复制一份改地址和密码即可：
 
-```powershell
-cargo run -- server `
-  --listen 0.0.0.0:8443 `
-  --password "change-me" `
-  --cert server.crt `
-  --key server.key
+```bash
+# 原生 TOML（一份文件里可以放多个 profile）
+./target/release/aerion run --config config.client.example.toml --profile anytls
+./target/release/aerion run --config config.server.example.toml --profile hysteria2
+
+# 也可以直接跑常见客户端配置
+./target/release/aerion run --config config.mihomo.example.yaml --profile shadowsocks
+./target/release/aerion run --config config.xray.example.json --profile vless-reality
+./target/release/aerion run --config config.singbox.example.json --profile naive-h2
 ```
 
-## Run client
+文件里有多个入站 / 出站时，用 `--profile <名称>` 选一个。`--listen 127.0.0.1:1080` 可以覆盖本地 SOCKS 端口。
 
-```powershell
-cargo run -- client `
-  --listen 127.0.0.1:1080 `
-  --server example.com:8443 `
-  --password "change-me" `
-  --sni example.com `
-  --heartbeat-interval-secs 30
-```
+### 命令行起 AnyTLS
 
-For a self-signed Hysteria2 server certificate, either add `--insecure`, pin the
-leaf SHA-256 with `--certificate-fingerprint`, or pass a CA PEM with
-`--ca-cert`.
+服务端需要先准备证书和私钥：
 
-## Config file
-
-```powershell
-cargo run -- run --config config.client.example.toml --profile anytls
-cargo run -- run --config config.client.example.toml --profile hysteria2
-cargo run -- run --config config.client.example.toml --profile mieru-tcp
-cargo run -- run --config config.client.example.toml --profile naive-h2
-cargo run -- run --config config.client.example.toml --profile http-proxy
-cargo run -- run --config config.client.example.toml --profile tuic
-cargo run -- run --config config.client.example.toml --profile shadowsocks
-cargo run -- run --config config.client.example.toml --profile trojan
-cargo run -- run --config config.client.example.toml --profile vless-reality
-cargo run -- run --config config.client.example.toml --profile vmess-tls
-cargo run -- run --config config.server.example.toml --profile anytls
-cargo run -- run --config config.server.example.toml --profile hysteria2
-cargo run -- run --config config.server.example.toml --profile mieru-tcp
-cargo run -- run --config config.server.example.toml --profile tuic
-cargo run -- run --config config.server.example.toml --profile shadowsocks
-cargo run -- run --config config.server.example.toml --profile naive-h2
-cargo run -- run --config config.server.example.toml --profile trojan
-cargo run -- run --config config.server.example.toml --profile vless
-cargo run -- run --config config.server.example.toml --profile vmess
-cargo run -- run --config config.mihomo.example.yaml --profile anytls
-cargo run -- run --config config.mihomo.example.yaml --profile shadowsocks
-cargo run -- run --config config.mihomo.example.yaml --profile mieru-tcp
-cargo run -- run --config config.mihomo.example.yaml --profile naive-h2
-cargo run -- run --config config.mihomo.example.yaml --profile http-proxy
-cargo run -- run --config config.mihomo.example.yaml --profile socks-proxy
-cargo run -- run --config config.mihomo.example.yaml --profile direct-out
-cargo run -- run --config config.mihomo.example.yaml --profile reject-out
-cargo run -- run --config config.xray.example.json --profile vless-reality
-cargo run -- run --config config.xray.example.json --profile http-proxy
-cargo run -- run --config config.xray.example.json --profile socks-proxy
-cargo run -- run --config config.xray.example.json --profile shadowsocks
-cargo run -- run --config config.xray.example.json --profile hysteria2
-cargo run -- run --config config.xray.example.json --profile anytls
-cargo run -- run --config config.xray.example.json --profile mieru-tcp
-cargo run -- run --config config.xray.example.json --profile direct-out
-cargo run -- run --config config.xray.example.json --profile blackhole-out
-cargo run -- run --config config.singbox.example.json --profile anytls
-cargo run -- run --config config.singbox.example.json --profile mieru-tcp
-cargo run -- run --config config.singbox.example.json --profile shadowsocks
-cargo run -- run --config config.singbox.example.json --profile naive-h2
-cargo run -- run --config config.singbox.example.json --profile http-proxy
-cargo run -- run --config config.singbox.example.json --profile socks-proxy
-cargo run -- run --config config.singbox.example.json --profile direct-out
-cargo run -- run --config config.singbox.example.json --profile block-out
-```
-
-Aerion-native TOML can keep multiple `[[clients]]` or `[[servers]]` profiles in
-one file. `mode = "client"` with `[client]` and `mode = "server"` with
-`[server]` remain supported for single-profile files. When a file has more than
-one runnable profile, pass `--profile <name>`; `--listen <addr:port>` can
-override a client/server listen address or supply the local SOCKS listen for
-mihomo / Xray / sing-box configs that omit an inbound listener.
-
-Use `protocol = "hysteria2"` to select Hysteria2, or `protocol = "mieru"` to
-select Mieru. Mieru defaults to `transport = "tcp"`; set `transport = "udp"` to
-use the native packet underlay. Use `protocol = "tuic"` with `username` as the
-TUIC UUID and `password` as the TUIC password; extra server users use
-`uuid:password` entries. Use `protocol = "naive"` for an HTTPS Naive client or
-server; set `transport = "quic"` or `protocol = "naive+quic"` for HTTP/3.
-For Naive HTTP/3, `quic_congestion_control` accepts `bbr`, `cubic`, `reno`,
-`newreno`, or `new_reno` and defaults to `bbr`. TLS clients accept
-`ca_cert_paths` / sing-box `tls.certificate_path` custom TLS roots.
-Aerion-native TOML also runs HTTP proxy, Shadowsocks, Trojan, VLESS, and VMess
-client profiles, SOCKS proxy client profiles, plus Shadowsocks, Trojan, VLESS,
-and VMess server profiles.
-
-The CLI can run mihomo YAML, Xray JSON/JSONC, and sing-box JSON/JSONC client
-profiles directly. If those files contain multiple proxies/outbounds, select one
-with `--profile`; unsupported transports still fail explicitly instead of being
-silently downgraded. Built-in direct/block-style outbounds run as local route
-clients and do not start fake upstream proxy processes. Mihomo route rules
-include exact, suffix, keyword, wildcard, regex, geo, IP CIDR, port, network,
-match/final forms, statically representable `OR` / `AND` logical rules, and
-`RULE-SET` expansion from inline or local YAML/text file
-`rule-providers` with `domain`, `ipcidr`, or `classical` behavior, including
-statically representable logical rules in classical payloads. Remote HTTP and
-binary MRS rule-provider loading still fails explicitly. Direct geo route
-references that are not backed by expanded rule-set data fail at config compile
-time instead of during route decisions. Source/process/inbound/sniffed-metadata
-matchers and Mihomo `src` route parameters require routing metadata and fail
-explicitly. Unknown mihomo proxy fields, unsupported WebSocket/gRPC/XHTTP/
-REALITY option fields, and transport option blocks attached to a different
-`network` fail explicitly rather than being silently dropped. Mihomo local
-HTTP-only `port`, transparent proxy listeners, authentication, and LAN source
-filters fail explicitly because the Aerion config runner exposes a plain SOCKS
-listener for mihomo client profiles. Mihomo `select` proxy-groups resolve to
-the first listed proxy. Mihomo health-check /
-load-balancing / relay groups and sing-box `urltest` outbounds resolve
-statically only when they contain a single explicit candidate; multi-candidate
-policies fail explicitly because Aerion does not implement active runtime
-selection yet. sing-box `selector` outbounds are resolved to their startup
-selection (`default`, or the first listed outbound when `default` is omitted).
-sing-box selector/urltest runtime policy fields such as
-`interrupt_exist_connections`, `url`, `interval`, `tolerance`, and
-`idle_timeout` fail explicitly instead of being ignored.
-sing-box route rules accept `route` / `reject` actions, logical route rules,
-inline route rule-sets, and local source JSON rule-sets when they can be
-represented by Aerion's static route table. If sing-box `final` is omitted,
-the route default follows the first outbound when it is tag-addressable (or a
-tagless direct/block outbound). sing-box route-level runtime options such as
-interface detection, DNS resolver policies, process/neighbor/DHCP lease lookup,
-remote rule-set HTTP client selection, legacy geo databases, and unknown route
-fields fail explicitly instead of being ignored. `network: icmp` route rules
-also fail explicitly because Aerion route decisions currently cover TCP/UDP
-proxy flows. Remote and binary rule-set loading still fails explicitly.
-Xray routing `domain` entries follow Xray's plain substring, `domain:`,
-`full:`, `keyword:`, `dotless:`, and regex forms; `balancerTag` resolves only
-when its balancer selectors identify exactly one outbound and no runtime
-strategy/fallback state is required. Xray routing defaults follow the first
-outbound when it is tag-addressable (or a tagless freedom/blackhole outbound).
-If a route rule sets both `outboundTag` and `balancerTag`, Aerion follows
-Xray's `outboundTag` precedence; string `ruleTag` values are accepted as debug
-labels and do not affect route decisions.
-Xray `domainMatcher` accepts `linear` / `hybrid` / `mph` as implementation
-hints; unknown routing fields and `domainStrategy` values that require DNS
-resolution during routing fail explicitly. Xray external `ext:` GeoIP routing
-files and `!` inverse IP matchers fail explicitly until rule-set data loading
-and negative route matching are wired. Xray `rawSettings` / `tcpSettings`,
-`sockopt`, and KCP/QUIC/domain-socket stream settings with data, plus unknown
-top-level profile options such as `log` / `dns` / `api`, unknown outbound
-profile, `settings`, stream transport, REALITY/finalmask, mux, and
-`streamSettings` fields, fail explicitly instead of being ignored. Xray TLS
-version/cipher/curve policy overrides, separate peer-name verification,
-server-side unknown-SNI rejection, session resumption, key logging, and unsupported
-certificate loading options fail explicitly until Aerion exposes equivalent TLS
-controls. Xray `echServerKeys` / sing-box inbound `tls.ech` are supported on TLS
-inbounds when built with the default `server-ech` feature (BoringSSL); client
-`echConfigList` remains unsupported. Xray local
-inbound protocols other than `socks` / `tun`, local SOCKS inbound
-authentication, sniffing, and non-raw transport settings also fail explicitly
-because the Aerion config runner exposes plain no-auth SOCKS and TUN listeners.
-Unsupported sing-box top-level config options such as `log` / `dns` /
-`experimental` fail explicitly for the same reason.
-sing-box TLS engine/version/cipher/curve overrides, SNI suppression, certificate
-pinning, mutual-TLS client certificate/authentication fields, kernel TLS,
-handshake timeout, certificate providers, fragmentation/spoofing/ACME options,
-and unknown TLS/uTLS/REALITY nested fields likewise fail explicitly instead of
-being silently ignored. Unknown sing-box protocol inbound/outbound fields,
-unsupported VLESS transport fields, Hysteria2 obfs fields, and disabled
-`multiplex` blocks that still carry settings fail explicitly too. sing-box
-local inbound protocols other than `socks` / `mixed` / `tun`, plus local
-`socks` / `mixed` inbound options, fail explicitly for the same reason.
-Inbound-only sing-box JSON can also run AnyTLS, Mieru, Shadowsocks, Trojan,
-VMess, Hysteria2, TUIC, Naive, and VLESS server profiles, including Naive
-TCP-only / HTTP/3-only listener networks and VLESS raw, TLS, or REALITY inbound
-TLS settings.
-Inbound-only Xray JSON can run AnyTLS, Mieru, Shadowsocks, Hysteria2, Trojan,
-VLESS, and VMess server profiles, with VLESS raw, TLS, or REALITY stream
-security.
-
-## Run Hysteria2
-
-```powershell
-cargo run -- hysteria2-server `
-  --listen 0.0.0.0:8443 `
-  --password "change-me" `
-  --user "extra-user-or-uuid" `
-  --congestion-control bbr `
-  --cert server.crt `
+```bash
+./target/release/aerion server \
+  --listen 0.0.0.0:8443 \
+  --password "change-me" \
+  --cert server.crt \
   --key server.key
 
-cargo run -- hysteria2-client `
-  --listen 127.0.0.1:1080 `
-  --server example.com:8443 `
-  --password "change-me" `
-  --sni example.com `
+./target/release/aerion client \
+  --listen 127.0.0.1:1080 \
+  --server example.com:8443 \
+  --password "change-me" \
+  --sni example.com
+```
+
+浏览器或系统代理把 SOCKS5 指到 `127.0.0.1:1080` 即可。自签 Hysteria2 / TLS 证书时，客户端可加 `--insecure`，或改用证书指纹 / CA 文件。
+
+### Hysteria2 / TUIC
+
+```bash
+./target/release/aerion hysteria2-server \
+  --listen 0.0.0.0:8443 \
+  --password "change-me" \
+  --cert server.crt \
+  --key server.key
+
+./target/release/aerion hysteria2-client \
+  --listen 127.0.0.1:1080 \
+  --server example.com:8443 \
+  --password "change-me" \
+  --sni example.com \
   --congestion-control bbr
 ```
 
-## Run TUIC
-
-```powershell
-cargo run -- tuic-server `
-  --listen 0.0.0.0:443 `
-  --uuid 00000000-0000-0000-0000-000000000000 `
-  --password "change-me" `
-  --congestion-control cubic `
-  --cert server.crt `
+```bash
+./target/release/aerion tuic-server \
+  --listen 0.0.0.0:443 \
+  --uuid 00000000-0000-0000-0000-000000000000 \
+  --password "change-me" \
+  --cert server.crt \
   --key server.key
 
-cargo run -- tuic-client `
-  --listen 127.0.0.1:1080 `
-  --server example.com:443 `
-  --uuid 00000000-0000-0000-0000-000000000000 `
-  --password "change-me" `
-  --sni example.com `
-  --udp-relay-mode native `
-  --congestion-control cubic `
-  --alpn h3
+./target/release/aerion tuic-client \
+  --listen 127.0.0.1:1080 \
+  --server example.com:443 \
+  --uuid 00000000-0000-0000-0000-000000000000 \
+  --password "change-me" \
+  --sni example.com
 ```
 
-## Validation
+完整命令和字段说明见 [使用方式](docs/usage.md)、[配置](docs/config.md)。
 
-Validation is workflow-only for this repository. Use `.github/workflows/ci.yml`
-and monitor the GitHub Actions run to completion; do not treat local build or
-test cache results as acceptance.
+## 原生配置长什么样
+
+客户端和服务器都可以把多个 profile 写在同一个 TOML 里：
+
+```toml
+[[clients]]
+name = "anytls"
+protocol = "anytls"
+listen = "127.0.0.1:1080"
+server = "example.com:8443"
+password = "change-me"
+sni = "example.com"
+```
+
+```toml
+[[servers]]
+name = "anytls"
+protocol = "anytls"
+listen = "0.0.0.0:8443"
+password = "change-me"
+cert = "server.crt"
+key = "server.key"
+```
+
+`protocol` 常用值：`anytls`、`hysteria2`、`mieru`（`transport = "tcp"` / `"udp"`）、`naive`、`shadowsocks`、`trojan`、`tuic`、`vless`、`vmess`、`http`、`socks5`。TUIC 的 `username` 填 UUID。
+
+## 给面板和客户端用
+
+Aerion 负责把连接跑起来；选节点、解析订阅、展示套餐这些仍由接入方完成：
+
+- **NodeRS** 从面板拉取节点和用户，交给 Aerion 监听并统计流量。
+- **XBClient** 把订阅编成客户端配置，先起本地 SOCKS，再挂 TUN 或系统代理。
+
+模块划分见 [架构](docs/architecture.md)，用户与限速见 [用户与流量](docs/core.md)。
+
+## 相关项目
+
+- [NodeRS](https://github.com/MoeclubM/NodeRS) — Xboard 机器节点
+- [XBClient](https://github.com/MoeclubM/XBClient) — Xboard 用户端
+- [Xboard](https://github.com/cedar2025/Xboard) — 面板
+
+## 许可
+
+MIT。详见 [LICENSE](LICENSE)。
