@@ -38,7 +38,7 @@ username = "default"
 password = "change-me"
 # Extra users use "username:password" entries.
 users = ["alice:alice-password"]
-mtu = 1500
+mtu = 1400
 transport = "tcp" # tcp/stream or udp/packet
 # Optional base64 protobuf trafficPattern / noncePattern strings from Mieru.
 # traffic_pattern = "..."

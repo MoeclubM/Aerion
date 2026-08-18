@@ -168,7 +168,7 @@ impl XrayOutbound {
                 .unwrap_or_else(|| password.clone()),
             password,
             hashed_password: None,
-            mtu: 1500,
+            mtu: 0,
             transport: MieruTransport::parse(
                 self.settings
                     .network

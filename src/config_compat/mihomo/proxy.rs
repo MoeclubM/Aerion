@@ -775,7 +775,7 @@ impl MihomoMieruProxy {
                 .unwrap_or_else(|| self.password.clone()),
             password: self.password.clone(),
             hashed_password: None,
-            mtu: 1500,
+            mtu: 0,
             transport: MieruTransport::parse(&self.transport)?,
             traffic_pattern: MieruTrafficPattern::parse_pair(
                 self.traffic_pattern.as_deref(),

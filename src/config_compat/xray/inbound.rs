@@ -238,7 +238,7 @@ impl XrayInbound {
             username,
             password,
             users,
-            mtu: 1500,
+            mtu: 0,
             user_hint_mandatory: false,
             transport: MieruTransport::parse(
                 self.settings

@@ -70,11 +70,11 @@ pub use ios_packet_flow::{
 pub use listener::ListenerStopToken;
 pub use log_bridge::{LogBridge, LogBridgeLayer, LogEntry};
 pub use mieru::{
-    MieruClientConfig, MieruNoncePattern, MieruNonceType, MieruPaddingPattern, MieruServerConfig,
-    MieruTcpFragment, MieruTrafficPattern, MieruTransport, MieruUser, parse_mieru_user,
-    run_mieru_client, run_mieru_client_listener, run_mieru_client_listener_with_core,
-    run_mieru_packet_server_socket_with_core, run_mieru_server,
-    run_mieru_server_listener_with_core, run_mieru_server_with_core,
+    MIERU_DEFAULT_MTU, MieruClientConfig, MieruNoncePattern, MieruNonceType, MieruPaddingPattern,
+    MieruServerConfig, MieruTcpFragment, MieruTrafficPattern, MieruTransport, MieruUser,
+    parse_mieru_user, run_mieru_client, run_mieru_client_listener,
+    run_mieru_client_listener_with_core, run_mieru_packet_server_socket_with_core,
+    run_mieru_server, run_mieru_server_listener_with_core, run_mieru_server_with_core,
 };
 pub use naive::{
     NaiveClientConfig, NaiveServerConfig, run_naive_client, run_naive_client_listener,

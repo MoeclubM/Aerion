@@ -1,5 +1,5 @@
 use crate::core::{CoreSession, CoreUser, ProxyCore, relay_bidirectional_counted};
-use crate::protocol::{ProxyTarget, resolve_target_addr, target_name};
+use crate::protocol::{ProxyTarget, canonicalize_socket_addr, resolve_target_addr, target_name};
 use crate::socket_protect;
 use crate::uot;
 use anyhow::{Context, Result, bail, ensure};
@@ -7,7 +7,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, split};
@@ -42,7 +45,8 @@ use wire::{
     encode_mieru_packet_segment, read_first_server_segment, read_mieru_segment,
 };
 
-const DEFAULT_MTU: usize = 1500;
+pub const MIERU_DEFAULT_MTU: usize = 1400;
+const DEFAULT_MTU: usize = MIERU_DEFAULT_MTU;
 const NONCE_LEN: usize = 24;
 pub const MIERU_KEY_LEN: usize = 32;
 const KEY_LEN: usize = MIERU_KEY_LEN;
@@ -103,10 +107,12 @@ struct MieruStreamWriter {
 
 struct MieruPacketWriter {
     socket: Arc<UdpSocket>,
-    peer: SocketAddr,
+    peer: Option<SocketAddr>,
+    candidates: Vec<SocketAddr>,
     cipher: MieruCipher,
     mtu: usize,
     traffic_pattern: Option<MieruTrafficPattern>,
+    family_fallback: bool,
 }
 
 enum MieruAnyWriter {
@@ -157,6 +163,8 @@ struct MieruSessionEntry {
     outbound: mpsc::UnboundedSender<SessionCommand>,
     ordered: bool,
     recv: Arc<Mutex<MieruReceiveState>>,
+    un_ack_seq: Arc<AtomicU32>,
+    writer: Arc<Mutex<MieruAnyWriter>>,
 }
 
 #[derive(Debug, Default)]
@@ -382,7 +390,8 @@ impl MieruStreamWriter {
 impl MieruPacketWriter {
     fn new(
         socket: Arc<UdpSocket>,
-        peer: SocketAddr,
+        peer: Option<SocketAddr>,
+        candidates: Vec<SocketAddr>,
         cipher: MieruCipher,
         mtu: usize,
         traffic_pattern: Option<MieruTrafficPattern>,
@@ -390,10 +399,16 @@ impl MieruPacketWriter {
         Self {
             socket,
             peer,
+            candidates,
             cipher,
             mtu,
             traffic_pattern,
+            family_fallback: false,
         }
+    }
+
+    fn lock_peer(&mut self, peer: SocketAddr) {
+        self.peer = Some(peer);
     }
 
     async fn write_segment(&mut self, segment: MieruSegment) -> Result<()> {
@@ -403,11 +418,42 @@ impl MieruPacketWriter {
             self.mtu,
             self.traffic_pattern.as_ref(),
         )?;
-        self.socket
-            .send_to(&packet, self.peer)
-            .await
-            .with_context(|| format!("send Mieru UDP packet to {}", self.peer))?;
-        Ok(())
+        if let Some(peer) = self.peer {
+            socket_protect::send_to_dual_stack(&self.socket, &packet, peer)
+                .await
+                .with_context(|| format!("send Mieru UDP packet to {peer}"))?;
+            return Ok(());
+        }
+        ensure!(
+            !self.candidates.is_empty(),
+            "Mieru UDP writer has no destination"
+        );
+        let prefer_v4 = self.candidates.iter().any(SocketAddr::is_ipv4);
+        let destinations: Vec<SocketAddr> = if !self.family_fallback && prefer_v4 {
+            self.family_fallback = true;
+            self.candidates
+                .iter()
+                .copied()
+                .filter(SocketAddr::is_ipv4)
+                .collect()
+        } else {
+            self.candidates.clone()
+        };
+        let mut sent = false;
+        let mut last_error = None;
+        for peer in destinations {
+            match socket_protect::send_to_dual_stack(&self.socket, &packet, peer).await {
+                Ok(_) => sent = true,
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if sent {
+            Ok(())
+        } else {
+            Err(last_error
+                .map(Into::into)
+                .unwrap_or_else(|| anyhow::anyhow!("send Mieru UDP packet failed")))
+        }
     }
 }
 
@@ -416,6 +462,19 @@ impl MieruAnyWriter {
         match self {
             Self::Stream(writer) => writer.set_cipher(cipher),
             Self::Packet(writer) => writer.cipher = cipher,
+        }
+    }
+
+    fn lock_packet_peer(&mut self, peer: SocketAddr) {
+        if let Self::Packet(writer) = self {
+            writer.lock_peer(peer);
+        }
+    }
+
+    fn packet_peer(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Packet(writer) => writer.peer,
+            Self::Stream(_) => None,
         }
     }
 
@@ -571,7 +630,7 @@ pub async fn run_mieru_server(config: MieruServerConfig) -> Result<()> {
 
 pub async fn run_mieru_server_with_core(config: MieruServerConfig, core: ProxyCore) -> Result<()> {
     if config.transport == MieruTransport::Udp {
-        let socket = UdpSocket::bind(config.listen)
+        let socket = socket_protect::bind_udp(config.listen)
             .await
             .with_context(|| format!("bind Mieru UDP server on {}", config.listen))?;
         return run_mieru_packet_server_socket_with_core(socket, config, core).await;
@@ -708,7 +767,7 @@ async fn handle_mieru_client_udp(
         ip => ip,
     };
     let udp = Arc::new(
-        UdpSocket::bind(SocketAddr::new(bind_ip, 0))
+        socket_protect::bind_udp(SocketAddr::new(bind_ip, 0))
             .await
             .with_context(|| format!("bind local Mieru UDP associate socket on {bind_ip}:0"))?,
     );
@@ -725,7 +784,11 @@ async fn handle_mieru_client_udp(
         async move {
             let mut buffer = vec![0u8; u16::MAX as usize + 32];
             loop {
-                let (read, source) = udp.recv_from(&mut buffer).await?;
+                let (read, source) = match udp.recv_from(&mut buffer).await {
+                    Ok(received) => received,
+                    Err(error) if is_ignorable_udp_recv_error(&error) => continue,
+                    Err(error) => return Err(error.into()),
+                };
                 *peer.lock().await = Some(source);
                 write_packet_over_stream(&mut *session_writer.lock().await, &buffer[..read])
                     .await?;
@@ -807,7 +870,7 @@ async fn connect_mieru_underlay(config: &MieruClientConfig) -> Result<ClientUnde
 }
 
 async fn connect_mieru_packet_underlay(config: &MieruClientConfig) -> Result<ClientUnderlay> {
-    let server_addr = tokio::net::lookup_host((config.server_host.as_str(), config.server_port))
+    let candidates = tokio::net::lookup_host((config.server_host.as_str(), config.server_port))
         .await
         .with_context(|| {
             format!(
@@ -815,19 +878,21 @@ async fn connect_mieru_packet_underlay(config: &MieruClientConfig) -> Result<Cli
                 config.server_host, config.server_port
             )
         })?
-        .next()
-        .with_context(|| {
-            format!(
-                "Mieru UDP server resolved to no addresses: {}:{}",
-                config.server_host, config.server_port
-            )
-        })?;
-    let bind = if server_addr.is_ipv4() {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        .map(canonicalize_socket_addr)
+        .collect::<Vec<_>>();
+    ensure!(
+        !candidates.is_empty(),
+        "Mieru UDP server resolved to no addresses: {}:{}",
+        config.server_host,
+        config.server_port
+    );
+    let socket = if candidates.iter().any(SocketAddr::is_ipv6) {
+        Arc::new(socket_protect::bind_dual_stack_udp().await?)
     } else {
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        Arc::new(
+            socket_protect::bind_udp(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await?,
+        )
     };
-    let socket = Arc::new(socket_protect::bind_udp(bind).await?);
     let key = current_mieru_key(&config.hashed_password())?;
     let send = MieruCipher::new(
         key,
@@ -844,7 +909,8 @@ async fn connect_mieru_packet_underlay(config: &MieruClientConfig) -> Result<Cli
     let mtu = config.mtu();
     let writer = Arc::new(Mutex::new(MieruAnyWriter::Packet(MieruPacketWriter::new(
         socket.clone(),
-        server_addr,
+        None,
+        candidates.clone(),
         send,
         mtu,
         config.traffic_pattern.clone(),
@@ -853,7 +919,7 @@ async fn connect_mieru_packet_underlay(config: &MieruClientConfig) -> Result<Cli
     let closed = Arc::new(Mutex::new(None));
     tokio::spawn(run_mieru_packet_client_read_loop(
         socket,
-        server_addr,
+        candidates,
         recv,
         writer.clone(),
         sessions.clone(),
@@ -882,6 +948,7 @@ impl ClientUnderlay {
         }
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+        let un_ack_seq = Arc::new(AtomicU32::new(0));
         self.sessions.lock().await.insert(
             session_id,
             MieruSessionEntry {
@@ -889,6 +956,8 @@ impl ClientUnderlay {
                 outbound: outbound_tx.clone(),
                 ordered: self.reliable,
                 recv: Arc::new(Mutex::new(MieruReceiveState::default())),
+                un_ack_seq: un_ack_seq.clone(),
+                writer: self.writer.clone(),
             },
         );
         tokio::spawn(run_mieru_session_output(
@@ -899,6 +968,7 @@ impl ClientUnderlay {
             outbound_rx,
             self.reliable,
             mtu,
+            un_ack_seq,
         ));
         Ok(MieruSession::new(inbound_rx, outbound_tx))
     }
@@ -1051,7 +1121,7 @@ async fn run_mieru_server_read_loop(
 
 async fn run_mieru_packet_client_read_loop(
     socket: Arc<UdpSocket>,
-    server_addr: SocketAddr,
+    candidates: Vec<SocketAddr>,
     mut recv: MieruCipher,
     writer: Arc<Mutex<MieruAnyWriter>>,
     sessions: MieruSessionMap,
@@ -1060,14 +1130,33 @@ async fn run_mieru_packet_client_read_loop(
     let result: Result<()> = async {
         let mut buffer = vec![0u8; u16::MAX as usize];
         loop {
-            let (read, peer) = socket
-                .recv_from(&mut buffer)
-                .await
-                .context("receive Mieru UDP packet")?;
-            if peer != server_addr {
-                continue;
+            let (read, peer) = match socket.recv_from(&mut buffer).await {
+                Ok(received) => received,
+                Err(error) if is_ignorable_udp_recv_error(&error) => continue,
+                Err(error) => {
+                    return Err(error).context("receive Mieru UDP packet");
+                }
+            };
+            let peer = canonicalize_socket_addr(peer);
+            {
+                let mut writer = writer.lock().await;
+                if let Some(locked) = writer.packet_peer() {
+                    if peer != locked {
+                        continue;
+                    }
+                } else if candidates.contains(&peer) {
+                    writer.lock_packet_peer(peer);
+                } else {
+                    continue;
+                }
             }
-            let segment = decode_mieru_packet_segment(&mut recv, &buffer[..read])?;
+            let segment = match decode_mieru_packet_segment(&mut recv, &buffer[..read]) {
+                Ok(segment) => segment,
+                Err(error) => {
+                    tracing::debug!("drop undecodable Mieru UDP packet from {peer}: {error:?}");
+                    continue;
+                }
+            };
             match segment.metadata.protocol() {
                 OPEN_SESSION_RESPONSE | DATA_SERVER_TO_CLIENT => {
                     if let Some(un_ack_seq) = segment.metadata.un_ack_seq() {
@@ -1123,10 +1212,14 @@ async fn run_mieru_packet_server(
     let replay = MieruReplayCache::new();
     let mut buffer = vec![0u8; u16::MAX as usize];
     loop {
-        let (read, peer) = socket
-            .recv_from(&mut buffer)
-            .await
-            .context("receive Mieru UDP client packet")?;
+        let (read, peer) = match socket.recv_from(&mut buffer).await {
+            Ok(received) => received,
+            Err(error) if is_ignorable_udp_recv_error(&error) => continue,
+            Err(error) => {
+                return Err(error).context("receive Mieru UDP client packet");
+            }
+        };
+        let peer = canonicalize_socket_addr(peer);
         let (segment, user, cipher) = match decode_mieru_packet_segment_for_server(
             &buffer[..read],
             &users,
@@ -1140,13 +1233,29 @@ async fn run_mieru_packet_server(
                 continue;
             }
         };
-        let writer = Arc::new(Mutex::new(MieruAnyWriter::Packet(MieruPacketWriter::new(
-            socket.clone(),
-            peer,
-            cipher,
-            mtu,
-            config.traffic_pattern.clone(),
-        ))));
+        let session_id = segment.metadata.session_id();
+        let existing = sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .map(|entry| entry.writer.clone());
+        let writer = if let Some(existing) = existing {
+            {
+                let mut writer = existing.lock().await;
+                writer.lock_packet_peer(peer);
+                writer.set_cipher(cipher);
+            }
+            existing
+        } else {
+            Arc::new(Mutex::new(MieruAnyWriter::Packet(MieruPacketWriter::new(
+                socket.clone(),
+                Some(peer),
+                Vec::new(),
+                cipher,
+                mtu,
+                config.traffic_pattern.clone(),
+            ))))
+        };
         handle_server_segment(
             segment,
             writer,
@@ -1185,6 +1294,7 @@ async fn handle_server_segment(
                 .await?;
             let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
             let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+            let un_ack_seq = Arc::new(AtomicU32::new(0));
             sessions.lock().await.insert(
                 session_id,
                 MieruSessionEntry {
@@ -1192,6 +1302,8 @@ async fn handle_server_segment(
                     outbound: outbound_tx.clone(),
                     ordered: reliable,
                     recv: Arc::new(Mutex::new(MieruReceiveState::default())),
+                    un_ack_seq: un_ack_seq.clone(),
+                    writer: writer.clone(),
                 },
             );
             tokio::spawn(run_mieru_session_output(
@@ -1202,6 +1314,7 @@ async fn handle_server_segment(
                 outbound_rx,
                 reliable,
                 mtu,
+                un_ack_seq,
             ));
             if outbound_tx
                 .send(SessionCommand::SendSegment(MieruSegment {
@@ -1265,6 +1378,7 @@ async fn run_mieru_session_output(
     mut outbound: mpsc::UnboundedReceiver<SessionCommand>,
     reliable: bool,
     mtu: usize,
+    un_ack_seq: Arc<AtomicU32>,
 ) {
     let result: Result<()> = async {
         let mut next_seq = if is_client { 0 } else { 1 };
@@ -1329,7 +1443,7 @@ async fn run_mieru_session_output(
                                         protocol,
                                         session_id,
                                         seq: next_seq,
-                                        un_ack_seq: 0,
+                                        un_ack_seq: un_ack_seq.load(Ordering::Relaxed),
                                         window_size: ACK_WINDOW_SIZE,
                                         fragment: 0,
                                         prefix_len: 0,
@@ -1466,6 +1580,7 @@ async fn route_session_segment(
             deliver_session_payload(&entry.inbound, payload);
             seq.wrapping_add(1)
         };
+        entry.un_ack_seq.store(un_ack_seq, Ordering::Relaxed);
         if let Some(protocol) = ack_protocol {
             let _ = entry.outbound.send(SessionCommand::SendAck {
                 protocol,
@@ -1558,7 +1673,11 @@ async fn handle_mieru_server_udp(
         async move {
             let mut buffer = vec![0u8; u16::MAX as usize];
             loop {
-                let (read, source) = udp.recv_from(&mut buffer).await?;
+                let (read, source) = match udp.recv_from(&mut buffer).await {
+                    Ok(received) => received,
+                    Err(error) if is_ignorable_udp_recv_error(&error) => continue,
+                    Err(error) => return Err(error.into()),
+                };
                 core_session.record_download(read).await?;
                 let packet =
                     uot::encode_socks_udp_packet(&ProxyTarget::Ip(source), &buffer[..read])?;
@@ -1576,6 +1695,24 @@ async fn handle_mieru_server_udp(
 
 fn unspecified_v4() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+}
+
+fn is_ignorable_udp_recv_error(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+    ) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        if error.raw_os_error() == Some(10054) {
+            return true;
+        }
+    }
+    false
 }
 
 fn random_u32() -> Result<u32> {

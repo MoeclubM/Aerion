@@ -197,7 +197,7 @@ enum Command {
         username: String,
         #[arg(long)]
         password: String,
-        #[arg(long, default_value_t = 1500)]
+        #[arg(long, default_value_t = 1400)]
         mtu: usize,
         #[arg(long, default_value = "tcp")]
         transport: String,
@@ -211,7 +211,7 @@ enum Command {
         password: String,
         #[arg(long = "user")]
         users: Vec<String>,
-        #[arg(long, default_value_t = 1500)]
+        #[arg(long, default_value_t = 1400)]
         mtu: usize,
         #[arg(long = "user-hint-mandatory")]
         user_hint_mandatory: bool,

@@ -131,6 +131,7 @@ pub async fn bind_dual_stack_udp() -> Result<UdpSocket> {
     socket
         .bind(&std::net::SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())
         .context("bind dual-stack UDP socket")?;
+    disable_windows_udp_connreset(&socket)?;
     #[cfg(unix)]
     protect_socket_fd(std::os::fd::AsRawFd::as_raw_fd(&socket))?;
     UdpSocket::from_std(socket.into()).context("create tokio dual-stack UDP socket")
@@ -164,10 +165,69 @@ pub async fn connect_dual_stack(socket: &UdpSocket, dest: SocketAddr) -> std::io
 pub fn bind_udp_std(addr: SocketAddr) -> Result<std::net::UdpSocket> {
     let socket = std::net::UdpSocket::bind(addr)
         .with_context(|| format!("bind protected UDP socket on {addr}"))?;
+    disable_windows_udp_connreset(&socket)?;
     #[cfg(unix)]
     protect_socket_fd(socket.as_raw_fd())?;
     socket
         .set_nonblocking(true)
         .context("set protected UDP socket nonblocking")?;
     Ok(socket)
+}
+
+#[cfg(windows)]
+mod windows_udp {
+    use super::*;
+    use std::os::windows::io::AsRawSocket;
+
+    const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn WSAIoctl(
+            s: usize,
+            dw_io_control_code: u32,
+            lpv_in_buffer: *mut core::ffi::c_void,
+            cb_in_buffer: u32,
+            lpv_out_buffer: *mut core::ffi::c_void,
+            cb_out_buffer: u32,
+            lpcb_bytes_returned: *mut u32,
+            lp_overlapped: *mut core::ffi::c_void,
+            lp_completion_routine: *mut core::ffi::c_void,
+        ) -> i32;
+    }
+
+    pub(super) fn disable_connreset<S: AsRawSocket>(socket: &S) -> Result<()> {
+        let mut enable: i32 = 0;
+        let mut bytes_returned = 0u32;
+        let result = unsafe {
+            WSAIoctl(
+                socket.as_raw_socket() as usize,
+                SIO_UDP_CONNRESET,
+                (&mut enable as *mut i32).cast(),
+                4,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if result != 0 {
+            bail!(
+                "disable Windows UDP connreset failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn disable_windows_udp_connreset<S: std::os::windows::io::AsRawSocket>(socket: &S) -> Result<()> {
+    windows_udp::disable_connreset(socket)
+}
+
+#[cfg(not(windows))]
+fn disable_windows_udp_connreset<T>(_: &T) -> Result<()> {
+    Ok(())
 }

@@ -1,4 +1,4 @@
-use super::crypto::{MieruCipher, check_user_from_hint, increment_nonce, mieru_keys_for_password};
+use super::crypto::{MieruCipher, check_user_from_hint, mieru_keys_for_password};
 use super::pattern::{MieruTrafficPattern, random_padding};
 use super::{MieruUserSecret, NONCE_LEN};
 use anyhow::{Context, Result, bail, ensure};
@@ -390,12 +390,11 @@ pub(super) fn encode_mieru_packet_segment(
         encrypted_metadata.len() == PACKET_METADATA_LEN,
         "invalid Mieru encrypted packet metadata length"
     );
-    let nonce = &encrypted_metadata[..NONCE_LEN];
-    let payload_nonce = increment_nonce(nonce)?;
+    let nonce = encrypted_metadata[..NONCE_LEN].to_vec();
     let mut packet = encrypted_metadata;
     packet.extend_from_slice(&prefix_padding);
     if !segment.payload.is_empty() {
-        let encrypted_payload = cipher.encrypt_with_nonce(&segment.payload, &payload_nonce)?;
+        let encrypted_payload = cipher.encrypt_with_nonce(&segment.payload, &nonce)?;
         packet.extend_from_slice(&encrypted_payload);
     }
     packet.extend_from_slice(&suffix_padding);
@@ -417,16 +416,11 @@ pub(super) fn decode_mieru_packet_segment(
         "Mieru UDP packet is shorter than encrypted metadata"
     );
     let encrypted_metadata = &packet[..PACKET_METADATA_LEN];
-    let nonce = &encrypted_metadata[..NONCE_LEN];
-    let payload_nonce = increment_nonce(nonce)?;
+    let nonce = encrypted_metadata[..NONCE_LEN].to_vec();
     let plain = cipher.decrypt(encrypted_metadata)?;
     let metadata = MieruMetadata::parse(&plain)?;
-    let payload = decode_mieru_packet_payload(
-        cipher,
-        &metadata,
-        &payload_nonce,
-        &packet[PACKET_METADATA_LEN..],
-    )?;
+    let payload =
+        decode_mieru_packet_payload(cipher, &metadata, &nonce, &packet[PACKET_METADATA_LEN..])?;
     Ok(MieruSegment { metadata, payload })
 }
 
@@ -465,7 +459,9 @@ pub(super) fn decode_mieru_packet_segment_for_server(
         for key in mieru_keys_for_password(&user.hashed_password)? {
             let mut cipher = MieruCipher::new(key, false, user.username.clone(), traffic_pattern);
             if let Ok(segment) = decode_mieru_packet_segment(&mut cipher, packet) {
-                replay.check_and_store(&packet[..PACKET_METADATA_LEN])?;
+                if segment.metadata.protocol() == OPEN_SESSION_REQUEST {
+                    replay.check_and_store(&packet[..PACKET_METADATA_LEN])?;
+                }
                 return Ok((segment, user, cipher));
             }
         }
@@ -532,7 +528,7 @@ mod tests {
     use crate::mieru::crypto::{current_mieru_key, hash_mieru_password};
 
     #[test]
-    fn udp_payload_uses_incremented_nonce() -> Result<()> {
+    fn udp_payload_reuses_metadata_nonce() -> Result<()> {
         let key = current_mieru_key(&hash_mieru_password(b"secret", b"user"))?;
         let mut send = MieruCipher::new(key, false, "user".to_string(), None);
         let mut recv = MieruCipher::new(key, false, "user".to_string(), None);
@@ -555,10 +551,10 @@ mod tests {
         let reused = send.encrypt_with_nonce(b"ping", nonce)?;
         let payload_offset = PACKET_METADATA_LEN;
         let encrypted_len = 4 + AEAD_OVERHEAD;
-        assert_ne!(
+        assert_eq!(
             &packet[payload_offset..payload_offset + encrypted_len],
             reused.as_slice(),
-            "payload must not reuse the metadata nonce"
+            "UDP payload must reuse the metadata nonce"
         );
         Ok(())
     }

@@ -117,12 +117,12 @@ where
         payload.len() <= u16::MAX as usize,
         "packet-over-stream payload is too large"
     );
-    writer.write_all(&[0x00]).await?;
-    writer
-        .write_all(&(payload.len() as u16).to_be_bytes())
-        .await?;
-    writer.write_all(payload).await?;
-    writer.write_all(&[0xff]).await?;
+    let mut packet = Vec::with_capacity(4 + payload.len());
+    packet.push(0x00);
+    packet.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    packet.extend_from_slice(payload);
+    packet.push(0xff);
+    writer.write_all(&packet).await?;
     writer.flush().await?;
     Ok(())
 }

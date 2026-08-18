@@ -38,7 +38,7 @@ listen = "127.0.0.1:1082"
 server = "127.0.0.1:8964"
 username = "default"
 password = "change-me"
-mtu = 1500
+mtu = 1400
 transport = "tcp" # tcp/stream or udp/packet
 # Optional base64 protobuf trafficPattern / noncePattern strings from Mieru.
 # traffic_pattern = "..."
