@@ -1234,11 +1234,11 @@ async fn run_mieru_packet_server(
             }
         };
         let session_id = segment.metadata.session_id();
-        let existing: Option<Arc<Mutex<MieruAnyWriter>>> = sessions
-            .lock()
-            .await
-            .get(&session_id)
-            .map(|entry| entry.writer.clone());
+        let existing = {
+            let sessions = sessions.lock().await;
+            let entry: Option<&MieruSessionEntry> = sessions.get(&session_id);
+            entry.map(|entry| entry.writer.clone())
+        };
         let writer = if let Some(existing) = existing {
             {
                 let mut writer = existing.lock().await;
