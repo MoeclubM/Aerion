@@ -1,4 +1,4 @@
-use crate::core::ProxyCore;
+use crate::core::{ProxyCore, relay_bidirectional_counted};
 use crate::listener::ListenerStopToken;
 use crate::protocol::{ProxyTarget, target_name};
 use crate::routing::{RouteDecision, RouteNetwork, RouteTable, SharedRouteTable};
@@ -205,7 +205,7 @@ async fn handle_route_client(mut local: TcpStream, state: RouteProxyState) -> Re
                     socks::write_reply(&mut local, 0x00).await?;
                     tracing::info!("routing {} direct", target_name(&target));
                     if let Some(session) = session {
-                        copy_bidirectional_recorded(&mut local, &mut remote, session)
+                        relay_bidirectional_counted(&mut local, &mut remote, session, "route")
                             .await
                             .context("relay direct recorded route")?;
                     } else {
@@ -233,7 +233,7 @@ async fn handle_route_client(mut local: TcpStream, state: RouteProxyState) -> Re
                     socks::write_reply(&mut local, 0x00).await?;
                     tracing::info!("routing {} via {tag}", target_name(&target));
                     if let Some(session) = session {
-                        copy_bidirectional_recorded(&mut local, &mut remote, session)
+                        relay_bidirectional_counted(&mut local, &mut remote, session, "route")
                             .await
                             .with_context(|| format!("relay recorded route via {tag}"))?;
                     } else {
@@ -247,47 +247,6 @@ async fn handle_route_client(mut local: TcpStream, state: RouteProxyState) -> Re
         }
         SocksRequest::UdpAssociate => handle_udp_associate(local, state).await,
     }
-}
-
-async fn copy_bidirectional_recorded(
-    local: &mut TcpStream,
-    remote: &mut TcpStream,
-    session: crate::core::CoreSession,
-) -> Result<()> {
-    let (mut local_read, mut local_write) = local.split();
-    let (mut remote_read, mut remote_write) = remote.split();
-
-    let upload = async {
-        let mut buffer = vec![0u8; 16384];
-        loop {
-            let read = local_read.read(&mut buffer).await?;
-            if read == 0 {
-                break;
-            }
-            session.record_upload(read).await?;
-            remote_write.write_all(&buffer[..read]).await?;
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-
-    let download = async {
-        let mut buffer = vec![0u8; 16384];
-        loop {
-            let read = remote_read.read(&mut buffer).await?;
-            if read == 0 {
-                break;
-            }
-            session.record_download(read).await?;
-            local_write.write_all(&buffer[..read]).await?;
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-
-    tokio::select! {
-        result = upload => result?,
-        result = download => result?,
-    }
-    Ok(())
 }
 
 async fn connect_direct(target: &ProxyTarget) -> Result<TcpStream> {

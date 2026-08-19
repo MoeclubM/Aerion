@@ -164,6 +164,102 @@ async fn anytls_server_rejects_tls_early_data() -> Result<()> {
 }
 
 #[tokio::test]
+async fn anytls_server_finishes_when_tcp_target_fins() -> Result<()> {
+    tls::init_crypto();
+
+    let target_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let target_addr = target_listener.local_addr()?;
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) = target_listener.accept().await?;
+        let mut buffer = [0u8; 64];
+        let read = stream.read(&mut buffer).await?;
+        stream.write_all(&buffer[..read]).await?;
+        stream.shutdown().await?;
+        Ok::<(), std::io::Error>(())
+    });
+
+    let temp = tempfile::tempdir()?;
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
+    let cert_path = temp.path().join("anytls-fin.crt");
+    let key_path = temp.path().join("anytls-fin.key");
+    let ca_cert_pem = certified.cert.pem();
+    std::fs::write(&cert_path, &ca_cert_pem)?;
+    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+
+    let server_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let server_addr = server_listener.local_addr()?;
+    let server_task = tokio::spawn(run_server_listener(
+        server_listener,
+        ServerConfig {
+            listen: server_addr,
+            password: "test-password".to_string(),
+            users: Vec::new(),
+            cert_path,
+            key_path,
+            certificates: Vec::new(),
+            key: None,
+            padding_scheme: PaddingScheme::default_lines(),
+            heartbeat_interval_secs: 30,
+            ech: None,
+        },
+    ));
+
+    let client_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let client_addr = client_listener.local_addr()?;
+    let client_task = tokio::spawn(run_client_listener(
+        client_listener,
+        ClientConfig {
+            listen: client_addr,
+            server_host: "127.0.0.1".to_string(),
+            server_port: server_addr.port(),
+            password: "test-password".to_string(),
+            sni: "localhost".to_string(),
+            insecure: false,
+            client_fingerprint: None,
+            ca_cert_paths: Vec::new(),
+            ca_certificates: vec![ca_cert_pem],
+            disable_system_roots: false,
+            pinned_cert_sha256: Vec::new(),
+            padding_scheme: PaddingScheme::default_lines(),
+            heartbeat_interval_secs: 30,
+        },
+        None,
+    ));
+
+    let result = timeout(Duration::from_secs(8), async {
+        let mut socks = TcpStream::connect(client_addr).await?;
+        socks.write_all(&[0x05, 0x01, 0x00]).await?;
+        let mut greeting = [0u8; 2];
+        socks.read_exact(&mut greeting).await?;
+        anyhow::ensure!(greeting == [0x05, 0x00], "unexpected SOCKS greeting reply");
+        write_socks_connect(&mut socks, target_addr).await?;
+        let mut reply = [0u8; 10];
+        socks.read_exact(&mut reply).await?;
+        anyhow::ensure!(reply[1] == 0x00, "SOCKS connect failed: {:?}", reply);
+        socks.write_all(b"ping").await?;
+        let mut echoed = [0u8; 4];
+        socks.read_exact(&mut echoed).await?;
+        anyhow::ensure!(&echoed == b"ping", "echo payload mismatch");
+        let mut tail = [0u8; 1];
+        let read = socks.read(&mut tail).await?;
+        anyhow::ensure!(read == 0, "expected AnyTLS stream EOF after target FIN");
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("AnyTLS target-FIN test timed out")
+    .and_then(|inner| inner);
+
+    client_task.abort();
+    server_task.abort();
+    if result.is_ok() {
+        target_task.await??;
+    } else {
+        target_task.abort();
+    }
+    result
+}
+
+#[tokio::test]
 async fn socks_udp_associate_reaches_udp_target_through_uot() -> Result<()> {
     tls::init_crypto();
 

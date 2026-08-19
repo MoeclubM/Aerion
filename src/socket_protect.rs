@@ -3,6 +3,7 @@ use anyhow::{Context, Result, bail};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 
@@ -10,6 +11,8 @@ use tokio::task::JoinSet;
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use tokio::net::TcpSocket;
+
+const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(15);
 
 type SocketProtector = Arc<dyn Fn(i32) -> Result<()> + Send + Sync + 'static>;
 
@@ -91,7 +94,16 @@ pub async fn connect_tcp_host_port(host: &str, port: u16) -> Result<TcpStream> {
 pub async fn connect_tcp_addr(addr: SocketAddr) -> Result<TcpStream> {
     let stream = connect_tcp_addr_inner(addr).await?;
     let _ = stream.set_nodelay(true);
+    enable_tcp_keepalive(&stream);
     Ok(stream)
+}
+
+pub fn enable_tcp_keepalive(stream: &TcpStream) {
+    let socket = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_TIME)
+        .with_interval(TCP_KEEPALIVE_TIME);
+    let _ = socket.set_tcp_keepalive(&keepalive);
 }
 
 async fn connect_tcp_addr_inner(addr: SocketAddr) -> Result<TcpStream> {

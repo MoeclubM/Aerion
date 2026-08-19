@@ -33,7 +33,7 @@ Unsupported options fail at config time. See [limitations.md](limitations.md).
 
 ### AnyTLS
 
-TLS session with frame multiplexing, SOCKS5 CONNECT / UDP ASSOCIATE, UoT detection, heartbeats, and padding-scheme negotiation. Server accepts a primary password plus optional `users`.
+TLS session with frame multiplexing, SOCKS5 CONNECT / UDP ASSOCIATE, UoT detection, heartbeats, and padding-scheme negotiation. Server accepts a primary password plus optional `users`. Mux streams abort both directions when either side FINs, and the server shuts down the outbound TCP write half so the target does not sit in CLOSE-WAIT. Client idle TLS sessions (30s, pool size 16) are actually closed rather than dropped; a 5s sweeper reaps expired entries. Accepted and dialed TCP sockets use nodelay plus 15s keepalive.
 
 ### Hysteria2
 

@@ -122,9 +122,49 @@ pub struct CoreSession {
     inner: Option<Arc<ActiveSession>>,
 }
 
-struct SessionControl {
-    cancelled: AtomicBool,
+pub struct TaskAbort {
+    done: AtomicBool,
     notify: Notify,
+}
+
+impl TaskAbort {
+    pub fn new() -> Self {
+        Self {
+            done: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    pub fn trigger(&self) {
+        if !self.done.swap(true, Ordering::Release) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    pub fn is_triggered(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+
+    pub async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        if self.done.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+impl std::fmt::Debug for TaskAbort {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TaskAbort")
+            .field("triggered", &self.is_triggered())
+            .finish()
+    }
+}
+
+struct SessionControl {
+    abort: TaskAbort,
 }
 
 #[derive(Clone, Debug)]
@@ -736,26 +776,20 @@ impl UserState {
 impl SessionControl {
     fn new() -> Self {
         Self {
-            cancelled: AtomicBool::new(false),
-            notify: Notify::new(),
+            abort: TaskAbort::new(),
         }
     }
 
     fn cancel(&self) {
-        if !self.cancelled.swap(true, Ordering::SeqCst) {
-            self.notify.notify_waiters();
-        }
+        self.abort.trigger();
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.abort.is_triggered()
     }
 
     async fn cancelled(&self) {
-        if self.is_cancelled() {
-            return;
-        }
-        self.notify.notified().await;
+        self.abort.cancelled().await;
     }
 
     fn ensure_active(&self) -> Result<()> {
@@ -798,7 +832,6 @@ where
                 .await
                 .with_context(|| format!("read {label} uplink"))?;
             if read == 0 {
-                let _ = rw.shutdown().await;
                 return Ok::<(), anyhow::Error>(());
             }
             uplink_session.record_upload(read).await?;
@@ -815,7 +848,6 @@ where
                 .await
                 .with_context(|| format!("read {label} downlink"))?;
             if read == 0 {
-                let _ = lw.shutdown().await;
                 return Ok::<(), anyhow::Error>(());
             }
             session.record_download(read).await?;
@@ -824,13 +856,29 @@ where
                 .with_context(|| format!("write {label} downlink"))?;
         }
     };
-    tokio::try_join!(uplink, downlink)?;
-    Ok(())
+    let result = tokio::select! {
+        result = uplink => result,
+        result = downlink => result,
+    };
+    let _ = rw.shutdown().await;
+    let _ = lw.shutdown().await;
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn task_abort_resolves_if_triggered_before_wait() -> Result<()> {
+        let abort = TaskAbort::new();
+        abort.trigger();
+        timeout(Duration::from_millis(50), abort.cancelled())
+            .await
+            .context("TaskAbort must resolve after trigger")?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn records_per_user_traffic() -> Result<()> {

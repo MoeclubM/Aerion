@@ -1,4 +1,4 @@
-use crate::core::{CoreSession, ProxyCore};
+use crate::core::{CoreSession, ProxyCore, TaskAbort};
 use crate::listener;
 use crate::padding::PaddingScheme;
 use crate::protocol::{
@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split};
-use tokio::net::{TcpListener, TcpStream, UdpSocket, tcp::OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, interval};
 use tokio_rustls::TlsConnector;
@@ -73,6 +73,7 @@ pub async fn run_client_listener(
         &config.pinned_cert_sha256,
     )?;
     let shared = Arc::new(SharedClientSession::new(config, tls_config, padding));
+    tokio::spawn(sweep_idle_client_sessions(shared.clone()));
     tracing::info!("client listening on socks5://{}", listener.local_addr()?);
     loop {
         let (stream, peer) = match listener::accept_client(&listener).await {
@@ -118,15 +119,23 @@ impl SharedClientSession {
     }
 
     async fn acquire(&self) -> Result<ClientSession> {
-        {
+        let mut to_close = Vec::new();
+        let reused = {
             let mut idle = self.idle.lock().await;
-            let now = Instant::now();
-            idle.retain(|(_, since)| now.duration_since(*since) < IDLE_SESSION_TIMEOUT);
+            to_close.extend(take_expired_idle_sessions(&mut idle));
+            let mut found = None;
             while let Some((session, _)) = idle.pop_front() {
-                if session.is_alive().await {
-                    return Ok(session);
+                if session.is_alive() {
+                    found = Some(session);
+                    break;
                 }
+                to_close.push(session);
             }
+            found
+        };
+        close_idle_sessions(to_close, "idle timeout").await;
+        if let Some(session) = reused {
+            return Ok(session);
         }
         let padding = self.padding.lock().await.clone();
         ClientSession::connect(
@@ -139,15 +148,58 @@ impl SharedClientSession {
     }
 
     async fn release(&self, session: ClientSession) {
-        if !session.is_alive().await {
+        if !session.is_alive() {
             return;
         }
-        let mut idle = self.idle.lock().await;
-        let now = Instant::now();
-        idle.retain(|(_, since)| now.duration_since(*since) < IDLE_SESSION_TIMEOUT);
-        if idle.len() < MAX_IDLE_SESSIONS {
-            idle.push_back((session, Instant::now()));
+        let overflow;
+        let expired;
+        {
+            let mut idle = self.idle.lock().await;
+            expired = take_expired_idle_sessions(&mut idle);
+            if idle.len() < MAX_IDLE_SESSIONS {
+                idle.push_back((session, Instant::now()));
+                overflow = None;
+            } else {
+                overflow = Some(session);
+            }
         }
+        close_idle_sessions(expired, "idle timeout").await;
+        if let Some(session) = overflow {
+            session.close("idle pool full").await;
+        }
+    }
+}
+
+fn take_expired_idle_sessions(idle: &mut VecDeque<(ClientSession, Instant)>) -> Vec<ClientSession> {
+    let now = Instant::now();
+    let mut keep = VecDeque::new();
+    let mut expired = Vec::new();
+    while let Some((session, since)) = idle.pop_front() {
+        if now.duration_since(since) < IDLE_SESSION_TIMEOUT {
+            keep.push_back((session, since));
+        } else {
+            expired.push(session);
+        }
+    }
+    *idle = keep;
+    expired
+}
+
+async fn close_idle_sessions(sessions: Vec<ClientSession>, reason: &str) {
+    for session in sessions {
+        session.close(reason).await;
+    }
+}
+
+async fn sweep_idle_client_sessions(shared: Arc<SharedClientSession>) {
+    let mut ticker = interval(Duration::from_secs(5));
+    loop {
+        ticker.tick().await;
+        let expired = {
+            let mut idle = shared.idle.lock().await;
+            take_expired_idle_sessions(&mut idle)
+        };
+        close_idle_sessions(expired, "idle timeout").await;
     }
 }
 
@@ -157,6 +209,7 @@ struct ClientSession {
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>>,
     next_stream_id: Arc<AtomicU32>,
     closed: Arc<Mutex<Option<String>>>,
+    abort: Arc<TaskAbort>,
     first_packet: Arc<AtomicBool>,
     server_v2: Arc<AtomicBool>,
 }
@@ -176,8 +229,39 @@ struct ClientStream {
 }
 
 impl ClientSession {
-    async fn is_alive(&self) -> bool {
-        self.closed.lock().await.is_none()
+    fn is_alive(&self) -> bool {
+        !self.abort.is_triggered()
+    }
+
+    async fn close(&self, reason: &str) {
+        let already = {
+            let mut closed = self.closed.lock().await;
+            if closed.is_some() {
+                true
+            } else {
+                *closed = Some(reason.to_string());
+                false
+            }
+        };
+        self.abort.trigger();
+        if already {
+            return;
+        }
+        let _ = self.writer.lock().await.shutdown().await;
+        self.fail_open_streams(reason).await;
+    }
+
+    async fn fail_open_streams(&self, reason: &str) {
+        let senders = {
+            let mut streams = self.streams.lock().await;
+            streams
+                .drain()
+                .map(|(_, sender)| sender)
+                .collect::<Vec<_>>()
+        };
+        for sender in senders {
+            let _ = sender.send(StreamEvent::Error(reason.to_string())).await;
+        }
     }
 
     async fn connect(
@@ -195,7 +279,6 @@ impl ClientSession {
                         config.server_host, config.server_port
                     )
                 })?;
-        let _ = tcp.set_nodelay(true);
         let connector = TlsConnector::from(tls_config);
         let server_name = ServerName::try_from(config.sni.clone())
             .with_context(|| format!("invalid SNI: {}", config.sni))?;
@@ -213,20 +296,13 @@ impl ClientSession {
             streams: Arc::new(Mutex::new(HashMap::new())),
             next_stream_id: Arc::new(AtomicU32::new(1)),
             closed: Arc::new(Mutex::new(None)),
+            abort: Arc::new(TaskAbort::new()),
             first_packet: Arc::new(AtomicBool::new(true)),
             server_v2: Arc::new(AtomicBool::new(false)),
         };
-        tokio::spawn(read_session_frames(
-            reader,
-            session.writer.clone(),
-            session.streams.clone(),
-            session.closed.clone(),
-            shared_padding,
-            session.server_v2.clone(),
-        ));
+        tokio::spawn(read_session_frames(reader, session.clone(), shared_padding));
         tokio::spawn(run_heartbeat(
-            session.writer.clone(),
-            session.closed.clone(),
+            session.clone(),
             config.heartbeat_interval_secs,
         ));
         Ok(session)
@@ -384,7 +460,7 @@ async fn relay_tcp_counted(
 ) -> Result<()> {
     let stream_id = stream.stream_id;
     let writer = stream.writer.clone();
-    let (mut local_reader, local_writer) = local.into_split();
+    let (mut local_reader, mut local_writer) = local.into_split();
     let uplink_session = session.clone();
     let uplink = async {
         let mut buffer = vec![0u8; 32 * 1024];
@@ -394,11 +470,6 @@ async fn relay_tcp_counted(
                 .await
                 .context("read local payload")?;
             if read == 0 {
-                writer
-                    .lock()
-                    .await
-                    .write_frame(CMD_FIN, stream_id, &[])
-                    .await?;
                 return Ok::<(), anyhow::Error>(());
             }
             uplink_session.record_upload(read).await?;
@@ -409,27 +480,26 @@ async fn relay_tcp_counted(
                 .await?;
         }
     };
-    let downlink = write_stream_payloads_counted(&mut stream, local_writer, session);
-    tokio::try_join!(uplink, downlink)?;
-    Ok(())
-}
-
-async fn write_stream_payloads_counted(
-    stream: &mut ClientStream,
-    mut local_writer: OwnedWriteHalf,
-    session: crate::core::CoreSession,
-) -> Result<()> {
-    while let Some(payload) = stream.read_payload().await? {
-        session.record_download(payload.len()).await?;
-        local_writer
-            .write_all(&payload)
-            .await
-            .context("write local payload")?;
+    let downlink = async {
+        while let Some(payload) = stream.read_payload().await? {
+            session.record_download(payload.len()).await?;
+            local_writer
+                .write_all(&payload)
+                .await
+                .context("write local payload")?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let result = tokio::select! {
+        result = uplink => result,
+        result = downlink => result,
+    };
+    {
+        let mut writer = writer.lock().await;
+        let _ = writer.write_frame(CMD_FIN, stream_id, &[]).await;
     }
-    local_writer
-        .shutdown()
-        .await
-        .context("shutdown local writer")
+    let _ = local_writer.shutdown().await;
+    result
 }
 
 async fn handle_udp_associate_counted(
@@ -457,6 +527,8 @@ async fn handle_udp_associate_counted(
     let stream = session
         .open_stream(uot::magic_target(), uot::encode_v2_associate_request()?)
         .await?;
+    let stream_id = stream.stream_id;
+    let writer = stream.writer.clone();
     let udp = Arc::new(udp);
     let (client_tx, mut client_rx) = mpsc::channel::<SocketAddr>(8);
 
@@ -528,41 +600,43 @@ async fn handle_udp_associate_counted(
         }
     };
 
-    tokio::select! {
+    let result = tokio::select! {
         result = udp_to_stream => result,
         result = stream_to_udp => result,
         result = control_closed => result,
+    };
+    {
+        let mut writer = writer.lock().await;
+        let _ = writer.write_frame(CMD_FIN, stream_id, &[]).await;
     }
+    result
 }
 
 async fn read_session_frames(
     mut reader: ReadHalf<TlsStream<TcpStream>>,
-    writer: Arc<Mutex<PaddedFrameWriter<WriteHalf<TlsStream<TcpStream>>>>>,
-    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>>,
-    closed: Arc<Mutex<Option<String>>>,
+    session: ClientSession,
     shared_padding: Arc<Mutex<PaddingScheme>>,
-    server_v2: Arc<AtomicBool>,
 ) {
     let result: Result<()> = async {
         loop {
-            let frame = read_frame(&mut reader).await?;
-            handle_session_frame(frame, &writer, &streams, &shared_padding, &server_v2).await?;
+            tokio::select! {
+                _ = session.abort.cancelled() => return Ok(()),
+                frame = read_frame(&mut reader) => {
+                    handle_session_frame(
+                        frame?,
+                        &session.writer,
+                        &session.streams,
+                        &shared_padding,
+                        &session.server_v2,
+                    )
+                    .await?;
+                }
+            }
         }
     }
     .await;
     if let Err(error) = result {
-        let message = format!("{error:?}");
-        *closed.lock().await = Some(message.clone());
-        let senders = {
-            let mut streams = streams.lock().await;
-            streams
-                .drain()
-                .map(|(_, sender)| sender)
-                .collect::<Vec<_>>()
-        };
-        for sender in senders {
-            let _ = sender.send(StreamEvent::Error(message.clone())).await;
-        }
+        session.close(&format!("{error:?}")).await;
     }
 }
 
@@ -627,25 +701,22 @@ async fn send_stream_event(
     }
 }
 
-async fn run_heartbeat(
-    writer: Arc<Mutex<PaddedFrameWriter<WriteHalf<TlsStream<TcpStream>>>>>,
-    closed: Arc<Mutex<Option<String>>>,
-    heartbeat_interval_secs: u64,
-) {
+async fn run_heartbeat(session: ClientSession, heartbeat_interval_secs: u64) {
     let mut ticker = interval(Duration::from_secs(heartbeat_interval_secs));
     ticker.tick().await;
     loop {
-        ticker.tick().await;
-        if closed.lock().await.is_some() {
-            return;
+        tokio::select! {
+            _ = session.abort.cancelled() => return,
+            _ = ticker.tick() => {}
         }
-        if let Err(error) = writer
+        if let Err(error) = session
+            .writer
             .lock()
             .await
             .write_frame(CMD_HEART_REQUEST, 0, &[])
             .await
         {
-            *closed.lock().await = Some(format!("write heartbeat: {error:?}"));
+            session.close(&format!("write heartbeat: {error:?}")).await;
             return;
         }
     }

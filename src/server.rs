@@ -1,4 +1,4 @@
-use crate::core::{CoreSession, ProxyCore};
+use crate::core::{CoreSession, ProxyCore, TaskAbort};
 use crate::padding::PaddingScheme;
 use crate::protocol::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
@@ -24,6 +24,17 @@ use tokio::time::{Duration, interval};
 
 const MAX_PENDING_UOT: usize = 256;
 const MAX_UOT_BUFFER: usize = 64 * 1024;
+
+struct StreamControl {
+    sender: mpsc::Sender<Vec<u8>>,
+    abort: Arc<TaskAbort>,
+}
+
+impl Drop for StreamControl {
+    fn drop(&mut self) {
+        self.abort.trigger();
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -134,6 +145,8 @@ pub async fn run_server_listener_with_core(
     tracing::info!("server listening on {}", listener.local_addr()?);
     loop {
         let (stream, peer) = listener.accept().await.context("accept Aerion client")?;
+        let _ = stream.set_nodelay(true);
+        socket_protect::enable_tcp_keepalive(&stream);
         let acceptor = acceptor.clone();
         let padding = padding.clone();
         let core = core.clone();
@@ -179,7 +192,7 @@ async fn handle_client(
     let mut received_settings = false;
     let mut pending = HashSet::new();
     let mut pending_uot: HashMap<u32, (ProxyTarget, Vec<u8>)> = HashMap::new();
-    let mut streams: HashMap<u32, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut streams: HashMap<u32, StreamControl> = HashMap::new();
     let mut heartbeat = interval(Duration::from_secs(heartbeat_interval_secs));
     heartbeat.tick().await;
 
@@ -205,7 +218,11 @@ async fn handle_client(
                 pending.insert(frame.stream_id);
             }
             CMD_PSH if streams.contains_key(&frame.stream_id) => {
-                let sender = streams.get(&frame.stream_id).expect("stream key exists");
+                let sender = streams
+                    .get(&frame.stream_id)
+                    .expect("stream key exists")
+                    .sender
+                    .clone();
                 if sender.send(frame.payload).await.is_err() {
                     streams.remove(&frame.stream_id);
                 }
@@ -237,8 +254,8 @@ async fn handle_client(
                     )
                     .await
                     {
-                        Ok((stream_id, sender)) => {
-                            streams.insert(stream_id, sender);
+                        Ok((opened_id, control)) => {
+                            streams.insert(opened_id, control);
                         }
                         Err(error) => {
                             tracing::warn!("open stream failed: {error:?}");
@@ -260,8 +277,8 @@ async fn handle_client(
                     continue;
                 }
                 match open_stream(frame, writer.clone(), session.clone()).await {
-                    Ok((stream_id, sender)) => {
-                        streams.insert(stream_id, sender);
+                    Ok((stream_id, control)) => {
+                        streams.insert(stream_id, control);
                     }
                     Err(error) => {
                         tracing::warn!("open stream failed: {error:?}");
@@ -305,7 +322,7 @@ async fn open_stream(
     frame: Frame,
     writer: Arc<Mutex<WriteHalf<EarlyDataTlsStream>>>,
     session: CoreSession,
-) -> Result<(u32, mpsc::Sender<Vec<u8>>)> {
+) -> Result<(u32, StreamControl)> {
     let stream_id = frame.stream_id;
     let (target, initial_payload) = decode_target(&frame.payload)?;
     if uot::is_magic_target(&target) {
@@ -332,6 +349,7 @@ async fn open_stream(
     }
     let (mut remote_reader, mut remote_writer) = remote.into_split();
     let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(32);
+    let abort = Arc::new(TaskAbort::new());
     tracing::info!("opened stream {stream_id} to {}", target_name(&target));
 
     if !initial_payload.is_empty() {
@@ -343,18 +361,21 @@ async fn open_stream(
 
     let downlink_writer = writer.clone();
     let downlink_session = session.clone();
+    let downlink_abort = abort.clone();
     tokio::spawn(async move {
         let result = async {
             let mut buffer = vec![0u8; 32 * 1024];
             loop {
-                let read = remote_reader
-                    .read(&mut buffer)
-                    .await
-                    .context("read target payload")?;
+                let read = tokio::select! {
+                    _ = downlink_abort.cancelled() => return Ok::<(), anyhow::Error>(()),
+                    read = remote_reader.read(&mut buffer) => {
+                        read.context("read target payload")?
+                    }
+                };
                 if read == 0 {
                     let mut writer = downlink_writer.lock().await;
                     write_frame(&mut *writer, CMD_FIN, stream_id, &[]).await?;
-                    return Ok::<(), anyhow::Error>(());
+                    return Ok(());
                 }
                 downlink_session.record_download(read).await?;
                 {
@@ -364,15 +385,26 @@ async fn open_stream(
             }
         }
         .await;
+        downlink_abort.trigger();
         if let Err(error) = result {
             tracing::warn!("stream {stream_id} downlink failed: {error:?}");
         }
     });
 
     let uplink_session = session;
+    let uplink_abort = abort.clone();
     tokio::spawn(async move {
         let result = async {
-            while let Some(payload) = receiver.recv().await {
+            loop {
+                let payload = tokio::select! {
+                    _ = uplink_abort.cancelled() => break,
+                    payload = receiver.recv() => {
+                        let Some(payload) = payload else {
+                            break;
+                        };
+                        payload
+                    }
+                };
                 uplink_session.record_upload(payload.len()).await?;
                 remote_writer
                     .write_all(&payload)
@@ -385,12 +417,13 @@ async fn open_stream(
                 .context("shutdown target writer")
         }
         .await;
+        uplink_abort.trigger();
         if let Err(error) = result {
             tracing::warn!("stream {stream_id} uplink failed: {error:?}");
         }
     });
 
-    Ok((stream_id, sender))
+    Ok((stream_id, StreamControl { sender, abort }))
 }
 
 async fn open_uot_stream(
@@ -399,7 +432,7 @@ async fn open_uot_stream(
     initial_payload: &[u8],
     writer: Arc<Mutex<WriteHalf<EarlyDataTlsStream>>>,
     session: CoreSession,
-) -> Result<(u32, mpsc::Sender<Vec<u8>>)> {
+) -> Result<(u32, StreamControl)> {
     let (request, initial_packet) = uot::decode_request_for_target(target, initial_payload)?;
     let udp = socket_protect::bind_dual_stack_udp()
         .await
@@ -416,6 +449,7 @@ async fn open_uot_stream(
     }
     let udp = Arc::new(udp);
     let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(32);
+    let abort = Arc::new(TaskAbort::new());
     tracing::info!("opened UOT stream {stream_id}");
     let is_connect = request.is_connect;
 
@@ -429,10 +463,20 @@ async fn open_uot_stream(
     let uplink_udp = udp.clone();
     let request = Arc::new(request);
     let uplink_session = session.clone();
+    let uplink_abort = abort.clone();
     tokio::spawn(async move {
         let result = async {
             let mut pending = Vec::new();
-            while let Some(packet) = receiver.recv().await {
+            loop {
+                let packet = tokio::select! {
+                    _ = uplink_abort.cancelled() => break,
+                    packet = receiver.recv() => {
+                        let Some(packet) = packet else {
+                            break;
+                        };
+                        packet
+                    }
+                };
                 ensure!(
                     pending.len() + packet.len() <= MAX_UOT_BUFFER,
                     "pending UOT buffer exceeded"
@@ -465,6 +509,7 @@ async fn open_uot_stream(
             Ok::<(), anyhow::Error>(())
         }
         .await;
+        uplink_abort.trigger();
         if let Err(error) = result {
             tracing::warn!("UOT stream {stream_id} uplink failed: {error:?}");
         }
@@ -473,22 +518,29 @@ async fn open_uot_stream(
     let downlink_udp = udp.clone();
     let downlink_writer = writer.clone();
     let downlink_session = session;
+    let downlink_abort = abort.clone();
     tokio::spawn(async move {
         let result: Result<()> = async {
             let mut buffer = vec![0u8; u16::MAX as usize];
             loop {
-                let (read, source) = if is_connect {
-                    let read = downlink_udp
-                        .recv(&mut buffer)
-                        .await
-                        .context("receive connected UDP payload")?;
-                    let source = downlink_udp.peer_addr().context("read UDP peer address")?;
-                    (read, source)
-                } else {
-                    downlink_udp
-                        .recv_from(&mut buffer)
-                        .await
-                        .context("receive UDP payload")?
+                let (read, source) = tokio::select! {
+                    _ = downlink_abort.cancelled() => return Ok(()),
+                    received = async {
+                        if is_connect {
+                            let read = downlink_udp
+                                .recv(&mut buffer)
+                                .await
+                                .context("receive connected UDP payload")?;
+                            let source = downlink_udp.peer_addr().context("read UDP peer address")?;
+                            Ok::<_, anyhow::Error>((read, source))
+                        } else {
+                            let (read, source) = downlink_udp
+                                .recv_from(&mut buffer)
+                                .await
+                                .context("receive UDP payload")?;
+                            Ok((read, source))
+                        }
+                    } => received?,
                 };
                 let packet = if is_connect {
                     uot::encode_connect_packet(&buffer[..read])?
@@ -503,10 +555,11 @@ async fn open_uot_stream(
             }
         }
         .await;
+        downlink_abort.trigger();
         if let Err(error) = result {
             tracing::warn!("UOT stream {stream_id} downlink failed: {error:?}");
         }
     });
 
-    Ok((stream_id, sender))
+    Ok((stream_id, StreamControl { sender, abort }))
 }

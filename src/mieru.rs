@@ -1,4 +1,4 @@
-use crate::core::{CoreSession, CoreUser, ProxyCore};
+use crate::core::{CoreSession, CoreUser, ProxyCore, TaskAbort, relay_bidirectional_counted};
 use crate::protocol::{ProxyTarget, canonicalize_socket_addr, resolve_target_addr, target_name};
 use crate::socket_protect;
 use crate::uot;
@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, split};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::Instant;
 
 mod crypto;
@@ -57,7 +57,6 @@ const SESSION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const SESSION_HEARTBEAT_JITTER_MS: i32 = 1000;
 const SESSION_CLEAN_INTERVAL: Duration = Duration::from_secs(5);
 const PACKET_TX_COUNT_LIMIT: u8 = 20;
-const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug)]
 pub struct MieruUser {
@@ -156,7 +155,7 @@ struct ClientUnderlay {
     reliable: bool,
     closed: Arc<Mutex<Option<String>>>,
     had_session: Arc<AtomicBool>,
-    abort: Arc<Notify>,
+    abort: Arc<TaskAbort>,
 }
 
 struct SharedMieruClientSession {
@@ -664,7 +663,7 @@ pub async fn run_mieru_server_listener_with_core(
     loop {
         let (stream, peer) = listener.accept().await.context("accept Mieru client")?;
         let _ = stream.set_nodelay(true);
-        enable_mieru_tcp_keepalive(&stream);
+        socket_protect::enable_tcp_keepalive(&stream);
         let users = users.clone();
         let core = core.clone();
         let mtu = config.mtu();
@@ -863,7 +862,7 @@ async fn connect_mieru_underlay(config: &MieruClientConfig) -> Result<ClientUnde
     let sessions = Arc::new(Mutex::new(HashMap::new()));
     let closed = Arc::new(Mutex::new(None));
     let had_session = Arc::new(AtomicBool::new(false));
-    let abort = Arc::new(Notify::new());
+    let abort = Arc::new(TaskAbort::new());
     tokio::spawn(run_mieru_client_read_loop(
         reader,
         recv,
@@ -937,7 +936,7 @@ async fn connect_mieru_packet_underlay(config: &MieruClientConfig) -> Result<Cli
     let sessions = Arc::new(Mutex::new(HashMap::new()));
     let closed = Arc::new(Mutex::new(None));
     let had_session = Arc::new(AtomicBool::new(false));
-    let abort = Arc::new(Notify::new());
+    let abort = Arc::new(TaskAbort::new());
     tokio::spawn(run_mieru_packet_client_read_loop(
         socket,
         candidates,
@@ -1024,7 +1023,7 @@ async fn handle_mieru_underlay_server(
         traffic_pattern.clone(),
     ))));
     let sessions = Arc::new(Mutex::new(HashMap::new()));
-    let abort = Arc::new(Notify::new());
+    let abort = Arc::new(TaskAbort::new());
     let had_session = Arc::new(AtomicBool::new(false));
     let cleaner = tokio::spawn(run_mieru_underlay_cleaner(
         sessions.clone(),
@@ -1047,7 +1046,7 @@ async fn handle_mieru_underlay_server(
         had_session,
     )
     .await;
-    abort.notify_waiters();
+    abort.trigger();
     cleaner.abort();
     let _ = writer.lock().await.shutdown().await;
     sessions.lock().await.clear();
@@ -1060,13 +1059,13 @@ async fn run_mieru_client_read_loop(
     writer: Arc<Mutex<MieruAnyWriter>>,
     sessions: MieruSessionMap,
     closed: Arc<Mutex<Option<String>>>,
-    abort: Arc<Notify>,
+    abort: Arc<TaskAbort>,
 ) {
     let result: Result<()> = async {
         let mut first_read = true;
         loop {
             tokio::select! {
-                _ = abort.notified() => {
+                _ = abort.cancelled() => {
                     return Ok(());
                 }
                 segment = read_mieru_segment(&mut reader, &mut recv, first_read) => {
@@ -1113,7 +1112,7 @@ async fn run_mieru_client_read_loop(
         let message = format!("{error:?}");
         *closed.lock().await = Some(message.clone());
         sessions.lock().await.clear();
-        abort.notify_waiters();
+        abort.trigger();
         tracing::debug!("Mieru client read loop stopped: {message}");
     } else {
         *closed.lock().await = Some("Mieru underlay closed".to_string());
@@ -1132,7 +1131,7 @@ async fn run_mieru_server_read_loop(
     traffic_pattern: Option<MieruTrafficPattern>,
     peer: SocketAddr,
     replay: Arc<MieruReplayCache>,
-    abort: Arc<Notify>,
+    abort: Arc<TaskAbort>,
     had_session: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut recv = None::<MieruCipher>;
@@ -1140,7 +1139,7 @@ async fn run_mieru_server_read_loop(
     loop {
         if recv.is_none() {
             let (cipher, matched_user, segment) = tokio::select! {
-                _ = abort.notified() => return Ok(()),
+                _ = abort.cancelled() => return Ok(()),
                 result = read_first_server_segment(
                     &mut reader,
                     &users,
@@ -1171,7 +1170,7 @@ async fn run_mieru_server_read_loop(
             continue;
         }
         let segment = tokio::select! {
-            _ = abort.notified() => return Ok(()),
+            _ = abort.cancelled() => return Ok(()),
             result = read_mieru_segment(
                 &mut reader,
                 recv.as_mut().expect("Mieru receive cipher is set"),
@@ -1201,13 +1200,13 @@ async fn run_mieru_packet_client_read_loop(
     writer: Arc<Mutex<MieruAnyWriter>>,
     sessions: MieruSessionMap,
     closed: Arc<Mutex<Option<String>>>,
-    abort: Arc<Notify>,
+    abort: Arc<TaskAbort>,
 ) {
     let result: Result<()> = async {
         let mut buffer = vec![0u8; u16::MAX as usize];
         loop {
             tokio::select! {
-                _ = abort.notified() => {
+                _ = abort.cancelled() => {
                     return Ok(());
                 }
                 received = socket.recv_from(&mut buffer) => {
@@ -1280,7 +1279,7 @@ async fn run_mieru_packet_client_read_loop(
         let message = format!("{error:?}");
         *closed.lock().await = Some(message.clone());
         sessions.lock().await.clear();
-        abort.notify_waiters();
+        abort.trigger();
         tracing::debug!("Mieru UDP client read loop stopped: {message}");
     } else {
         *closed.lock().await = Some("Mieru underlay closed".to_string());
@@ -1303,7 +1302,7 @@ async fn run_mieru_packet_server(
     tracing::info!("Mieru UDP server listening on {}", socket.local_addr()?);
     let sessions = Arc::new(Mutex::new(HashMap::new()));
     let replay = MieruReplayCache::new();
-    let abort = Arc::new(Notify::new());
+    let abort = Arc::new(TaskAbort::new());
     tokio::spawn(run_mieru_underlay_cleaner(
         sessions.clone(),
         None,
@@ -1381,7 +1380,7 @@ async fn handle_server_segment(
     mtu: usize,
     reliable: bool,
     peer: SocketAddr,
-    abort: Option<Arc<Notify>>,
+    abort: Option<Arc<TaskAbort>>,
     had_session: Option<Arc<AtomicBool>>,
 ) -> Result<()> {
     match segment.metadata.protocol() {
@@ -1489,7 +1488,7 @@ async fn run_mieru_session_output(
     mtu: usize,
     un_ack_seq: Arc<AtomicU32>,
     sessions: MieruSessionMap,
-    abort: Option<Arc<Notify>>,
+    abort: Option<Arc<TaskAbort>>,
 ) {
     let result: Result<()> = async {
         let mut next_seq = if is_client { 0 } else { 1 };
@@ -1683,7 +1682,7 @@ async fn run_mieru_session_output(
         tracing::debug!("Mieru session {session_id} output stopped: {error:?}");
         if !reliable {
             if let Some(abort) = abort {
-                abort.notify_waiters();
+                abort.trigger();
                 let _ = writer.lock().await.shutdown().await;
             }
         }
@@ -1715,7 +1714,7 @@ async fn write_output_segment(
 async fn run_mieru_underlay_cleaner(
     sessions: MieruSessionMap,
     writer: Option<Arc<Mutex<MieruAnyWriter>>>,
-    abort: Arc<Notify>,
+    abort: Arc<TaskAbort>,
     had_session: Arc<AtomicBool>,
 ) {
     let mut ticker = tokio::time::interval_at(
@@ -1724,7 +1723,7 @@ async fn run_mieru_underlay_cleaner(
     );
     loop {
         tokio::select! {
-            _ = abort.notified() => return,
+            _ = abort.cancelled() => return,
             _ = ticker.tick() => {}
         }
         {
@@ -1734,7 +1733,7 @@ async fn run_mieru_underlay_cleaner(
                 continue;
             }
         }
-        abort.notify_waiters();
+        abort.trigger();
         if let Some(writer) = writer.as_ref() {
             let _ = writer.lock().await.shutdown().await;
         }
@@ -1760,14 +1759,6 @@ fn random_heartbeat_jitter_ms() -> Result<i32> {
     getrandom::fill(&mut bytes).context("generate Mieru heartbeat jitter")?;
     let range = (SESSION_HEARTBEAT_JITTER_MS * 2 + 1) as u32;
     Ok((u32::from_le_bytes(bytes) % range) as i32 - SESSION_HEARTBEAT_JITTER_MS)
-}
-
-fn enable_mieru_tcp_keepalive(stream: &TcpStream) {
-    let socket = socket2::SockRef::from(stream);
-    let keepalive = socket2::TcpKeepalive::new()
-        .with_time(TCP_KEEPALIVE_TIME)
-        .with_interval(TCP_KEEPALIVE_TIME);
-    let _ = socket.set_tcp_keepalive(&keepalive);
 }
 
 async fn route_session_segment(
@@ -1848,57 +1839,6 @@ async fn write_close_response(writer: &Arc<Mutex<MieruAnyWriter>>, session_id: u
         .await
 }
 
-async fn relay_mieru_connect(
-    session: &mut MieruSession,
-    remote: &mut TcpStream,
-    core_session: CoreSession,
-) -> Result<()> {
-    let (mut session_read, mut session_write) = tokio::io::split(&mut *session);
-    let (mut remote_read, mut remote_write) = remote.split();
-    let uplink_session = core_session.clone();
-    let uplink = async {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            let read = session_read
-                .read(&mut buffer)
-                .await
-                .context("read Mieru uplink")?;
-            if read == 0 {
-                return Ok(());
-            }
-            uplink_session.record_upload(read).await?;
-            remote_write
-                .write_all(&buffer[..read])
-                .await
-                .context("write Mieru uplink")?;
-        }
-    };
-    let downlink = async {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            let read = remote_read
-                .read(&mut buffer)
-                .await
-                .context("read Mieru downlink")?;
-            if read == 0 {
-                return Ok(());
-            }
-            core_session.record_download(read).await?;
-            session_write
-                .write_all(&buffer[..read])
-                .await
-                .context("write Mieru downlink")?;
-        }
-    };
-    let result = tokio::select! {
-        result = uplink => result,
-        result = downlink => result,
-    };
-    let _ = remote_write.shutdown().await;
-    let _ = session_write.shutdown().await;
-    result
-}
-
 async fn handle_mieru_server_socks_session(
     mut session: MieruSession,
     core_session: CoreSession,
@@ -1910,7 +1850,7 @@ async fn handle_mieru_server_socks_session(
             let bind = remote.local_addr().unwrap_or_else(|_| unspecified_v4());
             write_socks_reply_with_bind(&mut session, 0, bind).await?;
             tracing::info!("Mieru opened {}", target_name(&target));
-            relay_mieru_connect(&mut session, &mut remote, core_session).await
+            relay_bidirectional_counted(&mut session, &mut remote, core_session, "Mieru").await
         }
         SocksRequest::UdpAssociate => handle_mieru_server_udp(session, core_session).await,
     }

@@ -120,13 +120,20 @@ where
     }
 
     pub async fn write_payload_chunks(&mut self, stream_id: u32, payload: &[u8]) -> Result<()> {
-        let chunks = payload.chunks(MAX_FRAME_PAYLOAD_LEN).collect::<Vec<_>>();
-        for (index, chunk) in chunks.iter().enumerate() {
-            let flush = index + 1 == chunks.len();
+        let mut chunks = payload.chunks(MAX_FRAME_PAYLOAD_LEN).peekable();
+        while let Some(chunk) = chunks.next() {
+            let flush = chunks.peek().is_none();
             self.write_frame_with_flush(CMD_PSH, stream_id, chunk, flush)
                 .await?;
         }
         Ok(())
+    }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.inner
+            .shutdown()
+            .await
+            .context("shutdown padded writer")
     }
 
     pub fn update_padding_scheme(&mut self, raw: &str) -> Result<()> {
