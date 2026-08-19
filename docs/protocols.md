@@ -41,7 +41,7 @@ QUIC + HTTP/3 `POST https://hysteria/auth`, TCP request id `0x401`, UDP session/
 
 ### Mieru
 
-TCP stream and native UDP packet underlays, Mieru v3 metadata, XChaCha20-Poly1305, password hashing with time-window keys, SOCKS CONNECT and UDP packet-over-stream, traffic-pattern TCP fragmentation and padding. Nonzero low-entropy patterns fail explicitly.
+TCP stream and native UDP packet underlays, Mieru v3 metadata, XChaCha20-Poly1305, password hashing with time-window keys, SOCKS CONNECT and UDP packet-over-stream, traffic-pattern TCP fragmentation and padding. Session heartbeat is 5s ± 1s; write failure closes the session (`closeSessionRequest`). Closed sessions are reaped every 5s, and a TCP underlay with no remaining sessions is shut down on the same interval. SOCKS CONNECT relay closes both the Mieru session and the outbound TCP when either side FINs. Nonzero low-entropy patterns fail explicitly.
 
 ### Naive
 

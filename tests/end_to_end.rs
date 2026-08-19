@@ -761,6 +761,81 @@ async fn socks_client_reaches_tcp_target_through_mieru_server() -> Result<()> {
 }
 
 #[tokio::test]
+async fn mieru_server_finishes_when_tcp_target_fins() -> Result<()> {
+    let target_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let target_addr = target_listener.local_addr()?;
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) = target_listener.accept().await?;
+        let mut buffer = [0u8; 64];
+        let read = stream.read(&mut buffer).await?;
+        stream.write_all(&buffer[..read]).await?;
+        stream.shutdown().await?;
+        Ok::<(), std::io::Error>(())
+    });
+
+    let server_addr = unused_tcp_addr()?;
+    let server_task = tokio::spawn(run_mieru_server(MieruServerConfig {
+        listen: server_addr,
+        username: "default".to_string(),
+        password: "test-password".to_string(),
+        users: Vec::new(),
+        mtu: 1500,
+        user_hint_mandatory: false,
+        traffic_pattern: None,
+        transport: MieruTransport::Tcp,
+    }));
+
+    let client_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let client_addr = client_listener.local_addr()?;
+    let client_task = tokio::spawn(run_mieru_client_listener(
+        client_listener,
+        MieruClientConfig {
+            listen: client_addr,
+            server_host: "127.0.0.1".to_string(),
+            server_port: server_addr.port(),
+            username: "default".to_string(),
+            password: "test-password".to_string(),
+            hashed_password: None,
+            mtu: 1500,
+            traffic_pattern: None,
+            transport: MieruTransport::Tcp,
+        },
+    ));
+
+    let result = timeout(Duration::from_secs(8), async {
+        let mut socks = TcpStream::connect(client_addr).await?;
+        socks.write_all(&[0x05, 0x01, 0x00]).await?;
+        let mut greeting = [0u8; 2];
+        socks.read_exact(&mut greeting).await?;
+        anyhow::ensure!(greeting == [0x05, 0x00], "unexpected SOCKS greeting reply");
+        write_socks_connect(&mut socks, target_addr).await?;
+        let mut reply = [0u8; 10];
+        socks.read_exact(&mut reply).await?;
+        anyhow::ensure!(reply[1] == 0x00, "SOCKS connect failed: {:?}", reply);
+        socks.write_all(b"ping").await?;
+        let mut echoed = [0u8; 4];
+        socks.read_exact(&mut echoed).await?;
+        anyhow::ensure!(&echoed == b"ping", "echo payload mismatch");
+        let mut tail = [0u8; 1];
+        let read = socks.read(&mut tail).await?;
+        anyhow::ensure!(read == 0, "expected Mieru session EOF after target FIN");
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("Mieru target-FIN test timed out")
+    .and_then(|inner| inner);
+
+    client_task.abort();
+    server_task.abort();
+    if result.is_ok() {
+        target_task.await??;
+    } else {
+        target_task.abort();
+    }
+    result
+}
+
+#[tokio::test]
 async fn socks_client_reaches_tcp_target_through_mieru_udp_packet_underlay() -> Result<()> {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await?;
     let echo_addr = echo_listener.local_addr()?;

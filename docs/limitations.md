@@ -15,7 +15,7 @@ These are also noted in `AGENTS.md` and the protocol modules:
 | Area | Status |
 | --- | --- |
 | VLESS XHTTP / SplitHTTP | `stream-one` only. `stream-up` and `packet-up` need a session table and multi-connection upload queue |
-| Mieru traffic patterns | TCP/UDP underlays and v3 frames exist; low-entropy body mode and some implicit padding/nonce shaping are incomplete. Nonzero low-entropy config fails |
+| Mieru traffic patterns | TCP/UDP underlays, v3 frames, session heartbeat, idle underlay/session cleanup, and SOCKS full close exist; low-entropy body mode and some implicit padding/nonce shaping are incomplete. Nonzero low-entropy config fails |
 | Shadowsocks SIP003 plugins | Not implemented |
 | Client ECH | `echConfigList` unsupported. Server ECH requires the `server-ech` feature |
 | Active outbound selection | Multi-candidate urltest / load-balance / relay groups fail. `select` / `selector` are static |
