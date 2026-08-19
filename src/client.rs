@@ -1,4 +1,4 @@
-use crate::core::{CoreSession, ProxyCore, TaskAbort};
+use crate::core::{CoreSession, ProxyCore};
 use crate::listener;
 use crate::padding::PaddingScheme;
 use crate::protocol::{
@@ -8,6 +8,7 @@ use crate::protocol::{
 };
 use crate::socket_protect;
 use crate::socks::{self, SocksRequest};
+use crate::task_abort::TaskAbort;
 use crate::tls;
 use crate::uot;
 use crate::utls::UtlsFingerprint;

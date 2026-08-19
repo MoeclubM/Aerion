@@ -1,4 +1,4 @@
-use crate::core::{CoreSession, ProxyCore, TaskAbort};
+use crate::core::{CoreSession, ProxyCore};
 use crate::padding::PaddingScheme;
 use crate::protocol::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
@@ -7,6 +7,7 @@ use crate::protocol::{
     resolve_target_addr, target_name, write_frame, write_payload_chunks,
 };
 use crate::socket_protect;
+use crate::task_abort::TaskAbort;
 use crate::tls::{self, ServerTlsAcceptor, ServerTlsMaterial, ServerTlsStream, TlsEchServerKeys};
 use crate::uot;
 use anyhow::{Context, Result, bail, ensure};
@@ -144,9 +145,9 @@ pub async fn run_server_listener_with_core(
     let padding = PaddingScheme::from_lines(config.padding_scheme.clone())?;
     tracing::info!("server listening on {}", listener.local_addr()?);
     loop {
-        let (stream, peer) = listener.accept().await.context("accept Aerion client")?;
-        let _ = stream.set_nodelay(true);
-        socket_protect::enable_tcp_keepalive(&stream);
+        let (stream, peer) = crate::listener::accept_tcp(&listener)
+            .await
+            .context("accept Aerion client")?;
         let acceptor = acceptor.clone();
         let padding = padding.clone();
         let core = core.clone();

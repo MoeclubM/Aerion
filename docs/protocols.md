@@ -37,7 +37,7 @@ TLS session with frame multiplexing, SOCKS5 CONNECT / UDP ASSOCIATE, UoT detecti
 
 ### Hysteria2
 
-QUIC + HTTP/3 `POST https://hysteria/auth`, TCP request id `0x401`, UDP session/packet/fragment fields, Salamander obfs, BBR / NewReno, configurable auth timeout, single password plus extra credentials.
+QUIC + HTTP/3 `POST https://hysteria/auth`, TCP request id `0x401`, UDP session/packet/fragment fields, Salamander obfs, BBR / NewReno, configurable auth timeout, single password plus extra credentials. TCP relay matches official `copyTwoWay`: the first finished direction closes both the QUIC stream and the outbound TCP.
 
 ### Mieru
 
@@ -45,7 +45,7 @@ TCP stream and native UDP packet underlays, Mieru v3 metadata, XChaCha20-Poly130
 
 ### Naive
 
-Local SOCKS CONNECT over HTTPS CONNECT. HTTP/1.1, HTTP/2, and HTTP/3 on both sides. Basic auth, SNI checks, extra headers, optional UoT UDP, randomized padding chunks.
+Local SOCKS CONNECT over HTTPS CONNECT. HTTP/1.1, HTTP/2, and HTTP/3 on both sides. Basic auth, SNI checks, extra headers, optional UoT UDP, randomized padding chunks. CONNECT tunnels stop both directions when either side FINs.
 
 ### Shadowsocks
 
@@ -53,16 +53,16 @@ TCP and UDP relay through `shadowsocks-rust` (AEAD, AEAD extra, AEAD-2022, AEAD-
 
 ### Trojan
 
-TLS core, TCP CONNECT, UDP ASSOCIATE over the Trojan stream, multi-user passwords, and the shared VLESS transport set.
+TLS core, TCP CONNECT, UDP ASSOCIATE over the Trojan stream, multi-user passwords, and the shared VLESS transport set. Fallback to a camouflage destination uses bidirectional copy with write-half shutdown.
 
 ### TUIC
 
-TUIC v5 over QUIC/TLS with `h3` ALPN, exporter token from UUID + password, TCP CONNECT, UDP via datagrams or uni streams, fragmentation, dissociate, heartbeat, Cubic / BBR / NewReno, `ProxyCore` accounting.
+TUIC v5 over QUIC/TLS with `h3` ALPN, exporter token from UUID + password, TCP CONNECT, UDP via datagrams or uni streams, fragmentation, dissociate, heartbeat, Cubic / BBR / NewReno, `ProxyCore` accounting. TCP CONNECT uses the shared first-finisher split relay.
 
 ### VLESS
 
-Raw TCP, TLS, or REALITY. TCP / WS / HTTPUpgrade / H2 / gRPC / XHTTP stream-one. TCP command, length-prefixed UDP, Vision (`xtls-rprx-vision`), XUDP on `v1.mux.cool:666`, Mux relay, multi-user UUIDs.
+Raw TCP, TLS, or REALITY. TCP / WS / HTTPUpgrade / H2 / gRPC / XHTTP stream-one. TCP command, length-prefixed UDP, Vision (`xtls-rprx-vision`), XUDP on `v1.mux.cool:666`, Mux relay, multi-user UUIDs. Mux `STATUS_END` and Vision TCP close both directions (Xray `Session.Close` / first-finisher).
 
 ### VMess
 
-AEAD request/response header, same stream transports as VLESS, TCP with `none` or chunked AES-128-GCM / ChaCha20-Poly1305, UDP including `packetaddr` and `xudp`, multi-user UUIDs.
+AEAD request/response header, same stream transports as VLESS, TCP with `none` or chunked AES-128-GCM / ChaCha20-Poly1305, UDP including `packetaddr` and `xudp`, multi-user UUIDs. TCP body relay closes both sides when either FINs.

@@ -1,4 +1,4 @@
-use crate::core::{CoreSession, CoreUser, ProxyCore};
+use crate::core::{CoreSession, CoreUser, ProxyCore, relay_split_counted};
 use crate::listener;
 use crate::protocol::{ProxyTarget, parse_uuid, resolve_target_addr, target_name};
 use crate::quic::{self, QuicCongestion};
@@ -15,7 +15,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket, tcp::OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 
@@ -195,13 +195,14 @@ impl TuicAuthState {
 
     async fn wait_session(&self) -> Result<CoreSession> {
         loop {
+            let notified = self.notify.notified();
             if let Some(session) = self.session.lock().await.clone() {
                 return Ok(session);
             }
             if let Some(error) = self.error.lock().await.clone() {
                 bail!("{error}");
             }
-            self.notify.notified().await;
+            notified.await;
         }
     }
 }
@@ -506,51 +507,17 @@ async fn relay_tuic_tcp(
     local: TcpStream,
     stream: (quinn::SendStream, quinn::RecvStream),
 ) -> Result<()> {
-    let (mut send, mut recv) = stream;
-    let (mut local_reader, local_writer) = local.into_split();
-    let uplink = async {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            let read = local_reader
-                .read(&mut buffer)
-                .await
-                .context("read TUIC local payload")?;
-            if read == 0 {
-                send.finish().context("finish TUIC send stream")?;
-                return Ok::<(), anyhow::Error>(());
-            }
-            send.write_all(&buffer[..read])
-                .await
-                .context("write TUIC stream payload")?;
-        }
-    };
-    let downlink = write_tuic_recv_to_local(&mut recv, local_writer);
-    tokio::try_join!(uplink, downlink)?;
-    Ok(())
-}
-
-async fn write_tuic_recv_to_local(
-    recv: &mut quinn::RecvStream,
-    mut local_writer: OwnedWriteHalf,
-) -> Result<()> {
-    let mut buffer = vec![0u8; 32 * 1024];
-    loop {
-        let read = recv
-            .read(&mut buffer)
-            .await
-            .context("read TUIC stream payload")?;
-        let Some(read) = read else {
-            local_writer
-                .shutdown()
-                .await
-                .context("shutdown TUIC local writer")?;
-            return Ok(());
-        };
-        local_writer
-            .write_all(&buffer[..read])
-            .await
-            .context("write TUIC local payload")?;
-    }
+    let (send, recv) = stream;
+    let (local_reader, local_writer) = local.into_split();
+    relay_split_counted(
+        local_reader,
+        local_writer,
+        recv,
+        send,
+        CoreSession::disabled(),
+        "TUIC",
+    )
+    .await
 }
 
 async fn handle_tuic_udp_associate(mut control: TcpStream, client: TuicClient) -> Result<()> {
@@ -1056,48 +1023,8 @@ async fn handle_server_bi_stream(
         }
     };
     let _ = remote.set_nodelay(true);
-    let (mut remote_reader, mut remote_writer) = remote.into_split();
-    let uplink_session = session.clone();
-    let uplink = async {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            let read = recv
-                .read(&mut buffer)
-                .await
-                .context("read TUIC uplink stream")?;
-            let Some(read) = read else {
-                remote_writer
-                    .shutdown()
-                    .await
-                    .context("shutdown TUIC target writer")?;
-                return Ok::<(), anyhow::Error>(());
-            };
-            uplink_session.record_upload(read).await?;
-            remote_writer
-                .write_all(&buffer[..read])
-                .await
-                .context("write TUIC target payload")?;
-        }
-    };
-    let downlink = async {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            let read = remote_reader
-                .read(&mut buffer)
-                .await
-                .context("read TUIC target payload")?;
-            if read == 0 {
-                send.finish().context("finish TUIC response stream")?;
-                return Ok::<(), anyhow::Error>(());
-            }
-            session.record_download(read).await?;
-            send.write_all(&buffer[..read])
-                .await
-                .context("write TUIC downlink stream")?;
-        }
-    };
-    tokio::try_join!(uplink, downlink)?;
-    Ok(())
+    let (remote_reader, remote_writer) = remote.into_split();
+    relay_split_counted(recv, send, remote_reader, remote_writer, session, "TUIC").await
 }
 
 async fn get_server_udp_session(

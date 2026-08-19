@@ -45,7 +45,9 @@ pub async fn run_socks_proxy_client_listener(
 ) -> Result<()> {
     tracing::info!("SOCKS proxy client listening on socks5://{}", config.listen);
     loop {
-        let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
+        let (stream, peer) = crate::listener::accept_tcp(&listener)
+            .await
+            .context("accept SOCKS client")?;
         let config = config.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_socks_proxy_client(stream, config).await {

@@ -1,18 +1,11 @@
+use crate::task_abort::TaskAbort;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
 
 #[derive(Clone, Debug, Default)]
 pub struct ListenerStopToken {
-    inner: Arc<ListenerStopInner>,
-}
-
-#[derive(Debug, Default)]
-struct ListenerStopInner {
-    stopped: AtomicBool,
-    notify: Notify,
+    abort: Arc<TaskAbort>,
 }
 
 impl ListenerStopToken {
@@ -21,20 +14,15 @@ impl ListenerStopToken {
     }
 
     pub fn stop(&self) {
-        if !self.inner.stopped.swap(true, Ordering::SeqCst) {
-            self.inner.notify.notify_waiters();
-        }
+        self.abort.trigger();
     }
 
     pub fn is_stopped(&self) -> bool {
-        self.inner.stopped.load(Ordering::SeqCst)
+        self.abort.is_triggered()
     }
 
     pub async fn stopped(&self) {
-        if self.is_stopped() {
-            return;
-        }
-        self.inner.notify.notified().await;
+        self.abort.cancelled().await;
     }
 }
 
@@ -69,8 +57,14 @@ pub fn is_accept_cancelled(error: &std::io::Error) -> bool {
         || message.contains("operation was aborted")
 }
 
+pub async fn accept_tcp(listener: &TcpListener) -> std::io::Result<(TcpStream, SocketAddr)> {
+    let (stream, peer) = listener.accept().await?;
+    crate::socket_protect::configure_tcp_socket(&stream);
+    Ok((stream, peer))
+}
+
 pub async fn accept_client(listener: &TcpListener) -> Result<(TcpStream, SocketAddr), AcceptError> {
-    listener.accept().await.map_err(AcceptError::from)
+    accept_tcp(listener).await.map_err(AcceptError::from)
 }
 
 #[cfg(test)]

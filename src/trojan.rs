@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll, ready};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
 use tokio_rustls::TlsConnector;
@@ -97,7 +97,9 @@ pub async fn run_trojan_client_listener(
         listener.local_addr()?
     );
     loop {
-        let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
+        let (stream, peer) = crate::listener::accept_tcp(&listener)
+            .await
+            .context("accept SOCKS client")?;
         let config = config.clone();
         let core = core.clone();
         tokio::spawn(async move {
@@ -134,7 +136,9 @@ pub async fn run_trojan_server_with_core(
     let fallback = config.fallback;
     tracing::info!("Trojan server listening on {}", listener.local_addr()?);
     loop {
-        let (stream, peer) = listener.accept().await.context("accept Trojan client")?;
+        let (stream, peer) = crate::listener::accept_tcp(&listener)
+            .await
+            .context("accept Trojan client")?;
         let acceptor = acceptor.clone();
         let core = core.clone();
         let transport = transport.clone();
@@ -370,12 +374,9 @@ where
         .write_all(&stream.take_captured())
         .await
         .context("write Trojan fallback prefix")?;
-    let (mut client_reader, mut client_writer) = tokio::io::split(stream);
-    let (mut fallback_reader, mut fallback_writer) = remote.into_split();
-    tokio::try_join!(
-        tokio::io::copy(&mut client_reader, &mut fallback_writer),
-        tokio::io::copy(&mut fallback_reader, &mut client_writer),
-    )?;
+    copy_bidirectional(&mut stream, &mut remote)
+        .await
+        .context("relay Trojan fallback")?;
     Ok(())
 }
 

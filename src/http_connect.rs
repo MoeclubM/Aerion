@@ -58,7 +58,9 @@ pub async fn run_http_proxy_client_listener(
 ) -> Result<()> {
     tracing::info!("HTTP proxy client listening on socks5://{}", config.listen);
     loop {
-        let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
+        let (stream, peer) = crate::listener::accept_tcp(&listener)
+            .await
+            .context("accept SOCKS client")?;
         let config = config.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_http_proxy_socks(stream, config).await {
@@ -86,7 +88,7 @@ pub async fn run_http_connect_listener_until(
     );
     loop {
         let (stream, peer) = tokio::select! {
-            accepted = listener.accept() => accepted.context("accept HTTP CONNECT client")?,
+            accepted = crate::listener::accept_tcp(&listener) => accepted.context("accept HTTP CONNECT client")?,
             _ = stop.stopped() => return Ok(()),
         };
         tokio::spawn(async move {

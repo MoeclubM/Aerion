@@ -77,8 +77,10 @@ where
         }
         Ok::<(), anyhow::Error>(())
     };
-    tokio::try_join!(client_to_udp, udp_to_client)?;
-    Ok(())
+    tokio::select! {
+        result = client_to_udp => result,
+        result = udp_to_client => result,
+    }
 }
 
 pub async fn write_client_packet<W>(

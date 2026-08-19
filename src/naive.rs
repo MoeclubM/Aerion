@@ -171,7 +171,9 @@ pub async fn run_naive_server_with_core(config: NaiveServerConfig, core: ProxyCo
     }
     let acceptor = tokio_rustls::TlsAcceptor::from(runtime.tls_config.clone());
     loop {
-        let (stream, peer) = listener.accept().await.context("accept Naive TCP client")?;
+        let (stream, peer) = crate::listener::accept_tcp(&listener)
+            .await
+            .context("accept Naive TCP client")?;
         let runtime = runtime.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
@@ -985,8 +987,10 @@ async fn relay_naive_http1_server_tcp(
             write_naive_h1_data(&mut inbound_writer, &mut state, &buffer[..read]).await?;
         }
     };
-    let _ = tokio::try_join!(upload, download)?;
-    Ok(())
+    tokio::select! {
+        result = upload => result,
+        result = download => result,
+    }
 }
 
 async fn relay_naive_http2_server_tcp(
@@ -1036,8 +1040,10 @@ async fn relay_naive_http2_server_tcp(
             send_naive_h2_data(&mut send, &mut state, &buffer[..read]).await?;
         }
     };
-    let _ = tokio::try_join!(upload, download)?;
-    Ok(())
+    tokio::select! {
+        result = upload => result,
+        result = download => result,
+    }
 }
 
 async fn relay_naive_http3_server_tcp<S1, S2>(
@@ -1090,8 +1096,10 @@ where
             send_naive_h3_server_data(&mut send, &mut state, &buffer[..read]).await?;
         }
     };
-    let _ = tokio::try_join!(upload, download)?;
-    Ok(())
+    tokio::select! {
+        result = upload => result,
+        result = download => result,
+    }
 }
 
 async fn relay_naive_http1_uot(
@@ -1535,8 +1543,10 @@ async fn relay_naive_http1_tcp(
                 .context("write local Naive TCP payload")?;
         }
     };
-    tokio::try_join!(upload, download)?;
-    Ok(())
+    tokio::select! {
+        result = upload => result,
+        result = download => result,
+    }
 }
 
 async fn relay_naive_http2_tcp(
@@ -1583,8 +1593,10 @@ async fn relay_naive_http2_tcp(
                 .context("write local Naive HTTP/2 payload")?;
         }
     };
-    tokio::try_join!(upload, download)?;
-    Ok(())
+    tokio::select! {
+        result = upload => result,
+        result = download => result,
+    }
 }
 
 async fn relay_naive_http3_tcp(
@@ -1629,8 +1641,10 @@ async fn relay_naive_http3_tcp(
                 .context("write local Naive HTTP/3 payload")?;
         }
     };
-    tokio::try_join!(upload, download)?;
-    Ok(())
+    tokio::select! {
+        result = upload => result,
+        result = download => result,
+    }
 }
 
 async fn handle_naive_udp_associate(

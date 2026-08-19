@@ -174,8 +174,15 @@ where
         Ok::<(), anyhow::Error>(())
     };
 
-    tokio::try_join!(local_to_mux, mux_to_local)?;
-    Ok(())
+    let result = tokio::select! {
+        result = local_to_mux => result,
+        result = mux_to_local => result,
+    };
+    let _ = mux_writer
+        .write_all(&encode_frame(session_id, STATUS_END, None, &[], false)?)
+        .await;
+    let _ = local_writer.shutdown().await;
+    result
 }
 
 async fn relay_frames<R, W>(

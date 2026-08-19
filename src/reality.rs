@@ -13,6 +13,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Sha256, Sha512};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -379,19 +380,21 @@ pub async fn proxy_fallback(stream: TcpStream, config: &RealityServerConfig) -> 
         })?;
     let (mut client_reader, mut client_writer) = stream.into_split();
     let (mut fallback_reader, mut fallback_writer) = fallback.into_split();
-    tokio::try_join!(
-        copy_limited(
+    let result = tokio::select! {
+        result = copy_limited(
             &mut client_reader,
             &mut fallback_writer,
             &config.fallback_limit
-        ),
-        copy_limited(
+        ) => result,
+        result = copy_limited(
             &mut fallback_reader,
             &mut client_writer,
             &config.fallback_limit
-        ),
-    )?;
-    Ok(())
+        ) => result,
+    };
+    let _ = fallback_writer.shutdown().await;
+    let _ = client_writer.shutdown().await;
+    result.map(|_| ())
 }
 
 async fn copy_limited<R, W>(

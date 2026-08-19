@@ -111,7 +111,9 @@ pub async fn run_shadowsocks_client_listener_with_core(
         listener.local_addr()?
     );
     loop {
-        let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
+        let (stream, peer) = crate::listener::accept_tcp(&listener)
+            .await
+            .context("accept SOCKS client")?;
         let runtime = runtime.clone();
         let core = core.clone();
         tokio::spawn(async move {
@@ -223,8 +225,7 @@ pub async fn run_shadowsocks_server_with_core(
         });
     }
     loop {
-        let (stream, peer) = listener
-            .accept()
+        let (stream, peer) = crate::listener::accept_tcp(&listener)
             .await
             .context("accept Shadowsocks client")?;
         let udp_over_tcp = runtime.udp_over_tcp;

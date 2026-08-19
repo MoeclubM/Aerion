@@ -103,7 +103,9 @@ pub async fn run_vless_client_listener(
         listener.local_addr()?
     );
     loop {
-        let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
+        let (stream, peer) = crate::listener::accept_tcp(&listener)
+            .await
+            .context("accept SOCKS client")?;
         let config = config.clone();
         let core = core.clone();
         tokio::spawn(async move {
@@ -163,7 +165,9 @@ pub async fn run_vless_server_with_core(config: VlessServerConfig, core: ProxyCo
     let transport = config.transport.clone();
     tracing::info!("VLESS server listening on {}", listener.local_addr()?);
     loop {
-        let (stream, peer) = listener.accept().await.context("accept VLESS client")?;
+        let (stream, peer) = crate::listener::accept_tcp(&listener)
+            .await
+            .context("accept VLESS client")?;
         let acceptor = acceptor.clone();
         let reality = reality.clone();
         let core = core.clone();
@@ -588,8 +592,13 @@ where
                 .context("write VLESS Vision downlink")?;
         }
     };
-    tokio::try_join!(uplink, downlink)?;
-    Ok(())
+    let result = tokio::select! {
+        result = uplink => result,
+        result = downlink => result,
+    };
+    let _ = remote_writer.shutdown().await;
+    let _ = client_writer.shutdown().await;
+    result
 }
 
 async fn relay_vision_client_counted(
@@ -640,8 +649,13 @@ async fn relay_vision_client_counted(
                 .context("write local Vision response")?;
         }
     };
-    tokio::try_join!(uplink, downlink)?;
-    Ok(())
+    let result = tokio::select! {
+        result = uplink => result,
+        result = downlink => result,
+    };
+    let _ = server_writer.shutdown().await;
+    let _ = local_writer.shutdown().await;
+    result
 }
 
 async fn relay_vless_udp<S>(mut stream: S, target: ProxyTarget, session: CoreSession) -> Result<()>

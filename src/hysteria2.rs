@@ -1,4 +1,4 @@
-use crate::core::{CoreSession, CoreUserLimits, ProxyCore};
+use crate::core::{CoreSession, CoreUserLimits, ProxyCore, relay_split_counted};
 use crate::listener;
 use crate::protocol::{ProxyTarget, resolve_target_addr, target_name};
 use crate::quic::{self, QuicCongestion};
@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context as TaskContext, Poll, ready};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket, tcp::OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
@@ -763,7 +763,7 @@ async fn relay_hy2_tcp(
     stream: Hysteria2TcpStream,
     session: Hysteria2Client,
 ) -> Result<()> {
-    let (mut local_reader, local_writer) = local.into_split();
+    let (mut local_reader, mut local_writer) = local.into_split();
     let Hysteria2TcpStream {
         mut send, mut recv, ..
     } = stream;
@@ -775,7 +775,6 @@ async fn relay_hy2_tcp(
                 .await
                 .context("read local TCP payload")?;
             if read == 0 {
-                send.finish().context("finish Hysteria2 send stream")?;
                 return Ok::<(), anyhow::Error>(());
             }
             session.wait_upload(read).await;
@@ -784,40 +783,32 @@ async fn relay_hy2_tcp(
                 .context("write Hysteria2 TCP payload")?;
         }
     };
-    let downlink = write_hy2_payloads(&mut recv, local_writer);
-    tokio::try_join!(uplink, downlink)?;
-    Ok(())
-}
-
-async fn write_hy2_payloads(
-    recv: &mut quinn::RecvStream,
-    mut local_writer: OwnedWriteHalf,
-) -> Result<()> {
-    let mut buffer = vec![0u8; 32 * 1024];
-    loop {
-        let Some(read) = recv
-            .read(&mut buffer)
-            .await
-            .context("read Hysteria2 TCP payload")?
-        else {
-            local_writer
-                .shutdown()
+    let downlink = async {
+        let mut buffer = vec![0u8; 32 * 1024];
+        loop {
+            let Some(read) = recv
+                .read(&mut buffer)
                 .await
-                .context("shutdown local TCP writer")?;
-            return Ok(());
-        };
-        if read == 0 {
+                .context("read Hysteria2 TCP payload")?
+            else {
+                return Ok::<(), anyhow::Error>(());
+            };
+            if read == 0 {
+                return Ok::<(), anyhow::Error>(());
+            }
             local_writer
-                .shutdown()
+                .write_all(&buffer[..read])
                 .await
-                .context("shutdown local TCP writer")?;
-            return Ok(());
+                .context("write local TCP payload")?;
         }
-        local_writer
-            .write_all(&buffer[..read])
-            .await
-            .context("write local TCP payload")?;
-    }
+    };
+    let result = tokio::select! {
+        result = uplink => result,
+        result = downlink => result,
+    };
+    let _ = send.finish();
+    let _ = local_writer.shutdown().await;
+    result
 }
 
 async fn handle_hy2_udp_associate(mut control: TcpStream, session: Hysteria2Client) -> Result<()> {
@@ -1077,12 +1068,16 @@ async fn handle_hy2_tcp_stream(
     };
     let _ = remote.set_nodelay(true);
     write_tcp_response(&mut send, 0, "").await?;
-    let (mut remote_reader, mut remote_writer) = remote.split();
-    let client_to_remote = copy_stream(&mut recv, &mut remote_writer, session.clone(), true);
-    let remote_to_client = copy_stream(&mut remote_reader, &mut send, session, false);
-    let _ = tokio::try_join!(client_to_remote, remote_to_client)?;
-    let _ = send.finish();
-    Ok(())
+    let (remote_reader, remote_writer) = remote.split();
+    relay_split_counted(
+        recv,
+        send,
+        remote_reader,
+        remote_writer,
+        session,
+        "Hysteria2",
+    )
+    .await
 }
 
 async fn handle_server_udp_datagrams(
@@ -1509,40 +1504,6 @@ async fn bind_udp_socket_for_target(_target: SocketAddr) -> Result<UdpSocket> {
     socket_protect::bind_dual_stack_udp()
         .await
         .context("bind Hysteria2 UDP relay socket")
-}
-
-async fn copy_stream<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    session: CoreSession,
-    upload: bool,
-) -> Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buffer = vec![0u8; 64 * 1024];
-    let mut total = 0u64;
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .await
-            .context("read Hysteria2 proxied chunk")?;
-        if read == 0 {
-            let _ = writer.shutdown().await;
-            return Ok(total);
-        }
-        if upload {
-            session.record_upload(read).await?;
-        } else {
-            session.record_download(read).await?;
-        }
-        writer
-            .write_all(&buffer[..read])
-            .await
-            .context("write Hysteria2 proxied chunk")?;
-        total += read as u64;
-    }
 }
 
 async fn read_tcp_request<R>(reader: &mut R) -> Result<ProxyTarget>

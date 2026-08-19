@@ -93,9 +93,13 @@ pub async fn connect_tcp_host_port(host: &str, port: u16) -> Result<TcpStream> {
 
 pub async fn connect_tcp_addr(addr: SocketAddr) -> Result<TcpStream> {
     let stream = connect_tcp_addr_inner(addr).await?;
-    let _ = stream.set_nodelay(true);
-    enable_tcp_keepalive(&stream);
+    configure_tcp_socket(&stream);
     Ok(stream)
+}
+
+pub fn configure_tcp_socket(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+    enable_tcp_keepalive(stream);
 }
 
 pub fn enable_tcp_keepalive(stream: &TcpStream) {

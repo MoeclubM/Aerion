@@ -1,6 +1,7 @@
-use crate::core::{CoreSession, CoreUser, ProxyCore, TaskAbort, relay_bidirectional_counted};
+use crate::core::{CoreSession, CoreUser, ProxyCore, relay_bidirectional_counted};
 use crate::protocol::{ProxyTarget, canonicalize_socket_addr, resolve_target_addr, target_name};
 use crate::socket_protect;
+use crate::task_abort::TaskAbort;
 use crate::uot;
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::{BTreeMap, HashMap};
@@ -613,7 +614,9 @@ pub async fn run_mieru_client_listener_with_core(
     );
     let shared = Arc::new(SharedMieruClientSession::new(config));
     loop {
-        let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
+        let (stream, peer) = crate::listener::accept_tcp(&listener)
+            .await
+            .context("accept SOCKS client")?;
         let shared = shared.clone();
         let core = core.clone();
         tokio::spawn(async move {
@@ -661,9 +664,9 @@ pub async fn run_mieru_server_listener_with_core(
     tracing::info!("Mieru server listening on {}", listener.local_addr()?);
     let replay = Arc::new(MieruReplayCache::new());
     loop {
-        let (stream, peer) = listener.accept().await.context("accept Mieru client")?;
-        let _ = stream.set_nodelay(true);
-        socket_protect::enable_tcp_keepalive(&stream);
+        let (stream, peer) = crate::listener::accept_tcp(&listener)
+            .await
+            .context("accept Mieru client")?;
         let users = users.clone();
         let core = core.clone();
         let mtu = config.mtu();

@@ -9,3 +9,4 @@
 - VLESS XHTTP/SplitHTTP 当前实现 `stream-one`；`stream-up`、`packet-up` 需要独立会话表和多连接上传队列后再开启。
 - Mieru 当前实现 TCP stream underlay、UDP packet underlay、Mieru v3 加密元数据帧、SOCKS CONNECT 与 UDP packet-over-stream、会话心跳（5s ± 1s）、空 underlay / 已关闭会话回收，以及 SOCKS 结束时关闭出站 TCP；traffic-pattern padding / nonce-pattern shaping 仍需后续补齐。
 - AnyTLS mux 流在任一侧 FIN 时中止双向转发并关闭出站 TCP 写半部；客户端空闲 TLS 会话超时后必须真正 shutdown，不能只从池里丢掉。
+- TCP 字节流转发（含 HY2 / TUIC / Vision / VMess / Naive / VLESS mux）对齐官方 first-finisher：任一方向结束后关闭两侧写半部，避免 CLOSE-WAIT。

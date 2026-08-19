@@ -21,6 +21,7 @@ pub mod server;
 pub mod shadowsocks;
 pub mod socket_protect;
 pub mod socks;
+mod task_abort;
 pub mod tls;
 pub mod tls_ech;
 pub mod trojan;

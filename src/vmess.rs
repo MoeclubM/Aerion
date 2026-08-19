@@ -205,7 +205,9 @@ pub async fn run_vmess_client_listener_with_core(
         listener.local_addr()?
     );
     loop {
-        let (stream, peer) = listener.accept().await.context("accept SOCKS client")?;
+        let (stream, peer) = crate::listener::accept_tcp(&listener)
+            .await
+            .context("accept SOCKS client")?;
         let config = config.clone();
         let core = core.clone();
         tokio::spawn(async move {
@@ -244,7 +246,9 @@ pub async fn run_vmess_server_with_core(config: VmessServerConfig, core: ProxyCo
     let replay = Arc::new(VmessReplayFilter::new());
     tracing::info!("VMess server listening on {}", listener.local_addr()?);
     loop {
-        let (stream, peer) = listener.accept().await.context("accept VMess client")?;
+        let (stream, peer) = crate::listener::accept_tcp(&listener)
+            .await
+            .context("accept VMess client")?;
         let acceptor = acceptor.clone();
         let users = users.clone();
         let core = core.clone();
@@ -450,8 +454,13 @@ async fn relay_vmess_client_tcp(
                 .context("write VMess local downlink")?;
         }
     };
-    tokio::try_join!(uplink, downlink)?;
-    Ok(())
+    let result = tokio::select! {
+        result = uplink => result,
+        result = downlink => result,
+    };
+    let _ = server_writer.finish().await;
+    let _ = local_writer.shutdown().await;
+    result
 }
 
 async fn relay_vmess_tcp(
@@ -503,8 +512,13 @@ async fn relay_vmess_tcp(
                 .context("write VMess TCP downlink body")?;
         }
     };
-    tokio::try_join!(uplink, downlink)?;
-    Ok(())
+    let result = tokio::select! {
+        result = uplink => result,
+        result = downlink => result,
+    };
+    let _ = remote_writer.shutdown().await;
+    let _ = client_writer.finish().await;
+    result
 }
 
 async fn handle_vmess_udp_associate(

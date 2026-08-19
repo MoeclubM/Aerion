@@ -1,10 +1,11 @@
+use crate::task_abort::TaskAbort;
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 
 mod events;
 mod limiter;
@@ -120,47 +121,6 @@ struct ActiveSession {
 #[derive(Clone, Debug)]
 pub struct CoreSession {
     inner: Option<Arc<ActiveSession>>,
-}
-
-pub struct TaskAbort {
-    done: AtomicBool,
-    notify: Notify,
-}
-
-impl TaskAbort {
-    pub fn new() -> Self {
-        Self {
-            done: AtomicBool::new(false),
-            notify: Notify::new(),
-        }
-    }
-
-    pub fn trigger(&self) {
-        if !self.done.swap(true, Ordering::Release) {
-            self.notify.notify_waiters();
-        }
-    }
-
-    pub fn is_triggered(&self) -> bool {
-        self.done.load(Ordering::Acquire)
-    }
-
-    pub async fn cancelled(&self) {
-        let notified = self.notify.notified();
-        if self.done.load(Ordering::Acquire) {
-            return;
-        }
-        notified.await;
-    }
-}
-
-impl std::fmt::Debug for TaskAbort {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TaskAbort")
-            .field("triggered", &self.is_triggered())
-            .finish()
-    }
 }
 
 struct SessionControl {
@@ -821,13 +781,38 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut lr, mut lw) = tokio::io::split(left);
-    let (mut rr, mut rw) = tokio::io::split(right);
+    let (left_reader, left_writer) = tokio::io::split(left);
+    let (right_reader, right_writer) = tokio::io::split(right);
+    relay_split_counted(
+        left_reader,
+        left_writer,
+        right_reader,
+        right_writer,
+        session,
+        label,
+    )
+    .await
+}
+
+pub async fn relay_split_counted<LR, LW, RR, RW>(
+    mut left_reader: LR,
+    mut left_writer: LW,
+    mut right_reader: RR,
+    mut right_writer: RW,
+    session: CoreSession,
+    label: &str,
+) -> Result<()>
+where
+    LR: AsyncRead + Unpin,
+    LW: AsyncWrite + Unpin,
+    RR: AsyncRead + Unpin,
+    RW: AsyncWrite + Unpin,
+{
     let uplink_session = session.clone();
     let uplink = async {
         let mut buffer = vec![0u8; 32 * 1024];
         loop {
-            let read = lr
+            let read = left_reader
                 .read(&mut buffer)
                 .await
                 .with_context(|| format!("read {label} uplink"))?;
@@ -835,7 +820,8 @@ where
                 return Ok::<(), anyhow::Error>(());
             }
             uplink_session.record_upload(read).await?;
-            rw.write_all(&buffer[..read])
+            right_writer
+                .write_all(&buffer[..read])
                 .await
                 .with_context(|| format!("write {label} uplink"))?;
         }
@@ -843,7 +829,7 @@ where
     let downlink = async {
         let mut buffer = vec![0u8; 32 * 1024];
         loop {
-            let read = rr
+            let read = right_reader
                 .read(&mut buffer)
                 .await
                 .with_context(|| format!("read {label} downlink"))?;
@@ -851,7 +837,8 @@ where
                 return Ok::<(), anyhow::Error>(());
             }
             session.record_download(read).await?;
-            lw.write_all(&buffer[..read])
+            left_writer
+                .write_all(&buffer[..read])
                 .await
                 .with_context(|| format!("write {label} downlink"))?;
         }
@@ -860,25 +847,14 @@ where
         result = uplink => result,
         result = downlink => result,
     };
-    let _ = rw.shutdown().await;
-    let _ = lw.shutdown().await;
+    let _ = right_writer.shutdown().await;
+    let _ = left_writer.shutdown().await;
     result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::{Duration, timeout};
-
-    #[tokio::test]
-    async fn task_abort_resolves_if_triggered_before_wait() -> Result<()> {
-        let abort = TaskAbort::new();
-        abort.trigger();
-        timeout(Duration::from_millis(50), abort.cancelled())
-            .await
-            .context("TaskAbort must resolve after trigger")?;
-        Ok(())
-    }
 
     #[tokio::test]
     async fn records_per_user_traffic() -> Result<()> {

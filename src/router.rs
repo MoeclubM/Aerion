@@ -93,7 +93,7 @@ pub async fn run_route_proxy_with_state_until(
     loop {
         let (stream, peer) = tokio::select! {
             _ = stop.stopped() => return Ok(()),
-            accepted = listener.accept() => accepted.context("accept route client")?,
+            accepted = crate::listener::accept_tcp(&listener) => accepted.context("accept route client")?,
         };
         let state = state.clone();
         tokio::spawn(async move {
