@@ -225,7 +225,8 @@ pub async fn run_shadowsocks_server_with_core(
         });
     }
     loop {
-        let (stream, peer) = crate::listener::accept_tcp(&listener)
+        let (stream, peer) = listener
+            .accept()
             .await
             .context("accept Shadowsocks client")?;
         let udp_over_tcp = runtime.udp_over_tcp;

@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split};
-use tokio::net::UdpSocket;
 
 pub const MUX_DESTINATION: &str = "v1.mux.cool";
 pub const MUX_PORT: u16 = 666;
