@@ -1,6 +1,9 @@
 use super::helpers::*;
 use aerion::{NaiveClientConfig, NaiveServerConfig, run_naive_server};
 
+// macOS defaults net.inet.udp.maxdgram to 9,216 bytes, including SOCKS headers.
+const UDP_TEST_PAYLOAD: usize = 8 * 1024;
+
 #[tokio::test]
 async fn socks_client_reaches_tcp_target_through_naive_custom_roots() -> Result<()> {
     naive_tcp_accounting_and_idle_revocation(false).await
@@ -133,8 +136,11 @@ async fn naive_tcp_accounting_and_idle_revocation(quic: bool) -> Result<()> {
         let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
         let send = async {
             for index in 0..4u8 {
-                udp.send_to(&socks_udp_packet(echo_addr, &vec![index; 32 * 1024])?, bind)
-                    .await?;
+                udp.send_to(
+                    &socks_udp_packet(echo_addr, &vec![index; UDP_TEST_PAYLOAD])?,
+                    bind,
+                )
+                .await?;
             }
             Ok::<(), anyhow::Error>(())
         };
@@ -145,7 +151,7 @@ async fn naive_tcp_accounting_and_idle_revocation(quic: bool) -> Result<()> {
                 let (read, _) = udp.recv_from(&mut buffer).await?;
                 let bytes = socks_udp_payload(&buffer[..read])?;
                 anyhow::ensure!(
-                    bytes.len() == 32 * 1024
+                    bytes.len() == UDP_TEST_PAYLOAD
                         && bytes[0] < 4
                         && bytes.iter().all(|byte| *byte == bytes[0]),
                     "Naive framed UDP payload was corrupted"
@@ -166,7 +172,7 @@ async fn naive_tcp_accounting_and_idle_revocation(quic: bool) -> Result<()> {
         tokio::try_join!(send, responses, echo)?;
         let stats = core.snapshot().await;
         anyhow::ensure!(
-            stats[0].upload_bytes == payload.len() as u64 + 4 * 32 * 1024
+            stats[0].upload_bytes == payload.len() as u64 + 4 * UDP_TEST_PAYLOAD as u64
                 && stats[0].download_bytes == stats[0].upload_bytes,
             "Naive UDP accounting mismatch"
         );
