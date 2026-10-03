@@ -485,7 +485,6 @@ async fn relay_vmess_tcp(
                 .await
                 .context("read VMess TCP uplink body")?;
             if read == 0 {
-                let _ = remote_writer.shutdown().await;
                 return Ok::<(), anyhow::Error>(());
             }
             uplink_session.record_upload(read).await?;
@@ -503,7 +502,7 @@ async fn relay_vmess_tcp(
                 .await
                 .context("read VMess TCP downlink")?;
             if read == 0 {
-                return client_writer.finish().await;
+                return Ok::<(), anyhow::Error>(());
             }
             session.record_download(read).await?;
             client_writer
@@ -513,11 +512,14 @@ async fn relay_vmess_tcp(
         }
     };
     let result = tokio::select! {
+        _ = session.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
         result = uplink => result,
         result = downlink => result,
     };
-    let _ = remote_writer.shutdown().await;
-    let _ = client_writer.finish().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let _ = tokio::join!(remote_writer.shutdown(), client_writer.finish());
+    })
+    .await;
     result
 }
 
@@ -912,6 +914,7 @@ async fn relay_vmess_udp(
         }
         Ok::<(), anyhow::Error>(())
     };
+    let cancellation = session.clone();
     let downlink = async move {
         let mut buffer = vec![0u8; u16::MAX as usize];
         loop {
@@ -927,6 +930,7 @@ async fn relay_vmess_udp(
         }
     };
     tokio::select! {
+        _ = cancellation.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
         result = uplink => result,
         result = downlink => result,
     }
@@ -971,6 +975,7 @@ where
         }
         Ok::<(), anyhow::Error>(())
     };
+    let cancellation = session.clone();
     let downlink = async move {
         let mut buffer = vec![0u8; u16::MAX as usize];
         loop {
@@ -988,6 +993,7 @@ where
         }
     };
     tokio::select! {
+        _ = cancellation.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
         result = uplink => result,
         result = downlink => result,
     }
@@ -1027,6 +1033,7 @@ where
         }
         Ok::<(), anyhow::Error>(())
     };
+    let cancellation = session.clone();
     let downlink = async move {
         let mut buffer = vec![0u8; u16::MAX as usize];
         loop {
@@ -1043,6 +1050,7 @@ where
         }
     };
     tokio::select! {
+        _ = cancellation.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
         result = uplink => result,
         result = downlink => result,
     }

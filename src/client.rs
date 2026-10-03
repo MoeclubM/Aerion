@@ -97,6 +97,9 @@ pub async fn run_client_listener(
 
 const MAX_IDLE_SESSIONS: usize = 16;
 const IDLE_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+type StreamRegistry = Arc<std::sync::Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>>;
 
 struct SharedClientSession {
     config: ClientConfig,
@@ -221,7 +224,7 @@ async fn sweep_idle_client_sessions(shared: std::sync::Weak<SharedClientSession>
 #[derive(Clone)]
 struct ClientSession {
     writer: Arc<Mutex<PaddedFrameWriter<WriteHalf<TlsStream<TcpStream>>>>>,
-    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>>,
+    streams: StreamRegistry,
     next_stream_id: Arc<AtomicU32>,
     closed: Arc<Mutex<Option<String>>>,
     abort: Arc<TaskAbort>,
@@ -241,6 +244,54 @@ struct ClientStream {
     writer: Arc<Mutex<PaddedFrameWriter<WriteHalf<TlsStream<TcpStream>>>>>,
     events: mpsc::Receiver<StreamEvent>,
     pending: Option<Vec<u8>>,
+    registration: StreamRegistration,
+}
+
+struct StreamRegistration {
+    session: ClientSession,
+    stream_id: u32,
+    finished: bool,
+}
+
+impl StreamRegistration {
+    async fn finish(&mut self) {
+        self.unregister();
+        let result = tokio::time::timeout(SESSION_CLOSE_TIMEOUT, async {
+            self.session
+                .writer
+                .lock()
+                .await
+                .write_frame(CMD_FIN, self.stream_id, &[])
+                .await
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            self.session.close("write stream FIN failed").await;
+        }
+        self.finished = true;
+    }
+
+    fn unregister(&self) {
+        self.session
+            .streams
+            .lock()
+            .expect("AnyTLS stream registry lock poisoned")
+            .remove(&self.stream_id);
+    }
+}
+
+impl Drop for StreamRegistration {
+    fn drop(&mut self) {
+        self.unregister();
+        if !self.finished {
+            // Dropping a partially written frame cannot safely reuse this TLS session.
+            self.session.abort.trigger();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let session = self.session.clone();
+                runtime.spawn(async move { session.close("stream task cancelled").await });
+            }
+        }
+    }
 }
 
 impl ClientSession {
@@ -262,13 +313,19 @@ impl ClientSession {
         if already {
             return;
         }
-        let _ = self.writer.lock().await.shutdown().await;
         self.fail_open_streams(reason).await;
+        let _ = tokio::time::timeout(SESSION_CLOSE_TIMEOUT, async {
+            self.writer.lock().await.shutdown().await
+        })
+        .await;
     }
 
     async fn fail_open_streams(&self, reason: &str) {
         let senders = {
-            let mut streams = self.streams.lock().await;
+            let mut streams = self
+                .streams
+                .lock()
+                .expect("AnyTLS stream registry lock poisoned");
             streams
                 .drain()
                 .map(|(_, sender)| sender)
@@ -308,7 +365,7 @@ impl ClientSession {
 
         let session = Self {
             writer: Arc::new(Mutex::new(writer)),
-            streams: Arc::new(Mutex::new(HashMap::new())),
+            streams: Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_stream_id: Arc::new(AtomicU32::new(1)),
             closed: Arc::new(Mutex::new(None)),
             abort: Arc::new(TaskAbort::new()),
@@ -331,15 +388,30 @@ impl ClientSession {
         if let Some(error) = self.closed.lock().await.clone() {
             bail!("Aerion client session is closed: {error}");
         }
-        let stream_id = self.next_stream_id.fetch_add(1, Ordering::SeqCst);
-        if stream_id == 0 {
-            bail!("Aerion stream id exhausted");
-        }
-        let (events_tx, mut events_rx) = mpsc::channel(32);
-        self.streams.lock().await.insert(stream_id, events_tx);
-
         let mut first_payload = encode_target(&target)?;
         first_payload.extend_from_slice(&initial_payload);
+        let stream_id =
+            match self
+                .next_stream_id
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+            {
+                Ok(id) => id,
+                Err(_) => {
+                    self.close("stream id exhausted").await;
+                    bail!("Aerion stream id exhausted");
+                }
+            };
+        let (events_tx, mut events_rx) = mpsc::channel(32);
+        self.streams
+            .lock()
+            .expect("AnyTLS stream registry lock poisoned")
+            .insert(stream_id, events_tx);
+        let registration = StreamRegistration {
+            session: self.clone(),
+            stream_id,
+            finished: false,
+        };
+
         let first = self.first_packet.swap(false, Ordering::SeqCst);
         {
             let mut writer = self.writer.lock().await;
@@ -364,18 +436,16 @@ impl ClientSession {
                         writer: self.writer.clone(),
                         events: events_rx,
                         pending: pending_payload,
+                        registration,
                     });
                 }
                 StreamEvent::SynAck(payload) => {
-                    self.streams.lock().await.remove(&stream_id);
                     bail!("stream open failed: {}", String::from_utf8_lossy(&payload));
                 }
                 StreamEvent::Error(error) => {
-                    self.streams.lock().await.remove(&stream_id);
                     bail!("{error}");
                 }
                 StreamEvent::Fin => {
-                    self.streams.lock().await.remove(&stream_id);
                     bail!("stream closed before SYNACK");
                 }
                 StreamEvent::Payload(payload) => {
@@ -388,6 +458,7 @@ impl ClientSession {
                         writer: self.writer.clone(),
                         events: events_rx,
                         pending: Some(payload),
+                        registration,
                     });
                 }
             }
@@ -510,10 +581,7 @@ async fn relay_tcp_counted(
         result = uplink => result,
         result = downlink => result,
     };
-    {
-        let mut writer = writer.lock().await;
-        let _ = writer.write_frame(CMD_FIN, stream_id, &[]).await;
-    }
+    stream.registration.finish().await;
     let _ = local_writer.shutdown().await;
     result
 }
@@ -540,11 +608,9 @@ async fn handle_udp_associate_counted(
     } else {
         CoreSession::disabled()
     };
-    let stream = session
+    let mut stream = session
         .open_stream(uot::magic_target(), uot::encode_v2_associate_request()?)
         .await?;
-    let stream_id = stream.stream_id;
-    let writer = stream.writer.clone();
     let udp = Arc::new(udp);
     let (client_tx, mut client_rx) = mpsc::channel::<SocketAddr>(8);
 
@@ -575,8 +641,8 @@ async fn handle_udp_associate_counted(
 
     let stream_to_udp = {
         let udp = udp.clone();
-        let mut stream = stream;
         let core_session = core_session.clone();
+        let stream = &mut stream;
         async move {
             let mut peer = None;
             loop {
@@ -617,14 +683,12 @@ async fn handle_udp_associate_counted(
     };
 
     let result = tokio::select! {
+        _ = core_session.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
         result = udp_to_stream => result,
         result = stream_to_udp => result,
         result = control_closed => result,
     };
-    {
-        let mut writer = writer.lock().await;
-        let _ = writer.write_frame(CMD_FIN, stream_id, &[]).await;
-    }
+    stream.registration.finish().await;
     result
 }
 
@@ -633,24 +697,29 @@ async fn read_session_frames(
     session: ClientSession,
     shared_padding: Arc<Mutex<PaddingScheme>>,
 ) {
-    let result: Result<()> = async {
+    let frames = async {
         loop {
-            tokio::select! {
-                _ = session.abort.cancelled() => return Ok(()),
-                frame = read_frame(&mut reader) => {
-                    handle_session_frame(
-                        frame?,
-                        &session.writer,
-                        &session.streams,
-                        &shared_padding,
-                        &session.server_v2,
-                    )
-                    .await?;
-                }
+            let frame = match read_frame(&mut reader).await {
+                Ok(frame) => frame,
+                Err(error) => break Err(error),
+            };
+            if let Err(error) = handle_session_frame(
+                frame,
+                &session.writer,
+                &session.streams,
+                &shared_padding,
+                &session.server_v2,
+            )
+            .await
+            {
+                break Err(error);
             }
         }
-    }
-    .await;
+    };
+    let result = tokio::select! {
+        _ = session.abort.cancelled() => Ok(()),
+        result = frames => result,
+    };
     if let Err(error) = result {
         session.close(&format!("{error:?}")).await;
     }
@@ -659,7 +728,7 @@ async fn read_session_frames(
 async fn handle_session_frame(
     frame: Frame,
     writer: &Arc<Mutex<PaddedFrameWriter<WriteHalf<TlsStream<TcpStream>>>>>,
-    streams: &Arc<Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>>,
+    streams: &StreamRegistry,
     shared_padding: &Arc<Mutex<PaddingScheme>>,
     server_v2: &Arc<AtomicBool>,
 ) -> Result<()> {
@@ -673,7 +742,10 @@ async fn handle_session_frame(
             .await
         }
         CMD_FIN => {
-            let sender = streams.lock().await.remove(&frame.stream_id);
+            let sender = streams
+                .lock()
+                .expect("AnyTLS stream registry lock poisoned")
+                .remove(&frame.stream_id);
             if let Some(sender) = sender {
                 let _ = sender.send(StreamEvent::Fin).await;
             }
@@ -706,12 +778,12 @@ async fn handle_session_frame(
     Ok(())
 }
 
-async fn send_stream_event(
-    streams: &Arc<Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>>,
-    stream_id: u32,
-    event: StreamEvent,
-) {
-    let sender = streams.lock().await.get(&stream_id).cloned();
+async fn send_stream_event(streams: &StreamRegistry, stream_id: u32, event: StreamEvent) {
+    let sender = streams
+        .lock()
+        .expect("AnyTLS stream registry lock poisoned")
+        .get(&stream_id)
+        .cloned();
     if let Some(sender) = sender {
         let _ = sender.send(event).await;
     }
@@ -725,15 +797,18 @@ async fn run_heartbeat(session: ClientSession, heartbeat_interval_secs: u64) {
             _ = session.abort.cancelled() => return,
             _ = ticker.tick() => {}
         }
-        if let Err(error) = session
-            .writer
-            .lock()
-            .await
-            .write_frame(CMD_HEART_REQUEST, 0, &[])
-            .await
-        {
+        let result = tokio::select! {
+            _ = session.abort.cancelled() => return,
+            result = async {
+                session.writer.lock().await.write_frame(CMD_HEART_REQUEST, 0, &[]).await
+            } => result,
+        };
+        if let Err(error) = result {
             session.close(&format!("write heartbeat: {error:?}")).await;
             return;
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

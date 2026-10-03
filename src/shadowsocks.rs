@@ -408,7 +408,7 @@ async fn relay_shadowsocks_udp_responses(
     .await
     {
         let (read, source) = read.context("receive Shadowsocks UDP response")?;
-        let source = ShadowsocksAddress::SocketAddress(source);
+        let source = canonicalize_ss_address(ShadowsocksAddress::SocketAddress(source));
         session.record_download(read).await?;
         if let Some(inbound_control) = control.as_ref() {
             let mut response_control = inbound_control.clone();
