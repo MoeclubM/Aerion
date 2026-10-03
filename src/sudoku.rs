@@ -368,7 +368,9 @@ impl Progress {
     }
     fn wake(&self) {
         let waker = self.waker.lock().unwrap().take();
-        if let Some(waker) = waker { waker.wake(); }
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 }
 impl Drop for Tunnel {

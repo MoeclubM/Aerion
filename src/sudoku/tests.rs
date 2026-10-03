@@ -302,7 +302,7 @@ fn appearance_roundtrips_all_bytes_and_fragmented_packed_records() -> Result<()>
 }
 
 #[tokio::test]
-async fn authenticated_handshake_rejects_replay_and_revoked_users() -> Result<()> {
+async fn authenticated_handshake_and_revoked_users() -> Result<()> {
     let core = ProxyCore::from_credentials("alice-key", &["bob-key".into()]);
     for aead in ["chacha20-poly1305", "aes-128-gcm"] {
         for pure in [false, true] {
@@ -350,5 +350,50 @@ fn mihomo_import_preserves_sudoku_settings() -> Result<()> {
     assert_eq!(proxy.options.table_type, "prefer_ascii");
     assert!(!proxy.options.enable_pure_downlink);
     assert_eq!(proxy.options.padding_max, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn replayed_hello_is_rejected_and_user_hash_cannot_choose_identity() -> Result<()> {
+    let key = "bob-key";
+    let options = SudokuOptions::default();
+    let core = ProxyCore::from_credentials("alice-key", &[key.into()]);
+    let replays = Arc::new(Mutex::new(HashMap::new()));
+    let ephemeral = secret()?;
+    let mut hello = timestamp()?.to_be_bytes().to_vec();
+    hello.extend(&Sha256::digest(b"alice-key")[..8]); // Deliberately claim another user's hash.
+    hello.extend([42; 16]);
+    hello.extend(PublicKey::from(&ephemeral).as_bytes());
+    hello.extend(7u32.to_be_bytes());
+    let table = options.tables(key)?.remove(0);
+    hello.extend(table.hint.to_be_bytes());
+    for attempt in 0..2 {
+        let (mut wire, mut server_wire) = tokio::io::duplex(4096);
+        let options = options.clone();
+        let core = core.clone();
+        let replays = replays.clone();
+        let server = tokio::spawn(async move {
+            server_handshake(
+                &mut server_wire,
+                &options,
+                &core,
+                "127.0.0.1:1234".parse().unwrap(),
+                &replays,
+            )
+            .await
+            .map(|(_, _, session)| session.user_id().to_string())
+        });
+        let (up, down) = bases(key, None, &[])?;
+        let mut sender = Sender::new(table.clone(), false, false, up, "chacha20-poly1305", 5)?;
+        sender.kip(&mut wire, 1, &hello).await?;
+        if attempt == 0 {
+            let mut receiver = Receiver::new(table.clone(), true, true, down, "chacha20-poly1305");
+            assert_eq!(receiver.kip(&mut wire).await?.0, 2);
+            assert_eq!(server.await??, key);
+        } else {
+            let error = server.await?.expect_err("replayed nonce must fail");
+            assert!(error.to_string().contains("replayed Sudoku handshake"));
+        }
+    }
     Ok(())
 }
