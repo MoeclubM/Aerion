@@ -200,7 +200,7 @@ async fn hysteria2_server_finishes_when_tcp_target_fins() -> Result<()> {
     result
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn socks_udp_associate_reaches_udp_target_through_hysteria2_datagrams() -> Result<()> {
     tls::init_crypto();
 

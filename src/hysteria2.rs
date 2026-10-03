@@ -20,13 +20,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::task::{Context as TaskContext, Poll, ready};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 const H3_ALPN: &[u8] = b"h3";
 const AUTH_URI: &str = "https://hysteria/auth";
@@ -94,8 +94,8 @@ pub struct Hysteria2Client {
 struct Hysteria2ClientInner {
     endpoint: Endpoint,
     connection: quinn::Connection,
-    h3_driver: JoinHandle<()>,
-    datagram_handle: JoinHandle<()>,
+    h3_driver: JoinSet<()>,
+    datagram_handle: OnceLock<JoinHandle<()>>,
     h3_sender: Mutex<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>>,
     udp_enabled: bool,
     upload_limiter: Hy2ByteRateLimiter,
@@ -199,8 +199,10 @@ impl Drop for Hysteria2ClientInner {
         let _ = &self.endpoint;
         let _ = &self.h3_sender;
         self.connection.close(VarInt::from_u32(0), b"client closed");
-        self.h3_driver.abort();
-        self.datagram_handle.abort();
+        self.h3_driver.abort_all();
+        if let Some(handle) = self.datagram_handle.get() {
+            handle.abort();
+        }
     }
 }
 
@@ -353,31 +355,33 @@ impl Hysteria2Client {
             h3::client::new(h3_quinn::Connection::new(connection.clone()))
                 .await
                 .context("initialize Hysteria2 HTTP/3 client")?;
-        let h3_driver = tokio::spawn(async move {
+        let mut driver_tasks = JoinSet::new();
+        driver_tasks.spawn(async move {
             let error = h3_driver.wait_idle().await;
             tracing::debug!(?error, "Hysteria2 HTTP/3 client driver exited");
         });
         let udp_enabled = authenticate_client(&mut h3_sender, &config).await?;
-        let inner = Arc::new_cyclic(move |weak: &std::sync::Weak<Hysteria2ClientInner>| {
-            let datagram_weak = weak.clone();
-            let datagram_connection = connection.clone();
-            Hysteria2ClientInner {
-                endpoint,
-                connection,
-                h3_driver,
-                datagram_handle: tokio::spawn(Self::dispatch_datagrams(
-                    datagram_connection,
-                    datagram_weak,
-                )),
-                h3_sender: Mutex::new(h3_sender),
-                udp_enabled: udp_enabled && config.udp,
-                upload_limiter: Hy2ByteRateLimiter::new(config.upload_bandwidth),
-                udp_sessions: Mutex::new(HashMap::new()),
-                udp_fragments: Mutex::new(HashMap::new()),
-                next_udp_session_id: AtomicU32::new(1),
-                next_udp_packet_id: AtomicU16::new(1),
-            }
+        let inner = Arc::new(Hysteria2ClientInner {
+            endpoint,
+            connection,
+            h3_driver: driver_tasks,
+            datagram_handle: OnceLock::new(),
+            h3_sender: Mutex::new(h3_sender),
+            udp_enabled: udp_enabled && config.udp,
+            upload_limiter: Hy2ByteRateLimiter::new(config.upload_bandwidth),
+            udp_sessions: Mutex::new(HashMap::new()),
+            udp_fragments: Mutex::new(HashMap::new()),
+            next_udp_session_id: AtomicU32::new(1),
+            next_udp_packet_id: AtomicU16::new(1),
         });
+        // Spawn only after construction: a task may run immediately on another worker.
+        inner
+            .datagram_handle
+            .set(tokio::spawn(Self::dispatch_datagrams(
+                inner.connection.clone(),
+                Arc::downgrade(&inner),
+            )))
+            .expect("HY2 datagram task initialized once");
         Ok(Self { inner })
     }
 
