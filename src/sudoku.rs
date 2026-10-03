@@ -355,13 +355,20 @@ struct Tunnel {
 #[derive(Default)]
 struct Progress {
     sent: std::sync::atomic::AtomicU64,
-    waker: futures::task::AtomicWaker,
+    waker: Mutex<Option<std::task::Waker>>,
 }
 impl Progress {
     fn advance(&self, n: usize) {
         self.sent
             .fetch_add(n as u64, std::sync::atomic::Ordering::Release);
-        self.waker.wake();
+        self.wake();
+    }
+    fn register(&self, waker: &std::task::Waker) {
+        *self.waker.lock().unwrap() = Some(waker.clone());
+    }
+    fn wake(&self) {
+        let waker = self.waker.lock().unwrap().take();
+        if let Some(waker) = waker { waker.wake(); }
     }
 }
 impl Drop for Tunnel {
@@ -403,7 +410,7 @@ impl AsyncWrite for Tunnel {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::task::ready!(std::pin::Pin::new(&mut self.stream).poll_flush(cx))?;
-        self.progress.waker.register(cx.waker());
+        self.progress.register(cx.waker());
         if let Some(error) = self.error.lock().unwrap().as_ref() {
             return std::task::Poll::Ready(Err(std::io::Error::other(error.clone())));
         }
@@ -477,7 +484,7 @@ fn tunnel<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         }
         let _ = write.shutdown().await;
         let _ = plain_write.shutdown().await;
-        sent.waker.wake();
+        sent.wake();
     });
     Tunnel {
         stream: local,
@@ -745,7 +752,7 @@ fn mux_client(stream: Tunnel) -> Tunnel {
             *errors.lock().unwrap() = Some(format!("{error:#}"));
         }
         let _ = plain_write.shutdown().await;
-        sent.waker.wake();
+        sent.wake();
     });
     Tunnel {
         stream: local,
