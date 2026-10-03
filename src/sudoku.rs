@@ -714,6 +714,7 @@ async fn mux_server(stream: Tunnel, session: CoreSession) -> Result<()> {
             while let Ok(id) = completion.try_recv() {
                 streams.remove(&id);
             }
+            while tasks.try_join_next().is_some() {}
             let kind = reader.read_u8().await?;
             let id = reader.read_u32().await?;
             let length = reader.read_u32().await? as usize;
@@ -731,7 +732,7 @@ async fn mux_server(stream: Tunnel, session: CoreSession) -> Result<()> {
                     let tracked = session.clone();
                     let completed = completed.clone();
                     let task = tasks.spawn(async move {
-                        let relay = async {
+                        let relay = async move {
                             let mut outbound =
                                 socket_protect::connect_proxy_target(&target).await?;
                             relay_bidirectional_counted(
@@ -742,17 +743,18 @@ async fn mux_server(stream: Tunnel, session: CoreSession) -> Result<()> {
                             )
                             .await
                         };
-                        let send = async {
+                        let send_output = output.clone();
+                        let send = async move {
                             let mut buf = [0; 32768];
                             loop {
                                 let n = down.read(&mut buf).await?;
                                 if n == 0 {
                                     return Ok::<_, anyhow::Error>(());
                                 }
-                                mux_frame(&mut *output.lock().await, 2, id, &buf[..n]).await?;
+                                mux_frame(&mut *send_output.lock().await, 2, id, &buf[..n]).await?;
                             }
                         };
-                        let result = tokio::select! {result=relay=>result,result=send=>result};
+                        let result = tokio::try_join!(relay, send).map(|_| ());
                         let kind = if result.is_ok() { 3 } else { 4 };
                         let message = result.err().map(|e| e.to_string()).unwrap_or_default();
                         if let Err(error) =
