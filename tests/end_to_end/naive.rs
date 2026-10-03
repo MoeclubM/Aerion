@@ -12,6 +12,11 @@ async fn naive_http3_records_traffic_and_revokes_idle_tcp() -> Result<()> {
 }
 
 async fn naive_tcp_accounting_and_idle_revocation(quic: bool) -> Result<()> {
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter("aerion=debug")
+        .with_test_writer()
+        .finish();
+    let _logging = tracing::subscriber::set_default(subscriber);
     tls::init_crypto();
 
     let echo_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -75,7 +80,9 @@ async fn naive_tcp_accounting_and_idle_revocation(quic: bool) -> Result<()> {
 
     let result = timeout(Duration::from_secs(10), async {
         let payload = b"hello naive custom roots";
-        socks_echo(client_addr, echo_addr, payload).await?;
+        socks_echo(client_addr, echo_addr, payload)
+            .await
+            .context("Naive TCP echo")?;
         let stats = core.snapshot().await;
         anyhow::ensure!(
             stats[0].upload_bytes == payload.len() as u64
@@ -88,7 +95,9 @@ async fn naive_tcp_accounting_and_idle_revocation(quic: bool) -> Result<()> {
         let mut greeting = [0; 2];
         socks.read_exact(&mut greeting).await?;
         write_socks_connect(&mut socks, idle_listener.local_addr()?).await?;
-        read_socks_reply_addr(&mut socks).await?;
+        read_socks_reply_addr(&mut socks)
+            .await
+            .context("open idle Naive TCP tunnel")?;
         let (mut target, _) = idle_listener.accept().await?;
         core.cancel_all_sessions();
         anyhow::ensure!(
@@ -105,7 +114,9 @@ async fn naive_tcp_accounting_and_idle_revocation(quic: bool) -> Result<()> {
         control.write_all(&[5, 1, 0]).await?;
         control.read_exact(&mut greeting).await?;
         write_socks_udp_associate(&mut control).await?;
-        let bind = read_socks_reply_addr(&mut control).await?;
+        let bind = read_socks_reply_addr(&mut control)
+            .await
+            .context("open Naive UOT tunnel")?;
         let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
         let send = async {
             for index in 0..4u8 {

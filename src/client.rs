@@ -393,7 +393,7 @@ impl ClientSession {
         let stream_id =
             match self
                 .next_stream_id
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
             {
                 Ok(id) => id,
                 Err(_) => {

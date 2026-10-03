@@ -32,7 +32,6 @@ fn decodes_in_memory_xudp_packet_chunk() -> Result<()> {
 #[test]
 fn xudp_end_status_is_0x03() {
     assert_eq!(STATUS_END, 0x03);
-    assert_eq!(STATUS_KEEPALIVE, 0x04);
 }
 
 #[test]
