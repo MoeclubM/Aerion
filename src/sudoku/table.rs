@@ -277,15 +277,18 @@ pub(super) fn encode(
     let mut random = vec![0; input.len() * 6 + 32];
     getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("Sudoku random source: {e}"))?;
     let mut draw = random.into_iter().cycle();
+    let mut puzzle_random = vec![0; input.len() * 4];
+    getrandom::fill(&mut puzzle_random)
+        .map_err(|e| anyhow::anyhow!("Sudoku puzzle random: {e}"))?;
+    let pool = layout
+        .padding
+        .iter()
+        .copied()
+        .filter(|b| !packed || *b != layout.marker)
+        .collect::<Vec<_>>();
     let mut output = Vec::new();
     let mut emit = |group: u8| {
         if draw.next().unwrap() as u16 * 100 < padding as u16 * 256 {
-            let pool = layout
-                .padding
-                .iter()
-                .copied()
-                .filter(|b| !packed || *b != layout.marker)
-                .collect::<Vec<_>>();
             output.push(pool[draw.next().unwrap() as usize % pool.len()]);
         }
         output.push(layout.encode[group as usize]);
@@ -306,11 +309,15 @@ pub(super) fn encode(
             output.push(layout.marker);
         }
     } else {
-        for &byte in input {
+        for (index, &byte) in input.iter().enumerate() {
             let choices = &grids().encodings[table.order[byte as usize]];
-            let mut hints = choices[(byte as usize + input.len()) % choices.len()];
+            let random = &puzzle_random[index * 4..index * 4 + 4];
+            let mut hints =
+                choices[u16::from_be_bytes([random[0], random[1]]) as usize % choices.len()];
             // Clue order has no meaning on the wire.
-            hints.rotate_left(byte as usize % 4);
+            for i in (1..4).rev() {
+                hints.swap(i, random[i] as usize % (i + 1));
+            }
             for group in hints {
                 emit(group);
             }

@@ -53,7 +53,7 @@ func main() {
     must(err)
     defer raw.Close()
     must(raw.SetDeadline(time.Now().Add(15*time.Second)))
-    conn, err := tunnel.ClientHandshakeWithUplinkMode(raw, cfg, table, nil, tunnel.ObfsUplinkClassic, table.Hint(), true)
+    conn, err := tunnel.ClientHandshakeWithUplinkMode(raw, cfg, table, nil, tunnel.ObfsUplinkPure, table.Hint(), true)
     must(err)
     defer conn.Close()
     host, port, err := net.SplitHostPort(*target)

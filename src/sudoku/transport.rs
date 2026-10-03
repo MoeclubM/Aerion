@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 fn auth(seed: &str, ts: u64) -> Vec<u8> {
@@ -78,9 +78,11 @@ pub(super) async fn server(
     if !options.http_mask {
         return Ok(Box::new(stream));
     }
-    let mut probe = [0; 4];
-    let n = stream.peek(&mut probe).await?;
-    if n < 3 || &probe[..3] != b"GET" {
+    let mut probe = [0; 3];
+    stream.read_exact(&mut probe).await?;
+    let (reader, writer) = stream.into_split();
+    let mut stream = tokio::io::join(std::io::Cursor::new(probe).chain(reader), writer);
+    if &probe != b"GET" {
         return Ok(Box::new(stream));
     }
     let request = vless_http::read_http_head(&mut stream).await?;
@@ -95,7 +97,15 @@ pub(super) async fn server(
         options.http_mask_mode == "ws",
         "Sudoku WebSocket mode is disabled"
     );
+    let uri = request
+        .split_whitespace()
+        .nth(1)
+        .context("Sudoku HTTP request URI missing")?;
+    let query_token = uri
+        .split_once('?')
+        .and_then(|(_, query)| query.split('&').find_map(|part| part.strip_prefix("auth=")));
     let token = vless_http::header_value(&request, "Authorization")
+        .or(query_token)
         .context("Sudoku WebSocket authorization missing")?;
     let token = URL_SAFE_NO_PAD.decode(token.strip_prefix("Bearer ").unwrap_or(token))?;
     ensure!(token.len() == 24, "invalid Sudoku WebSocket authorization");
