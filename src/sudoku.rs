@@ -515,6 +515,7 @@ pub async fn run_sudoku_server_listener_with_core(
     core: ProxyCore,
 ) -> Result<()> {
     config.options.validate()?;
+    tracing::info!("Sudoku server listening on {}", listener.local_addr()?);
     let replays = Arc::new(Mutex::new(HashMap::new()));
     loop {
         let (stream, peer) = crate::listener::accept_tcp(&listener).await?;
@@ -570,6 +571,7 @@ pub async fn run_sudoku_client_listener_with_core(
     config.options.validate()?;
     // Validate the complete appearance configuration before accepting clients.
     config.options.tables(&sudoku_key_seed(&config.key)?)?;
+    tracing::info!("Sudoku client listening on {}", listener.local_addr()?);
     loop {
         let (mut local, peer) = crate::listener::accept_tcp(&listener).await?;
         let config = config.clone();
