@@ -274,10 +274,10 @@ async fn handle_vmess_socks(
     core: Option<ProxyCore>,
     peer: SocketAddr,
 ) -> Result<()> {
-    let _session = if let Some(core) = core.as_ref() {
-        Some(core.authenticate_from(&config.user_id, peer).await?)
+    let session = if let Some(core) = core.as_ref() {
+        core.authenticate_from(&config.user_id, peer).await?
     } else {
-        None
+        CoreSession::disabled()
     };
     match socks::read_request(&mut local).await? {
         socks::SocksRequest::Connect(target) => {
@@ -296,7 +296,7 @@ async fn handle_vmess_socks(
             read_vmess_response_header(&mut server, &keys).await?;
             socks::write_reply(&mut local, 0x00).await?;
             tracing::info!("VMess proxying {}", target_name(&target));
-            relay_vmess_client_tcp(local, server, keys).await
+            relay_vmess_client_tcp(local, server, keys, session).await
         }
         socks::SocksRequest::UdpAssociate => {
             ensure!(config.udp, "VMess UDP is disabled by client config");
@@ -401,6 +401,7 @@ async fn relay_vmess_client_tcp(
     local: TcpStream,
     server: VmessTransport,
     keys: VmessClientKeys,
+    session: CoreSession,
 ) -> Result<()> {
     let request_config = BodyConfig::new_request(
         keys.security,
@@ -427,8 +428,9 @@ async fn relay_vmess_client_tcp(
                 .await
                 .context("read VMess local uplink")?;
             if read == 0 {
-                return server_writer.finish().await;
+                return Ok::<(), anyhow::Error>(());
             }
+            session.record_upload(read).await?;
             server_writer
                 .write_all_plain(&buffer[..read])
                 .await
@@ -443,11 +445,9 @@ async fn relay_vmess_client_tcp(
                 .await
                 .context("read VMess client downlink")?;
             if read == 0 {
-                return local_writer
-                    .shutdown()
-                    .await
-                    .context("shutdown VMess local downlink");
+                return Ok::<(), anyhow::Error>(());
             }
+            session.record_download(read).await?;
             local_writer
                 .write_all(&buffer[..read])
                 .await
@@ -455,11 +455,14 @@ async fn relay_vmess_client_tcp(
         }
     };
     let result = tokio::select! {
+        _ = session.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
         result = uplink => result,
         result = downlink => result,
     };
-    let _ = server_writer.finish().await;
-    let _ = local_writer.shutdown().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let _ = tokio::join!(server_writer.finish(), local_writer.shutdown());
+    })
+    .await;
     result
 }
 

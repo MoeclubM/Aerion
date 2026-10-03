@@ -1,8 +1,5 @@
 use super::helpers::*;
-use aerion::{
-    ShadowsocksClientConfig, ShadowsocksServerConfig, run_shadowsocks_client_listener,
-    run_shadowsocks_server_with_core,
-};
+use aerion::{ShadowsocksClientConfig, ShadowsocksServerConfig, run_shadowsocks_server_with_core};
 
 #[tokio::test]
 async fn malformed_udp_packets_do_not_stop_the_server() -> Result<()> {
@@ -95,22 +92,32 @@ async fn shadowsocks_server_with_core_records_tcp_traffic() -> Result<()> {
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
     let client_addr = client_listener.local_addr()?;
-    let client_task = tokio::spawn(run_shadowsocks_client_listener(
-        client_listener,
-        ShadowsocksClientConfig {
-            listen: client_addr,
-            server_host: "127.0.0.1".to_string(),
-            server_port: server_addr.port(),
-            method: "aes-128-gcm".to_string(),
-            password: "test-password".to_string(),
-            udp: false,
-            udp_over_tcp: false,
-        },
-    ));
+    let client_core = aerion::ProxyCore::from_credentials("test-password", &[]);
+    let client_task = tokio::spawn(
+        aerion::shadowsocks::run_shadowsocks_client_listener_with_core(
+            client_listener,
+            ShadowsocksClientConfig {
+                listen: client_addr,
+                server_host: "127.0.0.1".to_string(),
+                server_port: server_addr.port(),
+                method: "aes-128-gcm".to_string(),
+                password: "test-password".to_string(),
+                udp: false,
+                udp_over_tcp: false,
+            },
+            Some(client_core.clone()),
+        ),
+    );
 
     let payload = b"hello ss core";
     let result = timeout(Duration::from_secs(5), async {
         socks_echo(client_addr, echo_addr, payload).await?;
+        let client_stats = client_core.snapshot().await;
+        anyhow::ensure!(
+            client_stats[0].upload_bytes == payload.len() as u64
+                && client_stats[0].download_bytes == payload.len() as u64,
+            "Shadowsocks client did not record payload bytes"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
         let snapshots = core.snapshot().await;
         let snapshot = snapshots

@@ -448,10 +448,10 @@ async fn handle_shadowsocks_socks(
     core: Option<ProxyCore>,
     peer: SocketAddr,
 ) -> Result<()> {
-    let _session = if let Some(core) = core.as_ref() {
-        Some(core.authenticate_from(&runtime.password, peer).await?)
+    let session = if let Some(core) = core.as_ref() {
+        core.authenticate_from(&runtime.password, peer).await?
     } else {
-        None
+        CoreSession::disabled()
     };
     match socks::read_request(&mut local).await? {
         socks::SocksRequest::Connect(target) => {
@@ -477,10 +477,8 @@ async fn handle_shadowsocks_socks(
                 .context("write Shadowsocks TCP request header")?;
             socks::write_reply(&mut local, 0x00).await?;
             tracing::info!("Shadowsocks proxying {}", target_name(&target));
-            tokio::io::copy_bidirectional(&mut local, &mut remote)
+            relay_bidirectional_counted(&mut local, &mut remote, session, "Shadowsocks client")
                 .await
-                .context("relay Shadowsocks TCP")?;
-            Ok(())
         }
         socks::SocksRequest::UdpAssociate => {
             ensure!(runtime.udp, "Shadowsocks UDP is disabled by client config");

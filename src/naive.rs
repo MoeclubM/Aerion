@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 
 const NAIVE_PADDING_COUNT: usize = 8;
 const NAIVE_MAX_CHUNK: usize = u16::MAX as usize;
@@ -21,6 +21,7 @@ const NAIVE_H3_ALPN: &[u8] = b"h3";
 const NAIVE_HTTP11_ALPN: &[u8] = b"http/1.1";
 const NAIVE_QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const NAIVE_UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_NAIVE_UOT_PACKETS: usize = 64;
 
 pub fn default_naive_quic_congestion_control() -> String {
     "bbr".to_string()
@@ -90,14 +91,14 @@ enum NaiveTunnel {
     Http2 {
         send: h2::SendStream<Bytes>,
         recv: h2::RecvStream,
-        driver: JoinHandle<()>,
+        driver: JoinSet<()>,
     },
     Http3 {
         send: h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
         recv: h3::client::RequestStream<h3_quinn::RecvStream, Bytes>,
         endpoint: quinn::Endpoint,
         connection: quinn::Connection,
-        driver: JoinHandle<()>,
+        driver: JoinSet<()>,
     },
 }
 
@@ -257,7 +258,11 @@ async fn handle_naive_http1_connection(
         tls.write_all(response.as_bytes())
             .await
             .context("write Naive HTTP/1.1 UOT response")?;
-        return relay_naive_http1_uot(tls, pending, target, session, padding_enabled).await;
+        let cancellation = session.clone().unwrap_or_else(CoreSession::disabled);
+        return tokio::select! {
+            _ = cancellation.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
+            result = relay_naive_http1_uot(tls, pending, target, session, padding_enabled) => result,
+        };
     }
     let remote = connect_proxy_target(&target).await?;
     tls.write_all(response.as_bytes())
@@ -323,7 +328,11 @@ async fn handle_naive_h2_request(
             runtime.udp_over_tcp,
             "Naive HTTP/2 UDP-over-TCP is disabled by server config"
         );
-        return relay_naive_http2_uot(send, recv, target, session).await;
+        let cancellation = session.clone().unwrap_or_else(CoreSession::disabled);
+        return tokio::select! {
+            _ = cancellation.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
+            result = relay_naive_http2_uot(send, recv, target, session) => result,
+        };
     }
     let remote = connect_proxy_target(&target).await?;
     tracing::info!("Naive serving HTTP/2 {}", target_name(&target));
@@ -420,7 +429,11 @@ where
             runtime.udp_over_tcp,
             "Naive HTTP/3 UDP-over-TCP is disabled by server config"
         );
-        return relay_naive_http3_uot(send, recv, target, session).await;
+        let cancellation = session.clone().unwrap_or_else(CoreSession::disabled);
+        return tokio::select! {
+            _ = cancellation.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
+            result = relay_naive_http3_uot(send, recv, target, session) => result,
+        };
     }
     let remote = connect_proxy_target(&target).await?;
     tracing::info!("Naive serving HTTP/3 {}", target_name(&target));
@@ -632,7 +645,7 @@ async fn handle_naive_socks_client(
             );
             tokio::select! {
                 _ = session.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
-                result = handle_naive_udp_associate(local, config) => result,
+                result = handle_naive_udp_associate(local, config, session.clone()) => result,
             }
         }
     }
@@ -749,7 +762,8 @@ async fn open_naive_http2_tunnel(
     let (mut client, connection) = h2::client::handshake(tls)
         .await
         .context("initialize Naive HTTP/2 client")?;
-    let driver = tokio::spawn(async move {
+    let mut driver = JoinSet::new();
+    driver.spawn(async move {
         if let Err(error) = connection.await {
             tracing::debug!("Naive HTTP/2 connection exited: {error:?}");
         }
@@ -790,7 +804,8 @@ async fn open_naive_http3_tunnel(
         h3::client::new(h3_quinn::Connection::new(connection.clone()))
             .await
             .context("initialize Naive HTTP/3 client")?;
-    let driver = tokio::spawn(async move {
+    let mut driver = JoinSet::new();
+    driver.spawn(async move {
         let error = h3_driver.wait_idle().await;
         tracing::debug!("Naive HTTP/3 client driver exited: {error:?}");
     });
@@ -1116,7 +1131,8 @@ async fn relay_naive_http1_uot(
     let (request, mut raw_pending) =
         read_uot_request_h1(&mut reader, &mut naive_pending, &mut read_state, &target).await?;
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
-    let writer_task = tokio::spawn(async move {
+    let mut writer_tasks = JoinSet::new();
+    writer_tasks.spawn(async move {
         let (_, mut write_state) = naive_states(padding_enabled);
         while let Some(packet) = rx.recv().await {
             write_naive_h1_data(&mut writer, &mut write_state, &packet).await?;
@@ -1127,32 +1143,40 @@ async fn relay_naive_http1_uot(
             .context("shutdown Naive HTTP/1.1 UOT writer")?;
         Ok::<(), anyhow::Error>(())
     });
+    let mut packet_tasks = JoinSet::new();
     let mut buffer = vec![0u8; 16 * 1024];
     loop {
         while let Some((destination, payload, connected)) =
             take_uot_stream_packet(&request, &mut raw_pending)?
         {
-            let tx = tx.clone();
-            let session = session.clone();
-            tokio::spawn(async move {
-                if let Err(error) =
-                    relay_naive_uot_packet(tx, destination, payload, connected, session).await
-                {
-                    tracing::warn!("Naive HTTP/1.1 UOT packet failed: {error:?}");
-                }
-            });
+            spawn_naive_uot_packet(
+                &mut packet_tasks,
+                tx.clone(),
+                destination,
+                payload,
+                connected,
+                session.clone(),
+            );
         }
-        let read = read_naive_h1_data(
+        let read = tokio::select! {
+            result = writer_tasks.join_next() => {
+                result.context("Naive UOT writer task disappeared")?.context("join Naive UOT writer")??;
+                bail!("Naive UOT writer ended before request EOF");
+            }
+            result = read_naive_h1_data(
             &mut reader,
             &mut naive_pending,
             &mut read_state,
             &mut buffer,
-        )
-        .await?;
+        ) => result?,
+        };
         if read == 0 {
+            drop(packet_tasks);
             drop(tx);
-            writer_task
+            writer_tasks
+                .join_next()
                 .await
+                .context("Naive UOT writer task disappeared")?
                 .context("join Naive HTTP/1.1 UOT writer")??;
             return Ok(());
         }
@@ -1178,7 +1202,8 @@ async fn relay_naive_http2_uot(
     )
     .await?;
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
-    let writer_task = tokio::spawn(async move {
+    let mut writer_tasks = JoinSet::new();
+    writer_tasks.spawn(async move {
         let mut write_state = NaiveWriteState::default();
         while let Some(packet) = rx.recv().await {
             send_naive_h2_data(&mut send, &mut write_state, &packet).await?;
@@ -1187,33 +1212,41 @@ async fn relay_naive_http2_uot(
             .context("finish Naive HTTP/2 UOT response")?;
         Ok::<(), anyhow::Error>(())
     });
+    let mut packet_tasks = JoinSet::new();
     let mut buffer = vec![0u8; 16 * 1024];
     loop {
         while let Some((destination, payload, connected)) =
             take_uot_stream_packet(&request, &mut raw_pending)?
         {
-            let tx = tx.clone();
-            let session = session.clone();
-            tokio::spawn(async move {
-                if let Err(error) =
-                    relay_naive_uot_packet(tx, destination, payload, connected, session).await
-                {
-                    tracing::warn!("Naive HTTP/2 UOT packet failed: {error:?}");
-                }
-            });
+            spawn_naive_uot_packet(
+                &mut packet_tasks,
+                tx.clone(),
+                destination,
+                payload,
+                connected,
+                session.clone(),
+            );
         }
-        let read = read_naive_h2_data(
+        let read = tokio::select! {
+            result = writer_tasks.join_next() => {
+                result.context("Naive UOT writer task disappeared")?.context("join Naive UOT writer")??;
+                bail!("Naive UOT writer ended before request EOF");
+            }
+            result = read_naive_h2_data(
             &mut recv,
             &mut flow,
             &mut naive_pending,
             &mut read_state,
             &mut buffer,
-        )
-        .await?;
+        ) => result?,
+        };
         if read == 0 {
+            drop(packet_tasks);
             drop(tx);
-            writer_task
+            writer_tasks
+                .join_next()
                 .await
+                .context("Naive UOT writer task disappeared")?
                 .context("join Naive HTTP/2 UOT writer")??;
             return Ok(());
         }
@@ -1236,7 +1269,8 @@ where
     let (request, mut raw_pending) =
         read_uot_request_h3(&mut recv, &mut naive_pending, &mut read_state, &target).await?;
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
-    let writer_task = tokio::spawn(async move {
+    let mut writer_tasks = JoinSet::new();
+    writer_tasks.spawn(async move {
         let mut write_state = NaiveWriteState::default();
         while let Some(packet) = rx.recv().await {
             send_naive_h3_server_data(&mut send, &mut write_state, &packet).await?;
@@ -1246,28 +1280,35 @@ where
             .context("finish Naive HTTP/3 UOT response")?;
         Ok::<(), anyhow::Error>(())
     });
+    let mut packet_tasks = JoinSet::new();
     let mut buffer = vec![0u8; 16 * 1024];
     loop {
         while let Some((destination, payload, connected)) =
             take_uot_stream_packet(&request, &mut raw_pending)?
         {
-            let tx = tx.clone();
-            let session = session.clone();
-            tokio::spawn(async move {
-                if let Err(error) =
-                    relay_naive_uot_packet(tx, destination, payload, connected, session).await
-                {
-                    tracing::warn!("Naive HTTP/3 UOT packet failed: {error:?}");
-                }
-            });
+            spawn_naive_uot_packet(
+                &mut packet_tasks,
+                tx.clone(),
+                destination,
+                payload,
+                connected,
+                session.clone(),
+            );
         }
-        let read =
-            read_naive_h3_server_data(&mut recv, &mut naive_pending, &mut read_state, &mut buffer)
-                .await?;
+        let read = tokio::select! {
+            result = writer_tasks.join_next() => {
+                result.context("Naive UOT writer task disappeared")?.context("join Naive UOT writer")??;
+                bail!("Naive UOT writer ended before request EOF");
+            }
+            result = read_naive_h3_server_data(&mut recv, &mut naive_pending, &mut read_state, &mut buffer) => result?,
+        };
         if read == 0 {
+            drop(packet_tasks);
             drop(tx);
-            writer_task
+            writer_tasks
+                .join_next()
                 .await
+                .context("Naive UOT writer task disappeared")?
                 .context("join Naive HTTP/3 UOT writer")??;
             return Ok(());
         }
@@ -1414,6 +1455,32 @@ fn legacy_uot_request() -> uot::UotRequest {
     }
 }
 
+fn spawn_naive_uot_packet(
+    tasks: &mut JoinSet<()>,
+    tx: mpsc::Sender<Vec<u8>>,
+    destination: ProxyTarget,
+    payload: Vec<u8>,
+    connected: bool,
+    session: Option<CoreSession>,
+) {
+    while let Some(result) = tasks.try_join_next() {
+        if let Err(error) = result {
+            tracing::warn!("Naive UOT packet task failed: {error:?}");
+        }
+    }
+    if tasks.len() >= MAX_NAIVE_UOT_PACKETS {
+        tracing::debug!("discard Naive UOT packet: outstanding packet limit reached");
+        return;
+    }
+    tasks.spawn(async move {
+        if let Err(error) =
+            relay_naive_uot_packet(tx, destination, payload, connected, session).await
+        {
+            tracing::warn!("Naive UOT packet failed: {error:?}");
+        }
+    });
+}
+
 async fn relay_naive_uot_packet(
     tx: mpsc::Sender<Vec<u8>>,
     destination: ProxyTarget,
@@ -1482,7 +1549,7 @@ async fn relay_naive_tcp(
         } => relay_naive_http1_tcp(local, stream, pending, padding_enabled, session).await,
         NaiveTunnel::Http2 { send, recv, driver } => {
             let result = relay_naive_http2_tcp(local, send, recv, session).await;
-            driver.abort();
+            drop(driver);
             result
         }
         NaiveTunnel::Http3 {
@@ -1495,7 +1562,7 @@ async fn relay_naive_tcp(
             let _endpoint = endpoint;
             let result = relay_naive_http3_tcp(local, send, recv, session).await;
             connection.close(quinn::VarInt::from_u32(0), b"client closed");
-            driver.abort();
+            drop(driver);
             result
         }
     }
@@ -1659,6 +1726,7 @@ async fn relay_naive_http3_tcp(
 async fn handle_naive_udp_associate(
     mut control: TcpStream,
     config: NaiveClientConfig,
+    session: CoreSession,
 ) -> Result<()> {
     let bind_ip = match control.local_addr()?.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -1676,10 +1744,10 @@ async fn handle_naive_udp_associate(
             stream,
             pending,
             padding_enabled,
-        } => handle_naive_udp_h1(control, udp, stream, pending, padding_enabled).await,
+        } => handle_naive_udp_h1(control, udp, stream, pending, padding_enabled, session).await,
         NaiveTunnel::Http2 { send, recv, driver } => {
-            let result = handle_naive_udp_h2(control, udp, send, recv).await;
-            driver.abort();
+            let result = handle_naive_udp_h2(control, udp, send, recv, session).await;
+            drop(driver);
             result
         }
         NaiveTunnel::Http3 {
@@ -1690,9 +1758,9 @@ async fn handle_naive_udp_associate(
             driver,
         } => {
             let _endpoint = endpoint;
-            let result = handle_naive_udp_h3(control, udp, send, recv).await;
+            let result = handle_naive_udp_h3(control, udp, send, recv, session).await;
             connection.close(quinn::VarInt::from_u32(0), b"client closed");
-            driver.abort();
+            drop(driver);
             result
         }
     }
@@ -1704,6 +1772,7 @@ async fn handle_naive_udp_h1(
     stream: tokio_rustls::client::TlsStream<TcpStream>,
     pending: Vec<u8>,
     padding_enabled: bool,
+    session: CoreSession,
 ) -> Result<()> {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (_, mut write_state) = naive_states(padding_enabled);
@@ -1717,6 +1786,7 @@ async fn handle_naive_udp_h1(
     let udp_to_stream = {
         let udp = udp.clone();
         let peer = peer.clone();
+        let session = session.clone();
         async move {
             let mut buffer = vec![0u8; u16::MAX as usize + 32];
             loop {
@@ -1726,6 +1796,7 @@ async fn handle_naive_udp_h1(
                     .context("receive Naive SOCKS UDP packet")?;
                 *peer.lock().await = Some(next_peer);
                 let (target, payload) = uot::parse_socks_udp_packet(&buffer[..read])?;
+                session.record_upload(payload.len()).await?;
                 let packet = uot::encode_associate_packet(&target, payload)?;
                 write_naive_h1_data(&mut writer, &mut write_state, &packet).await?;
             }
@@ -1750,6 +1821,7 @@ async fn handle_naive_udp_h1(
                     return Ok::<(), anyhow::Error>(());
                 };
                 let (source, payload) = uot::decode_associate_packet(&packet)?;
+                session.record_download(payload.len()).await?;
                 let response = uot::encode_socks_udp_packet(&source, payload)?;
                 let peer = (*peer.lock().await).context("Naive SOCKS UDP peer is not known yet")?;
                 udp.send_to(&response, peer)
@@ -1771,6 +1843,7 @@ async fn handle_naive_udp_h2(
     udp: Arc<UdpSocket>,
     mut send: h2::SendStream<Bytes>,
     mut recv: h2::RecvStream,
+    session: CoreSession,
 ) -> Result<()> {
     let mut write_state = NaiveWriteState::default();
     send_naive_h2_data(
@@ -1783,6 +1856,7 @@ async fn handle_naive_udp_h2(
     let udp_to_stream = {
         let udp = udp.clone();
         let peer = peer.clone();
+        let session = session.clone();
         async move {
             let mut buffer = vec![0u8; u16::MAX as usize + 32];
             loop {
@@ -1792,6 +1866,7 @@ async fn handle_naive_udp_h2(
                     .context("receive Naive HTTP/2 SOCKS UDP packet")?;
                 *peer.lock().await = Some(next_peer);
                 let (target, payload) = uot::parse_socks_udp_packet(&buffer[..read])?;
+                session.record_upload(payload.len()).await?;
                 let packet = uot::encode_associate_packet(&target, payload)?;
                 send_naive_h2_data(&mut send, &mut write_state, &packet).await?;
             }
@@ -1818,6 +1893,7 @@ async fn handle_naive_udp_h2(
                     return Ok::<(), anyhow::Error>(());
                 };
                 let (source, payload) = uot::decode_associate_packet(&packet)?;
+                session.record_download(payload.len()).await?;
                 let response = uot::encode_socks_udp_packet(&source, payload)?;
                 let peer =
                     (*peer.lock().await).context("Naive HTTP/2 SOCKS UDP peer is not known yet")?;
@@ -1840,6 +1916,7 @@ async fn handle_naive_udp_h3(
     udp: Arc<UdpSocket>,
     mut send: h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
     mut recv: h3::client::RequestStream<h3_quinn::RecvStream, Bytes>,
+    session: CoreSession,
 ) -> Result<()> {
     let mut write_state = NaiveWriteState::default();
     send_naive_h3_data(
@@ -1852,6 +1929,7 @@ async fn handle_naive_udp_h3(
     let udp_to_stream = {
         let udp = udp.clone();
         let peer = peer.clone();
+        let session = session.clone();
         async move {
             let mut buffer = vec![0u8; u16::MAX as usize + 32];
             loop {
@@ -1861,6 +1939,7 @@ async fn handle_naive_udp_h3(
                     .context("receive Naive HTTP/3 SOCKS UDP packet")?;
                 *peer.lock().await = Some(next_peer);
                 let (target, payload) = uot::parse_socks_udp_packet(&buffer[..read])?;
+                session.record_upload(payload.len()).await?;
                 let packet = uot::encode_associate_packet(&target, payload)?;
                 send_naive_h3_data(&mut send, &mut write_state, &packet).await?;
             }
@@ -1885,6 +1964,7 @@ async fn handle_naive_udp_h3(
                     return Ok::<(), anyhow::Error>(());
                 };
                 let (source, payload) = uot::decode_associate_packet(&packet)?;
+                session.record_download(payload.len()).await?;
                 let response = uot::encode_socks_udp_packet(&source, payload)?;
                 let peer =
                     (*peer.lock().await).context("Naive HTTP/3 SOCKS UDP peer is not known yet")?;
