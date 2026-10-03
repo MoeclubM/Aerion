@@ -317,6 +317,18 @@ async fn handle_naive_h2_request(
         Some(credential)
     };
     let session = naive_core_session(&runtime, credential.as_deref(), peer).await?;
+    let remote = match connect_naive_target(&target, runtime.udp_over_tcp).await {
+        Ok(remote) => remote,
+        Err(error) => {
+            let status = if uot::is_magic_target(&target) {
+                403
+            } else {
+                502
+            };
+            send_h2_status(&mut respond, status)?;
+            return Err(error);
+        }
+    };
     let response = http::Response::builder()
         .status(http::StatusCode::OK)
         .body(())
@@ -324,20 +336,19 @@ async fn handle_naive_h2_request(
     let send = respond
         .send_response(response, false)
         .context("send Naive HTTP/2 CONNECT response")?;
-    if uot::is_magic_target(&target) {
-        ensure!(
-            runtime.udp_over_tcp,
-            "Naive HTTP/2 UDP-over-TCP is disabled by server config"
-        );
-        let cancellation = session.clone().unwrap_or_else(CoreSession::disabled);
-        return tokio::select! {
-            _ = cancellation.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
-            result = relay_naive_http2_uot(send, recv, target, session) => result,
-        };
+    match remote {
+        Some(remote) => {
+            tracing::info!("Naive serving HTTP/2 {}", target_name(&target));
+            relay_naive_http2_server_tcp(send, recv, remote, session).await
+        }
+        None => {
+            let cancellation = session.clone().unwrap_or_else(CoreSession::disabled);
+            tokio::select! {
+                _ = cancellation.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
+                result = relay_naive_http2_uot(send, recv, target, session) => result,
+            }
+        }
     }
-    let remote = connect_proxy_target(&target).await?;
-    tracing::info!("Naive serving HTTP/2 {}", target_name(&target));
-    relay_naive_http2_server_tcp(send, recv, remote, session).await
 }
 
 async fn run_naive_h3_server(config: NaiveServerConfig, runtime: NaiveServerRuntime) -> Result<()> {
@@ -416,6 +427,18 @@ where
         Some(credential)
     };
     let session = naive_core_session(&runtime, credential.as_deref(), peer).await?;
+    let remote = match connect_naive_target(&target, runtime.udp_over_tcp).await {
+        Ok(remote) => remote,
+        Err(error) => {
+            let status = if uot::is_magic_target(&target) {
+                403
+            } else {
+                502
+            };
+            send_h3_status(&mut stream, status).await?;
+            return Err(error);
+        }
+    };
     let response = http::Response::builder()
         .status(http::StatusCode::OK)
         .body(())
@@ -425,20 +448,34 @@ where
         .await
         .context("send Naive HTTP/3 CONNECT response")?;
     let (send, recv) = stream.split();
-    if uot::is_magic_target(&target) {
-        ensure!(
-            runtime.udp_over_tcp,
-            "Naive HTTP/3 UDP-over-TCP is disabled by server config"
-        );
-        let cancellation = session.clone().unwrap_or_else(CoreSession::disabled);
-        return tokio::select! {
-            _ = cancellation.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
-            result = relay_naive_http3_uot(send, recv, target, session) => result,
-        };
+    match remote {
+        Some(remote) => {
+            tracing::info!("Naive serving HTTP/3 {}", target_name(&target));
+            relay_naive_http3_server_tcp(send, recv, remote, session).await
+        }
+        None => {
+            let cancellation = session.clone().unwrap_or_else(CoreSession::disabled);
+            tokio::select! {
+                _ = cancellation.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
+                result = relay_naive_http3_uot(send, recv, target, session) => result,
+            }
+        }
     }
-    let remote = connect_proxy_target(&target).await?;
-    tracing::info!("Naive serving HTTP/3 {}", target_name(&target));
-    relay_naive_http3_server_tcp(send, recv, remote, session).await
+}
+
+async fn connect_naive_target(
+    target: &ProxyTarget,
+    udp_over_tcp: bool,
+) -> Result<Option<TcpStream>> {
+    if uot::is_magic_target(target) {
+        ensure!(
+            udp_over_tcp,
+            "Naive UDP-over-TCP is disabled by server config"
+        );
+        Ok(None)
+    } else {
+        connect_proxy_target(target).await.map(Some)
+    }
 }
 
 async fn read_naive_http1_connect(

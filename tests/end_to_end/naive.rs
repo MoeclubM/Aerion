@@ -89,10 +89,23 @@ async fn naive_tcp_accounting_and_idle_revocation(quic: bool) -> Result<()> {
                 && stats[0].download_bytes == payload.len() as u64,
             "Naive client did not record payload bytes"
         );
+        let mut refused = TcpStream::connect(client_addr).await?;
+        refused.write_all(&[5, 1, 0]).await?;
+        let mut greeting = [0; 2];
+        refused.read_exact(&mut greeting).await?;
+        write_socks_connect(&mut refused, unused_tcp_addr()?).await?;
+        let mut reply = [0; 10];
+        refused
+            .read_exact(&mut reply)
+            .await
+            .context("read rejected Naive CONNECT reply")?;
+        anyhow::ensure!(
+            reply[1] != 0,
+            "Naive reported success before connecting the TCP target"
+        );
         let idle_listener = TcpListener::bind("127.0.0.1:0").await?;
         let mut socks = TcpStream::connect(client_addr).await?;
         socks.write_all(&[5, 1, 0]).await?;
-        let mut greeting = [0; 2];
         socks.read_exact(&mut greeting).await?;
         write_socks_connect(&mut socks, idle_listener.local_addr()?).await?;
         read_socks_reply_addr(&mut socks)
