@@ -86,6 +86,17 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let request = vless_http::read_http_head(&mut stream).await?;
+    server_with_head(stream, transport, &request).await
+}
+
+pub(crate) async fn server_with_head<S>(
+    mut stream: S,
+    transport: &VlessTransportConfig,
+    request: &str,
+) -> Result<WebSocketStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     vless_http::ensure_request_path(&request, &transport.path)?;
     vless_http::ensure_upgrade_headers(&request, "websocket")?;
     let key = vless_http::header_value(&request, "Sec-WebSocket-Key")

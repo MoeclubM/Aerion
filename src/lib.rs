@@ -21,6 +21,7 @@ pub mod server;
 pub mod shadowsocks;
 pub mod socket_protect;
 pub mod socks;
+pub mod sudoku;
 mod task_abort;
 pub mod tls;
 pub mod tls_ech;
@@ -104,6 +105,11 @@ pub use shadowsocks::{
     run_shadowsocks_server, run_shadowsocks_server_with_core,
 };
 pub use socks::{SocksProxyClientConfig, run_socks_proxy_client, run_socks_proxy_client_listener};
+pub use sudoku::{
+    SudokuClientConfig, SudokuOptions, SudokuServerConfig, run_sudoku_client,
+    run_sudoku_client_listener, run_sudoku_client_listener_with_core, run_sudoku_server,
+    run_sudoku_server_listener_with_core, run_sudoku_server_with_core, sudoku_key_seed,
+};
 pub use tls::TlsEchServerKeys;
 pub use tls_ech::{tls_ech_from_compat_reference, tls_ech_from_inline, tls_ech_from_path};
 pub use trojan::{
