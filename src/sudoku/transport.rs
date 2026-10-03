@@ -120,6 +120,7 @@ pub(super) async fn server(
     });
     ensure!(authenticated, "invalid Sudoku WebSocket authorization");
     let transport = VlessTransportConfig::websocket(Some(path(options)), None, Vec::new());
+    let request = request.replacen(uri, uri.split('?').next().unwrap(), 1);
     Ok(Box::new(
         vless_websocket::server_with_head(stream, &transport, &request).await?,
     ))

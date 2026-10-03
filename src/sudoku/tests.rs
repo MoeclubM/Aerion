@@ -113,10 +113,10 @@ async fn socks_tcp_udp_httpmask_mux_and_revocation_work_end_to_end() -> Result<(
             assert!(bob.download_bytes >= data.len() as u64 + 4129);
             let alice = snapshots
                 .iter()
-                .find(|user| user.user_id == "alice-key")
+                .find(|user| user.user_id == "default")
                 .unwrap();
             assert_eq!(alice.upload_bytes, 0);
-            core.replace_users(vec![crate::CoreUser::password("alice-key", "alice-key")])?;
+            core.replace_users(vec![crate::CoreUser::password("default", "alice-key")])?;
             let mut byte = [0];
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(5), socks.read(&mut byte)).await??,
@@ -152,12 +152,15 @@ async fn official_go_peer_interoperates_in_both_directions() -> Result<()> {
     ] {
         for aead in ["chacha20-poly1305", "aes-128-gcm"] {
             for pure in [false, true] {
-                for custom in ["", "xpxvvpvv"] {
+                for (custom, mask) in [("", "raw"), ("xpxvvpvv", "raw"), ("xpxvvpvv", "ws")] {
                     let options = SudokuOptions {
                         table_type: mode.into(),
                         aead: aead.into(),
                         enable_pure_downlink: pure,
                         custom_table: custom.into(),
+                        http_mask: mask == "ws",
+                        http_mask_mode: "ws".into(),
+                        path_root: "edge".into(),
                         ..Default::default()
                     };
                     let args = [
@@ -167,6 +170,8 @@ async fn official_go_peer_interoperates_in_both_directions() -> Result<()> {
                         aead,
                         "-custom",
                         custom,
+                        "-mask",
+                        mask,
                         if pure { "-pure=true" } else { "-pure=false" },
                     ];
                     let mut peer = Peer(
@@ -178,7 +183,15 @@ async fn official_go_peer_interoperates_in_both_directions() -> Result<()> {
                     let mut address = String::new();
                     std::io::BufReader::new(peer.0.stdout.take().unwrap())
                         .read_line(&mut address)?;
-                    let mut stream = TcpStream::connect(address.trim()).await?;
+                    let address: SocketAddr = address.trim().parse()?;
+                    let mut stream = transport::client(&SudokuClientConfig {
+                        listen: address,
+                        server_host: address.ip().to_string(),
+                        server_port: address.port(),
+                        key: "interop-user-psk".into(),
+                        options: options.clone(),
+                    })
+                    .await?;
                     let (receiver, mut sender) = tokio::time::timeout(
                         Duration::from_secs(10),
                         client_handshake(&mut stream, "interop-user-psk", &options),

@@ -348,6 +348,21 @@ struct Tunnel {
     stream: tokio::io::DuplexStream,
     task: tokio::task::JoinHandle<()>,
     error: Arc<Mutex<Option<String>>>,
+    progress: Arc<Progress>,
+    written: u64,
+    closed: bool,
+}
+#[derive(Default)]
+struct Progress {
+    sent: std::sync::atomic::AtomicU64,
+    waker: futures::task::AtomicWaker,
+}
+impl Progress {
+    fn advance(&self, n: usize) {
+        self.sent
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Release);
+        self.waker.wake();
+    }
 }
 impl Drop for Tunnel {
     fn drop(&mut self) {
@@ -375,19 +390,51 @@ impl AsyncWrite for Tunnel {
         if let Some(error) = self.error.lock().unwrap().as_ref() {
             return std::task::Poll::Ready(Err(std::io::Error::other(error.clone())));
         }
-        std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
+        match std::pin::Pin::new(&mut self.stream).poll_write(cx, buf) {
+            std::task::Poll::Ready(Ok(n)) => {
+                self.written += n as u64;
+                std::task::Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
     }
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+        std::task::ready!(std::pin::Pin::new(&mut self.stream).poll_flush(cx))?;
+        self.progress.waker.register(cx.waker());
+        if let Some(error) = self.error.lock().unwrap().as_ref() {
+            return std::task::Poll::Ready(Err(std::io::Error::other(error.clone())));
+        }
+        if self
+            .progress
+            .sent
+            .load(std::sync::atomic::Ordering::Acquire)
+            >= self.written
+        {
+            std::task::Poll::Ready(Ok(()))
+        } else if self.task.is_finished() {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "Sudoku tunnel closed before flushing",
+            )))
+        } else {
+            std::task::Poll::Pending
+        }
     }
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+        use std::future::Future;
+        if self.closed {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::task::ready!(std::pin::Pin::new(&mut self.stream).poll_shutdown(cx))?;
+        let result = std::task::ready!(std::pin::Pin::new(&mut self.task).poll(cx));
+        self.closed = true;
+        std::task::Poll::Ready(result.map_err(std::io::Error::other))
     }
 }
 fn tunnel<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
@@ -398,6 +445,8 @@ fn tunnel<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (local, remote) = tokio::io::duplex(65536);
     let error = Arc::new(Mutex::new(None));
     let errors = error.clone();
+    let progress = Arc::new(Progress::default());
+    let sent = progress.clone();
     let task = tokio::spawn(async move {
         let (mut read, mut write) = tokio::io::split(stream);
         let (mut plain_read, mut plain_write) = tokio::io::split(remote);
@@ -409,6 +458,7 @@ fn tunnel<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     return Ok::<_, anyhow::Error>(());
                 }
                 sender.write(&mut write, &buf[..n]).await?;
+                sent.advance(n);
             }
         };
         let down = async {
@@ -427,11 +477,15 @@ fn tunnel<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         }
         let _ = write.shutdown().await;
         let _ = plain_write.shutdown().await;
+        sent.waker.wake();
     });
     Tunnel {
         stream: local,
         task,
         error,
+        progress,
+        written: 0,
+        closed: false,
     }
 }
 
@@ -648,6 +702,8 @@ fn mux_client(stream: Tunnel) -> Tunnel {
     let (local, remote) = tokio::io::duplex(65536);
     let error = Arc::new(Mutex::new(None));
     let errors = error.clone();
+    let progress = Arc::new(Progress::default());
+    let sent = progress.clone();
     let task = tokio::spawn(async move {
         let (mut read, write) = tokio::io::split(stream);
         let write = tokio::sync::Mutex::new(write);
@@ -661,6 +717,7 @@ fn mux_client(stream: Tunnel) -> Tunnel {
                     return Ok::<_, anyhow::Error>(());
                 }
                 mux_frame(&mut *write.lock().await, 2, 1, &buf[..n]).await?;
+                sent.advance(n);
             }
         };
         let down = async {
@@ -688,11 +745,15 @@ fn mux_client(stream: Tunnel) -> Tunnel {
             *errors.lock().unwrap() = Some(format!("{error:#}"));
         }
         let _ = plain_write.shutdown().await;
+        sent.waker.wake();
     });
     Tunnel {
         stream: local,
         task,
         error,
+        progress,
+        written: 0,
+        closed: false,
     }
 }
 
@@ -802,6 +863,7 @@ async fn mux_frame<W: AsyncWrite + Unpin>(
     frame.extend((payload.len() as u32).to_be_bytes());
     frame.extend(payload);
     writer.write_all(&frame).await?;
+    writer.flush().await?;
     Ok(())
 }
 

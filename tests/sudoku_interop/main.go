@@ -3,6 +3,7 @@
 package main
 
 import (
+    "context"
     "encoding/binary"
     "flag"
     "fmt"
@@ -15,6 +16,7 @@ import (
     "github.com/SUDOKU-ASCII/sudoku/internal/config"
     "github.com/SUDOKU-ASCII/sudoku/internal/tunnel"
     "github.com/SUDOKU-ASCII/sudoku/pkg/obfs/sudoku"
+    "github.com/SUDOKU-ASCII/sudoku/pkg/obfs/httpmask"
 )
 
 func main() {
@@ -27,12 +29,14 @@ func main() {
     ascii := flag.String("ascii", "prefer_entropy", "appearance")
     custom := flag.String("custom", "", "custom layout")
     pure := flag.Bool("pure", false, "classic downlink")
+    mask := flag.String("mask", "raw", "raw or ws")
     flag.Parse()
     cfg := &config.Config{Key:*key, AEAD:*aead, ASCII:*ascii, PaddingMin:5, PaddingMax:15, EnablePureDownlink:*pure}
     cfg.HTTPMask.Disable = true
     table, err := sudoku.NewTableWithCustom(*key, *ascii, *custom)
     must(err)
     if *mode == "server" {
+        maskServer := httpmask.NewTunnelServer(httpmask.TunnelServerOptions{Mode:"ws",AuthKey:*key,PathRoot:"edge"})
         listener, err := net.Listen("tcp", *addr)
         must(err)
         fmt.Println(listener.Addr())
@@ -41,6 +45,12 @@ func main() {
             must(err)
             go func() {
                 defer raw.Close()
+                if *mask == "ws" {
+                    result, wrapped, err := maskServer.HandleConn(raw)
+                    if err != nil { fmt.Fprintln(os.Stderr,err);return }
+                    if result != httpmask.HandleStartTunnel { fmt.Fprintln(os.Stderr,"WS tunnel was rejected");return }
+                    raw = wrapped
+                }
                 conn, _, err := tunnel.HandshakeAndUpgradeWithTablesMeta(raw, cfg, []*sudoku.Table{table})
                 if err != nil { fmt.Fprintln(os.Stderr, err); return }
                 defer conn.Close()
@@ -50,7 +60,12 @@ func main() {
             }()
         }
     }
-    raw, err := net.DialTimeout("tcp", *addr, 10*time.Second)
+    var raw net.Conn
+    if *mask == "ws" {
+        raw, err = httpmask.DialTunnel(context.Background(),*addr,httpmask.TunnelDialOptions{Mode:"ws",AuthKey:*key,PathRoot:"edge",Multiplex:"off"})
+    } else {
+        raw, err = net.DialTimeout("tcp", *addr, 10*time.Second)
+    }
     must(err)
     defer raw.Close()
     must(raw.SetDeadline(time.Now().Add(15*time.Second)))
