@@ -7,6 +7,81 @@ use std::sync::Arc;
 use tokio_rustls::TlsConnector;
 
 #[tokio::test]
+async fn heartbeat_preserves_partial_frames_and_revocation_closes_idle_sessions() -> Result<()> {
+    tls::init_crypto();
+    let temp = tempfile::tempdir()?;
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+    let cert_path = temp.path().join("server.crt");
+    let key_path = temp.path().join("server.key");
+    std::fs::write(&cert_path, certified.cert.pem())?;
+    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let core = aerion::ProxyCore::from_credentials("secret", &[]);
+    let server = tokio::spawn(aerion::run_server_listener_with_core(
+        listener,
+        ServerConfig {
+            listen: addr,
+            password: "secret".into(),
+            users: Vec::new(),
+            cert_path,
+            key_path,
+            certificates: Vec::new(),
+            key: None,
+            padding_scheme: PaddingScheme::default_lines(),
+            heartbeat_interval_secs: 1,
+            ech: None,
+        },
+        core.clone(),
+    ));
+    let result = timeout(Duration::from_secs(5), async {
+        let tcp = TcpStream::connect(addr).await?;
+        let mut stream = TlsConnector::from(tls::client_config(true))
+            .connect(rustls::pki_types::ServerName::try_from("localhost")?, tcp)
+            .await?;
+        stream.write_all(&password_hash("secret")).await?;
+        stream.write_all(&[0, 0]).await?;
+        let padding = PaddingScheme::from_lines(PaddingScheme::default_lines())?;
+        write_frame(
+            &mut stream,
+            CMD_SETTINGS,
+            0,
+            format!("v=2\npadding-md5={}", padding.md5()).as_bytes(),
+        )
+        .await?;
+        anyhow::ensure!(
+            read_frame(&mut stream).await?.cmd == CMD_SERVER_SETTINGS,
+            "missing settings"
+        );
+        let header = [aerion::protocol::CMD_HEART_REQUEST, 0, 0, 0, 17, 0, 0];
+        stream.write_all(&header[..3]).await?;
+        stream.flush().await?;
+        anyhow::ensure!(
+            read_frame(&mut stream).await?.cmd == aerion::protocol::CMD_HEART_REQUEST,
+            "missing heartbeat"
+        );
+        stream.write_all(&header[3..]).await?;
+        stream.flush().await?;
+        let reply = read_frame(&mut stream).await?;
+        anyhow::ensure!(
+            reply.cmd == aerion::protocol::CMD_HEART_RESPONSE && reply.stream_id == 17,
+            "partial frame was lost"
+        );
+        core.cancel_all_sessions();
+        anyhow::ensure!(
+            read_frame(&mut stream).await.is_err(),
+            "revoked idle connection remained open"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("AnyTLS heartbeat/revocation test timed out")
+    .and_then(|result| result);
+    server.abort();
+    result
+}
+
+#[tokio::test]
 async fn socks_client_reaches_tcp_target_through_aerion_server() -> Result<()> {
     tls::init_crypto();
 

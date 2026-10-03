@@ -49,7 +49,7 @@ Local SOCKS CONNECT over HTTPS CONNECT. HTTP/1.1, HTTP/2, and HTTP/3 on both sid
 
 ### Shadowsocks
 
-TCP and UDP relay through `shadowsocks-rust` (AEAD, AEAD extra, AEAD-2022, AEAD-2022 extra, stream ciphers). SIP003 UoT over the TCP stream is implemented; SIP003 *plugins* are not.
+TCP and UDP relay through `shadowsocks-rust` (AEAD, AEAD extra, AEAD-2022, AEAD-2022 extra). SIP003 UoT over the TCP stream is implemented; SIP003 *plugins* are not. TCP multi-user accounting is explicitly rejected until the dependency exposes the authenticated user identity.
 
 ### Trojan
 

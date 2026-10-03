@@ -62,6 +62,8 @@ Aerion is a Rust crate (`src/lib.rs`) plus an optional CLI (`src/main.rs`). Inte
 | Native config | `src/config.rs` |
 | Compatibility profiles | `src/config_compat/` |
 | Accounting | `src/core.rs` |
+| Shared byte-stream relay and shutdown | `src/relay.rs` (re-exported by `core`) |
+| Bounded HY2 / TUIC fragment reassembly | `src/udp_fragments.rs` |
 | Routing | `src/routing.rs`, `src/router.rs` |
 | TUN | `src/tun.rs` |
 | TLS / ECH / REALITY | `src/tls.rs`, `src/tls_ech.rs`, `src/reality.rs` |

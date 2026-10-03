@@ -74,7 +74,7 @@ pub async fn run_client_listener(
         &config.pinned_cert_sha256,
     )?;
     let shared = Arc::new(SharedClientSession::new(config, tls_config, padding));
-    tokio::spawn(sweep_idle_client_sessions(shared.clone()));
+    tokio::spawn(sweep_idle_client_sessions(Arc::downgrade(&shared)));
     tracing::info!("client listening on socks5://{}", listener.local_addr()?);
     loop {
         let (stream, peer) = match listener::accept_client(&listener).await {
@@ -103,6 +103,17 @@ struct SharedClientSession {
     tls_config: Arc<rustls::ClientConfig>,
     padding: Arc<Mutex<PaddingScheme>>,
     idle: Mutex<VecDeque<(ClientSession, Instant)>>,
+}
+
+impl Drop for SharedClientSession {
+    fn drop(&mut self) {
+        for (session, _) in self.idle.get_mut().drain(..) {
+            session.abort.trigger();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move { session.close("listener closed").await });
+            }
+        }
+    }
 }
 
 impl SharedClientSession {
@@ -192,10 +203,13 @@ async fn close_idle_sessions(sessions: Vec<ClientSession>, reason: &str) {
     }
 }
 
-async fn sweep_idle_client_sessions(shared: Arc<SharedClientSession>) {
+async fn sweep_idle_client_sessions(shared: std::sync::Weak<SharedClientSession>) {
     let mut ticker = interval(Duration::from_secs(5));
     loop {
         ticker.tick().await;
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
         let expired = {
             let mut idle = shared.idle.lock().await;
             take_expired_idle_sessions(&mut idle)
@@ -261,7 +275,7 @@ impl ClientSession {
                 .collect::<Vec<_>>()
         };
         for sender in senders {
-            let _ = sender.send(StreamEvent::Error(reason.to_string())).await;
+            let _ = sender.try_send(StreamEvent::Error(reason.to_string()));
         }
     }
 
@@ -492,6 +506,7 @@ async fn relay_tcp_counted(
         Ok::<(), anyhow::Error>(())
     };
     let result = tokio::select! {
+        _ = session.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
         result = uplink => result,
         result = downlink => result,
     };

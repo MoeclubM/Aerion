@@ -1,4 +1,4 @@
-use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::aead::{Aead, AeadInPlace, KeyInit};
 use aes_gcm::{Aes128Gcm, Nonce as AesNonce};
 use anyhow::{Context, Result, bail, ensure};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
@@ -357,9 +357,10 @@ impl<R: AsyncRead + Unpin> BodyReader<R> {
     }
 
     async fn read_next_chunk(&mut self) -> Result<()> {
-        let mut size_bytes = vec![0u8; self.state.size_field_len()];
+        let mut size_bytes = [0u8; 2 + AEAD_TAG_LEN];
+        let size_bytes = &mut size_bytes[..self.state.size_field_len()];
         self.inner
-            .read_exact(&mut size_bytes)
+            .read_exact(size_bytes)
             .await
             .context("read VMess chunk size")?;
         let padding_len = if self.state.padding_before_size_decode() {
@@ -367,7 +368,7 @@ impl<R: AsyncRead + Unpin> BodyReader<R> {
         } else {
             0
         };
-        let encoded_size = self.state.decode_size(&size_bytes)? as usize;
+        let encoded_size = self.state.decode_size(size_bytes)? as usize;
         let padding_len = if self.state.padding_before_size_decode() {
             padding_len
         } else {
@@ -391,20 +392,20 @@ impl<R: AsyncRead + Unpin> BodyReader<R> {
                 .context("read VMess chunk payload")?;
         }
         if padding_len > 0 {
-            let mut padding = vec![0u8; padding_len];
+            let mut padding = [0u8; MAX_PADDING_LEN];
             self.inner
-                .read_exact(&mut padding)
+                .read_exact(&mut padding[..padding_len])
                 .await
                 .context("read VMess chunk padding")?;
         }
-        let plaintext = self.state.decrypt_payload(&payload)?;
-        if payload_len == self.state.payload_overhead() && plaintext.is_empty() {
+        self.state.decrypt_payload(&mut payload)?;
+        if payload_len == self.state.payload_overhead() && payload.is_empty() {
             self.finished = true;
             self.pending.clear();
             self.pending_pos = 0;
             return Ok(());
         }
-        self.pending = plaintext;
+        self.pending = payload;
         self.pending_pos = 0;
         Ok(())
     }
@@ -498,7 +499,7 @@ impl<W: AsyncWrite + Unpin> BodyWriter<W> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ChunkState {
     config: BodyConfig,
     size_shake: Option<Shake128>,
@@ -506,6 +507,8 @@ struct ChunkState {
     padding_from_size_shake: bool,
     size_counter: u16,
     payload_counter: u16,
+    payload_cipher: BodyCipher,
+    length_cipher: Option<BodyCipher>,
 }
 
 impl ChunkState {
@@ -531,6 +534,13 @@ impl ChunkState {
                 size_shake = Some(shake);
             }
         }
+        let payload_cipher = BodyCipher::new(config.security, &config.payload_key);
+        let length_cipher = config.options.authenticated_length().then(|| {
+            BodyCipher::new(
+                config.security,
+                &kdf16(&config.length_key, AUTHENTICATED_LENGTH_SALT, &[]),
+            )
+        });
         Self {
             config,
             size_shake,
@@ -538,6 +548,8 @@ impl ChunkState {
             padding_from_size_shake,
             size_counter: 0,
             payload_counter: 0,
+            payload_cipher,
+            length_cipher,
         }
     }
 
@@ -602,84 +614,91 @@ impl ChunkState {
         Ok(size.to_be_bytes().to_vec())
     }
 
-    fn decrypt_payload(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
-        match self.config.security {
-            SecurityType::None => Ok(payload.to_vec()),
-            SecurityType::Aes128Gcm => {
-                let nonce = generate_chunk_nonce(&self.config.payload_iv, self.payload_counter);
-                self.payload_counter = self.payload_counter.wrapping_add(1);
-                decrypt_aes_gcm(&self.config.payload_key, &nonce, payload, &[])
-            }
-            SecurityType::ChaCha20Poly1305 => {
-                let nonce = generate_chunk_nonce(&self.config.payload_iv, self.payload_counter);
-                self.payload_counter = self.payload_counter.wrapping_add(1);
-                decrypt_chacha20_poly1305(
-                    &generate_chacha20_poly1305_key(&self.config.payload_key),
-                    &nonce,
-                    payload,
-                    &[],
-                )
-            }
-            SecurityType::Zero => unreachable!("normalized security never keeps zero"),
-        }
+    fn decrypt_payload(&mut self, payload: &mut Vec<u8>) -> Result<()> {
+        let nonce = generate_chunk_nonce(&self.config.payload_iv, self.payload_counter);
+        self.payload_counter = self.payload_counter.wrapping_add(1);
+        self.payload_cipher.decrypt_in_place(&nonce, payload)
     }
 
     fn encrypt_payload(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        match self.config.security {
-            SecurityType::None => Ok(plaintext.to_vec()),
-            SecurityType::Aes128Gcm => {
-                let nonce = generate_chunk_nonce(&self.config.payload_iv, self.payload_counter);
-                self.payload_counter = self.payload_counter.wrapping_add(1);
-                encrypt_aes_gcm(&self.config.payload_key, &nonce, plaintext, &[])
-            }
-            SecurityType::ChaCha20Poly1305 => {
-                let nonce = generate_chunk_nonce(&self.config.payload_iv, self.payload_counter);
-                self.payload_counter = self.payload_counter.wrapping_add(1);
-                encrypt_chacha20_poly1305(
-                    &generate_chacha20_poly1305_key(&self.config.payload_key),
-                    &nonce,
-                    plaintext,
-                    &[],
-                )
-            }
-            SecurityType::Zero => unreachable!("normalized security never keeps zero"),
-        }
+        let nonce = generate_chunk_nonce(&self.config.payload_iv, self.payload_counter);
+        self.payload_counter = self.payload_counter.wrapping_add(1);
+        self.payload_cipher.encrypt(&nonce, plaintext)
     }
 
     fn open_length_chunk(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let key = kdf16(&self.config.length_key, AUTHENTICATED_LENGTH_SALT, &[]);
         let nonce = generate_chunk_nonce(&self.config.length_iv, self.size_counter);
         self.size_counter = self.size_counter.wrapping_add(1);
-        match self.config.security {
-            SecurityType::ChaCha20Poly1305 => decrypt_chacha20_poly1305(
-                &generate_chacha20_poly1305_key(&key),
-                &nonce,
-                ciphertext,
-                &[],
-            ),
-            SecurityType::Aes128Gcm | SecurityType::None => {
-                decrypt_aes_gcm(&key, &nonce, ciphertext, &[])
-            }
+        self.length_cipher
+            .as_ref()
+            .context("VMess length cipher is disabled")?
+            .decrypt(&nonce, ciphertext)
+    }
+
+    fn seal_length_chunk(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let nonce = generate_chunk_nonce(&self.config.length_iv, self.size_counter);
+        self.size_counter = self.size_counter.wrapping_add(1);
+        self.length_cipher
+            .as_ref()
+            .context("VMess length cipher is disabled")?
+            .encrypt(&nonce, plaintext)
+    }
+}
+
+#[derive(Clone)]
+enum BodyCipher {
+    None,
+    Aes(Box<Aes128Gcm>),
+    ChaCha(ChaCha20Poly1305),
+}
+
+impl BodyCipher {
+    fn new(security: SecurityType, key: &[u8; 16]) -> Self {
+        match security {
+            SecurityType::None => Self::None,
+            SecurityType::Aes128Gcm => Self::Aes(Box::new(Aes128Gcm::new(key.into()))),
+            SecurityType::ChaCha20Poly1305 => Self::ChaCha(ChaCha20Poly1305::new(
+                (&generate_chacha20_poly1305_key(key)).into(),
+            )),
             SecurityType::Zero => unreachable!("normalized security never keeps zero"),
         }
     }
 
-    fn seal_length_chunk(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let key = kdf16(&self.config.length_key, AUTHENTICATED_LENGTH_SALT, &[]);
-        let nonce = generate_chunk_nonce(&self.config.length_iv, self.size_counter);
-        self.size_counter = self.size_counter.wrapping_add(1);
-        match self.config.security {
-            SecurityType::ChaCha20Poly1305 => encrypt_chacha20_poly1305(
-                &generate_chacha20_poly1305_key(&key),
-                &nonce,
-                plaintext,
-                &[],
-            ),
-            SecurityType::Aes128Gcm | SecurityType::None => {
-                encrypt_aes_gcm(&key, &nonce, plaintext, &[])
-            }
-            SecurityType::Zero => unreachable!("normalized security never keeps zero"),
+    fn encrypt(&self, nonce: &[u8; 12], plaintext: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            Self::None => return Ok(plaintext.to_vec()),
+            Self::Aes(cipher) => cipher.encrypt(AesNonce::from_slice(nonce), plaintext),
+            Self::ChaCha(cipher) => cipher.encrypt(ChaChaNonce::from_slice(nonce), plaintext),
         }
+        .map_err(|_| anyhow::anyhow!("encrypt VMess body"))
+    }
+
+    fn decrypt(&self, nonce: &[u8; 12], ciphertext: &[u8]) -> Result<Vec<u8>> {
+        if !matches!(self, Self::None) {
+            ensure!(
+                ciphertext.len() >= AEAD_TAG_LEN,
+                "VMess ciphertext too short"
+            );
+        }
+        match self {
+            Self::None => return Ok(ciphertext.to_vec()),
+            Self::Aes(cipher) => cipher.decrypt(AesNonce::from_slice(nonce), ciphertext),
+            Self::ChaCha(cipher) => cipher.decrypt(ChaChaNonce::from_slice(nonce), ciphertext),
+        }
+        .map_err(|_| anyhow::anyhow!("decrypt VMess body"))
+    }
+
+    fn decrypt_in_place(&self, nonce: &[u8; 12], ciphertext: &mut Vec<u8>) -> Result<()> {
+        match self {
+            Self::None => return Ok(()),
+            Self::Aes(cipher) => {
+                cipher.decrypt_in_place(AesNonce::from_slice(nonce), &[], ciphertext)
+            }
+            Self::ChaCha(cipher) => {
+                cipher.decrypt_in_place(ChaChaNonce::from_slice(nonce), &[], ciphertext)
+            }
+        }
+        .map_err(|_| anyhow::anyhow!("decrypt VMess body"))
     }
 }
 
@@ -896,76 +915,6 @@ fn sha256_hash(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     out
-}
-
-fn encrypt_aes_gcm(key: &[u8], nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
-    Aes128Gcm::new_from_slice(key)
-        .context("init VMess AES-128-GCM body")?
-        .encrypt(
-            AesNonce::from_slice(nonce),
-            Payload {
-                msg: plaintext,
-                aad,
-            },
-        )
-        .map_err(|_| anyhow::anyhow!("encrypt VMess AES-128-GCM body"))
-}
-
-fn decrypt_aes_gcm(key: &[u8], nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
-    ensure!(
-        ciphertext.len() >= AEAD_TAG_LEN,
-        "VMess AES-GCM ciphertext too short"
-    );
-    Aes128Gcm::new_from_slice(key)
-        .context("init VMess AES-128-GCM body")?
-        .decrypt(
-            AesNonce::from_slice(nonce),
-            Payload {
-                msg: ciphertext,
-                aad,
-            },
-        )
-        .map_err(|_| anyhow::anyhow!("decrypt VMess AES-128-GCM body"))
-}
-
-fn encrypt_chacha20_poly1305(
-    key: &[u8; CHACHA_KEY_LEN],
-    nonce: &[u8],
-    plaintext: &[u8],
-    aad: &[u8],
-) -> Result<Vec<u8>> {
-    ChaCha20Poly1305::new_from_slice(key)
-        .context("init VMess ChaCha20-Poly1305 body")?
-        .encrypt(
-            ChaChaNonce::from_slice(nonce),
-            Payload {
-                msg: plaintext,
-                aad,
-            },
-        )
-        .map_err(|_| anyhow::anyhow!("encrypt VMess ChaCha20-Poly1305 body"))
-}
-
-fn decrypt_chacha20_poly1305(
-    key: &[u8; CHACHA_KEY_LEN],
-    nonce: &[u8],
-    ciphertext: &[u8],
-    aad: &[u8],
-) -> Result<Vec<u8>> {
-    ensure!(
-        ciphertext.len() >= AEAD_TAG_LEN,
-        "VMess ChaCha20-Poly1305 ciphertext too short"
-    );
-    ChaCha20Poly1305::new_from_slice(key)
-        .context("init VMess ChaCha20-Poly1305 body")?
-        .decrypt(
-            ChaChaNonce::from_slice(nonce),
-            Payload {
-                msg: ciphertext,
-                aad,
-            },
-        )
-        .map_err(|_| anyhow::anyhow!("decrypt VMess ChaCha20-Poly1305 body"))
 }
 
 #[cfg(test)]

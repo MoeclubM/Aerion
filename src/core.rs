@@ -1,11 +1,12 @@
 use crate::task_abort::TaskAbort;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, ensure};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
+
+pub use crate::relay::{relay_bidirectional_counted, relay_split_counted};
 
 mod events;
 mod limiter;
@@ -102,6 +103,7 @@ struct UserState {
     credentials: RwLock<HashSet<String>>,
     upload: AtomicU64,
     download: AtomicU64,
+    total: AtomicU64,
     online: AtomicU64,
     online_ips: AtomicU64,
     limits: RwLock<CoreUserLimits>,
@@ -476,7 +478,12 @@ impl CoreSession {
             Some(inner) => {
                 inner
                     .user
-                    .record_upload(bytes, inner.session_id, &inner.control)
+                    .record_traffic(
+                        TrafficDirection::Upload,
+                        bytes,
+                        inner.session_id,
+                        &inner.control,
+                    )
                     .await
             }
             None => Ok(()),
@@ -488,7 +495,12 @@ impl CoreSession {
             Some(inner) => {
                 inner
                     .user
-                    .record_download(bytes, inner.session_id, &inner.control)
+                    .record_traffic(
+                        TrafficDirection::Download,
+                        bytes,
+                        inner.session_id,
+                        &inner.control,
+                    )
                     .await
             }
             None => Ok(()),
@@ -509,6 +521,7 @@ impl UserState {
             credentials: RwLock::new(credentials),
             upload: AtomicU64::new(0),
             download: AtomicU64::new(0),
+            total: AtomicU64::new(0),
             online: AtomicU64::new(0),
             online_ips: AtomicU64::new(0),
             limits: RwLock::new(user.limits()),
@@ -633,8 +646,9 @@ impl UserState {
         );
     }
 
-    async fn record_upload(
+    async fn record_traffic(
         &self,
+        direction: TrafficDirection,
         bytes: usize,
         session_id: u64,
         control: &SessionControl,
@@ -643,59 +657,41 @@ impl UserState {
             return Ok(());
         }
         control.ensure_active()?;
-        self.ensure_quota(bytes as u64)?;
-        self.upload_limiter.wait(bytes as u64, control).await?;
+        let limiter = match direction {
+            TrafficDirection::Upload => &self.upload_limiter,
+            TrafficDirection::Download => &self.download_limiter,
+        };
+        limiter.wait(bytes as u64, control).await?;
         control.ensure_active()?;
-        let upload = self.upload.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
-        let download = self.download.load(Ordering::Relaxed);
+        // Reserve both directions against one counter after the rate-limit wait.
+        // Holding the limits guard also orders this reservation with hot updates.
+        {
+            let limits = self.limits.read().expect("core limits lock poisoned");
+            self.total
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                    used.checked_add(bytes as u64)
+                        .filter(|next| limits.quota_bytes.is_none_or(|quota| *next <= quota))
+                })
+                .map_err(|_| anyhow::anyhow!("traffic quota exceeded for user {}", self.id))?;
+        }
+        let (upload, download) = match direction {
+            TrafficDirection::Upload => (
+                self.upload.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64,
+                self.download.load(Ordering::Relaxed),
+            ),
+            TrafficDirection::Download => (
+                self.upload.load(Ordering::Relaxed),
+                self.download.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64,
+            ),
+        };
         self.events.dispatch(|| CoreEvent::TrafficRecorded {
             user_id: self.id.clone(),
             session_id,
-            direction: TrafficDirection::Upload,
+            direction,
             bytes: bytes as u64,
             upload_bytes: upload,
             download_bytes: download,
         });
-        Ok(())
-    }
-
-    async fn record_download(
-        &self,
-        bytes: usize,
-        session_id: u64,
-        control: &SessionControl,
-    ) -> Result<()> {
-        if bytes == 0 {
-            return Ok(());
-        }
-        control.ensure_active()?;
-        self.ensure_quota(bytes as u64)?;
-        self.download_limiter.wait(bytes as u64, control).await?;
-        control.ensure_active()?;
-        let download = self.download.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
-        let upload = self.upload.load(Ordering::Relaxed);
-        self.events.dispatch(|| CoreEvent::TrafficRecorded {
-            user_id: self.id.clone(),
-            session_id,
-            direction: TrafficDirection::Download,
-            bytes: bytes as u64,
-            upload_bytes: upload,
-            download_bytes: download,
-        });
-        Ok(())
-    }
-
-    fn ensure_quota(&self, bytes: u64) -> Result<()> {
-        let limits = *self.limits.read().expect("core limits lock poisoned");
-        if let Some(quota) = limits.quota_bytes {
-            let used = self
-                .upload
-                .load(Ordering::Relaxed)
-                .saturating_add(self.download.load(Ordering::Relaxed));
-            if used.saturating_add(bytes) > quota {
-                bail!("traffic quota exceeded for user {}", self.id);
-            }
-        }
         Ok(())
     }
 
@@ -714,7 +710,7 @@ impl UserState {
             quota_bytes: limits.quota_bytes,
             quota_remaining_bytes: limits
                 .quota_bytes
-                .map(|quota| quota.saturating_sub(upload + download)),
+                .map(|quota| quota.saturating_sub(self.total.load(Ordering::Relaxed))),
             max_online_sessions: limits.max_online_sessions,
             max_online_ips: limits.max_online_ips,
         }
@@ -769,87 +765,6 @@ impl std::fmt::Debug for SessionControl {
 
 fn normalize_ip(ip: IpAddr) -> String {
     ip.to_string().trim_start_matches("::ffff:").to_string()
-}
-
-pub async fn relay_bidirectional_counted<A, B>(
-    left: &mut A,
-    right: &mut B,
-    session: CoreSession,
-    label: &str,
-) -> Result<()>
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-    B: AsyncRead + AsyncWrite + Unpin,
-{
-    let (left_reader, left_writer) = tokio::io::split(left);
-    let (right_reader, right_writer) = tokio::io::split(right);
-    relay_split_counted(
-        left_reader,
-        left_writer,
-        right_reader,
-        right_writer,
-        session,
-        label,
-    )
-    .await
-}
-
-pub async fn relay_split_counted<LR, LW, RR, RW>(
-    mut left_reader: LR,
-    mut left_writer: LW,
-    mut right_reader: RR,
-    mut right_writer: RW,
-    session: CoreSession,
-    label: &str,
-) -> Result<()>
-where
-    LR: AsyncRead + Unpin,
-    LW: AsyncWrite + Unpin,
-    RR: AsyncRead + Unpin,
-    RW: AsyncWrite + Unpin,
-{
-    let uplink_session = session.clone();
-    let uplink = async {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            let read = left_reader
-                .read(&mut buffer)
-                .await
-                .with_context(|| format!("read {label} uplink"))?;
-            if read == 0 {
-                return Ok::<(), anyhow::Error>(());
-            }
-            uplink_session.record_upload(read).await?;
-            right_writer
-                .write_all(&buffer[..read])
-                .await
-                .with_context(|| format!("write {label} uplink"))?;
-        }
-    };
-    let downlink = async {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            let read = right_reader
-                .read(&mut buffer)
-                .await
-                .with_context(|| format!("read {label} downlink"))?;
-            if read == 0 {
-                return Ok::<(), anyhow::Error>(());
-            }
-            session.record_download(read).await?;
-            left_writer
-                .write_all(&buffer[..read])
-                .await
-                .with_context(|| format!("write {label} downlink"))?;
-        }
-    };
-    let result = tokio::select! {
-        result = uplink => result,
-        result = downlink => result,
-    };
-    let _ = right_writer.shutdown().await;
-    let _ = left_writer.shutdown().await;
-    result
 }
 
 #[cfg(test)]

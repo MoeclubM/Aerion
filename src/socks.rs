@@ -100,9 +100,13 @@ pub async fn read_request(stream: &mut TcpStream) -> Result<SocksRequest> {
         .await
         .context("read SOCKS methods")?;
     stream
-        .write_all(&[0x05, 0x00])
+        .write_all(&[0x05, if methods.contains(&0x00) { 0x00 } else { 0xff }])
         .await
         .context("write SOCKS method response")?;
+    ensure!(
+        methods.contains(&0x00),
+        "SOCKS client did not offer no-authentication method"
+    );
 
     let mut request = [0u8; 4];
     stream
@@ -110,6 +114,7 @@ pub async fn read_request(stream: &mut TcpStream) -> Result<SocksRequest> {
         .await
         .context("read SOCKS request")?;
     ensure!(request[0] == 0x05, "invalid SOCKS version");
+    ensure!(request[2] == 0x00, "invalid SOCKS reserved byte");
     let target = match request[3] {
         0x01 => {
             let mut ip = [0u8; 4];

@@ -62,6 +62,10 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      - name: VMess cipher cache benchmark
+        if: runner.os == 'Linux'
+        run: cargo test --locked --release --no-default-features cipher_cache_microbenchmark -- --ignored --nocapture
+
   ios-check:
     name: iOS target check
     runs-on: macos-latest

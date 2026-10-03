@@ -42,7 +42,7 @@ fn fragment_buffer_rejects_duplicate_fragment() -> Result<()> {
     let mut fragments = HashMap::new();
     assert!(push_fragment(&mut fragments, packet.clone())?.is_none());
     let error = push_fragment(&mut fragments, packet).expect_err("duplicate fragment must fail");
-    assert!(error.to_string().contains("duplicate packet fragment"));
+    assert!(error.to_string().contains("duplicate UDP fragment"));
     Ok(())
 }
 
@@ -56,10 +56,10 @@ fn heartbeat_zero_disables_interval() {
 fn fragment_map_is_capped() -> Result<()> {
     let target = ProxyTarget::Domain("example.com".to_string(), 53);
     let mut fragments = HashMap::new();
-    for packet_id in 0..=MAX_UDP_FRAGMENTS as u16 {
+    for packet_id in 0..=MAX_PENDING_PACKETS as u16 {
         let frame = encode_packet_command(7, packet_id, 2, 0, Some(&target), b"p")?;
         let packet = parse_packet_command(&frame)?;
-        if packet_id < MAX_UDP_FRAGMENTS as u16 {
+        if packet_id < MAX_PENDING_PACKETS as u16 {
             assert!(push_fragment(&mut fragments, packet)?.is_none());
         } else {
             let error =

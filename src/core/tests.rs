@@ -70,6 +70,32 @@ async fn quota_rejects_over_limit() -> Result<()> {
 }
 
 #[tokio::test]
+async fn concurrent_directions_cannot_overrun_quota_after_rate_wait() -> Result<()> {
+    let mut user = CoreUser::password("u1", "secret");
+    user.quota_bytes = Some(100);
+    user.upload_limit_bps = Some(1000);
+    user.download_limit_bps = Some(1000);
+    let core = ProxyCore::new(vec![user])?;
+    let session = core.authenticate("secret").await?;
+    let results = tokio::join!(
+        session.record_upload(100),
+        session.record_download(100),
+        session.record_upload(100)
+    );
+    assert_eq!(
+        [results.0, results.1, results.2]
+            .iter()
+            .filter(|result| result.is_ok())
+            .count(),
+        1
+    );
+    let stats = core.snapshot().await;
+    assert_eq!(stats[0].upload_bytes + stats[0].download_bytes, 100);
+    assert_eq!(stats[0].quota_remaining_bytes, Some(0));
+    Ok(())
+}
+
+#[tokio::test]
 async fn online_limit_rejects_extra_sessions() -> Result<()> {
     let mut user = CoreUser::password("u1", "secret");
     user.max_online_sessions = Some(1);

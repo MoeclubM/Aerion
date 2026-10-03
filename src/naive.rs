@@ -160,20 +160,20 @@ pub async fn run_naive_server_with_core(config: NaiveServerConfig, core: ProxyCo
         .await
         .with_context(|| format!("bind Naive HTTPS listener on {}", config.listen))?;
     tracing::info!("Naive HTTPS server listening on {}", listener.local_addr()?);
+    let mut quic_task = tokio::task::JoinSet::new();
     if config.quic {
         let runtime = runtime.clone();
         let config = config.clone();
-        tokio::spawn(async move {
-            if let Err(error) = run_naive_h3_server(config, runtime).await {
-                tracing::warn!("Naive HTTP/3 server exited: {error:?}");
-            }
-        });
+        quic_task.spawn(run_naive_h3_server(config, runtime));
     }
     let acceptor = tokio_rustls::TlsAcceptor::from(runtime.tls_config.clone());
     loop {
-        let (stream, peer) = crate::listener::accept_tcp(&listener)
-            .await
-            .context("accept Naive TCP client")?;
+        let (stream, peer) = tokio::select! {
+            accepted = crate::listener::accept_tcp(&listener) => accepted.context("accept Naive TCP client")?,
+            result = quic_task.join_next(), if !quic_task.is_empty() => {
+                return result.context("Naive QUIC task missing")?.context("Naive QUIC task panicked")?;
+            }
+        };
         let runtime = runtime.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {

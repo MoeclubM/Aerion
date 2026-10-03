@@ -5,6 +5,68 @@ use aerion::{
 };
 
 #[tokio::test]
+async fn malformed_udp_packets_do_not_stop_the_server() -> Result<()> {
+    let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let echo_addr = echo.local_addr()?;
+    let echo_task = tokio::spawn(async move {
+        let mut bytes = [0; 64];
+        let (read, peer) = echo.recv_from(&mut bytes).await?;
+        echo.send_to(&bytes[..read], peer).await
+    });
+    let addr = unused_udp_addr()?;
+    let server = tokio::spawn(aerion::run_shadowsocks_server(ShadowsocksServerConfig {
+        listen: addr,
+        method: "aes-128-gcm".into(),
+        password: "secret".into(),
+        users: vec![],
+        tcp: false,
+        udp: true,
+        udp_over_tcp: false,
+    }));
+    let result = timeout(Duration::from_secs(5), async {
+        while std::net::UdpSocket::bind(addr).is_ok() {
+            tokio::task::yield_now().await;
+            anyhow::ensure!(!server.is_finished(), "UDP server failed to start");
+        }
+        let malformed = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        malformed.send_to(b"invalid", addr).await?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        anyhow::ensure!(
+            !server.is_finished(),
+            "malformed packet stopped the listener"
+        );
+        let config = shadowsocks::config::ServerConfig::new(
+            addr,
+            "secret",
+            shadowsocks::crypto::CipherKind::AES_128_GCM,
+        )?;
+        let context =
+            shadowsocks::context::Context::new_shared(shadowsocks::config::ServerType::Local);
+        let proxy = shadowsocks::relay::udprelay::ProxySocket::connect(context, &config).await?;
+        proxy
+            .send(
+                &shadowsocks::relay::socks5::Address::SocketAddress(echo_addr),
+                b"valid",
+            )
+            .await?;
+        let mut bytes = [0; 64];
+        let (read, target, _) = proxy.recv(&mut bytes).await?;
+        anyhow::ensure!(
+            &bytes[..read] == b"valid"
+                && target == shadowsocks::relay::socks5::Address::SocketAddress(echo_addr),
+            "valid UDP relay failed"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("Shadowsocks UDP regression timed out")
+    .and_then(|result| result);
+    server.abort();
+    echo_task.abort();
+    result
+}
+
+#[tokio::test]
 async fn shadowsocks_server_with_core_records_tcp_traffic() -> Result<()> {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await?;
     let echo_addr = echo_listener.local_addr()?;
