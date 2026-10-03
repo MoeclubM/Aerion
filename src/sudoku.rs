@@ -70,6 +70,17 @@ impl Default for SudokuOptions {
 }
 impl SudokuOptions {
     pub fn validate(&self) -> Result<()> {
+        self.tables("sudoku-options-validation")?;
+        ensure!(
+            !self.http_mask_host.contains(['\r', '\n']),
+            "invalid Sudoku HTTPMask host"
+        );
+        ensure!(
+            self.path_root
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')),
+            "invalid Sudoku HTTPMask path root"
+        );
         ensure!(
             matches!(self.aead.as_str(), "chacha20-poly1305" | "aes-128-gcm"),
             "Sudoku requires authenticated AEAD (chacha20-poly1305 or aes-128-gcm)"

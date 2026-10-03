@@ -18,6 +18,7 @@ import (
 )
 
 func main() {
+    must(os.Setenv("SUDOKU_LOG_LEVEL", "error"))
     mode := flag.String("mode", "server", "server or client")
     addr := flag.String("addr", "127.0.0.1:0", "listen or connect address")
     target := flag.String("target", "", "TCP destination")

@@ -36,6 +36,13 @@ where
     pending_write: Vec<u8>,
     pending_pos: usize,
     close_sent: bool,
+    read_task: tokio::task::JoinHandle<()>,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Drop for WebSocketStream<S> {
+    fn drop(&mut self) {
+        self.read_task.abort();
+    }
 }
 
 struct WebSocketFrame {
@@ -123,7 +130,7 @@ where
     fn new(stream: S, role: WebSocketRole) -> Self {
         let (reader, writer) = split(stream);
         let (tx, rx) = mpsc::channel(32);
-        tokio::spawn(async move {
+        let read_task = tokio::spawn(async move {
             if let Err(error) = read_frames(reader, tx.clone()).await {
                 let _ = tx.send(Err(format!("{error:?}"))).await;
             }
@@ -137,6 +144,7 @@ where
             pending_write: Vec::new(),
             pending_pos: 0,
             close_sent: false,
+            read_task,
         }
     }
 

@@ -553,6 +553,8 @@ pub struct MihomoSudokuProxy {
     pub server: String,
     pub port: u16,
     pub key: String,
+    #[serde(default)]
+    pub udp: bool,
     #[serde(flatten)]
     pub options: SudokuOptions,
     #[serde(flatten)]
