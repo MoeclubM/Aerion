@@ -451,15 +451,18 @@ pub async fn run_sudoku_server_listener_with_core(
             let result=async {
                 let mut stream=tokio::time::timeout(Duration::from_secs(5),transport::server(stream,&options,&core.known_credentials())).await??;
                 let (mut receiver,sender,session)=tokio::time::timeout(Duration::from_secs(5),server_handshake(&mut stream,&options,&core,peer,&replays)).await??;
-                let (kind,payload)=receiver.kip(&mut stream).await?;
+                let (kind,payload)=tokio::select! {
+                    _=session.cancelled()=>return Ok(()),
+                    result=tokio::time::timeout(Duration::from_secs(30),receiver.kip(&mut stream))=>result??,
+                };
                 let mut stream=tunnel(stream,receiver,sender);
                 tokio::select! {
                     _=session.cancelled()=>Ok(()),
                     result=async {
                         match kind {
                             0x10=>{ let (target,tail)=uot::read_socks_address(&payload)?;ensure!(tail.is_empty(),"trailing Sudoku target bytes");
-                                let outbound=socket_protect::connect_proxy_target(&target).await?;
-                                relay_bidirectional_counted(stream,outbound,session.clone(),"Sudoku").await
+                                let mut outbound=socket_protect::connect_proxy_target(&target).await?;
+                                relay_bidirectional_counted(&mut stream,&mut outbound,session.clone(),"Sudoku").await
                             },
                             0x12=>udp_server(&mut stream,session.clone()).await,
                             0x11=>mux_server(stream,session.clone()).await,
@@ -510,8 +513,8 @@ pub async fn run_sudoku_client_listener_with_core(
                         if multiplex { sender.kip(&mut upstream,0x11,&[]).await?; } else { sender.kip(&mut upstream,0x10,&address).await?; }
                         socks::write_reply(&mut local,0).await?;
                         let mut upstream=tunnel(upstream,receiver,sender);
-                        let upstream=if multiplex { mux_frame(&mut upstream,1,1,&address).await?; mux_client(upstream) } else { upstream };
-                        tokio::select!{_=session.cancelled()=>Ok(()),result=relay_bidirectional_counted(local,upstream,session.clone(),"Sudoku client")=>result}
+                        let mut upstream=if multiplex { mux_frame(&mut upstream,1,1,&address).await?; mux_client(upstream) } else { upstream };
+                        tokio::select!{_=session.cancelled()=>Ok(()),result=relay_bidirectional_counted(&mut local,&mut upstream,session.clone(),"Sudoku client")=>result}
                     },
                     socks::SocksRequest::UdpAssociate=>{
                         sender.kip(&mut upstream,0x12,&[]).await?;
@@ -689,11 +692,17 @@ async fn mux_server(stream: Tunnel, session: CoreSession) -> Result<()> {
         u32,
         (
             tokio::io::WriteHalf<tokio::io::DuplexStream>,
-            tokio::task::JoinHandle<()>,
+            tokio::task::AbortHandle,
         ),
     > = HashMap::new();
+    // JoinSet aborts every child on drop, including when the entire session is revoked.
+    let mut tasks = tokio::task::JoinSet::new();
+    let (completed, mut completion) = tokio::sync::mpsc::unbounded_channel();
     let result = async {
         loop {
+            while let Ok(id) = completion.try_recv() {
+                streams.remove(&id);
+            }
             let kind = reader.read_u8().await?;
             let id = reader.read_u32().await?;
             let length = reader.read_u32().await? as usize;
@@ -705,15 +714,22 @@ async fn mux_server(stream: Tunnel, session: CoreSession) -> Result<()> {
                     ensure!(!streams.contains_key(&id), "duplicate Sudoku mux stream");
                     let (target, tail) = uot::read_socks_address(&payload)?;
                     ensure!(tail.is_empty(), "trailing Sudoku mux target");
-                    let (local, remote) = tokio::io::duplex(65536);
+                    let (local, mut remote) = tokio::io::duplex(65536);
                     let (mut down, up) = tokio::io::split(local);
                     let output = writer.clone();
                     let tracked = session.clone();
-                    let task = tokio::spawn(async move {
+                    let completed = completed.clone();
+                    let task = tasks.spawn(async move {
                         let relay = async {
-                            let outbound = socket_protect::connect_proxy_target(&target).await?;
-                            relay_bidirectional_counted(remote, outbound, tracked, "Sudoku mux")
-                                .await
+                            let mut outbound =
+                                socket_protect::connect_proxy_target(&target).await?;
+                            relay_bidirectional_counted(
+                                &mut remote,
+                                &mut outbound,
+                                tracked,
+                                "Sudoku mux",
+                            )
+                            .await
                         };
                         let send = async {
                             let mut buf = [0; 32768];
@@ -733,6 +749,7 @@ async fn mux_server(stream: Tunnel, session: CoreSession) -> Result<()> {
                         {
                             tracing::warn!("Sudoku mux close: {error:#}");
                         }
+                        let _ = completed.send(id);
                     });
                     streams.insert(id, (up, task));
                 }
