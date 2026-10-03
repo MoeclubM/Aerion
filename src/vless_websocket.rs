@@ -228,7 +228,9 @@ where
             matches!(self.role, WebSocketRole::Client),
         )
         .map_err(std::io::Error::other)?;
-        ready!(self.as_mut().poll_pending(cx))?;
+        // Accept the buffered frame once. A Pending result here would cause the
+        // next poll to drain it and then construct the same frame a second time.
+        // The next write, flush or shutdown drains the accepted frame.
         Poll::Ready(Ok(buf.len()))
     }
 
