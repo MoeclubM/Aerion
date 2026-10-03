@@ -99,6 +99,7 @@ enum NaiveTunnel {
         endpoint: quinn::Endpoint,
         connection: quinn::Connection,
         driver: JoinSet<()>,
+        sender: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
     },
 }
 
@@ -832,6 +833,7 @@ async fn open_naive_http3_tunnel(
         endpoint,
         connection,
         driver,
+        sender,
     })
 }
 
@@ -1558,6 +1560,7 @@ async fn relay_naive_tcp(
             endpoint,
             connection,
             driver,
+            sender: _sender,
         } => {
             let _endpoint = endpoint;
             let result = relay_naive_http3_tcp(local, send, recv, session).await;
@@ -1756,6 +1759,7 @@ async fn handle_naive_udp_associate(
             endpoint,
             connection,
             driver,
+            sender: _sender,
         } => {
             let _endpoint = endpoint;
             let result = handle_naive_udp_h3(control, udp, send, recv, session).await;
