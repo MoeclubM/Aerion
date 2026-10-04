@@ -1,6 +1,6 @@
 use super::crypto::{MieruCipher, check_user_from_hint, mieru_keys_for_password};
 use super::pattern::{MieruTrafficPattern, random_padding};
-use super::{MieruUserSecret, NONCE_LEN};
+use super::{AEAD_OVERHEAD, MieruUserSecret, NONCE_LEN};
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -9,7 +9,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const METADATA_LEN: usize = 32;
-const AEAD_OVERHEAD: usize = 16;
 const PACKET_METADATA_LEN: usize = NONCE_LEN + METADATA_LEN + AEAD_OVERHEAD;
 const REPLAY_CACHE_TTL: Duration = Duration::from_secs(6 * 60);
 const REPLAY_CACHE_MAX: usize = 65_536;
@@ -390,7 +389,7 @@ pub(super) fn encode_mieru_packet_segment(
         encrypted_metadata.len() == PACKET_METADATA_LEN,
         "invalid Mieru encrypted packet metadata length"
     );
-    let nonce = encrypted_metadata[..NONCE_LEN].to_vec();
+    let nonce: [u8; NONCE_LEN] = encrypted_metadata[..NONCE_LEN].try_into()?;
     let mut packet = encrypted_metadata;
     packet.extend_from_slice(&prefix_padding);
     if !segment.payload.is_empty() {
@@ -416,11 +415,11 @@ pub(super) fn decode_mieru_packet_segment(
         "Mieru UDP packet is shorter than encrypted metadata"
     );
     let encrypted_metadata = &packet[..PACKET_METADATA_LEN];
-    let nonce = encrypted_metadata[..NONCE_LEN].to_vec();
+    let nonce = &encrypted_metadata[..NONCE_LEN];
     let plain = cipher.decrypt(encrypted_metadata)?;
     let metadata = MieruMetadata::parse(&plain)?;
     let payload =
-        decode_mieru_packet_payload(cipher, &metadata, &nonce, &packet[PACKET_METADATA_LEN..])?;
+        decode_mieru_packet_payload(cipher, &metadata, nonce, &packet[PACKET_METADATA_LEN..])?;
     Ok(MieruSegment { metadata, payload })
 }
 

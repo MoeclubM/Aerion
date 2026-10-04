@@ -1,6 +1,129 @@
 use super::*;
 use tokio::io::duplex;
 
+include!("../../tests/performance/vmess.rs");
+
+#[tokio::test]
+async fn vectored_plaintext_chunks_survive_one_byte_partial_writes() -> Result<()> {
+    let options = RequestOptions::new(
+        REQUEST_OPTION_CHUNK_STREAM | REQUEST_OPTION_CHUNK_MASKING | REQUEST_OPTION_GLOBAL_PADDING,
+    );
+    let config = BodyConfig::new_request(SecurityType::None, options, [0x11; 16], [0x22; 16])?;
+    let (client, server) = duplex(1);
+    let write = tokio::spawn(async move {
+        let mut writer = BodyWriter::new(client, config);
+        for size in [1, 64, 513] {
+            writer.write_packet_plain(&vec![size as u8; size]).await?;
+        }
+        writer.finish().await
+    });
+    let mut reader = BodyReader::new(server, config);
+    for size in [1, 64, 513] {
+        assert_eq!(reader.read_packet().await?, Some(vec![size as u8; size]));
+    }
+    assert!(reader.read_packet().await?.is_none());
+    write.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn coalesced_chunks_match_reference_wire_and_fragmented_reads() -> Result<()> {
+    for security in [
+        SecurityType::None,
+        SecurityType::Aes128Gcm,
+        SecurityType::ChaCha20Poly1305,
+    ] {
+        for authenticated in [false, true] {
+            if authenticated && security == SecurityType::None {
+                continue;
+            }
+            let options = RequestOptions::new(
+                REQUEST_OPTION_CHUNK_STREAM
+                    | REQUEST_OPTION_CHUNK_MASKING
+                    | REQUEST_OPTION_GLOBAL_PADDING
+                    | if authenticated {
+                        REQUEST_OPTION_AUTHENTICATED_LENGTH
+                    } else {
+                        0
+                    },
+            );
+            let config = BodyConfig::new_request(security, options, [0x11; 16], [0x22; 16])?;
+            let mut writer = BodyWriter::new(Vec::new(), config);
+            let mut reference = ChunkState::new(config);
+            let mut expected = Vec::new();
+            for size in [1, 64, MAX_CHUNK_PLAIN_LEN, 13, 1024] {
+                let plain = vec![size as u8; size];
+                expected.extend_from_slice(&plain);
+                let start = writer.inner.len();
+                writer.write_all_plain(&plain).await?;
+                let padding = reference.next_padding_len();
+                let nonce = generate_chunk_nonce(&config.payload_iv, reference.payload_counter);
+                reference.payload_counter = reference.payload_counter.wrapping_add(1);
+                let payload = reference.payload_cipher.encrypt(&nonce, &plain)?;
+                let total = (payload.len() + padding) as u16;
+                let header = if authenticated {
+                    let nonce = generate_chunk_nonce(&config.length_iv, reference.size_counter);
+                    reference.size_counter = reference.size_counter.wrapping_add(1);
+                    reference
+                        .length_cipher
+                        .as_ref()
+                        .unwrap()
+                        .encrypt(&nonce, &(total - AEAD_TAG_LEN as u16).to_be_bytes())?
+                } else {
+                    (reference.size_shake.as_mut().unwrap().next_u16() ^ total)
+                        .to_be_bytes()
+                        .to_vec()
+                };
+                let wire = &writer.inner[start..];
+                assert_eq!(&wire[..header.len()], header);
+                assert_eq!(&wire[header.len()..header.len() + payload.len()], payload);
+                assert_eq!(wire.len(), header.len() + total as usize);
+            }
+            let capacity = writer.frame.capacity();
+            writer.finish().await?;
+            assert_eq!(writer.frame.capacity(), capacity);
+            let mut reader = BodyReader::new(writer.inner.as_slice(), config);
+            let mut actual = Vec::new();
+            let mut fragment = [0; 37];
+            loop {
+                let n = reader.read_plain(&mut fragment).await?;
+                if n == 0 {
+                    break;
+                }
+                actual.extend_from_slice(&fragment[..n]);
+            }
+            assert_eq!(actual, expected);
+            assert!(reader.pending.capacity() >= MAX_CHUNK_PLAIN_LEN);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn modified_payload_and_authenticated_length_are_rejected() -> Result<()> {
+    for security in [SecurityType::Aes128Gcm, SecurityType::ChaCha20Poly1305] {
+        let options =
+            RequestOptions::new(REQUEST_OPTION_CHUNK_STREAM | REQUEST_OPTION_AUTHENTICATED_LENGTH);
+        let config = BodyConfig::new_request(security, options, [0x11; 16], [0x22; 16])?;
+        let mut writer = BodyWriter::new(Vec::new(), config);
+        writer.write_packet_plain(b"authenticated").await?;
+        for offset in [0, 2 + AEAD_TAG_LEN] {
+            let mut wire = writer.inner.clone();
+            wire[offset] ^= 1;
+            let mut reader = BodyReader::new(wire.as_slice(), config);
+            assert!(reader.read_packet().await.is_err());
+            assert!(reader.pending.is_empty());
+            assert!(reader.read_plain(&mut [0; 64]).await.is_err());
+        }
+        let truncated = &writer.inner[..writer.inner.len() - 1];
+        let mut reader = BodyReader::new(truncated, config);
+        assert!(reader.read_plain(&mut [0; 64]).await.is_err());
+        assert!(reader.pending.is_empty());
+        assert!(reader.read_plain(&mut [0; 64]).await.is_err());
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn cached_ciphers_preserve_authenticated_lengths_padding_and_responses() -> Result<()> {
     for security in [SecurityType::Aes128Gcm, SecurityType::ChaCha20Poly1305] {

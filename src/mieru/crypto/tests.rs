@@ -1,6 +1,51 @@
 use super::*;
 use crate::mieru::{MieruNoncePattern, MieruNonceType, MieruTrafficPattern};
 
+include!("../../../tests/performance/mieru.rs");
+
+#[test]
+fn cipher_preserves_reference_bytes_nonces_clone_reset_and_authentication() -> Result<()> {
+    let key = [0x42; KEY_LEN];
+    let reference = XChaCha20Poly1305::new((&key).into());
+    for implicit in [false, true] {
+        let mut send = MieruCipher::new(key, implicit, "alice".into(), None);
+        let mut receive = send.clone();
+        let mut nonce = [0; NONCE_LEN];
+        for (index, size) in [1, 64, 16384, 0].into_iter().enumerate() {
+            let plain = vec![index as u8; size];
+            let wire = send.encrypt(&plain)?;
+            let payload = if index == 0 || !implicit {
+                nonce.copy_from_slice(&wire[..NONCE_LEN]);
+                assert!(check_user_from_hint(b"alice", &nonce));
+                &wire[NONCE_LEN..]
+            } else {
+                nonce = increment_nonce(&nonce)?;
+                wire.as_slice()
+            };
+            assert_eq!(
+                payload,
+                reference
+                    .encrypt(XNonce::from_slice(&nonce), plain.as_slice())
+                    .unwrap()
+            );
+            assert_eq!(receive.decrypt(&wire)?, plain);
+            let explicit = send.encrypt_with_nonce(&plain, &nonce)?;
+            assert_eq!(explicit, payload);
+            assert_eq!(send.decrypt_with_nonce(&explicit, &nonce)?, plain);
+            let mut corrupted = explicit;
+            corrupted[0] ^= 1;
+            assert!(send.decrypt_with_nonce(&corrupted, &nonce).is_err());
+        }
+        let mut reset = send.clone_reset_implicit();
+        let mut receive = MieruCipher::new(key, true, "alice".into(), None);
+        assert_eq!(
+            receive.decrypt(&reset.encrypt(b"new stream")?)?,
+            b"new stream"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn password_hash_uses_username_separator() {
     let hash1 = hash_mieru_password(b"password", b"alice");

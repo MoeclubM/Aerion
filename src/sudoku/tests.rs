@@ -1,5 +1,31 @@
 use super::*;
 
+include!("../../tests/performance/sudoku.rs");
+
+#[test]
+fn appearance_preserves_fragmented_record_boundaries_without_padding() -> Result<()> {
+    for mode in ["prefer_ascii", "prefer_entropy", "up_ascii_down_entropy"] {
+        for packed in [false, true] {
+            let table = Table::new("fragmented-records", mode, "xpxvvpvv")?;
+            for down in [false, true] {
+                let mut decoder = table::Decoder::new(table.clone(), down, packed);
+                let mut output = Vec::new();
+                let mut expected = Vec::new();
+                for size in [0, 1, 2, 3, 4, 255, 8192] {
+                    let plain = (0..size).map(|i| i as u8).collect::<Vec<_>>();
+                    expected.extend_from_slice(&plain);
+                    let wire = table::encode(&table, down, packed, &plain, 0)?;
+                    for fragment in wire.chunks(7) {
+                        output.extend(decoder.feed(fragment)?);
+                    }
+                }
+                assert_eq!(output, expected);
+            }
+        }
+    }
+    Ok(())
+}
+
 struct Peer(std::process::Child);
 impl Drop for Peer {
     fn drop(&mut self) {

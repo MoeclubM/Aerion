@@ -109,10 +109,10 @@ pub fn take_stream_packet(
     if pending.len() < length {
         return Ok(None);
     }
-    let packet = pending[..length].to_vec();
+    let (destination, payload) = decode_associate_packet(&pending[..length])?;
+    let payload = payload.to_vec();
     pending.drain(..length);
-    let (destination, payload) = decode_associate_packet(&packet)?;
-    Ok(Some((destination, payload.to_vec(), false)))
+    Ok(Some((destination, payload, false)))
 }
 
 pub fn encode_associate_packet(destination: &ProxyTarget, payload: &[u8]) -> Result<Vec<u8>> {
