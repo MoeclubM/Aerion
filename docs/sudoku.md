@@ -11,6 +11,8 @@ HTTPMask. HTTPS clients validate certificates; servers use a fronting HTTPS
 reverse proxy for TLS termination. HTTPMask stream, poll and auto modes are
 explicitly rejected. Client mux currently creates a session per local connection;
 it does not share a connection pool. `multiplex=auto` uses the plain TCP command.
+Mihomo imports accept the standard `http-mask-multiplex` field; the existing
+`multiplex` field remains accepted for native and panel configurations.
 
 Each panel user receives a distinct UUID PSK. Authentication verifies AEAD under
 that PSK, rather than trusting the supplied UserHash. User limits, cancellation,

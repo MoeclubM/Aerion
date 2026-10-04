@@ -95,9 +95,6 @@ impl Receiver {
         self.counter = None;
     }
     pub fn take_record(&mut self) -> Result<Option<Vec<u8>>> {
-        if self.method == "none" {
-            return Ok((!self.decoded.is_empty()).then(|| std::mem::take(&mut self.decoded)));
-        }
         if self.decoded.len() < 2 {
             return Ok(None);
         }
@@ -222,21 +219,16 @@ impl Sender {
         input: &[u8],
     ) -> Result<()> {
         for chunk in input.chunks(65507) {
-            let frame = if self.method == "none" {
-                chunk.to_vec()
-            } else {
-                let mut header = self.epoch.to_be_bytes().to_vec();
-                header.extend(self.seq.to_be_bytes());
-                let ciphertext = crypt(&self.method, &self.base, &header, chunk, true)?;
-                let mut frame = ((12 + ciphertext.len()) as u16).to_be_bytes().to_vec();
-                frame.extend(header);
-                frame.extend(ciphertext);
-                self.seq = self
-                    .seq
-                    .checked_add(1)
-                    .context("Sudoku sequence exhausted")?;
-                frame
-            };
+            let mut header = self.epoch.to_be_bytes().to_vec();
+            header.extend(self.seq.to_be_bytes());
+            let ciphertext = crypt(&self.method, &self.base, &header, chunk, true)?;
+            let mut frame = ((12 + ciphertext.len()) as u16).to_be_bytes().to_vec();
+            frame.extend(header);
+            frame.extend(ciphertext);
+            self.seq = self
+                .seq
+                .checked_add(1)
+                .context("Sudoku sequence exhausted")?;
             writer
                 .write_all(&encode(
                     &self.table,
