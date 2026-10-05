@@ -82,6 +82,121 @@ async fn heartbeat_preserves_partial_frames_and_revocation_closes_idle_sessions(
 }
 
 #[tokio::test]
+async fn fin_and_connection_close_interrupt_rate_limited_streams() -> Result<()> {
+    tls::init_crypto();
+    let temp = tempfile::tempdir()?;
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+    let cert_path = temp.path().join("server.crt");
+    let key_path = temp.path().join("server.key");
+    std::fs::write(&cert_path, certified.cert.pem())?;
+    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mut user = aerion::CoreUser::password("user", "secret");
+    user.upload_limit_bps = Some(1);
+    user.download_limit_bps = Some(1);
+    let core = aerion::ProxyCore::new(vec![user])?;
+    let server = tokio::spawn(aerion::run_server_listener_with_core(
+        listener,
+        ServerConfig {
+            listen: addr,
+            password: "secret".into(),
+            users: Vec::new(),
+            cert_path,
+            key_path,
+            certificates: Vec::new(),
+            key: None,
+            padding_scheme: PaddingScheme::default_lines(),
+            heartbeat_interval_secs: 30,
+            ech: None,
+        },
+        core.clone(),
+    ));
+    let result = timeout(Duration::from_secs(10), async {
+        for (download, close_connection) in [(false, false), (true, false), (false, true)] {
+            let target_listener = TcpListener::bind("127.0.0.1:0").await?;
+            let tcp = TcpStream::connect(addr).await?;
+            let mut stream = TlsConnector::from(tls::client_config(true))
+                .connect(rustls::pki_types::ServerName::try_from("localhost")?, tcp)
+                .await?;
+            stream.write_all(&password_hash("secret")).await?;
+            stream.write_all(&[0, 0]).await?;
+            let padding = PaddingScheme::from_lines(PaddingScheme::default_lines())?;
+            write_frame(
+                &mut stream,
+                CMD_SETTINGS,
+                0,
+                format!("v=2\npadding-md5={}", padding.md5()).as_bytes(),
+            )
+            .await?;
+            assert_eq!(read_frame(&mut stream).await?.cmd, CMD_SERVER_SETTINGS);
+            write_frame(&mut stream, aerion::protocol::CMD_SYN, 1, &[]).await?;
+            let target = aerion::protocol::ProxyTarget::Ip(target_listener.local_addr()?);
+            write_frame(
+                &mut stream,
+                aerion::protocol::CMD_PSH,
+                1,
+                &aerion::protocol::encode_target(&target)?,
+            )
+            .await?;
+            assert_eq!(
+                read_frame(&mut stream).await?.cmd,
+                aerion::protocol::CMD_SYNACK
+            );
+            let (mut target, _) = target_listener.accept().await?;
+            if download {
+                target.write_all(b"delayed payload").await?;
+            } else {
+                write_frame(
+                    &mut stream,
+                    aerion::protocol::CMD_PSH,
+                    1,
+                    b"delayed payload",
+                )
+                .await?;
+                write_frame(&mut stream, aerion::protocol::CMD_HEART_REQUEST, 0, &[]).await?;
+                assert_eq!(
+                    read_frame(&mut stream).await?.cmd,
+                    aerion::protocol::CMD_HEART_RESPONSE
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if close_connection {
+                stream.shutdown().await?;
+            } else {
+                write_frame(&mut stream, aerion::protocol::CMD_FIN, 1, &[]).await?;
+            }
+            assert_eq!(
+                timeout(Duration::from_secs(2), target.read(&mut [0; 1])).await??,
+                0,
+                "cancelled stream retained its target writer while waiting for the limiter"
+            );
+            if !close_connection {
+                write_frame(&mut stream, aerion::protocol::CMD_HEART_REQUEST, 0, &[]).await?;
+                assert_eq!(
+                    read_frame(&mut stream).await?.cmd,
+                    aerion::protocol::CMD_HEART_RESPONSE
+                );
+                stream.shutdown().await?;
+            }
+            drop(stream);
+            timeout(Duration::from_secs(2), async {
+                while core.snapshot().await[0].online_sessions != 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("AnyTLS cancellation test timed out")
+    .and_then(|result| result);
+    server.abort();
+    result
+}
+
+#[tokio::test]
 async fn socks_client_reaches_tcp_target_through_aerion_server() -> Result<()> {
     tls::init_crypto();
 

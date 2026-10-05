@@ -22,9 +22,14 @@ async fn websocket_backpressure_sends_each_frame_once() -> Result<()> {
             Ok::<(), anyhow::Error>(())
         };
         let receive = async {
-            let first = read_frame(&mut peer).await?.context("first frame")?;
-            assert_eq!(first.opcode, OPCODE_BINARY);
-            assert_eq!(first.payload, payload);
+            let mut received = Vec::new();
+            while received.len() < payload.len() {
+                let frame = read_frame(&mut peer).await?.context("data frame")?;
+                assert_eq!(frame.opcode, OPCODE_BINARY);
+                assert!(!frame.payload.is_empty());
+                received.extend(frame.payload);
+            }
+            assert_eq!(received, payload);
             let second = read_frame(&mut peer).await?.context("second frame")?;
             assert_eq!(second.payload, b"next-frame");
             let close = read_frame(&mut peer).await?.context("close frame")?;
@@ -38,3 +43,8 @@ async fn websocket_backpressure_sends_each_frame_once() -> Result<()> {
     }
     Ok(())
 }
+
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/performance/websocket.rs"
+));

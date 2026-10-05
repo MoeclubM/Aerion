@@ -11,6 +11,11 @@ on:
         description: Base revision for benchmark-only run (empty runs full CI)
         required: false
         default: ''
+      performance_suite:
+        description: Benchmark suite to compare
+        type: choice
+        options: [codecs, transport, anytls]
+        default: codecs
 
 
 jobs:
@@ -144,7 +149,7 @@ jobs:
           ref: ${{ inputs.performance_base }}
           path: .performance-baseline
       - name: Compare release codecs
-        run: python3 .github/scripts/protocol_performance.py
+        run: python3 .github/scripts/protocol_performance.py --suite "${{ inputs.performance_suite }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

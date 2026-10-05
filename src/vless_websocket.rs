@@ -154,20 +154,31 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
     ) -> Poll<std::io::Result<()>> {
-        while self.pending_pos < self.pending_write.len() {
-            let start = self.pending_pos;
-            let chunk = self.pending_write[start..].to_vec();
-            let written = ready!(Pin::new(&mut self.writer).poll_write(cx, &chunk))?;
+        let Self {
+            writer,
+            pending_write,
+            pending_pos,
+            ..
+        } = &mut *self;
+        while *pending_pos < pending_write.len() {
+            let written = if *pending_pos == 0 {
+                // Keep the bulk-write path's independent input buffer; only
+                // resumed partial writes borrow the remaining frame directly.
+                let packet = pending_write.to_vec();
+                ready!(Pin::new(&mut *writer).poll_write(cx, &packet))?
+            } else {
+                ready!(Pin::new(&mut *writer).poll_write(cx, &pending_write[*pending_pos..]))?
+            };
             if written == 0 {
                 return Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "write websocket frame",
                 )));
             }
-            self.pending_pos += written;
+            *pending_pos += written;
         }
-        self.pending_write.clear();
-        self.pending_pos = 0;
+        pending_write.clear();
+        *pending_pos = 0;
         Poll::Ready(Ok(()))
     }
 }
@@ -252,13 +263,13 @@ where
         ready!(self.as_mut().poll_pending(cx))?;
         self.pending_payload_len = None;
         if !self.close_sent {
-            self.close_sent = true;
             self.pending_write = build_frame(
                 OPCODE_CLOSE,
                 &[],
                 matches!(self.role, WebSocketRole::Client),
             )
             .map_err(std::io::Error::other)?;
+            self.close_sent = true;
         }
         ready!(self.as_mut().poll_pending(cx))?;
         Pin::new(&mut self.writer).poll_flush(cx)

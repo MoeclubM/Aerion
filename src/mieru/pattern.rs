@@ -2,8 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::NONCE_LEN;
 
@@ -412,8 +411,8 @@ fn random_seed() -> Result<i32> {
     Ok(i32::from_be_bytes(bytes))
 }
 
-pub(super) async fn write_with_possible_fragment(
-    writer: &mut OwnedWriteHalf,
+pub(super) async fn write_with_possible_fragment<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     data: &[u8],
     traffic_pattern: &Option<MieruTrafficPattern>,
 ) -> Result<()> {

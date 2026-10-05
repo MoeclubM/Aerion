@@ -1,6 +1,7 @@
 use crate::padding::{PADDING_CHECKPOINT, PaddingScheme};
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
+use std::io::IoSlice;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -18,6 +19,7 @@ pub const CMD_SERVER_SETTINGS: u8 = 10;
 pub const MAX_FRAME_PAYLOAD_LEN: usize = u16::MAX as usize;
 
 const FRAME_HEADER_LEN: usize = 7;
+const VECTORED_FRAME_MIN_PAYLOAD: usize = 32 * 1024;
 const CLIENT_NAME: &str = "aerion/0.1.0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,6 +115,16 @@ where
             payload.len() <= MAX_FRAME_PAYLOAD_LEN,
             "Aerion frame payload too large"
         );
+        if !self.send_padding
+            && payload.len() >= VECTORED_FRAME_MIN_PAYLOAD
+            && self.inner.is_write_vectored()
+        {
+            write_vectored_frame_bytes(&mut self.inner, cmd, stream_id, payload).await?;
+            if flush {
+                self.inner.flush().await.context("flush packet")?;
+            }
+            return Ok(());
+        }
         let frame = encode_frame(cmd, stream_id, payload);
         self.write_packet(&frame, flush)
             .await
@@ -289,12 +301,48 @@ where
         payload.len() <= MAX_FRAME_PAYLOAD_LEN,
         "Aerion frame payload too large"
     );
-    let frame = encode_frame(cmd, stream_id, payload);
-    writer
-        .write_all(&frame)
-        .await
-        .context("write Aerion frame")?;
+    if payload.len() >= VECTORED_FRAME_MIN_PAYLOAD && writer.is_write_vectored() {
+        write_vectored_frame_bytes(writer, cmd, stream_id, payload).await?;
+    } else {
+        let frame = encode_frame(cmd, stream_id, payload);
+        writer
+            .write_all(&frame)
+            .await
+            .context("write Aerion frame")?;
+    }
     writer.flush().await.context("flush Aerion frame")
+}
+
+async fn write_vectored_frame_bytes<W>(
+    writer: &mut W,
+    cmd: u8,
+    stream_id: u32,
+    payload: &[u8],
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut header = [0u8; FRAME_HEADER_LEN];
+    header[0] = cmd;
+    header[1..5].copy_from_slice(&stream_id.to_be_bytes());
+    header[5..].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+    let mut slices = [IoSlice::new(&header), IoSlice::new(payload)];
+    let mut remaining = &mut slices[..];
+    while !remaining.is_empty() {
+        let written = writer
+            .write_vectored(remaining)
+            .await
+            .context("write Aerion frame")?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write Aerion frame",
+            ))
+            .context("write Aerion frame");
+        }
+        IoSlice::advance_slices(&mut remaining, written);
+    }
+    Ok(())
 }
 
 pub async fn write_payload_chunks<W>(writer: &mut W, stream_id: u32, payload: &[u8]) -> Result<()>
