@@ -11,3 +11,4 @@ Product overview and getting started live in the [README](../README.md). This fo
 | 使用方式 | Usage | [usage.md](usage.md) |
 | 配置 | Config | [config.md](config.md) |
 | 限制 | Limitations | [limitations.md](limitations.md) |
+| 协议检查 | Protocol audit | [protocol-audit.md](protocol-audit.md) |

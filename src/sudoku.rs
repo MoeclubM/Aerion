@@ -37,6 +37,7 @@ pub struct SudokuOptions {
     pub custom_table: String,
     #[serde(alias = "custom-tables")]
     pub custom_tables: Vec<String>,
+    #[serde(alias = "http-mask-multiplex")]
     pub multiplex: String,
     #[serde(alias = "http-mask")]
     pub http_mask: bool,

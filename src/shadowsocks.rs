@@ -16,7 +16,7 @@ use shadowsocks::relay::tcprelay::ProxyClientStream;
 use shadowsocks::relay::tcprelay::ProxyListener;
 use shadowsocks::relay::tcprelay::ProxyServerStream;
 use shadowsocks::relay::udprelay::options::UdpSocketControlData;
-use shadowsocks::relay::udprelay::proxy_socket::UdpSocketType;
+use shadowsocks::relay::udprelay::proxy_socket::{ProxySocketError, UdpSocketType};
 use shadowsocks::relay::udprelay::{MAXIMUM_UDP_PAYLOAD_SIZE, ProxySocket};
 use std::collections::HashMap;
 use std::future::poll_fn;
@@ -216,19 +216,18 @@ pub async fn run_shadowsocks_server_with_core(
         .await
         .context("bind Shadowsocks server TCP listener")?;
     tracing::info!("Shadowsocks server listening on {}", listener.local_addr()?);
+    let mut udp_task = tokio::task::JoinSet::new();
     if runtime.udp {
         let udp_runtime = runtime.clone();
-        tokio::spawn(async move {
-            if let Err(error) = run_shadowsocks_udp_server(udp_runtime).await {
-                tracing::warn!("Shadowsocks UDP server exited: {error:?}");
-            }
-        });
+        udp_task.spawn(run_shadowsocks_udp_server(udp_runtime));
     }
     loop {
-        let (stream, peer) = listener
-            .accept()
-            .await
-            .context("accept Shadowsocks client")?;
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => accepted.context("accept Shadowsocks client")?,
+            result = udp_task.join_next(), if !udp_task.is_empty() => {
+                return result.context("Shadowsocks UDP task missing")?.context("Shadowsocks UDP task panicked")?;
+            }
+        };
         let udp_over_tcp = runtime.udp_over_tcp;
         let core = runtime.core.clone();
         let password = runtime.password.clone();
@@ -282,14 +281,26 @@ async fn run_shadowsocks_udp_server(runtime: ShadowsocksServerRuntime) -> Result
         proxy.local_addr()?
     );
     let buffer_len = MAXIMUM_UDP_PAYLOAD_SIZE + ShadowsocksAddress::max_serialized_len();
+    let mut buffer = vec![0u8; buffer_len];
     loop {
-        let mut buffer = vec![0u8; buffer_len];
-        let (read, peer, target, _, control) = proxy
-            .recv_from_with_ctrl(&mut buffer)
-            .await
-            .context("receive Shadowsocks UDP packet")?;
+        let (read, peer, target, _, control) = match proxy.recv_from_with_ctrl(&mut buffer).await {
+            Ok(packet) => packet,
+            Err(error @ ProxySocketError::IoError(_)) => {
+                return Err(error).context("receive Shadowsocks UDP packet");
+            }
+            Err(error) => {
+                tracing::debug!(?error, "discard invalid Shadowsocks UDP packet");
+                continue;
+            }
+        };
         let proxy = proxy.clone();
-        let session = shadowsocks_udp_core_session(&runtime, peer, control.as_ref()).await?;
+        let session = match shadowsocks_udp_core_session(&runtime, peer, control.as_ref()).await {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::debug!(?error, %peer, "discard unauthorized Shadowsocks UDP packet");
+                continue;
+            }
+        };
         let payload = buffer[..read].to_vec();
         let nat = runtime.udp_nat.clone();
         tokio::spawn(async move {
@@ -397,7 +408,7 @@ async fn relay_shadowsocks_udp_responses(
     .await
     {
         let (read, source) = read.context("receive Shadowsocks UDP response")?;
-        let source = ShadowsocksAddress::SocketAddress(source);
+        let source = canonicalize_ss_address(ShadowsocksAddress::SocketAddress(source));
         session.record_download(read).await?;
         if let Some(inbound_control) = control.as_ref() {
             let mut response_control = inbound_control.clone();
@@ -437,10 +448,10 @@ async fn handle_shadowsocks_socks(
     core: Option<ProxyCore>,
     peer: SocketAddr,
 ) -> Result<()> {
-    let _session = if let Some(core) = core.as_ref() {
-        Some(core.authenticate_from(&runtime.password, peer).await?)
+    let session = if let Some(core) = core.as_ref() {
+        core.authenticate_from(&runtime.password, peer).await?
     } else {
-        None
+        CoreSession::disabled()
     };
     match socks::read_request(&mut local).await? {
         socks::SocksRequest::Connect(target) => {
@@ -466,10 +477,8 @@ async fn handle_shadowsocks_socks(
                 .context("write Shadowsocks TCP request header")?;
             socks::write_reply(&mut local, 0x00).await?;
             tracing::info!("Shadowsocks proxying {}", target_name(&target));
-            tokio::io::copy_bidirectional(&mut local, &mut remote)
+            relay_bidirectional_counted(&mut local, &mut remote, session, "Shadowsocks client")
                 .await
-                .context("relay Shadowsocks TCP")?;
-            Ok(())
         }
         socks::SocksRequest::UdpAssociate => {
             ensure!(runtime.udp, "Shadowsocks UDP is disabled by client config");

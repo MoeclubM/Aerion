@@ -2,6 +2,7 @@ use crate::core::{CoreSession, CoreUserLimits, ProxyCore, relay_split_counted};
 use crate::listener;
 use crate::protocol::{ProxyTarget, resolve_target_addr, target_name};
 use crate::quic::{self, QuicCongestion};
+use crate::udp_fragments::{FragmentPayload, MAX_PENDING_PACKETS, MAX_UDP_PAYLOAD};
 use crate::{socket_protect, socks, tls, uot};
 use anyhow::{Context, Result, bail, ensure};
 use blake2::Blake2bVar;
@@ -19,13 +20,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::task::{Context as TaskContext, Poll, ready};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 const H3_ALPN: &[u8] = b"h3";
 const AUTH_URI: &str = "https://hysteria/auth";
@@ -93,7 +94,8 @@ pub struct Hysteria2Client {
 struct Hysteria2ClientInner {
     endpoint: Endpoint,
     connection: quinn::Connection,
-    h3_driver: JoinHandle<()>,
+    h3_driver: JoinSet<()>,
+    datagram_handle: OnceLock<JoinHandle<()>>,
     h3_sender: Mutex<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>>,
     udp_enabled: bool,
     upload_limiter: Hy2ByteRateLimiter,
@@ -160,7 +162,7 @@ struct UdpMessage {
 struct UdpFragmentBuffer {
     address: String,
     created_at: Instant,
-    fragments: Vec<Option<Vec<u8>>>,
+    fragments: FragmentPayload,
 }
 
 type ServerUdpSessions = Arc<Mutex<HashMap<u32, Arc<ServerUdpSession>>>>;
@@ -197,7 +199,10 @@ impl Drop for Hysteria2ClientInner {
         let _ = &self.endpoint;
         let _ = &self.h3_sender;
         self.connection.close(VarInt::from_u32(0), b"client closed");
-        self.h3_driver.abort();
+        self.h3_driver.abort_all();
+        if let Some(handle) = self.datagram_handle.get() {
+            handle.abort();
+        }
     }
 }
 
@@ -350,28 +355,34 @@ impl Hysteria2Client {
             h3::client::new(h3_quinn::Connection::new(connection.clone()))
                 .await
                 .context("initialize Hysteria2 HTTP/3 client")?;
-        let h3_driver = tokio::spawn(async move {
+        let mut driver_tasks = JoinSet::new();
+        driver_tasks.spawn(async move {
             let error = h3_driver.wait_idle().await;
             tracing::debug!(?error, "Hysteria2 HTTP/3 client driver exited");
         });
         let udp_enabled = authenticate_client(&mut h3_sender, &config).await?;
-        let client = Self {
-            inner: Arc::new(Hysteria2ClientInner {
-                endpoint,
-                connection,
-                h3_driver,
-                h3_sender: Mutex::new(h3_sender),
-                udp_enabled: udp_enabled && config.udp,
-                upload_limiter: Hy2ByteRateLimiter::new(config.upload_bandwidth),
-                udp_sessions: Mutex::new(HashMap::new()),
-                udp_fragments: Mutex::new(HashMap::new()),
-                next_udp_session_id: AtomicU32::new(1),
-                next_udp_packet_id: AtomicU16::new(1),
-            }),
-        };
-        let datagram_client = client.clone();
-        tokio::spawn(async move { datagram_client.dispatch_datagrams().await });
-        Ok(client)
+        let inner = Arc::new(Hysteria2ClientInner {
+            endpoint,
+            connection,
+            h3_driver: driver_tasks,
+            datagram_handle: OnceLock::new(),
+            h3_sender: Mutex::new(h3_sender),
+            udp_enabled: udp_enabled && config.udp,
+            upload_limiter: Hy2ByteRateLimiter::new(config.upload_bandwidth),
+            udp_sessions: Mutex::new(HashMap::new()),
+            udp_fragments: Mutex::new(HashMap::new()),
+            next_udp_session_id: AtomicU32::new(1),
+            next_udp_packet_id: AtomicU16::new(1),
+        });
+        // Spawn only after construction: a task may run immediately on another worker.
+        inner
+            .datagram_handle
+            .set(tokio::spawn(Self::dispatch_datagrams(
+                inner.connection.clone(),
+                Arc::downgrade(&inner),
+            )))
+            .expect("HY2 datagram task initialized once");
+        Ok(Self { inner })
     }
 
     fn is_alive(&self) -> bool {
@@ -472,14 +483,31 @@ impl Hysteria2Client {
         Ok(())
     }
 
-    async fn dispatch_datagrams(self) {
+    async fn dispatch_datagrams(
+        connection: quinn::Connection,
+        inner: std::sync::Weak<Hysteria2ClientInner>,
+    ) {
+        let mut cleanup = tokio::time::interval(UDP_FRAGMENT_TIMEOUT);
         loop {
-            let datagram = match self.inner.connection.read_datagram().await {
+            let datagram = match tokio::select! {
+                datagram = connection.read_datagram() => datagram,
+                _ = cleanup.tick() => {
+                    let Some(inner) = inner.upgrade() else { return; };
+                    cleanup_udp_fragments(&inner.udp_fragments).await;
+                    continue;
+                }
+            } {
                 Ok(datagram) => datagram,
                 Err(error) => {
+                    if let Some(inner) = inner.upgrade() {
+                        inner.udp_sessions.lock().await.clear();
+                    }
                     debug_connection_closed_as_udp_end(error);
                     return;
                 }
+            };
+            let Some(inner) = inner.upgrade() else {
+                return;
             };
             let message = match decode_udp_message(&datagram) {
                 Ok(message) => message,
@@ -488,7 +516,16 @@ impl Hysteria2Client {
                     continue;
                 }
             };
-            let message = match reassemble_udp_message(message, &self.inner.udp_fragments).await {
+            let sender = inner
+                .udp_sessions
+                .lock()
+                .await
+                .get(&message.session_id)
+                .cloned();
+            let Some(sender) = sender else {
+                continue;
+            };
+            let message = match reassemble_udp_message(message, &inner.udp_fragments).await {
                 Ok(Some(message)) => message,
                 Ok(None) => continue,
                 Err(error) => {
@@ -496,17 +533,8 @@ impl Hysteria2Client {
                     continue;
                 }
             };
-            cleanup_udp_fragments(&self.inner.udp_fragments).await;
-            let sender = self
-                .inner
-                .udp_sessions
-                .lock()
-                .await
-                .get(&message.session_id)
-                .cloned();
-            if let Some(sender) = sender {
-                let _ = sender.send(message).await;
-            }
+            // Datagram delivery must not let one slow association block the connection.
+            let _ = sender.try_send(message);
         }
     }
 }
@@ -636,26 +664,16 @@ impl SharedHysteria2Client {
     }
 
     async fn get_or_connect(&self) -> Result<Hysteria2Client> {
-        loop {
-            {
-                let guard = self.client.lock().await;
-                if let Some(client) = guard.as_ref() {
-                    if client.is_alive() {
-                        return Ok(client.clone());
-                    }
-                }
+        let mut guard = self.client.lock().await;
+        if let Some(client) = guard.as_ref() {
+            if client.is_alive() {
+                return Ok(client.clone());
             }
-            let mut guard = self.client.lock().await;
-            if let Some(client) = guard.as_ref() {
-                if client.is_alive() {
-                    return Ok(client.clone());
-                }
-                guard.take();
-            }
-            let client = Hysteria2Client::connect(self.config.clone()).await?;
-            guard.replace(client.clone());
-            return Ok(client);
         }
+        guard.take();
+        let client = Hysteria2Client::connect(self.config.clone()).await?;
+        guard.replace(client.clone());
+        Ok(client)
     }
 }
 
@@ -1741,39 +1759,55 @@ async fn reassemble_udp_message(
         message.fragment_count > 0,
         "Hysteria2 UDP fragment_count must be positive"
     );
-    if message.fragment_count == 1 {
-        return Ok(Some(message));
-    }
     ensure!(
         message.fragment_id < message.fragment_count,
         "Hysteria2 UDP fragment_id must be less than fragment_count"
     );
+    ensure!(
+        message.payload.len() <= MAX_UDP_PAYLOAD,
+        "Hysteria2 UDP payload too large"
+    );
+    if message.fragment_count == 1 {
+        return Ok(Some(message));
+    }
     let key = (message.session_id, message.packet_id);
     let mut guard = fragments.lock().await;
+    let now = Instant::now();
+    if guard.len() >= MAX_PENDING_PACKETS
+        || guard.get(&key).is_some_and(|entry| {
+            now.saturating_duration_since(entry.created_at) >= UDP_FRAGMENT_TIMEOUT
+        })
+    {
+        guard.retain(|_, entry| {
+            now.saturating_duration_since(entry.created_at) < UDP_FRAGMENT_TIMEOUT
+        });
+    }
+    ensure!(
+        guard.len() < MAX_PENDING_PACKETS || guard.contains_key(&key),
+        "Hysteria2 fragment map exceeded"
+    );
     let entry = guard.entry(key).or_insert_with(|| UdpFragmentBuffer {
         address: message.address.clone(),
         created_at: Instant::now(),
-        fragments: vec![None; usize::from(message.fragment_count)],
+        fragments: FragmentPayload::new(message.fragment_count),
     });
     ensure!(
-        entry.fragments.len() == usize::from(message.fragment_count),
+        entry.fragments.count() == usize::from(message.fragment_count),
         "Hysteria2 UDP fragment_count changed for packet"
     );
     ensure!(
         entry.address == message.address,
         "Hysteria2 UDP fragment address changed for packet"
     );
-    entry.fragments[usize::from(message.fragment_id)] = Some(message.payload);
-    if entry.fragments.iter().any(Option::is_none) {
+    let Some(payload) = entry
+        .fragments
+        .insert(message.fragment_id, message.payload)?
+    else {
         return Ok(None);
-    }
+    };
     let entry = guard
         .remove(&key)
         .expect("Hysteria2 fragment buffer exists");
-    let mut payload = Vec::new();
-    for fragment in entry.fragments {
-        payload.extend(fragment.expect("Hysteria2 fragment present"));
-    }
     Ok(Some(UdpMessage {
         session_id: key.0,
         packet_id: key.1,

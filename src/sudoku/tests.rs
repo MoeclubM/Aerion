@@ -363,7 +363,7 @@ async fn authenticated_handshake_and_revoked_users() -> Result<()> {
 #[test]
 fn mihomo_import_preserves_sudoku_settings() -> Result<()> {
     let config: crate::MihomoConfig = serde_yaml::from_str(
-        "proxies:\n  - name: Sudoku\n    type: sudoku\n    server: example.com\n    port: 443\n    key: user-psk\n    table-type: prefer_ascii\n    enable-pure-downlink: false\n    padding-min: 0\n    padding-max: 0\n    udp: true\n",
+        "proxies:\n  - name: Sudoku\n    type: sudoku\n    server: example.com\n    port: 443\n    key: user-psk\n    table-type: prefer_ascii\n    enable-pure-downlink: false\n    padding-min: 0\n    padding-max: 0\n    http-mask-multiplex: on\n    udp: true\n",
     )?;
     let proxy = config.proxies[0].to_client_config("127.0.0.1:1080".parse()?)?;
     let crate::MihomoClientConfig::Sudoku(proxy) = proxy else {
@@ -373,6 +373,9 @@ fn mihomo_import_preserves_sudoku_settings() -> Result<()> {
     assert_eq!(proxy.options.table_type, "prefer_ascii");
     assert!(!proxy.options.enable_pure_downlink);
     assert_eq!(proxy.options.padding_max, 0);
+    assert_eq!(proxy.options.multiplex, "on");
+    let legacy: SudokuOptions = serde_json::from_str(r#"{"multiplex":"on"}"#)?;
+    assert_eq!(legacy.multiplex, proxy.options.multiplex);
     Ok(())
 }
 

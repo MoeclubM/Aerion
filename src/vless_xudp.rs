@@ -1,11 +1,7 @@
-use crate::core::CoreSession;
-use crate::protocol::{ProxyTarget, resolve_target_addr};
-use crate::socket_protect;
+use crate::protocol::ProxyTarget;
 use anyhow::{Context, Result, bail, ensure};
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MUX_DESTINATION: &str = "v1.mux.cool";
 pub const MUX_PORT: u16 = 666;
@@ -13,7 +9,6 @@ pub const MUX_PORT: u16 = 666;
 const STATUS_NEW: u8 = 0x01;
 const STATUS_KEEP: u8 = 0x02;
 const STATUS_END: u8 = 0x03;
-const STATUS_KEEPALIVE: u8 = 0x04;
 const NETWORK_UDP: u8 = 0x02;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x02;
@@ -30,56 +25,6 @@ pub fn mux_target() -> ProxyTarget {
 
 pub fn is_mux_target(target: &ProxyTarget) -> bool {
     matches!(target, ProxyTarget::Domain(host, port) if host.eq_ignore_ascii_case(MUX_DESTINATION) && *port == MUX_PORT)
-}
-
-pub async fn relay_server<S>(stream: S, session: CoreSession) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let socket = Arc::new(
-        socket_protect::bind_dual_stack_udp()
-            .await
-            .context("bind XUDP UDP")?,
-    );
-    let (mut reader, mut writer) = split(stream);
-    let mut current_destination = None;
-    let mut destination_cache = HashMap::new();
-    let udp_to_client = {
-        let socket = socket.clone();
-        let session = session.clone();
-        async move {
-            let mut buffer = vec![0u8; u16::MAX as usize];
-            loop {
-                let (read, source) = socket
-                    .recv_from(&mut buffer)
-                    .await
-                    .context("receive XUDP UDP response")?;
-                session.record_download(read).await?;
-                let encoded = encode_packet(&ProxyTarget::Ip(source), &buffer[..read])?;
-                writer
-                    .write_all(&encoded)
-                    .await
-                    .context("write XUDP response")?;
-            }
-            #[allow(unreachable_code)]
-            Ok::<(), anyhow::Error>(())
-        }
-    };
-    let client_to_udp = async {
-        while let Some(packet) = read_packet(&mut reader, &mut current_destination).await? {
-            let target =
-                target_socket_addr_cached(&packet.destination, &mut destination_cache).await?;
-            session.record_upload(packet.payload.len()).await?;
-            socket_protect::send_to_dual_stack(&socket, &packet.payload, target)
-                .await
-                .with_context(|| format!("send XUDP payload to {target}"))?;
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-    tokio::select! {
-        result = client_to_udp => result,
-        result = udp_to_client => result,
-    }
 }
 
 pub async fn write_client_packet<W>(
@@ -321,25 +266,6 @@ fn write_destination_xudp(buffer: &mut Vec<u8>, destination: &ProxyTarget) -> Re
         }
     }
     Ok(())
-}
-
-async fn target_socket_addr_cached(
-    target: &ProxyTarget,
-    cache: &mut HashMap<String, SocketAddr>,
-) -> Result<SocketAddr> {
-    let key = match target {
-        ProxyTarget::Ip(addr) => return Ok(*addr),
-        ProxyTarget::Domain(host, port) => format!("{host}:{port}"),
-    };
-    if let Some(addr) = cache.get(&key).copied() {
-        return Ok(addr);
-    }
-    let ProxyTarget::Domain(_host, _port) = target else {
-        unreachable!("IP target returned above")
-    };
-    let addr = resolve_target_addr(target).await?;
-    cache.insert(key, addr);
-    Ok(addr)
 }
 
 async fn read_length_or_eof<R>(reader: &mut R, context: &str) -> Result<Option<u16>>

@@ -34,7 +34,8 @@ async fn socks_client_reaches_tcp_target_through_vmess_server() -> Result<()> {
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await?;
     let client_addr = client_listener.local_addr()?;
-    let client_task = tokio::spawn(run_vmess_client_listener(
+    let core = aerion::ProxyCore::from_credentials(&user_id, &[]);
+    let client_task = tokio::spawn(aerion::vmess::run_vmess_client_listener_with_core(
         client_listener,
         VmessClientConfig {
             listen: client_addr,
@@ -54,12 +55,18 @@ async fn socks_client_reaches_tcp_target_through_vmess_server() -> Result<()> {
             client_fingerprint: None,
             transport: VlessTransportConfig::tcp(),
         },
+        Some(core.clone()),
     ));
 
-    let result = timeout(
-        Duration::from_secs(5),
-        socks_echo(client_addr, echo_addr, b"hello vmess"),
-    )
+    let result = timeout(Duration::from_secs(5), async {
+        socks_echo(client_addr, echo_addr, b"hello vmess").await?;
+        let stats = core.snapshot().await;
+        anyhow::ensure!(
+            stats[0].upload_bytes == 11 && stats[0].download_bytes == 11,
+            "VMess client did not record payload bytes"
+        );
+        Ok::<(), anyhow::Error>(())
+    })
     .await
     .context("VMess TCP end-to-end test timed out")
     .and_then(|inner| inner);

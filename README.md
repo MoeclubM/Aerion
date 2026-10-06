@@ -28,7 +28,7 @@ Xboard
 | AnyTLS | ✓ | ✓ | TLS 多路复用 | UDP over TCP |
 | Hysteria2 | ✓ | ✓ | QUIC | 原生数据报 |
 | Mieru | ✓ | ✓ | 流 underlay | 原生包 underlay |
-| Sudoku | ✓ | UoT | KIP、经典/packed 编码、HTTPMask legacy / WS | UDP over TCP |
+| Sudoku | ✓ | ✓ | KIP、经典/packed 编码、HTTPMask legacy / WS | UDP over TCP |
 | Naive | ✓ | ✓ | HTTP/1.1 · H2 · H3 | UDP over TCP |
 | Shadowsocks | ✓ | ✓ | AEAD / 2022 | SS UDP / UoT |
 | Trojan | ✓ | ✓ | TLS / WS / H2 / gRPC / XHTTP | 流内 UDP |

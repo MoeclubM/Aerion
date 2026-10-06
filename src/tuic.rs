@@ -2,6 +2,7 @@ use crate::core::{CoreSession, CoreUser, ProxyCore, relay_split_counted};
 use crate::listener;
 use crate::protocol::{ProxyTarget, parse_uuid, resolve_target_addr, target_name};
 use crate::quic::{self, QuicCongestion};
+use crate::udp_fragments::{FragmentPayload, MAX_PENDING_PACKETS, MAX_UDP_PAYLOAD};
 use crate::{socket_protect, socks, tls};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use bytes::Bytes;
@@ -39,7 +40,6 @@ const TUIC_MAX_INCOMING_STREAMS: u32 = 1024;
 const TUIC_DATAGRAM_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const TUIC_MAX_UNI_COMMAND: usize = u16::MAX as usize + 512;
 const UDP_FRAGMENT_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_UDP_FRAGMENTS: usize = 64;
 const PACKET_COMMAND_FIXED_LEN: usize = 10;
 
 #[derive(Clone, Debug)]
@@ -118,7 +118,7 @@ struct TuicPacket {
 struct TuicFragmentBuffer {
     target: Option<ProxyTarget>,
     created_at: Instant,
-    fragments: Vec<Option<Vec<u8>>>,
+    fragments: FragmentPayload,
 }
 
 #[derive(Clone, Debug)]
@@ -282,26 +282,16 @@ impl SharedTuicClient {
     }
 
     async fn get_or_connect(&self) -> Result<TuicClient> {
-        loop {
-            {
-                let guard = self.client.lock().await;
-                if let Some(client) = guard.as_ref() {
-                    if client.is_alive() {
-                        return Ok(client.clone());
-                    }
-                }
+        let mut guard = self.client.lock().await;
+        if let Some(client) = guard.as_ref() {
+            if client.is_alive() {
+                return Ok(client.clone());
             }
-            let mut guard = self.client.lock().await;
-            if let Some(client) = guard.as_ref() {
-                if client.is_alive() {
-                    return Ok(client.clone());
-                }
-                guard.take();
-            }
-            let client = TuicClient::connect(&self.config).await?;
-            guard.replace(client.clone());
-            return Ok(client);
         }
+        guard.take();
+        let client = TuicClient::connect(&self.config).await?;
+        guard.replace(client.clone());
+        Ok(client)
     }
 }
 
@@ -669,8 +659,10 @@ async fn handle_client_packet_bytes(inner: &TuicClientInner, bytes: &[u8]) -> Re
     match bytes[1] {
         CMD_PACKET => {
             let packet = parse_packet_command(bytes)?;
-            let mut fragments = inner.udp_fragments.lock().await;
-            let packet = push_fragment(&mut fragments, packet)?;
+            let packet = {
+                let mut fragments = inner.udp_fragments.lock().await;
+                push_fragment(&mut fragments, packet)?
+            };
             if let Some(packet) = packet {
                 let sender = inner
                     .udp_sessions
@@ -679,7 +671,7 @@ async fn handle_client_packet_bytes(inner: &TuicClientInner, bytes: &[u8]) -> Re
                     .get(&packet.assoc_id)
                     .cloned();
                 if let Some(sender) = sender {
-                    let _ = sender.send(packet).await;
+                    let _ = sender.try_send(packet);
                 }
             }
             Ok(())
@@ -941,8 +933,10 @@ async fn handle_server_packet_bytes(
     ensure!(udp_enabled, "TUIC UDP is disabled by server config");
     let session = auth.wait_session().await?;
     let packet = parse_packet_command(bytes)?;
-    let mut fragments = udp_fragments.lock().await;
-    let packet = push_fragment(&mut fragments, packet)?;
+    let packet = {
+        let mut fragments = udp_fragments.lock().await;
+        push_fragment(&mut fragments, packet)?
+    };
     let Some(packet) = packet else {
         return Ok(());
     };
@@ -1277,6 +1271,14 @@ fn push_fragment(
     fragments: &mut HashMap<(u16, u16), TuicFragmentBuffer>,
     packet: TuicPacketCommand,
 ) -> Result<Option<TuicPacket>> {
+    ensure!(
+        packet.frag_total > 0 && packet.frag_id < packet.frag_total,
+        "invalid TUIC fragment index"
+    );
+    ensure!(
+        packet.payload.len() <= MAX_UDP_PAYLOAD,
+        "TUIC UDP payload too large"
+    );
     if packet.frag_total == 1 {
         return Ok(Some(TuicPacket {
             assoc_id: packet.assoc_id,
@@ -1287,7 +1289,7 @@ fn push_fragment(
     let now = Instant::now();
     fragments.retain(|_, buffer| now.duration_since(buffer.created_at) <= UDP_FRAGMENT_TIMEOUT);
     ensure!(
-        fragments.len() < MAX_UDP_FRAGMENTS
+        fragments.len() < MAX_PENDING_PACKETS
             || fragments.contains_key(&(packet.assoc_id, packet.packet_id)),
         "TUIC fragment map exceeded"
     );
@@ -1295,34 +1297,22 @@ fn push_fragment(
     let buffer = fragments.entry(key).or_insert_with(|| TuicFragmentBuffer {
         target: None,
         created_at: now,
-        fragments: vec![None; packet.frag_total as usize],
+        fragments: FragmentPayload::new(packet.frag_total),
     });
     ensure!(
-        buffer.fragments.len() == packet.frag_total as usize,
+        buffer.fragments.count() == packet.frag_total as usize,
         "TUIC packet fragment count changed"
     );
     if packet.frag_id == 0 {
         buffer.target = packet.target;
     }
-    ensure!(
-        buffer.fragments[packet.frag_id as usize].is_none(),
-        "TUIC duplicate packet fragment"
-    );
-    buffer.fragments[packet.frag_id as usize] = Some(packet.payload);
-    let Some(target) = buffer.target.clone() else {
+    let Some(payload) = buffer.fragments.insert(packet.frag_id, packet.payload)? else {
         return Ok(None);
     };
-    if buffer.fragments.iter().any(Option::is_none) {
-        return Ok(None);
-    }
-    let mut payload = Vec::new();
-    for fragment in &mut buffer.fragments {
-        payload.extend(
-            fragment
-                .take()
-                .context("TUIC fragment disappeared after completeness check")?,
-        );
-    }
+    let target = buffer
+        .target
+        .clone()
+        .context("TUIC fragmented packet has no address")?;
     fragments.remove(&key);
     Ok(Some(TuicPacket {
         assoc_id: key.0,

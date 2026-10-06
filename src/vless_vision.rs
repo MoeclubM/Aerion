@@ -230,7 +230,8 @@ where
     }
 }
 
-pub fn encode_end_frame(user: &[u8; 16], payload: &[u8]) -> Result<Vec<u8>> {
+#[cfg(test)]
+fn encode_end_frame(user: &[u8; 16], payload: &[u8]) -> Result<Vec<u8>> {
     encode_vision_frame(user, true, COMMAND_PADDING_END, payload)
 }
 

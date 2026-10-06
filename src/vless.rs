@@ -341,22 +341,23 @@ async fn handle_vless_xudp_associate_counted(
     write_vless_request(&mut server, &user, CMD_MUX, &vless_xudp::mux_target(), "").await?;
     read_vless_response_header(&mut server).await?;
     let (mut reader, mut writer) = tokio::io::split(server);
-    let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<SocketAddr>(8);
+    let peer = Arc::new(tokio::sync::Mutex::new(None::<SocketAddr>));
 
     let mut is_new = true;
     let mut global_id = [0u8; 8];
     getrandom::fill(&mut global_id).context("generate XUDP GlobalID")?;
     let udp_to_xudp = {
         let udp = udp.clone();
+        let peer = peer.clone();
         let session = session.clone();
         async move {
             let mut buffer = vec![0u8; u16::MAX as usize + 32];
             loop {
-                let (read, peer) = udp
+                let (read, next_peer) = udp
                     .recv_from(&mut buffer)
                     .await
                     .context("receive SOCKS UDP packet")?;
-                let _ = client_tx.try_send(peer);
+                *peer.lock().await = Some(next_peer);
                 let (target, payload) = uot::parse_socks_udp_packet(&buffer[..read])?;
                 session.record_upload(payload.len()).await?;
                 vless_xudp::write_client_packet(&mut writer, &target, payload, is_new, &global_id)
@@ -368,22 +369,20 @@ async fn handle_vless_xudp_associate_counted(
 
     let xudp_to_udp = {
         let udp = udp.clone();
+        let peer = peer.clone();
         let session = session.clone();
         async move {
-            let mut peer = None;
             loop {
-                tokio::select! {
-                    next_peer = client_rx.recv() => if let Some(next_peer) = next_peer { peer = Some(next_peer); },
-                    packet = vless_xudp::read_response_packet(&mut reader) => {
-                        let Some((source, payload)) = packet? else { return Ok::<(), anyhow::Error>(()); };
-                        session.record_download(payload.len()).await?;
-                        let response = uot::encode_socks_udp_packet(&source, &payload)?;
-                        let peer = peer.context("SOCKS UDP peer is not known yet")?;
-                        udp.send_to(&response, peer)
-                            .await
-                            .with_context(|| format!("send SOCKS XUDP response to {peer}"))?;
-                    }
-                }
+                let packet = vless_xudp::read_response_packet(&mut reader).await;
+                let Some((source, payload)) = packet? else {
+                    return Ok::<(), anyhow::Error>(());
+                };
+                session.record_download(payload.len()).await?;
+                let response = uot::encode_socks_udp_packet(&source, &payload)?;
+                let peer = (*peer.lock().await).context("SOCKS UDP peer is not known yet")?;
+                udp.send_to(&response, peer)
+                    .await
+                    .with_context(|| format!("send SOCKS XUDP response to {peer}"))?;
             }
         }
     };
@@ -403,6 +402,7 @@ async fn handle_vless_xudp_associate_counted(
     };
 
     tokio::select! {
+        _ = session.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
         result = udp_to_xudp => result,
         result = xudp_to_udp => result,
         result = control_closed => result,
@@ -562,7 +562,6 @@ where
                 .await
                 .context("read VLESS Vision uplink")?;
             if read == 0 {
-                let _ = remote_writer.shutdown().await;
                 return Ok::<(), anyhow::Error>(());
             }
             uplink_session.record_upload(read).await?;
@@ -581,7 +580,6 @@ where
                 .await
                 .context("read VLESS Vision downlink")?;
             if read == 0 {
-                let _ = client_writer.shutdown().await;
                 return Ok::<(), anyhow::Error>(());
             }
             session.record_download(read).await?;
@@ -593,11 +591,14 @@ where
         }
     };
     let result = tokio::select! {
+        _ = session.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
         result = uplink => result,
         result = downlink => result,
     };
-    let _ = remote_writer.shutdown().await;
-    let _ = client_writer.shutdown().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let _ = tokio::join!(remote_writer.shutdown(), client_writer.shutdown());
+    })
+    .await;
     result
 }
 
@@ -620,7 +621,6 @@ async fn relay_vision_client_counted(
                 .await
                 .context("read local Vision payload")?;
             if read == 0 {
-                let _ = server_writer.shutdown().await;
                 return Ok::<(), anyhow::Error>(());
             }
             uplink_session.record_upload(read).await?;
@@ -639,7 +639,6 @@ async fn relay_vision_client_counted(
                 .await
                 .context("read VLESS Vision response")?;
             if read == 0 {
-                let _ = local_writer.shutdown().await;
                 return Ok::<(), anyhow::Error>(());
             }
             session.record_download(read).await?;
@@ -650,11 +649,14 @@ async fn relay_vision_client_counted(
         }
     };
     let result = tokio::select! {
+        _ = session.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
         result = uplink => result,
         result = downlink => result,
     };
-    let _ = server_writer.shutdown().await;
-    let _ = local_writer.shutdown().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let _ = tokio::join!(server_writer.shutdown(), local_writer.shutdown());
+    })
+    .await;
     result
 }
 

@@ -198,14 +198,20 @@ async fn handle_client(
     heartbeat.tick().await;
 
     loop {
-        let frame = tokio::select! {
-            frame = read_frame(&mut reader) => frame?,
-            _ = heartbeat.tick() => {
-                if received_settings {
-                    let mut writer = writer.lock().await;
-                    write_frame(&mut *writer, CMD_HEART_REQUEST, 0, &[]).await?;
+        let frame = {
+            let next_frame = read_frame(&mut reader);
+            tokio::pin!(next_frame);
+            loop {
+                tokio::select! {
+                    _ = session.cancelled() => bail!("core session cancelled"),
+                    frame = &mut next_frame => break frame?,
+                    _ = heartbeat.tick() => {
+                        if received_settings {
+                            let mut writer = writer.lock().await;
+                            write_frame(&mut *writer, CMD_HEART_REQUEST, 0, &[]).await?;
+                        }
+                    }
                 }
-                continue;
             }
         };
         match frame.cmd {
@@ -288,6 +294,7 @@ async fn handle_client(
             }
             CMD_FIN => {
                 streams.remove(&frame.stream_id);
+                pending.remove(&frame.stream_id);
                 pending_uot.remove(&frame.stream_id);
             }
             CMD_HEART_REQUEST => {
