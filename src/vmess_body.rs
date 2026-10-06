@@ -1,4 +1,6 @@
-use aes_gcm::aead::{Aead, AeadInPlace, KeyInit};
+#[cfg(test)]
+use aes_gcm::aead::Aead;
+use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes128Gcm, Nonce as AesNonce};
 use anyhow::{Context, Result, bail, ensure};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
@@ -384,7 +386,10 @@ impl<R: AsyncRead + Unpin> BodyReader<R> {
             "invalid VMess chunk payload size {payload_len} below overhead {}",
             self.state.payload_overhead()
         );
-        let mut payload = vec![0u8; payload_len];
+        // Keep unverified/partially read bytes out of the public pending buffer.
+        // Successful chunks return this allocation for reuse; errors drop it.
+        let mut payload = std::mem::take(&mut self.pending);
+        payload.resize(payload_len, 0);
         if payload_len > 0 {
             self.inner
                 .read_exact(&mut payload)
@@ -399,13 +404,13 @@ impl<R: AsyncRead + Unpin> BodyReader<R> {
                 .context("read VMess chunk padding")?;
         }
         self.state.decrypt_payload(&mut payload)?;
-        if payload_len == self.state.payload_overhead() && payload.is_empty() {
+        self.pending = payload;
+        if payload_len == self.state.payload_overhead() && self.pending.is_empty() {
             self.finished = true;
             self.pending.clear();
             self.pending_pos = 0;
             return Ok(());
         }
-        self.pending = payload;
         self.pending_pos = 0;
         Ok(())
     }
@@ -414,6 +419,7 @@ impl<R: AsyncRead + Unpin> BodyReader<R> {
 pub struct BodyWriter<W> {
     inner: W,
     state: ChunkState,
+    frame: Vec<u8>,
     finished: bool,
 }
 
@@ -422,6 +428,7 @@ impl<W: AsyncWrite + Unpin> BodyWriter<W> {
         Self {
             inner,
             state: ChunkState::new(config),
+            frame: Vec::new(),
             finished: false,
         }
     }
@@ -470,32 +477,62 @@ impl<W: AsyncWrite + Unpin> BodyWriter<W> {
 
     async fn write_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
         let padding_len = self.state.next_padding_len();
-        let ciphertext = self.state.encrypt_payload(plaintext)?;
-        let total_len = ciphertext.len() + padding_len;
+        let total_len = plaintext.len() + self.state.payload_overhead() + padding_len;
         ensure!(
             total_len <= u16::MAX as usize,
             "VMess chunk too large: {total_len}"
         );
-        let size_bytes = self.state.encode_size(total_len as u16)?;
-        self.inner
-            .write_all(&size_bytes)
-            .await
-            .context("write VMess chunk size")?;
-        if !ciphertext.is_empty() {
-            self.inner
-                .write_all(&ciphertext)
-                .await
-                .context("write VMess chunk payload")?;
+        if self.state.config.security == SecurityType::None {
+            // Raw chunked bodies can borrow the payload rather than copy it
+            // into the encrypted-frame buffer. TCP supports a single writev;
+            // other writers still handle partial/unvectored writes correctly.
+            let mut size = [0; 2];
+            self.state.payload_counter = self.state.payload_counter.wrapping_add(1);
+            self.state.encode_size(total_len as u16, &mut size)?;
+            let mut padding = [0; MAX_PADDING_LEN];
+            if padding_len > 0 {
+                getrandom::fill(&mut padding[..padding_len])
+                    .context("generate VMess chunk padding")?;
+            }
+            let mut buffers = [
+                std::io::IoSlice::new(&size),
+                std::io::IoSlice::new(plaintext),
+                std::io::IoSlice::new(&padding[..padding_len]),
+            ];
+            let mut remaining = &mut buffers[..];
+            while !remaining.is_empty() {
+                let written = self
+                    .inner
+                    .write_vectored(remaining)
+                    .await
+                    .context("write VMess chunk")?;
+                if written == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+                        .context("write VMess chunk");
+                }
+                std::io::IoSlice::advance_slices(&mut remaining, written);
+            }
+            return Ok(());
         }
+        let size_len = self.state.size_field_len();
+        self.frame.clear();
+        self.frame.reserve(size_len + total_len);
+        self.frame.resize(size_len, 0);
+        self.frame.extend_from_slice(plaintext);
+        if let Some(tag) = self.state.encrypt_payload(&mut self.frame[size_len..])? {
+            self.frame.extend_from_slice(&tag);
+        }
+        self.state
+            .encode_size(total_len as u16, &mut self.frame[..size_len])?;
         if padding_len > 0 {
-            let mut padding = vec![0u8; padding_len];
-            getrandom::fill(&mut padding).context("generate VMess chunk padding")?;
-            self.inner
-                .write_all(&padding)
-                .await
-                .context("write VMess chunk padding")?;
+            let start = self.frame.len();
+            self.frame.resize(start + padding_len, 0);
+            getrandom::fill(&mut self.frame[start..]).context("generate VMess chunk padding")?;
         }
-        Ok(())
+        self.inner
+            .write_all(&self.frame)
+            .await
+            .context("write VMess chunk")
     }
 }
 
@@ -594,8 +631,13 @@ impl ChunkState {
             encoded.len()
         );
         if self.config.options.authenticated_length() {
-            let plain = self.open_length_chunk(encoded)?;
-            ensure!(plain.len() == 2, "invalid VMess AEAD length payload size");
+            let mut plain = [encoded[0], encoded[1]];
+            let nonce = generate_chunk_nonce(&self.config.length_iv, self.size_counter);
+            self.size_counter = self.size_counter.wrapping_add(1);
+            self.length_cipher
+                .as_ref()
+                .context("VMess length cipher is disabled")?
+                .decrypt_detached(&nonce, &mut plain, &encoded[2..])?;
             return Ok(u16::from_be_bytes([plain[0], plain[1]]).wrapping_add(AEAD_TAG_LEN as u16));
         }
         if let Some(shake) = self.size_shake.as_mut() {
@@ -604,14 +646,26 @@ impl ChunkState {
         Ok(u16::from_be_bytes([encoded[0], encoded[1]]))
     }
 
-    fn encode_size(&mut self, size: u16) -> Result<Vec<u8>> {
+    fn encode_size(&mut self, size: u16, encoded: &mut [u8]) -> Result<()> {
         if self.config.options.authenticated_length() {
-            return self.seal_length_chunk(&size.wrapping_sub(AEAD_TAG_LEN as u16).to_be_bytes());
+            encoded[..2].copy_from_slice(&size.wrapping_sub(AEAD_TAG_LEN as u16).to_be_bytes());
+            let nonce = generate_chunk_nonce(&self.config.length_iv, self.size_counter);
+            self.size_counter = self.size_counter.wrapping_add(1);
+            let tag = self
+                .length_cipher
+                .as_ref()
+                .context("VMess length cipher is disabled")?
+                .encrypt_detached(&nonce, &mut encoded[..2])?
+                .context("VMess authenticated length requires AEAD")?;
+            encoded[2..].copy_from_slice(&tag);
+            return Ok(());
         }
-        if let Some(shake) = self.size_shake.as_mut() {
-            return Ok((shake.next_u16() ^ size).to_be_bytes().to_vec());
-        }
-        Ok(size.to_be_bytes().to_vec())
+        let size = self
+            .size_shake
+            .as_mut()
+            .map_or(size, |shake| shake.next_u16() ^ size);
+        encoded.copy_from_slice(&size.to_be_bytes());
+        Ok(())
     }
 
     fn decrypt_payload(&mut self, payload: &mut Vec<u8>) -> Result<()> {
@@ -620,28 +674,10 @@ impl ChunkState {
         self.payload_cipher.decrypt_in_place(&nonce, payload)
     }
 
-    fn encrypt_payload(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+    fn encrypt_payload(&mut self, plaintext: &mut [u8]) -> Result<Option<[u8; AEAD_TAG_LEN]>> {
         let nonce = generate_chunk_nonce(&self.config.payload_iv, self.payload_counter);
         self.payload_counter = self.payload_counter.wrapping_add(1);
-        self.payload_cipher.encrypt(&nonce, plaintext)
-    }
-
-    fn open_length_chunk(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let nonce = generate_chunk_nonce(&self.config.length_iv, self.size_counter);
-        self.size_counter = self.size_counter.wrapping_add(1);
-        self.length_cipher
-            .as_ref()
-            .context("VMess length cipher is disabled")?
-            .decrypt(&nonce, ciphertext)
-    }
-
-    fn seal_length_chunk(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let nonce = generate_chunk_nonce(&self.config.length_iv, self.size_counter);
-        self.size_counter = self.size_counter.wrapping_add(1);
-        self.length_cipher
-            .as_ref()
-            .context("VMess length cipher is disabled")?
-            .encrypt(&nonce, plaintext)
+        self.payload_cipher.encrypt_detached(&nonce, plaintext)
     }
 }
 
@@ -664,6 +700,7 @@ impl BodyCipher {
         }
     }
 
+    #[cfg(test)]
     fn encrypt(&self, nonce: &[u8; 12], plaintext: &[u8]) -> Result<Vec<u8>> {
         match self {
             Self::None => return Ok(plaintext.to_vec()),
@@ -673,17 +710,39 @@ impl BodyCipher {
         .map_err(|_| anyhow::anyhow!("encrypt VMess body"))
     }
 
-    fn decrypt(&self, nonce: &[u8; 12], ciphertext: &[u8]) -> Result<Vec<u8>> {
-        if !matches!(self, Self::None) {
-            ensure!(
-                ciphertext.len() >= AEAD_TAG_LEN,
-                "VMess ciphertext too short"
-            );
-        }
+    fn encrypt_detached(
+        &self,
+        nonce: &[u8; 12],
+        plaintext: &mut [u8],
+    ) -> Result<Option<[u8; AEAD_TAG_LEN]>> {
         match self {
-            Self::None => return Ok(ciphertext.to_vec()),
-            Self::Aes(cipher) => cipher.decrypt(AesNonce::from_slice(nonce), ciphertext),
-            Self::ChaCha(cipher) => cipher.decrypt(ChaChaNonce::from_slice(nonce), ciphertext),
+            Self::None => return Ok(None),
+            Self::Aes(cipher) => {
+                cipher.encrypt_in_place_detached(AesNonce::from_slice(nonce), &[], plaintext)
+            }
+            Self::ChaCha(cipher) => {
+                cipher.encrypt_in_place_detached(ChaChaNonce::from_slice(nonce), &[], plaintext)
+            }
+        }
+        .map(|tag| Some(tag.into()))
+        .map_err(|_| anyhow::anyhow!("encrypt VMess body"))
+    }
+
+    fn decrypt_detached(&self, nonce: &[u8; 12], ciphertext: &mut [u8], tag: &[u8]) -> Result<()> {
+        match self {
+            Self::None => return Ok(()),
+            Self::Aes(cipher) => cipher.decrypt_in_place_detached(
+                AesNonce::from_slice(nonce),
+                &[],
+                ciphertext,
+                tag.into(),
+            ),
+            Self::ChaCha(cipher) => cipher.decrypt_in_place_detached(
+                ChaChaNonce::from_slice(nonce),
+                &[],
+                ciphertext,
+                tag.into(),
+            ),
         }
         .map_err(|_| anyhow::anyhow!("decrypt VMess body"))
     }

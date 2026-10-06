@@ -49,6 +49,7 @@ use wire::{
 pub const MIERU_DEFAULT_MTU: usize = 1400;
 const DEFAULT_MTU: usize = MIERU_DEFAULT_MTU;
 const NONCE_LEN: usize = 24;
+const AEAD_OVERHEAD: usize = 16;
 pub const MIERU_KEY_LEN: usize = 32;
 const KEY_LEN: usize = MIERU_KEY_LEN;
 const KEY_ITER: usize = 64;

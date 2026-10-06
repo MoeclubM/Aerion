@@ -274,21 +274,38 @@ pub(super) fn encode(
     padding: u8,
 ) -> Result<Vec<u8>> {
     let layout = if down { &table.down } else { &table.up };
-    let mut random = vec![0; input.len() * 6 + 32];
-    getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("Sudoku random source: {e}"))?;
-    let mut draw = random.into_iter().cycle();
-    let mut puzzle_random = vec![0; input.len() * 4];
-    getrandom::fill(&mut puzzle_random)
-        .map_err(|e| anyhow::anyhow!("Sudoku puzzle random: {e}"))?;
-    let pool = layout
-        .padding
-        .iter()
-        .copied()
-        .filter(|b| !packed || *b != layout.marker)
-        .collect::<Vec<_>>();
-    let mut output = Vec::new();
+    let groups = if packed {
+        (input.len() * 8).div_ceil(6)
+    } else {
+        input.len() * 4
+    };
+    let draw_len = if padding == 0 { 0 } else { groups * 2 };
+    let puzzle_len = if packed { 0 } else { input.len() * 4 };
+    let mut random = vec![0; draw_len + puzzle_len];
+    if !random.is_empty() {
+        getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("Sudoku random source: {e}"))?;
+    }
+    let (padding_random, puzzle_random) = random.split_at(draw_len);
+    let mut draw = padding_random.iter().copied();
+    let packed_padding = if packed && padding != 0 {
+        layout
+            .padding
+            .iter()
+            .copied()
+            .filter(|b| *b != layout.marker)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let pool = if packed {
+        &packed_padding
+    } else {
+        &layout.padding
+    };
+    let mut output =
+        Vec::with_capacity(groups * if padding == 0 { 1 } else { 2 } + usize::from(packed));
     let mut emit = |group: u8| {
-        if draw.next().unwrap() as u16 * 100 < padding as u16 * 256 {
+        if padding != 0 && draw.next().unwrap() as u16 * 100 < padding as u16 * 256 {
             output.push(pool[draw.next().unwrap() as usize % pool.len()]);
         }
         output.push(layout.encode[group as usize]);

@@ -1,5 +1,34 @@
 use super::*;
 
+include!("../../tests/performance/uot.rs");
+
+#[test]
+fn stream_packet_parsing_preserves_following_and_partial_packets() -> Result<()> {
+    for target in [
+        ProxyTarget::Ip("[::1]:53".parse()?),
+        ProxyTarget::Domain("example.com".into(), 53),
+    ] {
+        let request = legacy_associate_request();
+        let first = encode_associate_packet(&target, b"first")?;
+        let second = encode_associate_packet(&target, b"second")?;
+        let mut pending = first.clone();
+        pending.extend_from_slice(&second[..second.len() - 1]);
+        let (destination, payload, connect) = take_stream_packet(&request, &mut pending)?.unwrap();
+        assert_eq!(destination, target);
+        assert_eq!(payload, b"first");
+        assert!(!connect);
+        assert_eq!(pending, second[..second.len() - 1]);
+        assert!(take_stream_packet(&request, &mut pending)?.is_none());
+        pending.push(*second.last().unwrap());
+        assert_eq!(
+            take_stream_packet(&request, &mut pending)?.unwrap().1,
+            b"second"
+        );
+        assert!(pending.is_empty());
+    }
+    Ok(())
+}
+
 #[test]
 fn roundtrips_associate_packet() {
     let target = ProxyTarget::Domain("example.com".to_string(), 53);

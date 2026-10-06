@@ -1,7 +1,7 @@
 use super::pattern::{MieruNoncePattern, MieruTrafficPattern, apply_nonce_pattern};
-use super::{KEY_ITER, KEY_LEN, KEY_REFRESH_SECS, NONCE_LEN};
+use super::{AEAD_OVERHEAD, KEY_ITER, KEY_LEN, KEY_REFRESH_SECS, NONCE_LEN};
 use anyhow::{Context, Result, ensure};
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -71,16 +71,17 @@ impl MieruCipher {
         };
         let cipher = <XChaCha20Poly1305 as KeyInit>::new_from_slice(&self.key)
             .map_err(|_| anyhow::anyhow!("invalid Mieru XChaCha20-Poly1305 key"))?;
-        let mut sealed = cipher
-            .encrypt(XNonce::from_slice(&nonce), plaintext)
-            .map_err(|_| anyhow::anyhow!("Mieru XChaCha20-Poly1305 encrypt failed"))?;
+        let prefix_len = if send_nonce { NONCE_LEN } else { 0 };
+        let mut sealed = Vec::with_capacity(prefix_len + plaintext.len() + AEAD_OVERHEAD);
         if send_nonce {
-            let mut out = nonce.to_vec();
-            out.append(&mut sealed);
-            Ok(out)
-        } else {
-            Ok(sealed)
+            sealed.extend_from_slice(&nonce);
         }
+        sealed.extend_from_slice(plaintext);
+        let tag = cipher
+            .encrypt_in_place_detached(XNonce::from_slice(&nonce), &[], &mut sealed[prefix_len..])
+            .map_err(|_| anyhow::anyhow!("Mieru XChaCha20-Poly1305 encrypt failed"))?;
+        sealed.extend_from_slice(&tag);
+        Ok(sealed)
     }
 
     pub(super) fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
@@ -271,10 +272,10 @@ fn add_user_hint_to_nonce(username: &str, nonce: &mut [u8; NONCE_LEN]) {
     if username.is_empty() {
         return;
     }
-    let mut input = Vec::with_capacity(username.len() + 16);
-    input.extend_from_slice(username.as_bytes());
-    input.extend_from_slice(&nonce[..16]);
-    let digest = Sha256::digest(&input);
+    let mut hash = Sha256::new();
+    hash.update(username.as_bytes());
+    hash.update(&nonce[..16]);
+    let digest = hash.finalize();
     nonce[20..24].copy_from_slice(&digest[..4]);
 }
 
@@ -282,10 +283,10 @@ pub(super) fn check_user_from_hint(username: &[u8], nonce: &[u8]) -> bool {
     if username.is_empty() || nonce.len() < 20 {
         return false;
     }
-    let mut input = Vec::with_capacity(username.len() + 16);
-    input.extend_from_slice(username);
-    input.extend_from_slice(&nonce[..16]);
-    let digest = Sha256::digest(&input);
+    let mut hash = Sha256::new();
+    hash.update(username);
+    hash.update(&nonce[..16]);
+    let digest = hash.finalize();
     digest[..4].eq(&nonce[nonce.len() - 4..])
 }
 

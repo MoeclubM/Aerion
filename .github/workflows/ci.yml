@@ -6,10 +6,16 @@ on:
       - main
   pull_request:
   workflow_dispatch:
+    inputs:
+      performance_base:
+        description: Base revision for benchmark-only run (empty runs full CI)
+        required: false
+        default: ''
 
 
 jobs:
   library-tests:
+    if: github.event_name != 'workflow_dispatch' || inputs.performance_base == ''
     name: Library protocol tests
     runs-on: ubuntu-latest
     steps:
@@ -17,6 +23,7 @@ jobs:
       - name: Test without optional server ECH
         run: cargo test --locked --no-default-features
   sudoku-interop:
+    if: github.event_name != 'workflow_dispatch' || inputs.performance_base == ''
     name: Official Sudoku interoperability
     runs-on: ubuntu-latest
     steps:
@@ -35,6 +42,7 @@ jobs:
         env:
           SUDOKU_INTEROP_BIN: /tmp/sudoku-interop
   rust:
+    if: github.event_name != 'workflow_dispatch' || inputs.performance_base == ''
     name: Rust ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -74,6 +82,7 @@ jobs:
         run: cargo test --locked --release --no-default-features cipher_cache_microbenchmark -- --ignored --nocapture
 
   ios-check:
+    if: github.event_name != 'workflow_dispatch' || inputs.performance_base == ''
     name: iOS target check
     runs-on: macos-latest
     steps:
@@ -95,6 +104,7 @@ jobs:
         run: cargo check --locked --no-default-features --target aarch64-apple-ios-sim
 
   android-check:
+    if: github.event_name != 'workflow_dispatch' || inputs.performance_base == ''
     name: Android target check
     runs-on: ubuntu-latest
     steps:
@@ -119,3 +129,24 @@ jobs:
 
       - name: Check Android arm64 target
         run: cargo check --locked --no-default-features --target aarch64-linux-android
+
+  protocol-performance:
+    name: Protocol performance comparison
+    if: github.event_name == 'workflow_dispatch' && inputs.performance_base != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.performance_base }}
+          path: .performance-baseline
+      - name: Compare release codecs
+        run: python3 .github/scripts/protocol_performance.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: protocol-performance
+          path: performance-results/
