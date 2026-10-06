@@ -105,10 +105,11 @@ struct MieruUserSecret {
     hashed_password: [u8; KEY_LEN],
 }
 
-struct MieruStreamWriter {
-    inner: OwnedWriteHalf,
+struct MieruStreamWriter<W = OwnedWriteHalf> {
+    inner: W,
     cipher: Option<MieruCipher>,
     traffic_pattern: Option<MieruTrafficPattern>,
+    buffer: Vec<u8>,
 }
 
 struct MieruPacketWriter {
@@ -309,9 +310,9 @@ impl SharedMieruClientSession {
     }
 }
 
-impl MieruStreamWriter {
+impl<W: AsyncWrite + Unpin> MieruStreamWriter<W> {
     fn new(
-        inner: OwnedWriteHalf,
+        inner: W,
         cipher: Option<MieruCipher>,
         traffic_pattern: Option<MieruTrafficPattern>,
     ) -> Self {
@@ -319,6 +320,7 @@ impl MieruStreamWriter {
             inner,
             cipher,
             traffic_pattern,
+            buffer: Vec::new(),
         }
     }
 
@@ -369,21 +371,22 @@ impl MieruStreamWriter {
                 metadata.suffix_len = suffix_padding.len() as u8;
             }
         }
-        let encrypted_metadata = cipher.encrypt(&segment.metadata.marshal()?)?;
-        let mut data_to_send = encrypted_metadata;
+        let data_to_send = &mut self.buffer;
+        data_to_send.clear();
+        data_to_send.reserve(segment.payload.len() + NONCE_LEN + 2 * AEAD_OVERHEAD + 32 + 510);
+        cipher.encrypt_into(&segment.metadata.marshal()?, data_to_send)?;
         data_to_send.extend_from_slice(&prefix_padding);
         if !segment.payload.is_empty() {
-            let encrypted_payload = cipher.encrypt(&segment.payload)?;
-            data_to_send.extend_from_slice(&encrypted_payload);
+            cipher.encrypt_into(&segment.payload, data_to_send)?;
         }
         data_to_send.extend_from_slice(&suffix_padding);
         if is_session {
-            write_with_possible_fragment(&mut self.inner, &data_to_send, &self.traffic_pattern)
+            write_with_possible_fragment(&mut self.inner, data_to_send, &self.traffic_pattern)
                 .await
                 .context("write Mieru stream segment")?;
         } else {
             self.inner
-                .write_all(&data_to_send)
+                .write_all(data_to_send)
                 .await
                 .context("write Mieru stream segment")?;
         }

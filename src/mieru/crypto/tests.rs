@@ -4,6 +4,48 @@ use crate::mieru::{MieruNoncePattern, MieruNonceType, MieruTrafficPattern};
 include!("../../../tests/performance/mieru.rs");
 
 #[test]
+fn appended_encryption_and_in_place_decryption_preserve_nonces_and_authentication() -> Result<()> {
+    let key = [0x37; KEY_LEN];
+    let reference = XChaCha20Poly1305::new((&key).into());
+    for implicit in [false, true] {
+        let mut send = MieruCipher::new(key, implicit, "alice".into(), None);
+        let mut receive = send.clone();
+        let mut nonce = [0; NONCE_LEN];
+        let mut output = Vec::with_capacity(66000);
+        for (index, size) in [0, 1, 1024, 32768, 65535].into_iter().enumerate() {
+            let payload = vec![index as u8; size];
+            output.clear();
+            output.extend_from_slice(b"prefix");
+            send.encrypt_into(&payload, &mut output)?;
+            assert_eq!(&output[..6], b"prefix");
+            let encrypted = &output[6..];
+            let body = if index == 0 || !implicit {
+                nonce.copy_from_slice(&encrypted[..NONCE_LEN]);
+                &encrypted[NONCE_LEN..]
+            } else {
+                nonce = increment_nonce(&nonce)?;
+                encrypted
+            };
+            assert_eq!(
+                body,
+                reference
+                    .encrypt(XNonce::from_slice(&nonce), payload.as_slice())
+                    .unwrap()
+            );
+            let mut invalid = encrypted.to_vec();
+            *invalid.last_mut().unwrap() ^= 1;
+            assert!(receive.clone().decrypt_in_place(&mut invalid).is_err());
+            let mut decrypted = encrypted.to_vec();
+            let allocation = decrypted.as_ptr();
+            receive.decrypt_in_place(&mut decrypted)?;
+            assert_eq!(decrypted, payload);
+            assert_eq!(decrypted.as_ptr(), allocation);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn cipher_preserves_reference_bytes_nonces_clone_reset_and_authentication() -> Result<()> {
     let key = [0x42; KEY_LEN];
     let reference = XChaCha20Poly1305::new((&key).into());

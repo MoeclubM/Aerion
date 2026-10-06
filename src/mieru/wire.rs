@@ -292,7 +292,8 @@ where
                     .read_exact(&mut encrypted_payload)
                     .await
                     .context("read Mieru session payload")?;
-                payload = cipher.decrypt(&encrypted_payload)?;
+                cipher.decrypt_in_place(&mut encrypted_payload)?;
+                payload = encrypted_payload;
             }
             if metadata.suffix_len > 0 {
                 let mut padding = vec![0u8; metadata.suffix_len as usize];
@@ -319,7 +320,8 @@ where
                     .read_exact(&mut encrypted_payload)
                     .await
                     .context("read Mieru data payload")?;
-                payload = cipher.decrypt(&encrypted_payload)?;
+                cipher.decrypt_in_place(&mut encrypted_payload)?;
+                payload = encrypted_payload;
             }
             if metadata.suffix_len > 0 {
                 let mut padding = vec![0u8; metadata.suffix_len as usize];

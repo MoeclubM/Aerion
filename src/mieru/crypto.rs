@@ -54,6 +54,12 @@ impl MieruCipher {
     }
 
     pub(super) fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let mut sealed = Vec::with_capacity(NONCE_LEN + plaintext.len() + AEAD_OVERHEAD);
+        self.encrypt_into(plaintext, &mut sealed)?;
+        Ok(sealed)
+    }
+
+    pub(super) fn encrypt_into(&mut self, plaintext: &[u8], output: &mut Vec<u8>) -> Result<()> {
         let (nonce, send_nonce) = if self.implicit {
             if self.implicit_nonce.is_none() {
                 let mut nonce = self.random_nonce()?;
@@ -71,21 +77,27 @@ impl MieruCipher {
         };
         let cipher = <XChaCha20Poly1305 as KeyInit>::new_from_slice(&self.key)
             .map_err(|_| anyhow::anyhow!("invalid Mieru XChaCha20-Poly1305 key"))?;
-        let prefix_len = if send_nonce { NONCE_LEN } else { 0 };
-        let mut sealed = Vec::with_capacity(prefix_len + plaintext.len() + AEAD_OVERHEAD);
+        output.reserve(if send_nonce { NONCE_LEN } else { 0 } + plaintext.len() + AEAD_OVERHEAD);
         if send_nonce {
-            sealed.extend_from_slice(&nonce);
+            output.extend_from_slice(&nonce);
         }
-        sealed.extend_from_slice(plaintext);
+        let start = output.len();
+        output.extend_from_slice(plaintext);
         let tag = cipher
-            .encrypt_in_place_detached(XNonce::from_slice(&nonce), &[], &mut sealed[prefix_len..])
+            .encrypt_in_place_detached(XNonce::from_slice(&nonce), &[], &mut output[start..])
             .map_err(|_| anyhow::anyhow!("Mieru XChaCha20-Poly1305 encrypt failed"))?;
-        sealed.extend_from_slice(&tag);
-        Ok(sealed)
+        output.extend_from_slice(&tag);
+        Ok(())
     }
 
     pub(super) fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let (nonce, payload) = if self.implicit {
+        let mut plaintext = ciphertext.to_vec();
+        self.decrypt_in_place(&mut plaintext)?;
+        Ok(plaintext)
+    }
+
+    pub(super) fn decrypt_in_place(&mut self, ciphertext: &mut Vec<u8>) -> Result<()> {
+        let (nonce, prefix_len) = if self.implicit {
             if self.implicit_nonce.is_none() {
                 ensure!(
                     ciphertext.len() >= NONCE_LEN,
@@ -94,13 +106,10 @@ impl MieruCipher {
                 let mut nonce = [0u8; NONCE_LEN];
                 nonce.copy_from_slice(&ciphertext[..NONCE_LEN]);
                 self.implicit_nonce = Some(nonce);
-                (nonce, &ciphertext[NONCE_LEN..])
+                (nonce, NONCE_LEN)
             } else {
                 self.increase_nonce();
-                (
-                    self.implicit_nonce.expect("implicit nonce is set"),
-                    ciphertext,
-                )
+                (self.implicit_nonce.expect("implicit nonce is set"), 0)
             }
         } else {
             ensure!(
@@ -109,13 +118,29 @@ impl MieruCipher {
             );
             let mut nonce = [0u8; NONCE_LEN];
             nonce.copy_from_slice(&ciphertext[..NONCE_LEN]);
-            (nonce, &ciphertext[NONCE_LEN..])
+            (nonce, NONCE_LEN)
         };
+        ensure!(
+            ciphertext.len() >= prefix_len + AEAD_OVERHEAD,
+            "Mieru ciphertext is shorter than authentication tag"
+        );
+        let tag_offset = ciphertext.len() - AEAD_OVERHEAD;
+        let tag = *chacha20poly1305::Tag::from_slice(&ciphertext[tag_offset..]);
         let cipher = <XChaCha20Poly1305 as KeyInit>::new_from_slice(&self.key)
             .map_err(|_| anyhow::anyhow!("invalid Mieru XChaCha20-Poly1305 key"))?;
         cipher
-            .decrypt(XNonce::from_slice(&nonce), payload)
-            .map_err(|_| anyhow::anyhow!("Mieru XChaCha20-Poly1305 decrypt failed"))
+            .decrypt_in_place_detached(
+                XNonce::from_slice(&nonce),
+                &[],
+                &mut ciphertext[prefix_len..tag_offset],
+                &tag,
+            )
+            .map_err(|_| anyhow::anyhow!("Mieru XChaCha20-Poly1305 decrypt failed"))?;
+        if prefix_len > 0 {
+            ciphertext.copy_within(prefix_len..tag_offset, 0);
+        }
+        ciphertext.truncate(tag_offset - prefix_len);
+        Ok(())
     }
 
     pub(super) fn encrypt_with_nonce(&self, plaintext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {

@@ -1,5 +1,6 @@
 """Build and compare identical release benchmarks inside GitHub Actions."""
 
+import argparse
 import hashlib
 import json
 import os
@@ -16,8 +17,14 @@ def build(root, destination, target):
     output = subprocess.run(
         ["cargo", "test", "--locked", "--release", "--no-default-features", "--lib",
          "--no-run", "--message-format=json"],
-        cwd=root, env=env, check=True, text=True, stdout=subprocess.PIPE,
+        cwd=root, env=env, text=True, stdout=subprocess.PIPE,
     )
+    if output.returncode:
+        for line in output.stdout.splitlines():
+            item = json.loads(line)
+            if item.get("reason") == "compiler-message":
+                print(item["message"].get("rendered", ""), flush=True)
+        output.check_returncode()
     executables = [
         item["executable"] for line in output.stdout.splitlines()
         if (item := json.loads(line)).get("reason") == "compiler-artifact"
@@ -28,6 +35,9 @@ def build(root, destination, target):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--suite", choices=["codecs", "transport", "anytls"], default="codecs")
+    suite = parser.parse_args().suite
     current = Path.cwd()
     baseline = current / ".performance-baseline"
     results = current / "performance-results"
@@ -38,6 +48,42 @@ def main():
         "mieru": "src/mieru/crypto/tests.rs",
         "uot": "src/uot/tests.rs",
     }
+    if suite == "transport":
+        modules = {
+            "relay": "src/relay/tests.rs",
+            "websocket": "src/vless_websocket/tests.rs",
+            "anytls": "src/protocol/tests.rs",
+            "mieru_stream": "src/mieru/tests.rs",
+        }
+        # Use the same in-memory underlay for both Mieru revisions. This only
+        # generalizes the old private writer's type, retaining its encoding/I/O.
+        replacements = {
+            "src/mieru.rs": [
+                ("struct MieruStreamWriter {\n    inner: OwnedWriteHalf,",
+                 "struct MieruStreamWriter<W = OwnedWriteHalf> {\n    inner: W,"),
+                ("impl MieruStreamWriter {\n    fn new(\n        inner: OwnedWriteHalf,",
+                 "impl<W: AsyncWrite + Unpin> MieruStreamWriter<W> {\n    fn new(\n        inner: W,"),
+            ],
+            "src/mieru/pattern.rs": [
+                ("use tokio::io::AsyncWriteExt;\nuse tokio::net::tcp::OwnedWriteHalf;",
+                 "use tokio::io::{AsyncWrite, AsyncWriteExt};"),
+                ("pub(super) async fn write_with_possible_fragment(\n    writer: &mut OwnedWriteHalf,",
+                 "pub(super) async fn write_with_possible_fragment<W: AsyncWrite + Unpin>(\n    writer: &mut W,"),
+            ],
+        }
+        for path, pairs in replacements.items():
+            path = baseline / path
+            source = path.read_text()
+            for old, new in pairs:
+                assert old in source or new in source, f"Unexpected baseline API: {path}"
+                source = source.replace(old, new)
+            path.write_text(source)
+    if suite == "anytls":
+        modules = {"anytls": "src/protocol/tests.rs"}
+    test_filter = (
+        "protocol::tests::transport_performance" if suite == "anytls" else
+        "transport_performance" if suite == "transport" else "protocol_performance"
+    )
     shutil.copytree(current / "tests/performance", baseline / "tests/performance", dirs_exist_ok=True)
     for name, path in modules.items():
         test_file = baseline / path
@@ -64,18 +110,25 @@ def main():
             order = ["baseline", "optimized"] if round_number % 2 == 0 else ["optimized", "baseline"]
             for name in order:
                 output = subprocess.check_output(
-                    [str(temporary / name), "protocol_performance", "--ignored", "--nocapture", "--test-threads=1"],
+                    [str(temporary / name), test_filter, "--ignored", "--nocapture", "--test-threads=1"],
                     text=True,
                 )
                 (results / f"{name}-{round_number}.log").write_text(output)
                 print(f"Round {round_number + 1} {name}\n{output}", flush=True)
                 for label, mib in re.findall(r"PERF (\S+) ([0-9.]+)", output):
                     samples[name].setdefault(label, []).append(float(mib))
-    assert len(samples["baseline"]) == 57, "Missing benchmark cases"
+    assert len(samples["baseline"]) == (20 if suite == "anytls" else 57), "Missing benchmark cases"
     assert samples["baseline"].keys() == samples["optimized"].keys()
-    report = ["# Protocol codec performance", "",
+    scope = (
+        "AnyTLS TLS frames over in-memory pipes; not Internet throughput."
+        if suite == "anytls" else
+        "AnyTLS TLS frames, Mieru encrypted streams and WebSocket over in-memory pipes; counted relay over pipes/loopback TCP. Not Internet throughput."
+        if suite == "transport" else
+        "These are in-memory codec benchmarks, not end-to-end network measurements."
+    )
+    report = [f"# Protocol {suite} performance", "",
               "Same runner, release build, six alternating rounds; median MiB/s of plaintext.",
-              "These are in-memory codec benchmarks, not end-to-end network measurements.", "",
+              scope, "",
               "| Case | Baseline | Optimized | Change |", "|---|---:|---:|---:|"]
     for label in sorted(samples["baseline"]):
         before = samples["baseline"][label]

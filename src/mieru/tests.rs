@@ -4,6 +4,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/performance/mieru_stream.rs"
+));
+
 #[test]
 fn metadata_roundtrip() -> Result<()> {
     let metadata = MieruMetadata::DataAck(MieruDataAckMetadata {

@@ -137,6 +137,26 @@ impl tokio::io::AsyncWrite for ServerTlsStream {
         }
     }
 
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
+        match &mut *self {
+            Self::Rustls(stream) => std::pin::Pin::new(stream).poll_write_vectored(cx, bufs),
+            #[cfg(feature = "server-ech")]
+            Self::Boring(stream) => std::pin::Pin::new(stream).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Rustls(stream) => stream.is_write_vectored(),
+            #[cfg(feature = "server-ech")]
+            Self::Boring(stream) => stream.is_write_vectored(),
+        }
+    }
+
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,

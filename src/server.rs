@@ -12,7 +12,7 @@ use crate::tls::{self, ServerTlsAcceptor, ServerTlsMaterial, ServerTlsStream, Tl
 use crate::uot;
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{IoSlice, Read};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -29,6 +29,14 @@ const MAX_UOT_BUFFER: usize = 64 * 1024;
 struct StreamControl {
     sender: mpsc::Sender<Vec<u8>>,
     abort: Arc<TaskAbort>,
+}
+
+struct ConnectionAbortGuard(Arc<TaskAbort>);
+
+impl Drop for ConnectionAbortGuard {
+    fn drop(&mut self) {
+        self.0.trigger();
+    }
 }
 
 impl Drop for StreamControl {
@@ -95,6 +103,18 @@ impl AsyncWrite for EarlyDataTlsStream {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 
     fn poll_shutdown(
@@ -188,6 +208,20 @@ async fn handle_client(
     let password_refs = passwords.iter().map(String::as_str).collect::<Vec<_>>();
     let credential = read_auth_preface_user(&mut tls_stream, &password_refs).await?;
     let session = core.authenticate_from(&credential, peer).await?;
+    let connection = ConnectionAbortGuard(Arc::new(TaskAbort::new()));
+    tokio::select! {
+        _ = session.cancelled() => bail!("core session cancelled"),
+        result = serve_session(tls_stream, padding, session.clone(), heartbeat_interval_secs, connection.0.clone()) => result,
+    }
+}
+
+async fn serve_session(
+    tls_stream: EarlyDataTlsStream,
+    padding: PaddingScheme,
+    session: CoreSession,
+    heartbeat_interval_secs: u64,
+    connection_abort: Arc<TaskAbort>,
+) -> Result<()> {
     let (mut reader, writer) = split(tls_stream);
     let writer = Arc::new(Mutex::new(writer));
     let mut received_settings = false;
@@ -258,6 +292,7 @@ async fn handle_client(
                         },
                         writer.clone(),
                         session.clone(),
+                        connection_abort.clone(),
                     )
                     .await
                     {
@@ -283,7 +318,14 @@ async fn handle_client(
                     );
                     continue;
                 }
-                match open_stream(frame, writer.clone(), session.clone()).await {
+                match open_stream(
+                    frame,
+                    writer.clone(),
+                    session.clone(),
+                    connection_abort.clone(),
+                )
+                .await
+                {
                     Ok((stream_id, control)) => {
                         streams.insert(stream_id, control);
                     }
@@ -330,11 +372,20 @@ async fn open_stream(
     frame: Frame,
     writer: Arc<Mutex<WriteHalf<EarlyDataTlsStream>>>,
     session: CoreSession,
+    connection_abort: Arc<TaskAbort>,
 ) -> Result<(u32, StreamControl)> {
     let stream_id = frame.stream_id;
     let (target, initial_payload) = decode_target(&frame.payload)?;
     if uot::is_magic_target(&target) {
-        return open_uot_stream(stream_id, &target, initial_payload, writer, session).await;
+        return open_uot_stream(
+            stream_id,
+            &target,
+            initial_payload,
+            writer,
+            session,
+            connection_abort,
+        )
+        .await;
     }
     let remote = match socket_protect::connect_proxy_target(&target).await {
         Ok(remote) => remote,
@@ -370,8 +421,11 @@ async fn open_stream(
     let downlink_writer = writer.clone();
     let downlink_session = session.clone();
     let downlink_abort = abort.clone();
+    let downlink_connection_abort = connection_abort.clone();
     tokio::spawn(async move {
-        let result = async {
+        let result = tokio::select! {
+            _ = downlink_connection_abort.cancelled() => Ok(()),
+            result = async {
             let mut buffer = vec![0u8; 32 * 1024];
             loop {
                 let read = tokio::select! {
@@ -385,14 +439,22 @@ async fn open_stream(
                     write_frame(&mut *writer, CMD_FIN, stream_id, &[]).await?;
                     return Ok(());
                 }
-                downlink_session.record_download(read).await?;
+                tokio::select! {
+                    _ = downlink_abort.cancelled() => return Ok(()),
+                    result = downlink_session.record_download(read) => result?,
+                }
                 {
-                    let mut writer = downlink_writer.lock().await;
+                    let mut writer = tokio::select! {
+                        _ = downlink_abort.cancelled() => return Ok(()),
+                        writer = downlink_writer.lock() => writer,
+                    };
+                    // A stream FIN cannot cancel a partially written mux frame.
+                    // Only closing the whole TLS connection may interrupt it.
                     write_payload_chunks(&mut *writer, stream_id, &buffer[..read]).await?;
                 }
             }
-        }
-        .await;
+            } => result,
+        };
         downlink_abort.trigger();
         if let Err(error) = result {
             tracing::warn!("stream {stream_id} downlink failed: {error:?}");
@@ -402,29 +464,21 @@ async fn open_stream(
     let uplink_session = session;
     let uplink_abort = abort.clone();
     tokio::spawn(async move {
-        let result = async {
-            loop {
-                let payload = tokio::select! {
-                    _ = uplink_abort.cancelled() => break,
-                    payload = receiver.recv() => {
-                        let Some(payload) = payload else {
-                            break;
-                        };
-                        payload
-                    }
-                };
+        let result = tokio::select! {
+            _ = connection_abort.cancelled() => Ok(()),
+            _ = uplink_abort.cancelled() => Ok(()),
+            result = async {
+            while let Some(payload) = receiver.recv().await {
                 uplink_session.record_upload(payload.len()).await?;
                 remote_writer
                     .write_all(&payload)
                     .await
                     .context("write target payload")?;
             }
-            remote_writer
-                .shutdown()
-                .await
-                .context("shutdown target writer")
-        }
-        .await;
+            Ok::<(), anyhow::Error>(())
+            } => result,
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(5), remote_writer.shutdown()).await;
         uplink_abort.trigger();
         if let Err(error) = result {
             tracing::warn!("stream {stream_id} uplink failed: {error:?}");
@@ -440,6 +494,7 @@ async fn open_uot_stream(
     initial_payload: &[u8],
     writer: Arc<Mutex<WriteHalf<EarlyDataTlsStream>>>,
     session: CoreSession,
+    connection_abort: Arc<TaskAbort>,
 ) -> Result<(u32, StreamControl)> {
     let (request, initial_packet) = uot::decode_request_for_target(target, initial_payload)?;
     let udp = socket_protect::bind_dual_stack_udp()
@@ -472,8 +527,12 @@ async fn open_uot_stream(
     let request = Arc::new(request);
     let uplink_session = session.clone();
     let uplink_abort = abort.clone();
+    let uplink_connection_abort = connection_abort.clone();
     tokio::spawn(async move {
-        let result = async {
+        let result = tokio::select! {
+            _ = uplink_connection_abort.cancelled() => Ok(()),
+            _ = uplink_abort.cancelled() => Ok(()),
+            result = async {
             let mut pending = Vec::new();
             loop {
                 let packet = tokio::select! {
@@ -515,8 +574,8 @@ async fn open_uot_stream(
                 }
             }
             Ok::<(), anyhow::Error>(())
-        }
-        .await;
+            } => result,
+        };
         uplink_abort.trigger();
         if let Err(error) = result {
             tracing::warn!("UOT stream {stream_id} uplink failed: {error:?}");
@@ -528,7 +587,9 @@ async fn open_uot_stream(
     let downlink_session = session;
     let downlink_abort = abort.clone();
     tokio::spawn(async move {
-        let result: Result<()> = async {
+        let result: Result<()> = tokio::select! {
+            _ = connection_abort.cancelled() => Ok(()),
+            result = async {
             let mut buffer = vec![0u8; u16::MAX as usize];
             loop {
                 let (read, source) = tokio::select! {
@@ -555,14 +616,20 @@ async fn open_uot_stream(
                 } else {
                     uot::encode_associate_packet(&ProxyTarget::Ip(source), &buffer[..read])?
                 };
-                downlink_session.record_download(read).await?;
+                tokio::select! {
+                    _ = downlink_abort.cancelled() => return Ok(()),
+                    result = downlink_session.record_download(read) => result?,
+                }
                 {
-                    let mut writer = downlink_writer.lock().await;
+                    let mut writer = tokio::select! {
+                        _ = downlink_abort.cancelled() => return Ok(()),
+                        writer = downlink_writer.lock() => writer,
+                    };
                     write_payload_chunks(&mut *writer, stream_id, &packet).await?;
                 }
             }
-        }
-        .await;
+            } => result,
+        };
         downlink_abort.trigger();
         if let Err(error) = result {
             tracing::warn!("UOT stream {stream_id} downlink failed: {error:?}");
