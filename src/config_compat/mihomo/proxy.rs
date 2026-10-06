@@ -15,6 +15,7 @@ impl MihomoProxy {
             Self::Hysteria2(proxy) => &proxy.name,
             Self::AnyTls(proxy) => &proxy.name,
             Self::Mieru(proxy) => &proxy.name,
+            Self::Sudoku(proxy) => &proxy.name,
             Self::Naive(proxy) => &proxy.name,
             Self::Tuic(proxy) => &proxy.name,
             Self::Unsupported(proxy) => &proxy.name,
@@ -36,6 +37,7 @@ impl MihomoProxy {
             }
             Self::AnyTls(proxy) => MihomoClientConfig::AnyTls(proxy.to_client_config(listen)?),
             Self::Mieru(proxy) => MihomoClientConfig::Mieru(proxy.to_client_config(listen)?),
+            Self::Sudoku(proxy) => MihomoClientConfig::Sudoku(proxy.to_client_config(listen)?),
             Self::Naive(proxy) => MihomoClientConfig::Naive(proxy.to_client_config(listen)?),
             Self::Tuic(proxy) => MihomoClientConfig::Tuic(proxy.to_client_config(listen)?),
             Self::Unsupported(proxy) => proxy.to_client_config(listen)?,
@@ -330,6 +332,11 @@ impl MihomoUnsupportedProxy {
             "anytls" | "any-tls" => MihomoClientConfig::AnyTls(
                 serde_yaml::from_value::<MihomoAnyTlsProxy>(value)
                     .with_context(|| format!("parse mihomo AnyTLS proxy {}", self.name))?
+                    .to_client_config(listen)?,
+            ),
+            "sudoku" => MihomoClientConfig::Sudoku(
+                serde_yaml::from_value::<MihomoSudokuProxy>(value)
+                    .with_context(|| format!("parse mihomo Sudoku proxy {}", self.name))?
                     .to_client_config(listen)?,
             ),
             "mieru" => MihomoClientConfig::Mieru(
@@ -758,6 +765,20 @@ impl MihomoAnyTlsProxy {
                 self.padding_scheme.clone()
             },
             heartbeat_interval_secs: 30,
+        })
+    }
+}
+
+impl MihomoSudokuProxy {
+    pub fn to_client_config(&self, listen: SocketAddr) -> Result<SudokuClientConfig> {
+        ensure_no_proxy_extra_fields(&format!("mihomo Sudoku proxy {}", self.name), &self.fields)?;
+        self.options.validate()?;
+        Ok(SudokuClientConfig {
+            listen,
+            server_host: self.server.clone(),
+            server_port: self.port,
+            key: self.key.clone(),
+            options: self.options.clone(),
         })
     }
 }

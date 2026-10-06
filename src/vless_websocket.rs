@@ -35,7 +35,15 @@ where
     role: WebSocketRole,
     pending_write: Vec<u8>,
     pending_pos: usize,
+    pending_payload_len: Option<usize>,
     close_sent: bool,
+    read_task: tokio::task::JoinHandle<()>,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Drop for WebSocketStream<S> {
+    fn drop(&mut self) {
+        self.read_task.abort();
+    }
 }
 
 struct WebSocketFrame {
@@ -86,6 +94,17 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let request = vless_http::read_http_head(&mut stream).await?;
+    server_with_head(stream, transport, &request).await
+}
+
+pub(crate) async fn server_with_head<S>(
+    mut stream: S,
+    transport: &VlessTransportConfig,
+    request: &str,
+) -> Result<WebSocketStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     vless_http::ensure_request_path(&request, &transport.path)?;
     vless_http::ensure_upgrade_headers(&request, "websocket")?;
     let key = vless_http::header_value(&request, "Sec-WebSocket-Key")
@@ -112,7 +131,7 @@ where
     fn new(stream: S, role: WebSocketRole) -> Self {
         let (reader, writer) = split(stream);
         let (tx, rx) = mpsc::channel(32);
-        tokio::spawn(async move {
+        let read_task = tokio::spawn(async move {
             if let Err(error) = read_frames(reader, tx.clone()).await {
                 let _ = tx.send(Err(format!("{error:?}"))).await;
             }
@@ -125,7 +144,9 @@ where
             role,
             pending_write: Vec::new(),
             pending_pos: 0,
+            pending_payload_len: None,
             close_sent: false,
+            read_task,
         }
     }
 
@@ -202,19 +223,25 @@ where
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
+        if self.pending_payload_len.is_none() {
+            ready!(self.as_mut().poll_pending(cx))?;
+            self.pending_write = build_frame(
+                OPCODE_BINARY,
+                buf,
+                matches!(self.role, WebSocketRole::Client),
+            )
+            .map_err(std::io::Error::other)?;
+            self.pending_payload_len = Some(buf.len());
+        }
+        // A resumed poll completes the existing frame and acknowledges it once.
+        // Keep writes immediate for protocol handshakes that then await a reply.
         ready!(self.as_mut().poll_pending(cx))?;
-        self.pending_write = build_frame(
-            OPCODE_BINARY,
-            buf,
-            matches!(self.role, WebSocketRole::Client),
-        )
-        .map_err(std::io::Error::other)?;
-        ready!(self.as_mut().poll_pending(cx))?;
-        Poll::Ready(Ok(buf.len()))
+        Poll::Ready(Ok(self.pending_payload_len.take().unwrap()))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         ready!(self.as_mut().poll_pending(cx))?;
+        self.pending_payload_len = None;
         Pin::new(&mut self.writer).poll_flush(cx)
     }
 
@@ -223,6 +250,7 @@ where
         cx: &mut TaskContext<'_>,
     ) -> Poll<std::io::Result<()>> {
         ready!(self.as_mut().poll_pending(cx))?;
+        self.pending_payload_len = None;
         if !self.close_sent {
             self.close_sent = true;
             self.pending_write = build_frame(

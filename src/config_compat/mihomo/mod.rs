@@ -12,6 +12,7 @@ use crate::routing::{
 };
 use crate::shadowsocks::ShadowsocksClientConfig;
 use crate::socks::SocksProxyClientConfig;
+use crate::sudoku::{SudokuClientConfig, SudokuOptions};
 use crate::trojan::TrojanClientConfig;
 use crate::tuic::TuicClientConfig;
 use crate::tun::{TunConfig, TunDnsStrategy, socks_proxy_url};
@@ -145,6 +146,7 @@ pub enum MihomoProxy {
     Hysteria2(MihomoHysteria2Proxy),
     AnyTls(MihomoAnyTlsProxy),
     Mieru(MihomoMieruProxy),
+    Sudoku(MihomoSudokuProxy),
     Naive(MihomoNaiveProxy),
     Tuic(MihomoTuicProxy),
     Unsupported(MihomoUnsupportedProxy),
@@ -180,6 +182,7 @@ impl<'de> Deserialize<'de> for MihomoProxy {
             "anytls" | "any-tls" => {
                 decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::AnyTls)
             }
+            "sudoku" => decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::Sudoku),
             "mieru" => decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::Mieru),
             "naive" | "naive+https" | "naive+quic" => {
                 decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::Naive)
@@ -545,6 +548,20 @@ pub struct MihomoHysteria2Proxy {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct MihomoSudokuProxy {
+    pub name: String,
+    pub server: String,
+    pub port: u16,
+    pub key: String,
+    #[serde(default)]
+    pub udp: bool,
+    #[serde(flatten)]
+    pub options: SudokuOptions,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct MihomoMieruProxy {
     pub name: String,
     pub server: String,
@@ -820,6 +837,7 @@ pub enum MihomoClientConfig {
     Hysteria2(Hysteria2ClientConfig),
     AnyTls(ClientConfig),
     Mieru(MieruClientConfig),
+    Sudoku(SudokuClientConfig),
     Naive(NaiveClientConfig),
     Tuic(TuicClientConfig),
 }

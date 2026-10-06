@@ -9,7 +9,7 @@
 ## 特性
 
 - **一端内核，两端复用**：同一套协议栈同时覆盖入站和出站，面板和客户端不容易各写各的。
-- **协议覆盖面大**：AnyTLS、Hysteria2、Mieru、Naive、Shadowsocks、Trojan、TUIC、VLESS（含 REALITY / Vision）、VMess，以及 HTTP / SOCKS、直连 / 阻断。
+- **协议覆盖面大**：AnyTLS、Hysteria2、Mieru、[Sudoku](docs/sudoku.md)、Naive、Shadowsocks、Trojan、TUIC、VLESS（含 REALITY / Vision）、VMess，以及 HTTP / SOCKS、直连 / 阻断。
 - **配置兼容**：能读取 Clash Meta / mihomo YAML、Xray JSON/JSONC、sing-box JSON/JSONC，以及 Aerion 自己的 TOML。
 - **给面板用的记账**：多用户凭证、在线会话、设备数、速率和流量配额，热更新用户时保留已有计数。
 - **本地入口简单**：客户端暴露 SOCKS5（含 UDP ASSOCIATE），并可挂 TUN，方便桌面和 Android VPN 接入。
@@ -28,6 +28,7 @@ Xboard
 | AnyTLS | ✓ | ✓ | TLS 多路复用 | UDP over TCP |
 | Hysteria2 | ✓ | ✓ | QUIC | 原生数据报 |
 | Mieru | ✓ | ✓ | 流 underlay | 原生包 underlay |
+| Sudoku | ✓ | UoT | KIP、经典/packed 编码、HTTPMask legacy / WS | UDP over TCP |
 | Naive | ✓ | ✓ | HTTP/1.1 · H2 · H3 | UDP over TCP |
 | Shadowsocks | ✓ | ✓ | AEAD / 2022 | SS UDP / UoT |
 | Trojan | ✓ | ✓ | TLS / WS / H2 / gRPC / XHTTP | 流内 UDP |

@@ -9,6 +9,24 @@ on:
 
 
 jobs:
+  sudoku-interop:
+    name: Official Sudoku interoperability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+      - run: |
+          git clone https://github.com/SUDOKU-ASCII/sudoku.git /tmp/sudoku-upstream
+          git -C /tmp/sudoku-upstream checkout 4889b53cb35355123bebd40e6c76a9582de7c23d
+          mkdir -p /tmp/sudoku-upstream/cmd/aerion-interop
+          cp tests/sudoku_interop/main.go /tmp/sudoku-upstream/cmd/aerion-interop/main.go
+          cd /tmp/sudoku-upstream
+          go build -o /tmp/sudoku-interop ./cmd/aerion-interop
+      - run: cargo test --locked --no-default-features sudoku::tests -- --nocapture
+        env:
+          SUDOKU_INTEROP_BIN: /tmp/sudoku-interop
   rust:
     name: Rust ${{ matrix.os }}
     runs-on: ${{ matrix.os }}

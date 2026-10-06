@@ -257,12 +257,12 @@ fn associate_packet_len(packet: &[u8]) -> Result<Option<usize>> {
     Ok(Some(payload_len_offset + 2 + payload_len))
 }
 
-fn write_socks_address(bytes: &mut Vec<u8>, target: &ProxyTarget) -> Result<()> {
+pub(crate) fn write_socks_address(bytes: &mut Vec<u8>, target: &ProxyTarget) -> Result<()> {
     bytes.extend_from_slice(&encode_target(target)?);
     Ok(())
 }
 
-fn read_socks_address(packet: &[u8]) -> Result<(ProxyTarget, &[u8])> {
+pub(crate) fn read_socks_address(packet: &[u8]) -> Result<(ProxyTarget, &[u8])> {
     decode_target(packet)
 }
 
