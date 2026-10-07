@@ -850,18 +850,23 @@ async fn mux_server(stream: Tunnel, session: CoreSession) -> Result<()> {
                             loop {
                                 let n = down.read(&mut buf).await?;
                                 if n == 0 {
+                                    mux_frame(&mut *send_output.lock().await, 3, id, &[]).await?;
                                     return Ok::<_, anyhow::Error>(());
                                 }
                                 mux_frame(&mut *send_output.lock().await, 2, id, &buf[..n]).await?;
                             }
                         };
                         let result = tokio::try_join!(relay, send).map(|_| ());
-                        let kind = if result.is_ok() { 3 } else { 4 };
-                        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
-                        if let Err(error) =
-                            mux_frame(&mut *output.lock().await, kind, id, message.as_bytes()).await
+                        if let Err(error) = result
+                            && let Err(error) = mux_frame(
+                                &mut *output.lock().await,
+                                4,
+                                id,
+                                error.to_string().as_bytes(),
+                            )
+                            .await
                         {
-                            tracing::warn!("Sudoku mux close: {error:#}");
+                            tracing::warn!("Sudoku mux reset: {error:#}");
                         }
                         let _ = completed.send(id);
                     });
