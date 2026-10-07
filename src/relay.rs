@@ -26,12 +26,65 @@ where
 }
 
 pub async fn relay_split_counted<LR, LW, RR, RW>(
+    left_reader: LR,
+    left_writer: LW,
+    right_reader: RR,
+    right_writer: RW,
+    session: CoreSession,
+    label: &str,
+) -> Result<()>
+where
+    LR: AsyncRead + Unpin,
+    LW: AsyncWrite + Unpin,
+    RR: AsyncRead + Unpin,
+    RW: AsyncWrite + Unpin,
+{
+    relay_split_with_close_mode(
+        left_reader,
+        left_writer,
+        right_reader,
+        right_writer,
+        session,
+        label,
+        false,
+    )
+    .await
+}
+
+// Sudoku's record and mux transports expose directional FIN. Drain the other
+// direction after FIN, while retaining cancellation, limits and accounting.
+pub(crate) async fn relay_bidirectional_half_closed_counted<A, B>(
+    left: &mut A,
+    right: &mut B,
+    session: CoreSession,
+    label: &str,
+) -> Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (left_reader, left_writer) = tokio::io::split(left);
+    let (right_reader, right_writer) = tokio::io::split(right);
+    relay_split_with_close_mode(
+        left_reader,
+        left_writer,
+        right_reader,
+        right_writer,
+        session,
+        label,
+        true,
+    )
+    .await
+}
+
+async fn relay_split_with_close_mode<LR, LW, RR, RW>(
     mut left_reader: LR,
     mut left_writer: LW,
     mut right_reader: RR,
     mut right_writer: RW,
     session: CoreSession,
     label: &str,
+    half_close: bool,
 ) -> Result<()>
 where
     LR: AsyncRead + Unpin,
@@ -48,6 +101,9 @@ where
                 .await
                 .with_context(|| format!("read {label} uplink"))?;
             if read == 0 {
+                if half_close {
+                    right_writer.shutdown().await?;
+                }
                 return Ok::<(), anyhow::Error>(());
             }
             uplink_session.record_upload(read).await?;
@@ -69,6 +125,9 @@ where
                 .await
                 .with_context(|| format!("read {label} downlink"))?;
             if read == 0 {
+                if half_close {
+                    left_writer.shutdown().await?;
+                }
                 return Ok::<(), anyhow::Error>(());
             }
             session.record_download(read).await?;
@@ -82,10 +141,19 @@ where
                 .with_context(|| format!("flush {label} downlink"))?;
         }
     };
+    let forwarding = async {
+        if half_close {
+            tokio::try_join!(uplink, downlink).map(|_| ())
+        } else {
+            tokio::select! {
+                result = uplink => result,
+                result = downlink => result,
+            }
+        }
+    };
     let result = tokio::select! {
         _ = session.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
-        result = uplink => result,
-        result = downlink => result,
+        result = forwarding => result,
     };
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let _ = tokio::join!(right_writer.shutdown(), left_writer.shutdown());

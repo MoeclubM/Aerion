@@ -37,7 +37,8 @@ async fn record_tunnel_half_close_drains_backpressured_write() -> Result<()> {
         tokio::try_join!(send, receive).map(|(_, received)| received)
     })
     .await??;
-    assert_eq!(received, payload);
+    assert_eq!(received.len(), payload.len());
+    assert!(received == payload, "backpressured record data changed");
     Ok(())
 }
 
@@ -104,7 +105,8 @@ async fn raw_and_mux_fin_preserve_delayed_response_and_accounting() -> Result<()
                         _ => bail!("unexpected mux response {kind}"),
                     }
                 }
-                assert_eq!(received, expected);
+                assert_eq!(received.len(), expected.len());
+                assert!(received == expected, "mux response data changed");
             } else {
                 sender.kip(&mut wire, 0x10, &address).await?;
                 sender.write(&mut wire, b"request before FIN").await?;
@@ -117,7 +119,8 @@ async fn raw_and_mux_fin_preserve_delayed_response_and_accounting() -> Result<()
                     }
                     received.extend(plain);
                 }
-                assert_eq!(received, expected);
+                assert_eq!(received.len(), expected.len());
+                assert!(received == expected, "raw response data changed");
             }
             responder.await??;
             Ok::<(), anyhow::Error>(())
@@ -129,6 +132,77 @@ async fn raw_and_mux_fin_preserve_delayed_response_and_accounting() -> Result<()
         assert_eq!(snapshot[0].upload_bytes, b"request before FIN".len() as u64);
         assert_eq!(snapshot[0].download_bytes, expected.len() as u64);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn official_go_half_close_receives_delayed_response() -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let Ok(binary) = std::env::var("SUDOKU_INTEROP_BIN") else {
+        return Ok(());
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(run_sudoku_server_listener_with_core(
+        listener,
+        SudokuServerConfig {
+            listen: address,
+            key: "interop-user-psk".into(),
+            users: vec![],
+            options: SudokuOptions {
+                aead: "aes-128-gcm".into(),
+                ..Default::default()
+            },
+        },
+        ProxyCore::from_credentials("interop-user-psk", &[]),
+    ));
+    let destination = TcpListener::bind("127.0.0.1:0").await?;
+    let target = destination.local_addr()?.to_string();
+    let responder = tokio::spawn(async move {
+        let (mut stream, _) = destination.accept().await?;
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).await?;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stream.write_all(&request).await?;
+        stream.shutdown().await?;
+        Ok::<(), anyhow::Error>(())
+    });
+    let expected = (0..131_073).map(|i| i as u8).collect::<Vec<_>>();
+    let payload = expected.clone();
+    let response = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let mut peer = Peer(
+            Command::new(binary)
+                .args([
+                    "-mode",
+                    "client",
+                    "-addr",
+                    &address.to_string(),
+                    "-target",
+                    &target,
+                    "-aead",
+                    "aes-128-gcm",
+                    "-half-close",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?,
+        );
+        peer.0.stdin.take().unwrap().write_all(&payload)?;
+        let mut response = Vec::new();
+        std::io::Read::read_to_end(&mut peer.0.stdout.take().unwrap(), &mut response)?;
+        ensure!(
+            peer.0.wait()?.success(),
+            "official half-close client failed"
+        );
+        Ok(response)
+    })
+    .await?;
+    server.abort();
+    responder.await??;
+    let response = response?;
+    assert_eq!(response.len(), expected.len());
+    assert!(response == expected, "official peer response data changed");
     Ok(())
 }
 
