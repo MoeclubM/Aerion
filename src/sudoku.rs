@@ -4,8 +4,9 @@ mod record;
 mod table;
 mod transport;
 
-use crate::core::{CoreSession, ProxyCore, relay_bidirectional_counted};
+use crate::core::{CoreSession, ProxyCore};
 use crate::protocol::ProxyTarget;
+use crate::relay::relay_bidirectional_half_closed_counted;
 use crate::{socket_protect, socks, uot};
 use anyhow::{Context, Result, bail, ensure};
 use record::{Receiver, Sender, bases};
@@ -356,6 +357,7 @@ struct Tunnel {
 #[derive(Default)]
 struct Progress {
     sent: std::sync::atomic::AtomicU64,
+    write_closed: std::sync::atomic::AtomicBool,
     waker: Mutex<Option<std::task::Waker>>,
 }
 impl Progress {
@@ -366,6 +368,11 @@ impl Progress {
     }
     fn register(&self, waker: &std::task::Waker) {
         *self.waker.lock().unwrap() = Some(waker.clone());
+    }
+    fn finish_write(&self) {
+        self.write_closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.wake();
     }
     fn wake(&self) {
         let waker = self.waker.lock().unwrap().take();
@@ -437,14 +444,29 @@ impl AsyncWrite for Tunnel {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        use std::future::Future;
         if self.closed {
             return std::task::Poll::Ready(Ok(()));
         }
         std::task::ready!(std::pin::Pin::new(&mut self.stream).poll_shutdown(cx))?;
-        let result = std::task::ready!(std::pin::Pin::new(&mut self.task).poll(cx));
-        self.closed = true;
-        std::task::Poll::Ready(result.map_err(std::io::Error::other))
+        self.progress.register(cx.waker());
+        if let Some(error) = self.error.lock().unwrap().as_ref() {
+            return std::task::Poll::Ready(Err(std::io::Error::other(error.clone())));
+        }
+        if self
+            .progress
+            .write_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.closed = true;
+            std::task::Poll::Ready(Ok(()))
+        } else if self.task.is_finished() {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "Sudoku tunnel closed before write shutdown",
+            )))
+        } else {
+            std::task::Poll::Pending
+        }
     }
 }
 fn tunnel<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
@@ -465,6 +487,8 @@ fn tunnel<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             loop {
                 let n = plain_read.read(&mut buf).await?;
                 if n == 0 {
+                    write.shutdown().await?;
+                    sent.finish_write();
                     return Ok::<_, anyhow::Error>(());
                 }
                 sender.write(&mut write, &buf[..n]).await?;
@@ -475,17 +499,17 @@ fn tunnel<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             loop {
                 let plain = receiver.read(&mut read).await?;
                 if plain.is_empty() {
+                    plain_write.shutdown().await?;
                     return Ok::<_, anyhow::Error>(());
                 }
                 plain_write.write_all(&plain).await?;
             }
         };
-        let result = tokio::select! {result=up=>result,result=down=>result};
+        let result = tokio::try_join!(up, down);
         if let Err(error) = result {
             *errors.lock().unwrap() = Some(format!("{error:#}"));
             tracing::warn!("Sudoku tunnel: {error:#}");
         }
-        let _ = write.shutdown().await;
         let _ = plain_write.shutdown().await;
         sent.wake();
     });
@@ -538,7 +562,7 @@ pub async fn run_sudoku_server_listener_with_core(
                         match kind {
                             0x10=>{ let (target,tail)=uot::read_socks_address(&payload)?;ensure!(tail.is_empty(),"trailing Sudoku target bytes");
                                 let mut outbound=socket_protect::connect_proxy_target(&target).await?;
-                                relay_bidirectional_counted(&mut stream,&mut outbound,session.clone(),"Sudoku").await
+                                relay_bidirectional_half_closed_counted(&mut stream,&mut outbound,session.clone(),"Sudoku").await
                             },
                             0x12=>udp_server(&mut stream,session.clone()).await,
                             0x11=>mux_server(stream,session.clone()).await,
@@ -591,7 +615,7 @@ pub async fn run_sudoku_client_listener_with_core(
                         socks::write_reply(&mut local,0).await?;
                         let mut upstream=tunnel(upstream,receiver,sender);
                         let mut upstream=if multiplex { mux_frame(&mut upstream,1,1,&address).await?; mux_client(upstream) } else { upstream };
-                        tokio::select!{_=session.cancelled()=>Ok(()),result=relay_bidirectional_counted(&mut local,&mut upstream,session.clone(),"Sudoku client")=>result}
+                        tokio::select!{_=session.cancelled()=>Ok(()),result=relay_bidirectional_half_closed_counted(&mut local,&mut upstream,session.clone(),"Sudoku client")=>result}
                     },
                     socks::SocksRequest::UdpAssociate=>{
                         sender.kip(&mut upstream,0x12,&[]).await?;
@@ -726,6 +750,7 @@ fn mux_client(stream: Tunnel) -> Tunnel {
                 let n = plain_read.read(&mut buf).await?;
                 if n == 0 {
                     mux_frame(&mut *write.lock().await, 3, 1, &[]).await?;
+                    sent.finish_write();
                     return Ok::<_, anyhow::Error>(());
                 }
                 mux_frame(&mut *write.lock().await, 2, 1, &buf[..n]).await?;
@@ -742,7 +767,10 @@ fn mux_client(stream: Tunnel) -> Tunnel {
                 read.read_exact(&mut payload).await?;
                 match kind {
                     2 if id == 1 => plain_write.write_all(&payload).await?,
-                    3 if id == 1 => return Ok::<_, anyhow::Error>(()),
+                    3 if id == 1 => {
+                        plain_write.shutdown().await?;
+                        return Ok::<_, anyhow::Error>(());
+                    }
                     4 if id == 1 => {
                         bail!("Sudoku mux reset: {}", String::from_utf8_lossy(&payload))
                     }
@@ -752,7 +780,7 @@ fn mux_client(stream: Tunnel) -> Tunnel {
                 }
             }
         };
-        let result = tokio::select! {result=up=>result,result=down=>result};
+        let result = tokio::try_join!(up, down);
         if let Err(error) = result {
             *errors.lock().unwrap() = Some(format!("{error:#}"));
         }
@@ -775,7 +803,7 @@ async fn mux_server(stream: Tunnel, session: CoreSession) -> Result<()> {
     let mut streams: HashMap<
         u32,
         (
-            tokio::io::WriteHalf<tokio::io::DuplexStream>,
+            Option<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
             tokio::task::AbortHandle,
         ),
     > = HashMap::new();
@@ -788,7 +816,19 @@ async fn mux_server(stream: Tunnel, session: CoreSession) -> Result<()> {
                 streams.remove(&id);
             }
             while tasks.try_join_next().is_some() {}
-            let kind = reader.read_u8().await?;
+            let mut kind = [0];
+            if reader.read(&mut kind).await? == 0 {
+                // A session FIN may follow DATA/CLOSE while a stream is still
+                // draining its accepted payload to the destination.
+                for (up, _) in streams.values_mut() {
+                    if let Some(mut up) = up.take() {
+                        let _ = up.shutdown().await;
+                    }
+                }
+                while tasks.join_next().await.is_some() {}
+                return Ok::<(), anyhow::Error>(());
+            }
+            let kind = kind[0];
             let id = reader.read_u32().await?;
             let length = reader.read_u32().await? as usize;
             ensure!(length <= 256 * 1024, "oversized Sudoku mux frame");
@@ -808,7 +848,7 @@ async fn mux_server(stream: Tunnel, session: CoreSession) -> Result<()> {
                         let relay = async move {
                             let mut outbound =
                                 socket_protect::connect_proxy_target(&target).await?;
-                            relay_bidirectional_counted(
+                            relay_bidirectional_half_closed_counted(
                                 &mut remote,
                                 &mut outbound,
                                 tracked,
@@ -822,33 +862,47 @@ async fn mux_server(stream: Tunnel, session: CoreSession) -> Result<()> {
                             loop {
                                 let n = down.read(&mut buf).await?;
                                 if n == 0 {
+                                    mux_frame(&mut *send_output.lock().await, 3, id, &[]).await?;
                                     return Ok::<_, anyhow::Error>(());
                                 }
                                 mux_frame(&mut *send_output.lock().await, 2, id, &buf[..n]).await?;
                             }
                         };
                         let result = tokio::try_join!(relay, send).map(|_| ());
-                        let kind = if result.is_ok() { 3 } else { 4 };
-                        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
-                        if let Err(error) =
-                            mux_frame(&mut *output.lock().await, kind, id, message.as_bytes()).await
+                        if let Err(error) = result
+                            && let Err(error) = mux_frame(
+                                &mut *output.lock().await,
+                                4,
+                                id,
+                                error.to_string().as_bytes(),
+                            )
+                            .await
                         {
-                            tracing::warn!("Sudoku mux close: {error:#}");
+                            tracing::warn!("Sudoku mux reset: {error:#}");
                         }
                         let _ = completed.send(id);
                     });
-                    streams.insert(id, (up, task));
+                    streams.insert(id, (Some(up), task));
                 }
                 2 => {
-                    if let Some((up, _)) = streams.get_mut(&id) {
-                        up.write_all(&payload).await?;
-                    } else {
-                        mux_frame(&mut *writer.lock().await, 4, id, b"unknown stream").await?;
+                    if let Some((Some(up), _)) = streams.get_mut(&id)
+                        && up.write_all(&payload).await.is_err()
+                    {
+                        if let Some((_, task)) = streams.remove(&id) {
+                            task.abort();
+                        }
+                        mux_frame(&mut *writer.lock().await, 4, id, b"stream closed").await?;
                     }
                 }
-                3 | 4 => {
-                    if let Some((mut up, task)) = streams.remove(&id) {
-                        up.shutdown().await?;
+                3 => {
+                    if let Some((up, _)) = streams.get_mut(&id)
+                        && let Some(mut up) = up.take()
+                    {
+                        let _ = up.shutdown().await;
+                    }
+                }
+                4 => {
+                    if let Some((_, task)) = streams.remove(&id) {
                         task.abort();
                     }
                 }

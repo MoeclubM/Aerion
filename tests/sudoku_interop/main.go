@@ -30,6 +30,7 @@ func main() {
     custom := flag.String("custom", "", "custom layout")
     pure := flag.Bool("pure", false, "classic downlink")
     mask := flag.String("mask", "raw", "raw or ws")
+    halfClose := flag.Bool("half-close", false, "close the TCP write side before reading the response")
     flag.Parse()
     cfg := &config.Config{Key:*key, AEAD:*aead, ASCII:*ascii, PaddingMin:5, PaddingMax:15, EnablePureDownlink:*pure}
     cfg.HTTPMask.Disable = true
@@ -85,6 +86,11 @@ func main() {
     must(err)
     _, err = conn.Write(payload)
     must(err)
+    if *halfClose {
+        writer, ok := raw.(interface{ CloseWrite() error })
+        if !ok { panic("test transport does not support half-close") }
+        must(writer.CloseWrite())
+    }
     response := make([]byte,len(payload))
     _, err = io.ReadFull(conn,response)
     must(err)

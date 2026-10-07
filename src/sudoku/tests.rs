@@ -2,6 +2,283 @@ use super::*;
 
 include!("../../tests/performance/sudoku.rs");
 
+#[tokio::test]
+async fn record_tunnel_half_close_drains_backpressured_write() -> Result<()> {
+    let table = Table::new("half-close", "prefer_entropy", "")?;
+    let (up, down) = bases("half-close", None, &[])?;
+    // A tiny wire buffer forces every record through multiple Pending writes.
+    let (wire, mut peer) = tokio::io::duplex(17);
+    let mut stream = tunnel(
+        wire,
+        Receiver::new(table.clone(), false, false, up, "aes-128-gcm"),
+        Sender::new(table.clone(), true, true, down, "aes-128-gcm", 0)?,
+    );
+    let mut decoder = Receiver::new(table, true, true, down, "aes-128-gcm");
+    peer.shutdown().await?;
+    let mut byte = [0];
+    assert_eq!(stream.read(&mut byte).await?, 0);
+    let payload = (0..131_073).map(|i| (i * 7) as u8).collect::<Vec<_>>();
+    let received = tokio::time::timeout(Duration::from_secs(5), async {
+        let send = async {
+            stream.write_all(&payload).await?;
+            stream.shutdown().await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        let receive = async {
+            let mut received = Vec::new();
+            loop {
+                let plain = decoder.read(&mut peer).await?;
+                if plain.is_empty() {
+                    return Ok::<_, anyhow::Error>(received);
+                }
+                received.extend(plain);
+            }
+        };
+        tokio::try_join!(send, receive).map(|(_, received)| received)
+    })
+    .await??;
+    assert_eq!(received.len(), payload.len());
+    assert!(received == payload, "backpressured record data changed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn raw_and_mux_fin_preserve_delayed_response_and_accounting() -> Result<()> {
+    for multiplex in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let options = SudokuOptions {
+            aead: "aes-128-gcm".into(),
+            padding_min: 1,
+            padding_max: 5,
+            ..Default::default()
+        };
+        let core = ProxyCore::from_credentials("half-close-user", &[]);
+        let server = tokio::spawn(run_sudoku_server_listener_with_core(
+            listener,
+            SudokuServerConfig {
+                listen: address,
+                key: "half-close-user".into(),
+                users: vec![],
+                options: options.clone(),
+            },
+            core.clone(),
+        ));
+        let destination = TcpListener::bind("127.0.0.1:0").await?;
+        let target = ProxyTarget::Ip(destination.local_addr()?);
+        let expected = (0..131_073).map(|i| (i * 3) as u8).collect::<Vec<_>>();
+        let response = expected.clone();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = destination.accept().await?;
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await?;
+            assert_eq!(request, b"request before FIN");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            stream.write_all(&response).await?;
+            stream.shutdown().await?;
+            Ok::<(), anyhow::Error>(())
+        });
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut wire = TcpStream::connect(address).await?;
+            let (mut receiver, mut sender) =
+                client_handshake(&mut wire, "half-close-user", &options).await?;
+            let mut address = Vec::new();
+            uot::write_socks_address(&mut address, &target)?;
+            if multiplex {
+                sender.kip(&mut wire, 0x11, &[]).await?;
+                let mut stream = tunnel(wire, receiver, sender);
+                mux_frame(&mut stream, 1, 1, &address).await?;
+                // Mihomo's idle keepalive must not reset stream zero.
+                mux_frame(&mut stream, 2, 0, &[]).await?;
+                mux_frame(&mut stream, 2, 1, b"request before FIN").await?;
+                mux_frame(&mut stream, 3, 1, &[]).await?;
+                let mut received = Vec::new();
+                loop {
+                    let kind = stream.read_u8().await?;
+                    assert_eq!(stream.read_u32().await?, 1);
+                    let length = stream.read_u32().await? as usize;
+                    let mut data = vec![0; length];
+                    stream.read_exact(&mut data).await?;
+                    match kind {
+                        2 => received.extend(data),
+                        3 => break,
+                        _ => bail!("unexpected mux response {kind}"),
+                    }
+                }
+                assert_eq!(received.len(), expected.len());
+                assert!(received == expected, "mux response data changed");
+            } else {
+                sender.kip(&mut wire, 0x10, &address).await?;
+                sender.write(&mut wire, b"request before FIN").await?;
+                wire.shutdown().await?;
+                let mut received = Vec::new();
+                loop {
+                    let plain = receiver.read(&mut wire).await?;
+                    if plain.is_empty() {
+                        break;
+                    }
+                    received.extend(plain);
+                }
+                assert_eq!(received.len(), expected.len());
+                assert!(received == expected, "raw response data changed");
+            }
+            responder.await??;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+        server.abort();
+        result.with_context(|| format!("multiplex={multiplex}"))??;
+        let snapshot = core.snapshot().await;
+        assert_eq!(snapshot[0].upload_bytes, b"request before FIN".len() as u64);
+        assert_eq!(snapshot[0].download_bytes, expected.len() as u64);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn raw_and_mux_target_fin_keep_upload_open() -> Result<()> {
+    for multiplex in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let options = SudokuOptions {
+            aead: "aes-128-gcm".into(),
+            padding_min: 1,
+            padding_max: 5,
+            ..Default::default()
+        };
+        let core = ProxyCore::from_credentials("target-fin-user", &[]);
+        let server = tokio::spawn(run_sudoku_server_listener_with_core(
+            listener,
+            SudokuServerConfig {
+                listen: address,
+                key: "target-fin-user".into(),
+                users: vec![],
+                options: options.clone(),
+            },
+            core.clone(),
+        ));
+        let destination = TcpListener::bind("127.0.0.1:0").await?;
+        let target = ProxyTarget::Ip(destination.local_addr()?);
+        let upload = (0..131_073).map(|i| (i * 11) as u8).collect::<Vec<_>>();
+        let expected = upload.clone();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = destination.accept().await?;
+            let mut request = [0; 7];
+            stream.read_exact(&mut request).await?;
+            assert_eq!(&request, b"request");
+            stream.write_all(b"reply before FIN").await?;
+            stream.shutdown().await?;
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await?;
+            assert_eq!(received.len(), expected.len());
+            assert!(received == expected, "upload after target FIN changed");
+            Ok::<(), anyhow::Error>(())
+        });
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut wire = TcpStream::connect(address).await?;
+            let (receiver, mut sender) =
+                client_handshake(&mut wire, "target-fin-user", &options).await?;
+            let mut address = Vec::new();
+            uot::write_socks_address(&mut address, &target)?;
+            let mut stream = if multiplex {
+                sender.kip(&mut wire, 0x11, &[]).await?;
+                let mut stream = tunnel(wire, receiver, sender);
+                mux_frame(&mut stream, 1, 1, &address).await?;
+                mux_client(stream)
+            } else {
+                sender.kip(&mut wire, 0x10, &address).await?;
+                tunnel(wire, receiver, sender)
+            };
+            stream.write_all(b"request").await?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await?;
+            assert_eq!(response, b"reply before FIN");
+            stream.write_all(&upload).await?;
+            stream.shutdown().await?;
+            responder.await??;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+        server.abort();
+        result.with_context(|| format!("multiplex={multiplex}"))??;
+        let snapshot = core.snapshot().await;
+        assert_eq!(snapshot[0].upload_bytes, 7 + upload.len() as u64);
+        assert_eq!(snapshot[0].download_bytes, 16);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn official_go_half_close_receives_delayed_response() -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let Ok(binary) = std::env::var("SUDOKU_INTEROP_BIN") else {
+        return Ok(());
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(run_sudoku_server_listener_with_core(
+        listener,
+        SudokuServerConfig {
+            listen: address,
+            key: "interop-user-psk".into(),
+            users: vec![],
+            options: SudokuOptions {
+                aead: "aes-128-gcm".into(),
+                ..Default::default()
+            },
+        },
+        ProxyCore::from_credentials("interop-user-psk", &[]),
+    ));
+    let destination = TcpListener::bind("127.0.0.1:0").await?;
+    let target = destination.local_addr()?.to_string();
+    let responder = tokio::spawn(async move {
+        let (mut stream, _) = destination.accept().await?;
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).await?;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stream.write_all(&request).await?;
+        stream.shutdown().await?;
+        Ok::<(), anyhow::Error>(())
+    });
+    let expected = (0..131_073).map(|i| i as u8).collect::<Vec<_>>();
+    let payload = expected.clone();
+    let response = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let mut peer = Peer(
+            Command::new(binary)
+                .args([
+                    "-mode",
+                    "client",
+                    "-addr",
+                    &address.to_string(),
+                    "-target",
+                    &target,
+                    "-aead",
+                    "aes-128-gcm",
+                    "-half-close",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?,
+        );
+        peer.0.stdin.take().unwrap().write_all(&payload)?;
+        let mut response = Vec::new();
+        std::io::Read::read_to_end(&mut peer.0.stdout.take().unwrap(), &mut response)?;
+        ensure!(
+            peer.0.wait()?.success(),
+            "official half-close client failed"
+        );
+        Ok(response)
+    })
+    .await?;
+    server.abort();
+    responder.await??;
+    let response = response?;
+    assert_eq!(response.len(), expected.len());
+    assert!(response == expected, "official peer response data changed");
+    Ok(())
+}
+
 #[test]
 fn appearance_preserves_fragmented_record_boundaries_without_padding() -> Result<()> {
     for mode in ["prefer_ascii", "prefer_entropy", "up_ascii_down_entropy"] {
