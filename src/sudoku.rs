@@ -816,7 +816,19 @@ async fn mux_server(stream: Tunnel, session: CoreSession) -> Result<()> {
                 streams.remove(&id);
             }
             while tasks.try_join_next().is_some() {}
-            let kind = reader.read_u8().await?;
+            let mut kind = [0];
+            if reader.read(&mut kind).await? == 0 {
+                // A session FIN may follow DATA/CLOSE while a stream is still
+                // draining its accepted payload to the destination.
+                for (up, _) in streams.values_mut() {
+                    if let Some(mut up) = up.take() {
+                        let _ = up.shutdown().await;
+                    }
+                }
+                while tasks.join_next().await.is_some() {}
+                return Ok::<(), anyhow::Error>(());
+            }
+            let kind = kind[0];
             let id = reader.read_u32().await?;
             let length = reader.read_u32().await? as usize;
             ensure!(length <= 256 * 1024, "oversized Sudoku mux frame");
