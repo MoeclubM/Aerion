@@ -292,7 +292,7 @@ fn chrome_like_profile(randomized: bool) -> Result<ProfileSpec> {
         ],
         groups: vec![GROUP_X25519, GROUP_SECP256R1, GROUP_SECP384R1],
         signatures: vec![
-            0x0403, 0x0804, 0x0807, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+            0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
         ],
         extensions: vec![
             ExtensionKind::Grease,

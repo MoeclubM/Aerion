@@ -28,8 +28,6 @@ const REALITY_AUTH_PLAIN_LEN: usize = 16;
 
 type HmacSha512 = Hmac<Sha512>;
 
-const REALITY_MAX_CLIENT_VERSION: [u8; 4] = [0, 0, 0, 1];
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RealityFallbackLimit {
     pub after_bytes: u64,
@@ -96,6 +94,29 @@ pub struct RealityCertificateState {
     signature_offset: usize,
 }
 
+#[derive(Debug)]
+struct RealitySigningKey(Arc<dyn rustls::sign::SigningKey>);
+
+impl rustls::sign::SigningKey for RealitySigningKey {
+    fn choose_scheme(
+        &self,
+        _offered: &[rustls::SignatureScheme],
+    ) -> Option<Box<dyn rustls::sign::Signer>> {
+        // Authenticated REALITY uses Ed25519 CertificateVerify, including for
+        // Chrome fingerprints that omit Ed25519. This matches XTLS/REALITY;
+        // the signature is still generated and verified with the real key.
+        self.0.choose_scheme(&[rustls::SignatureScheme::ED25519])
+    }
+
+    fn public_key(&self) -> Option<rustls::pki_types::SubjectPublicKeyInfoDer<'_>> {
+        self.0.public_key()
+    }
+
+    fn algorithm(&self) -> rustls::SignatureAlgorithm {
+        self.0.algorithm()
+    }
+}
+
 impl RealityServerConfig {
     pub fn from_strings(
         server_name: impl Into<String>,
@@ -122,7 +143,7 @@ impl RealityServerConfig {
             short_ids: parse_short_ids(short_ids)?,
             alpn_protocols,
             max_time_diff_secs: 0,
-            max_client_version: Some(REALITY_MAX_CLIENT_VERSION),
+            max_client_version: None,
             fallback_limit: RealityFallbackLimit::default(),
         })
     }
@@ -249,10 +270,18 @@ impl RealityCertificateState {
         crate::tls::init_crypto();
         let certificate = self.certificate_for_auth_key(auth_key)?;
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.key_der.clone()));
-        let mut config = ServerConfig::builder()
+        let key = rustls::crypto::ring::sign::any_supported_type(&key)
+            .context("load REALITY Ed25519 signing key")?;
+        let certified = rustls::sign::CertifiedKey::new(
+            vec![CertificateDer::from(certificate)],
+            Arc::new(RealitySigningKey(key)),
+        );
+        certified
+            .keys_match()
+            .context("validate REALITY certificate key")?;
+        let mut config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_no_client_auth()
-            .with_single_cert(vec![CertificateDer::from(certificate)], key)
-            .context("build REALITY TLS server config")?;
+            .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(certified)));
         config.alpn_protocols = alpn.to_vec();
         Ok(Arc::new(config))
     }

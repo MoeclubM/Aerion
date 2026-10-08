@@ -78,21 +78,27 @@ pub(super) async fn server(
     if !options.http_mask {
         return Ok(Box::new(stream));
     }
-    let mut probe = [0; 3];
+    let mut probe = [0; 4];
     stream.read_exact(&mut probe).await?;
     let (reader, writer) = stream.into_split();
     let mut stream = tokio::io::join(std::io::Cursor::new(probe).chain(reader), writer);
-    if &probe != b"GET" {
+    if !matches!(
+        &probe,
+        b"GET " | b"POST" | b"HEAD" | b"PUT " | b"OPTI" | b"PATC" | b"DELE"
+    ) {
         return Ok(Box::new(stream));
     }
     let request = vless_http::read_http_head(&mut stream).await?;
-    if !request.to_ascii_lowercase().contains("upgrade: websocket") {
-        ensure!(
-            options.http_mask_mode == "legacy",
-            "Sudoku requires a WebSocket upgrade"
-        );
+    // Legacy's Upgrade header is camouflage: its body is still the raw
+    // Sudoku stream, not WebSocket frames.
+    if options.http_mask_mode == "legacy" {
         return Ok(Box::new(stream));
     }
+    ensure!(
+        vless_http::header_value(&request, "Upgrade")
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket")),
+        "Sudoku requires a WebSocket upgrade"
+    );
     ensure!(
         options.http_mask_mode == "ws",
         "Sudoku WebSocket mode is disabled"

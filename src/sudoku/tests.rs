@@ -1,5 +1,31 @@
 use super::*;
 
+#[tokio::test]
+async fn legacy_httpmask_preserves_body_after_post_and_fake_websocket_headers() -> Result<()> {
+    for header in [
+        "POST /api/upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1048576\r\n\r\n",
+        "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        "", // raw clients remain accepted by a legacy listener
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let mut client = TcpStream::connect(listener.local_addr()?).await?;
+        let (server, _) = listener.accept().await?;
+        let mut packet = header.as_bytes().to_vec();
+        packet.extend(b"raw-encrypted-body");
+        client.write_all(&packet).await?;
+        let options = SudokuOptions {
+            http_mask: true,
+            http_mask_mode: "legacy".into(),
+            ..Default::default()
+        };
+        let mut server = transport::server(server, &options, &["test-user".into()]).await?;
+        let mut body = [0; 18];
+        tokio::time::timeout(Duration::from_secs(1), server.read_exact(&mut body)).await??;
+        assert_eq!(&body, b"raw-encrypted-body");
+    }
+    Ok(())
+}
+
 include!("../../tests/performance/sudoku.rs");
 include!("../../tests/performance/sudoku_transport.rs");
 
@@ -665,7 +691,7 @@ async fn authenticated_handshake_and_revoked_users() -> Result<()> {
                 ..SudokuOptions::default()
             };
             let (mut client, mut server) = tokio::io::duplex(4096);
-            let cache = Arc::new(Mutex::new(HashMap::new()));
+            let cache = handshake_replays();
             let (client_result, server_result) = tokio::join!(
                 client_handshake(&mut client, "bob-key", &options),
                 server_handshake(
@@ -719,7 +745,7 @@ async fn credential_cache_reuses_tables_and_enforces_live_revocation() -> Result
     assert!(current.iter().any(|entry| entry.value == "carol-key"));
     // A handshake already holding an old snapshot must fail after revocation.
     let (mut client, mut server) = tokio::io::duplex(4096);
-    let replays = Arc::new(Mutex::new(HashMap::new()));
+    let replays = handshake_replays();
     let handshake = async {
         let result = server_handshake(
             &mut server,
@@ -772,7 +798,7 @@ async fn replayed_hello_is_rejected_and_user_hash_cannot_choose_identity() -> Re
     let key = "bob-key";
     let options = SudokuOptions::default();
     let core = ProxyCore::from_credentials("alice-key", &[key.into()]);
-    let replays = Arc::new(Mutex::new(HashMap::new()));
+    let replays = handshake_replays();
     let ephemeral = secret()?;
     let mut hello = timestamp()?.to_be_bytes().to_vec();
     hello.extend(&Sha256::digest(b"alice-key")[..8]); // Deliberately claim another user's hash.

@@ -1,7 +1,143 @@
 use std::io::{Error, ErrorKind, Result};
 use std::pin::Pin;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
+
+pub(crate) mod tls;
+
+#[derive(Default)]
+pub(crate) struct VisionControl {
+    read_direct: AtomicBool,
+    write_direct: AtomicBool,
+    filter: Mutex<TlsFilter>,
+}
+
+impl VisionControl {
+    pub(crate) fn read_direct(&self) -> bool {
+        self.read_direct.load(Ordering::Acquire)
+    }
+    pub(crate) fn write_direct(&self) -> bool {
+        self.write_direct.load(Ordering::Acquire)
+    }
+    pub(crate) fn start_write_direct(&self) {
+        self.write_direct.store(true, Ordering::Release);
+    }
+    fn observe(&self, payload: &[u8], incoming: bool) {
+        self.filter
+            .lock()
+            .expect("Vision TLS filter poisoned")
+            .observe(payload, incoming);
+    }
+}
+
+#[derive(Default)]
+struct TlsFilter {
+    incoming: TlsProbe,
+    outgoing: TlsProbe,
+    tls: bool,
+    direct: bool,
+}
+
+#[derive(Default)]
+struct TlsProbe {
+    buffer: Vec<u8>,
+    handshake: Vec<u8>,
+    stopped: bool,
+}
+
+impl TlsFilter {
+    fn observe(&mut self, payload: &[u8], incoming: bool) {
+        let probe = if incoming {
+            &mut self.incoming
+        } else {
+            &mut self.outgoing
+        };
+        if probe.stopped {
+            return;
+        }
+        probe.buffer.extend_from_slice(payload);
+        loop {
+            if probe.buffer.len() < 5 {
+                return;
+            }
+            if probe.buffer[0] != 22 || probe.buffer[1] != 3 {
+                probe.buffer.clear();
+                probe.handshake.clear();
+                probe.stopped = true;
+                return;
+            }
+            let len = u16::from_be_bytes([probe.buffer[3], probe.buffer[4]]) as usize;
+            if len > 18432 {
+                probe.stopped = true;
+                probe.buffer.clear();
+                return;
+            }
+            if probe.buffer.len() < 5 + len {
+                return;
+            }
+            probe.handshake.extend_from_slice(&probe.buffer[5..5 + len]);
+            probe.buffer.drain(..5 + len);
+            while probe.handshake.len() >= 4 {
+                let len = (usize::from(probe.handshake[1]) << 16)
+                    | (usize::from(probe.handshake[2]) << 8)
+                    | usize::from(probe.handshake[3]);
+                if len > 65536 {
+                    probe.stopped = true;
+                    probe.handshake.clear();
+                    return;
+                }
+                if probe.handshake.len() < 4 + len {
+                    break;
+                }
+                if matches!(probe.handshake[0], 1 | 2) {
+                    self.tls = true;
+                }
+                if probe.handshake[0] == 2 {
+                    self.direct = server_hello_allows_direct(&probe.handshake[4..4 + len]);
+                }
+                probe.handshake.drain(..4 + len);
+            }
+        }
+    }
+}
+
+fn server_hello_allows_direct(hello: &[u8]) -> bool {
+    if hello.len() < 38 || hello[..2] != [3, 3] {
+        return false;
+    }
+    let cipher_offset = 35 + usize::from(hello[34]);
+    let Some(suite) = hello.get(cipher_offset..cipher_offset + 2) else {
+        return false;
+    };
+    if !matches!(u16::from_be_bytes([suite[0], suite[1]]), 0x1301..=0x1304) {
+        return false;
+    }
+    let extensions_offset = cipher_offset + 3;
+    let Some(size) = hello.get(extensions_offset..extensions_offset + 2) else {
+        return false;
+    };
+    let size = u16::from_be_bytes([size[0], size[1]]) as usize;
+    let Some(mut extensions) = hello.get(extensions_offset + 2..extensions_offset + 2 + size)
+    else {
+        return false;
+    };
+    while extensions.len() >= 4 {
+        let kind = u16::from_be_bytes([extensions[0], extensions[1]]);
+        let len = u16::from_be_bytes([extensions[2], extensions[3]]) as usize;
+        let Some(value) = extensions.get(4..4 + len) else {
+            return false;
+        };
+        if kind == 43 && value == [3, 4] {
+            return true;
+        }
+        extensions = &extensions[4 + len..];
+    }
+    false
+}
 
 const COMMAND_PADDING_CONTINUE: u8 = 0;
 const COMMAND_PADDING_END: u8 = 1;
@@ -32,6 +168,7 @@ pub struct VisionReader<R> {
     encoded: Vec<u8>,
     decoded: Vec<u8>,
     decoded_offset: usize,
+    control: Option<Arc<VisionControl>>,
 }
 
 impl<R> VisionReader<R> {
@@ -43,7 +180,14 @@ impl<R> VisionReader<R> {
             encoded: Vec::new(),
             decoded: Vec::new(),
             decoded_offset: 0,
+            control: None,
         }
+    }
+
+    pub(crate) fn with_control(inner: R, user: [u8; 16], control: Arc<VisionControl>) -> Self {
+        let mut reader = Self::new(inner, user);
+        reader.control = Some(control);
+        reader
     }
 
     fn poll_decoded(&mut self, buf: &mut ReadBuf<'_>) -> bool {
@@ -54,6 +198,9 @@ impl<R> VisionReader<R> {
         }
         let available = &self.decoded[self.decoded_offset..];
         let take = available.len().min(buf.remaining());
+        if let Some(control) = &self.control {
+            control.observe(&available[..take], true);
+        }
         buf.put_slice(&available[..take]);
         self.decoded_offset += take;
         true
@@ -92,6 +239,9 @@ impl<R> VisionReader<R> {
                         return Ok(());
                     }
                     let command = self.encoded[0];
+                    if command > COMMAND_PADDING_DIRECT {
+                        return Err(Error::new(ErrorKind::InvalidData, "invalid Vision command"));
+                    }
                     let content_len =
                         u16::from_be_bytes([self.encoded[1], self.encoded[2]]) as usize;
                     let padding_len =
@@ -162,6 +312,15 @@ impl<R> VisionReader<R> {
                     match command {
                         COMMAND_PADDING_CONTINUE => self.state = ReadState::Header,
                         COMMAND_PADDING_END | COMMAND_PADDING_DIRECT => {
+                            if command == COMMAND_PADDING_DIRECT {
+                                let control = self.control.as_ref().ok_or_else(|| {
+                                    Error::new(
+                                        ErrorKind::Unsupported,
+                                        "Vision DIRECT requires a switchable TLS transport",
+                                    )
+                                })?;
+                                control.read_direct.store(true, Ordering::Release);
+                            }
                             self.state = ReadState::Raw;
                             self.decoded.extend_from_slice(&self.encoded);
                             self.encoded.clear();
@@ -201,6 +360,12 @@ where
         }
 
         loop {
+            // Finish cached content, padding and following blocks before
+            // polling the network, including the DIRECT transport transition.
+            self.decode_available(false)?;
+            if self.poll_decoded(buf) {
+                return Poll::Ready(Ok(()));
+            }
             if matches!(self.state, ReadState::Raw) && self.encoded.is_empty() {
                 return Pin::new(&mut self.inner).poll_read(cx, buf);
             }
@@ -239,7 +404,8 @@ pub fn encode_continue_frame(user: &[u8; 16], write_uuid: bool, payload: &[u8]) 
     encode_vision_frame(user, write_uuid, COMMAND_PADDING_CONTINUE, payload)
 }
 
-pub fn encode_direct_frame(user: &[u8; 16], write_uuid: bool, payload: &[u8]) -> Result<Vec<u8>> {
+#[cfg(test)]
+fn encode_direct_frame(user: &[u8; 16], write_uuid: bool, payload: &[u8]) -> Result<Vec<u8>> {
     encode_vision_frame(user, write_uuid, COMMAND_PADDING_DIRECT, payload)
 }
 
@@ -247,26 +413,61 @@ pub struct VisionEncoder {
     user: [u8; 16],
     uuid_written: bool,
     direct: bool,
+    ended: bool,
+    blocks: u8,
+    control: Arc<VisionControl>,
 }
 
 impl VisionEncoder {
-    pub fn new(user: [u8; 16]) -> Self {
+    #[cfg(test)]
+    fn new(user: [u8; 16]) -> Self {
+        Self::with_control(user, Arc::new(VisionControl::default()))
+    }
+
+    pub(crate) fn with_control(user: [u8; 16], control: Arc<VisionControl>) -> Self {
         Self {
             user,
             uuid_written: false,
             direct: false,
+            ended: false,
+            blocks: 0,
+            control,
         }
     }
 
+    pub(crate) fn direct(&self) -> bool {
+        self.direct
+    }
+
     pub fn encode(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
-        if self.direct {
+        if self.ended {
             return Ok(payload.to_vec());
         }
+        self.control.observe(payload, false);
+        self.blocks = self.blocks.saturating_add(1);
         let write_uuid = !self.uuid_written;
         self.uuid_written = true;
-        if looks_like_tls13_application_data(payload) {
-            self.direct = true;
-            encode_direct_frame(&self.user, write_uuid, payload)
+        let filter = self
+            .control
+            .filter
+            .lock()
+            .expect("Vision TLS filter poisoned");
+        if filter.tls && looks_like_tls13_application_data(payload) {
+            self.ended = true;
+            self.direct = filter.direct;
+            encode_vision_frame(
+                &self.user,
+                write_uuid,
+                if self.direct {
+                    COMMAND_PADDING_DIRECT
+                } else {
+                    COMMAND_PADDING_END
+                },
+                payload,
+            )
+        } else if !filter.tls && self.blocks >= 8 {
+            self.ended = true;
+            encode_vision_frame(&self.user, write_uuid, COMMAND_PADDING_END, payload)
         } else {
             encode_continue_frame(&self.user, write_uuid, payload)
         }

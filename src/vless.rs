@@ -15,7 +15,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use vless_transport::VlessTransportConfig;
+use vless_transport::{VlessTransportConfig, VlessTransportKind};
+use vless_vision::{
+    VisionControl,
+    tls::{RecordIo, VisionTlsStream},
+};
 
 const VERSION: u8 = 0x00;
 const CMD_TCP: u8 = 0x01;
@@ -87,6 +91,11 @@ pub async fn run_vless_client_with_core(
     config: VlessClientConfig,
     core: Option<ProxyCore>,
 ) -> Result<()> {
+    validate_vision_transport(
+        &config.flow,
+        &config.transport,
+        config.tls || config.reality.is_some(),
+    )?;
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind VLESS SOCKS listener on {}", config.listen))?;
@@ -129,6 +138,19 @@ pub async fn run_vless_server_with_core(config: VlessServerConfig, core: ProxyCo
                 .as_ref()
                 .is_some_and(TlsEchServerKeys::is_configured)),
         "VLESS REALITY and TLS ECH are mutually exclusive server modes"
+    );
+    validate_vision_transport(
+        &config.flow,
+        &config.transport,
+        config.tls || config.reality.is_some(),
+    )?;
+    ensure!(
+        !is_vision_flow(&config.flow)
+            || !config
+                .ech
+                .as_ref()
+                .is_some_and(TlsEchServerKeys::is_configured),
+        "VLESS Vision DIRECT with server ECH is not implemented"
     );
     let listener = TcpListener::bind(config.listen)
         .await
@@ -197,7 +219,13 @@ async fn handle_vless_socks_with_core(
     };
     match request {
         socks::SocksRequest::Connect(target) => {
-            let mut server = connect_vless_server(&config).await?;
+            validate_vision_transport(
+                &config.flow,
+                &config.transport,
+                config.tls || config.reality.is_some(),
+            )?;
+            let vision = is_vision_flow(&config.flow).then(|| Arc::new(VisionControl::default()));
+            let mut server = connect_vless_server(&config, vision.clone()).await?;
             let user = parse_uuid(&config.user_id)?;
             if config.mux {
                 write_vless_request(&mut server, &user, CMD_MUX, &vless_xudp::mux_target(), "")
@@ -212,7 +240,14 @@ async fn handle_vless_socks_with_core(
             socks::write_reply(&mut stream, 0x00).await?;
             tracing::info!("VLESS proxying {}", target_name(&target));
             if is_vision_flow(&config.flow) {
-                relay_vision_client_counted(stream, server, user, session).await
+                relay_vision_client_counted(
+                    stream,
+                    server,
+                    user,
+                    session,
+                    vision.context("missing Vision control")?,
+                )
+                .await
             } else {
                 relay_bidirectional_counted(&mut stream, &mut server, session, "VLESS").await
             }
@@ -318,7 +353,7 @@ impl VlessUdpSessionPool {
         let key = target_name(target);
         let mut sessions = self.sessions.lock().await;
         if !sessions.contains_key(&key) {
-            let mut server = connect_vless_server(&self.config).await?;
+            let mut server = connect_vless_server(&self.config, None).await?;
             write_vless_request(&mut server, &self.user, CMD_UDP, target, "").await?;
             read_vless_response_header(&mut server).await?;
             sessions.insert(key.clone(), server);
@@ -337,7 +372,7 @@ async fn handle_vless_xudp_associate_counted(
     user: [u8; 16],
     session: CoreSession,
 ) -> Result<()> {
-    let mut server = connect_vless_server(&config).await?;
+    let mut server = connect_vless_server(&config, None).await?;
     write_vless_request(&mut server, &user, CMD_MUX, &vless_xudp::mux_target(), "").await?;
     read_vless_response_header(&mut server).await?;
     let (mut reader, mut writer) = tokio::io::split(server);
@@ -409,7 +444,22 @@ async fn handle_vless_xudp_associate_counted(
     }
 }
 
-async fn connect_vless_server(config: &VlessClientConfig) -> Result<BoxedVlessStream> {
+fn validate_vision_transport(
+    flow: &str,
+    transport: &VlessTransportConfig,
+    tls: bool,
+) -> Result<()> {
+    ensure!(
+        !is_vision_flow(flow) || (tls && transport.kind == VlessTransportKind::Tcp),
+        "VLESS Vision requires TCP with TLS or REALITY"
+    );
+    Ok(())
+}
+
+async fn connect_vless_server(
+    config: &VlessClientConfig,
+    vision: Option<Arc<VisionControl>>,
+) -> Result<BoxedVlessStream> {
     let tcp =
         socket_protect::connect_tcp_host_port(config.server_host.as_str(), config.server_port)
             .await
@@ -425,9 +475,10 @@ async fn connect_vless_server(config: &VlessClientConfig) -> Result<BoxedVlessSt
             .unwrap_or(utls::UtlsFingerprint::Chrome);
         let alpn = config.transport.alpn_protocols();
         let alpn = if alpn.is_empty() { None } else { Some(alpn) };
-        let stream = reality_tls_client::connect(tcp, reality, &config.sni, fingerprint, alpn)
-            .await
-            .context("REALITY connect to VLESS server")?;
+        let stream =
+            reality_tls_client::connect(tcp, reality, &config.sni, fingerprint, alpn, vision)
+                .await
+                .context("REALITY connect to VLESS server")?;
         return vless_transport::apply_client_transport(
             stream,
             &config.transport,
@@ -460,6 +511,13 @@ async fn connect_vless_server(config: &VlessClientConfig) -> Result<BoxedVlessSt
     let connector = TlsConnector::from(Arc::new(client_config));
     let server_name = ServerName::try_from(config.sni.clone())
         .with_context(|| format!("invalid VLESS SNI: {}", config.sni))?;
+    if let Some(vision) = vision {
+        let stream = connector
+            .connect(server_name, RecordIo::new(tcp))
+            .await
+            .context("TLS connect to Vision server")?;
+        return Ok(Box::new(VisionTlsStream::new(stream, vision)));
+    }
     let stream = connector
         .connect(server_name, tcp)
         .await
@@ -470,7 +528,8 @@ async fn connect_vless_server(config: &VlessClientConfig) -> Result<BoxedVlessSt
 async fn accept_reality_tls(
     stream: TcpStream,
     reality: &RealityServerState,
-) -> Result<Option<tokio_rustls::server::TlsStream<TcpStream>>> {
+    vision: Option<Arc<VisionControl>>,
+) -> Result<Option<BoxedVlessStream>> {
     let client_hello = reality::peek_client_hello(&stream)
         .await
         .context("peek VLESS REALITY ClientHello")?;
@@ -485,11 +544,19 @@ async fn accept_reality_tls(
     let server_config = reality
         .cert_state
         .server_config(&authenticated.auth_key, &reality.config.alpn_protocols)?;
-    let stream = TlsAcceptor::from(server_config)
+    let acceptor = TlsAcceptor::from(server_config);
+    if let Some(vision) = vision {
+        let stream = acceptor
+            .accept(RecordIo::new(stream))
+            .await
+            .context("accept Vision REALITY TLS")?;
+        return Ok(Some(Box::new(VisionTlsStream::new(stream, vision))));
+    }
+    let stream = acceptor
         .accept(stream)
         .await
         .context("accept VLESS REALITY TLS")?;
-    Ok(Some(stream))
+    Ok(Some(Box::new(stream)))
 }
 
 async fn handle_vless_client(
@@ -501,17 +568,52 @@ async fn handle_vless_client(
     transport: VlessTransportConfig,
     peer: SocketAddr,
 ) -> Result<()> {
-    let mut stream = if let Some(reality) = reality {
-        let Some(stream) = accept_reality_tls(stream, &reality).await? else {
+    let vision = is_vision_flow(&allowed_flow).then(|| Arc::new(VisionControl::default()));
+    let stream: BoxedVlessStream = if let Some(reality) = reality {
+        let Some(stream) = accept_reality_tls(stream, &reality, vision.clone()).await? else {
             return Ok(());
         };
-        vless_transport::apply_server_transport(stream, &transport).await?
+        stream
     } else if let Some(acceptor) = acceptor {
-        let stream = acceptor.accept(stream).await.context("accept VLESS TLS")?;
-        vless_transport::apply_server_transport(stream, &transport).await?
+        if let Some(vision) = vision.clone() {
+            match acceptor {
+                ServerTlsAcceptor::Rustls(acceptor) => {
+                    let stream = acceptor
+                        .accept(RecordIo::new(stream))
+                        .await
+                        .context("accept Vision TLS")?;
+                    Box::new(VisionTlsStream::new(stream, vision))
+                }
+                #[cfg(feature = "server-ech")]
+                ServerTlsAcceptor::Boring(_) => {
+                    bail!("Vision DIRECT with server ECH is not implemented")
+                }
+            }
+        } else {
+            Box::new(acceptor.accept(stream).await.context("accept VLESS TLS")?)
+        }
     } else {
-        vless_transport::apply_server_transport(stream, &transport).await?
+        Box::new(stream)
     };
+    vless_transport::serve_server_transport(stream, &transport, |stream| {
+        handle_vless_stream(
+            stream,
+            core.clone(),
+            allowed_flow.clone(),
+            peer,
+            vision.clone(),
+        )
+    })
+    .await
+}
+
+async fn handle_vless_stream(
+    mut stream: BoxedVlessStream,
+    core: ProxyCore,
+    allowed_flow: String,
+    peer: SocketAddr,
+    vision: Option<Arc<VisionControl>>,
+) -> Result<()> {
     let users = vless_users_from_core(&core)?;
     let request = read_vless_request(&mut stream).await?;
     let credential = lookup_vless_user(&users, &request.user)
@@ -524,7 +626,14 @@ async fn handle_vless_client(
             write_vless_response_header(&mut stream).await?;
             tracing::info!("VLESS opened {}", target_name(&request.target));
             if is_vision_flow(&request.flow) {
-                relay_vision_server_counted(stream, remote, session, request.user).await
+                relay_vision_server_counted(
+                    stream,
+                    remote,
+                    session,
+                    request.user,
+                    vision.context("missing Vision TLS transport")?,
+                )
+                .await
             } else {
                 relay_bidirectional_counted(&mut stream, &mut remote, session, "VLESS").await
             }
@@ -546,12 +655,14 @@ async fn relay_vision_server_counted<S>(
     mut remote: TcpStream,
     session: CoreSession,
     user: [u8; 16],
+    vision: Arc<VisionControl>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (client_reader, mut client_writer) = tokio::io::split(stream);
-    let mut client_reader = vless_vision::VisionReader::new(client_reader, user);
+    let mut client_reader =
+        vless_vision::VisionReader::with_control(client_reader, user, vision.clone());
     let (mut remote_reader, mut remote_writer) = remote.split();
     let uplink_session = session.clone();
     let uplink = async {
@@ -573,7 +684,7 @@ where
     };
     let downlink = async {
         let mut buffer = vec![0u8; 32 * 1024];
-        let mut encoder = vless_vision::VisionEncoder::new(user);
+        let mut encoder = vless_vision::VisionEncoder::with_control(user, vision.clone());
         loop {
             let read = remote_reader
                 .read(&mut buffer)
@@ -588,6 +699,10 @@ where
                 .write_all(&encoded)
                 .await
                 .context("write VLESS Vision downlink")?;
+            client_writer.flush().await?;
+            if encoder.direct() && !vision.write_direct() {
+                vision.start_write_direct();
+            }
         }
     };
     let result = tokio::select! {
@@ -607,14 +722,16 @@ async fn relay_vision_client_counted(
     server: BoxedVlessStream,
     user: [u8; 16],
     session: CoreSession,
+    vision: Arc<VisionControl>,
 ) -> Result<()> {
     let (mut local_reader, mut local_writer) = local.into_split();
     let (mut server_reader, mut server_writer) = tokio::io::split(server);
-    let mut server_reader = vless_vision::VisionReader::new(&mut server_reader, user);
+    let mut server_reader =
+        vless_vision::VisionReader::with_control(&mut server_reader, user, vision.clone());
     let uplink_session = session.clone();
     let uplink = async {
         let mut buffer = vec![0u8; 32 * 1024];
-        let mut encoder = vless_vision::VisionEncoder::new(user);
+        let mut encoder = vless_vision::VisionEncoder::with_control(user, vision.clone());
         loop {
             let read = local_reader
                 .read(&mut buffer)
@@ -629,6 +746,10 @@ async fn relay_vision_client_counted(
                 .write_all(&encoded)
                 .await
                 .context("write VLESS Vision payload")?;
+            server_writer.flush().await?;
+            if encoder.direct() && !vision.write_direct() {
+                vision.start_write_direct();
+            }
         }
     };
     let downlink = async {

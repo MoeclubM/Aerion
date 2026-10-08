@@ -7,6 +7,7 @@ mod transport;
 use crate::core::{CoreSession, ProxyCore};
 use crate::protocol::ProxyTarget;
 use crate::relay::relay_bidirectional_half_closed_counted;
+use crate::replay_cache::{ReplayCache, ReplayError};
 use crate::{socket_protect, socks, uot};
 use anyhow::{Context, Result, bail, ensure};
 use record::{Receiver, Sender, bases};
@@ -239,7 +240,11 @@ async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     Ok((receiver, sender))
 }
 
-type ReplayCache = Arc<Mutex<HashMap<(String, [u8; 16]), u64>>>;
+type HandshakeReplays = Arc<ReplayCache<(String, [u8; 16])>>;
+
+fn handshake_replays() -> HandshakeReplays {
+    Arc::new(ReplayCache::new(Duration::from_secs(120), 65_536))
+}
 
 struct Credential {
     value: String,
@@ -294,7 +299,7 @@ async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     options: &SudokuOptions,
     core: &ProxyCore,
     peer: SocketAddr,
-    replays: &ReplayCache,
+    replays: &HandshakeReplays,
     credentials: Vec<Arc<Credential>>,
 ) -> Result<(Receiver, Sender, CoreSession)> {
     let mut candidates = Vec::new();
@@ -349,15 +354,10 @@ async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     let ts = u64::from_be_bytes(hello[..8].try_into()?);
     ensure!(now.abs_diff(ts) <= 60, "expired Sudoku handshake");
     let nonce: [u8; 16] = hello[16..32].try_into()?;
-    {
-        let mut cache = replays.lock().expect("Sudoku replay cache poisoned");
-        cache.retain(|_, ts| now.saturating_sub(*ts) <= 120);
-        ensure!(
-            cache
-                .insert((credential.seed.clone(), nonce), now)
-                .is_none(),
-            "replayed Sudoku handshake"
-        );
+    match replays.check_and_store((credential.seed.clone(), nonce)) {
+        Ok(()) => {}
+        Err(ReplayError::Replayed) => bail!("replayed Sudoku handshake"),
+        Err(ReplayError::Full) => bail!("Sudoku replay cache is full"),
     }
     let table = if hello.len() == 72 {
         let hint = u32::from_be_bytes(hello[68..72].try_into()?);
@@ -590,7 +590,7 @@ pub async fn run_sudoku_server_listener_with_core(
 ) -> Result<()> {
     config.options.validate()?;
     tracing::info!("Sudoku server listening on {}", listener.local_addr()?);
-    let replays = Arc::new(Mutex::new(HashMap::new()));
+    let replays = handshake_replays();
     let mut credentials = CredentialCache::default();
     credentials.snapshot(&core, &config.options)?;
     loop {
@@ -983,11 +983,11 @@ async fn mux_frame<W: AsyncWrite + Unpin>(
     id: u32,
     payload: &[u8],
 ) -> Result<()> {
-    let mut frame = vec![kind];
-    frame.extend(id.to_be_bytes());
-    frame.extend((payload.len() as u32).to_be_bytes());
-    frame.extend(payload);
-    writer.write_all(&frame).await?;
+    let mut header = [0u8; 9];
+    header[0] = kind;
+    header[1..5].copy_from_slice(&id.to_be_bytes());
+    header[5..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    crate::io_util::write_frame_parts(writer, &header, payload).await?;
     writer.flush().await?;
     Ok(())
 }

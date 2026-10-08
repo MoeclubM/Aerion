@@ -1,5 +1,6 @@
 use crate::reality::{RealityClientConfig, build_reality_client_hello_with_alpn};
 use crate::utls::UtlsFingerprint;
+use crate::vless_vision::VisionControl;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use anyhow::{Context, Result, bail, ensure};
@@ -8,6 +9,29 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::pin::Pin;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+
+#[derive(Default)]
+struct WriteProgress {
+    pending: AtomicUsize,
+    closed: AtomicBool,
+    waker: Mutex<Option<std::task::Waker>>,
+}
+impl WriteProgress {
+    fn wake(&self) {
+        if let Some(waker) = self
+            .waker
+            .lock()
+            .expect("REALITY flush waker poisoned")
+            .take()
+        {
+            waker.wake();
+        }
+    }
+}
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex,
@@ -44,6 +68,9 @@ pub struct RealityTlsClientStream {
     writer: DuplexStream,
     read_task: JoinHandle<Result<()>>,
     write_task: JoinHandle<Result<()>>,
+    progress: Arc<WriteProgress>,
+    read_permit: Option<UnboundedSender<()>>,
+    permit_needed: bool,
 }
 
 impl Drop for RealityTlsClientStream {
@@ -59,7 +86,18 @@ impl AsyncRead for RealityTlsClientStream {
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.reader).poll_read(cx, buf)
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.reader).poll_read(cx, buf);
+        if buf.filled().len() > before {
+            self.permit_needed = true;
+        }
+        if result.is_pending() && self.permit_needed {
+            if let Some(permit) = &self.read_permit {
+                let _ = permit.send(());
+            }
+            self.permit_needed = false;
+        }
+        result
     }
 }
 
@@ -69,11 +107,34 @@ impl AsyncWrite for RealityTlsClientStream {
         cx: &mut TaskContext<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.writer).poll_write(cx, buf)
+        self.progress.pending.fetch_add(buf.len(), Ordering::AcqRel);
+        let result = Pin::new(&mut self.writer).poll_write(cx, buf);
+        let written = match &result {
+            Poll::Ready(Ok(n)) => *n,
+            _ => 0,
+        };
+        self.progress
+            .pending
+            .fetch_sub(buf.len() - written, Ordering::AcqRel);
+        result
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.writer).poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        *self
+            .progress
+            .waker
+            .lock()
+            .expect("REALITY flush waker poisoned") = Some(cx.waker().clone());
+        if self.progress.pending.load(Ordering::Acquire) == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if self.progress.closed.load(Ordering::Acquire) {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "REALITY writer stopped",
+            )));
+        }
+        Poll::Pending
     }
 
     fn poll_shutdown(
@@ -84,12 +145,13 @@ impl AsyncWrite for RealityTlsClientStream {
     }
 }
 
-pub async fn connect(
+pub(crate) async fn connect(
     mut stream: TcpStream,
     config: &RealityClientConfig,
     server_name: &str,
     fingerprint: UtlsFingerprint,
     alpn_protocols: Option<Vec<Vec<u8>>>,
+    vision: Option<Arc<VisionControl>>,
 ) -> Result<RealityTlsClientStream> {
     let built =
         build_reality_client_hello_with_alpn(config, server_name, fingerprint, alpn_protocols)
@@ -167,29 +229,62 @@ pub async fn connect(
         .context("create REALITY application reader")?;
     let writer_cipher = RecordCipher::new(suite, &client_application_secret)
         .context("create REALITY application writer")?;
-    Ok(spawn_reality_stream(stream, reader_cipher, writer_cipher))
+    Ok(spawn_reality_stream(
+        stream,
+        reader_cipher,
+        writer_cipher,
+        vision,
+    ))
 }
 
 fn spawn_reality_stream(
     stream: TcpStream,
     reader_cipher: RecordCipher,
     writer_cipher: RecordCipher,
+    vision: Option<Arc<VisionControl>>,
 ) -> RealityTlsClientStream {
     let (inbound_sink, reader) = duplex(REALITY_PIPE_CAPACITY);
     let (writer, outbound_source) = duplex(REALITY_PIPE_CAPACITY);
     let (stream_reader, stream_writer) = stream.into_split();
     let (control_tx, control_rx) = unbounded_channel();
+    let (permit_tx, permit_rx) = unbounded_channel();
+    let read_vision = vision.clone();
     let read_task = tokio::spawn(async move {
-        pump_inbound(stream_reader, inbound_sink, reader_cipher, control_tx).await
+        pump_inbound(
+            stream_reader,
+            inbound_sink,
+            reader_cipher,
+            control_tx,
+            read_vision,
+            permit_rx,
+        )
+        .await
     });
+    let progress = Arc::new(WriteProgress::default());
+    let write_progress = progress.clone();
+    let vision_enabled = vision.is_some();
     let write_task = tokio::spawn(async move {
-        pump_outbound(stream_writer, outbound_source, writer_cipher, control_rx).await
+        let result = pump_outbound(
+            stream_writer,
+            outbound_source,
+            writer_cipher,
+            control_rx,
+            vision,
+            &write_progress,
+        )
+        .await;
+        write_progress.closed.store(true, Ordering::Release);
+        write_progress.wake();
+        result
     });
     RealityTlsClientStream {
         reader,
         writer,
         read_task,
         write_task,
+        progress,
+        read_permit: vision_enabled.then_some(permit_tx),
+        permit_needed: false,
     }
 }
 
@@ -198,8 +293,15 @@ async fn pump_inbound(
     mut sink: DuplexStream,
     mut cipher: RecordCipher,
     control: UnboundedSender<OutboundControl>,
+    vision: Option<Arc<VisionControl>>,
+    mut permit: UnboundedReceiver<()>,
 ) -> Result<()> {
     loop {
+        if vision.as_ref().is_some_and(|v| v.read_direct()) {
+            tokio::io::copy(&mut stream, &mut sink).await?;
+            sink.shutdown().await?;
+            return Ok(());
+        }
         let Some(mut record) = read_tls_record(&mut stream).await? else {
             let _ = control.send(OutboundControl::CloseNotify);
             sink.shutdown().await.ok();
@@ -229,6 +331,9 @@ async fn pump_inbound(
                         sink.write_all(&record.payload)
                             .await
                             .context("write REALITY plaintext into pipe")?;
+                        if vision.is_some() && permit.recv().await.is_none() {
+                            return Ok(());
+                        }
                     }
                     TLS_CONTENT_TYPE_ALERT => {
                         if record.payload.len() == 2 && record.payload[1] == TLS_ALERT_CLOSE_NOTIFY
@@ -260,6 +365,8 @@ async fn pump_outbound(
     mut source: DuplexStream,
     mut cipher: RecordCipher,
     mut control: UnboundedReceiver<OutboundControl>,
+    vision: Option<Arc<VisionControl>>,
+    progress: &WriteProgress,
 ) -> Result<()> {
     let mut buffer = vec![0u8; TLS_MAX_PLAINTEXT_LEN];
     let mut control_closed = false;
@@ -268,9 +375,14 @@ async fn pump_outbound(
             biased;
             command = control.recv(), if !control_closed => {
                 match command {
-                    Some(OutboundControl::KeyUpdate) => send_key_update(&mut stream, &mut cipher).await?,
+                    Some(OutboundControl::KeyUpdate) => {
+                        ensure!(!vision.as_ref().is_some_and(|v| v.write_direct()), "REALITY KeyUpdate after Vision DIRECT");
+                        send_key_update(&mut stream, &mut cipher).await?;
+                    }
                     Some(OutboundControl::CloseNotify) => {
-                        send_close_notify(&mut stream, &mut cipher).await.ok();
+                        if !vision.as_ref().is_some_and(|v| v.read_direct() || v.write_direct()) {
+                            send_close_notify(&mut stream, &mut cipher).await.ok();
+                        }
                         stream.shutdown().await.ok();
                         return Ok(());
                     }
@@ -280,17 +392,25 @@ async fn pump_outbound(
             read = source.read(&mut buffer) => {
                 let read = read.context("read REALITY plaintext from pipe")?;
                 if read == 0 {
-                    send_close_notify(&mut stream, &mut cipher).await.ok();
+                    if !vision.as_ref().is_some_and(|v| v.read_direct() || v.write_direct()) {
+                        send_close_notify(&mut stream, &mut cipher).await.ok();
+                    }
                     stream.shutdown().await.ok();
                     return Ok(());
                 }
-                let record = cipher
-                    .encrypt_record(TLS_CONTENT_TYPE_APPLICATION_DATA, &buffer[..read])
-                    .context("encrypt REALITY application record")?;
+                let record = if vision.as_ref().is_some_and(|v| v.write_direct()) {
+                    buffer[..read].to_vec()
+                } else {
+                    cipher.encrypt_record(TLS_CONTENT_TYPE_APPLICATION_DATA, &buffer[..read])
+                        .context("encrypt REALITY application record")?
+                };
                 stream
                     .write_all(&record)
                     .await
                     .context("write REALITY application record")?;
+                stream.flush().await?;
+                progress.pending.fetch_sub(read, Ordering::AcqRel);
+                progress.wake();
             }
         }
     }
