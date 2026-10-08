@@ -239,6 +239,9 @@ impl<R> VisionReader<R> {
                         return Ok(());
                     }
                     let command = self.encoded[0];
+                    if command > COMMAND_PADDING_DIRECT {
+                        return Err(Error::new(ErrorKind::InvalidData, "invalid Vision command"));
+                    }
                     let content_len =
                         u16::from_be_bytes([self.encoded[1], self.encoded[2]]) as usize;
                     let padding_len =

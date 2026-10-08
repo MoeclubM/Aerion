@@ -11,12 +11,13 @@ use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::pin::Pin;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 #[derive(Default)]
 struct WriteProgress {
     pending: AtomicUsize,
+    closed: AtomicBool,
     waker: Mutex<Option<std::task::Waker>>,
 }
 impl WriteProgress {
@@ -127,7 +128,7 @@ impl AsyncWrite for RealityTlsClientStream {
         if self.progress.pending.load(Ordering::Acquire) == 0 {
             return Poll::Ready(Ok(()));
         }
-        if self.write_task.is_finished() {
+        if self.progress.closed.load(Ordering::Acquire) {
             return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "REALITY writer stopped",
@@ -272,6 +273,7 @@ fn spawn_reality_stream(
             &write_progress,
         )
         .await;
+        write_progress.closed.store(true, Ordering::Release);
         write_progress.wake();
         result
     });
