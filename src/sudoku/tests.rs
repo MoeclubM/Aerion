@@ -691,7 +691,7 @@ async fn authenticated_handshake_and_revoked_users() -> Result<()> {
                 ..SudokuOptions::default()
             };
             let (mut client, mut server) = tokio::io::duplex(4096);
-            let cache = Arc::new(Mutex::new(HashMap::new()));
+            let cache = handshake_replays();
             let (client_result, server_result) = tokio::join!(
                 client_handshake(&mut client, "bob-key", &options),
                 server_handshake(
