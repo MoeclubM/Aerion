@@ -18,7 +18,7 @@ pub const CMD_SERVER_SETTINGS: u8 = 10;
 pub const MAX_FRAME_PAYLOAD_LEN: usize = u16::MAX as usize;
 
 const FRAME_HEADER_LEN: usize = 7;
-const VECTORED_FRAME_MIN_PAYLOAD: usize = 32 * 1024;
+const VECTORED_FRAME_MIN_PAYLOAD: usize = 16 * 1024;
 const CLIENT_NAME: &str = "aerion/0.1.0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
