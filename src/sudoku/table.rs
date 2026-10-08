@@ -286,33 +286,60 @@ impl Decoder {
         Ok(output)
     }
     pub fn feed_into(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<()> {
+        if self.packed {
+            self.feed_packed(input, output);
+            return Ok(());
+        }
         for &byte in input {
             let group = self.layout.decode[byte as usize];
             if group == 255 {
-                if self.packed && byte == self.layout.marker {
+                continue;
+            }
+            self.hints[self.count as usize] = group;
+            self.count += 1;
+            if self.count == 4 {
+                output.push(self.table.decode(self.hints)?);
+                self.count = 0;
+            }
+        }
+        Ok(())
+    }
+    fn feed_packed(&mut self, input: &[u8], output: &mut Vec<u8>) {
+        let mut pos = 0;
+        while pos < input.len() {
+            // Four aligned six-bit symbols yield three bytes, including when
+            // a record spans reads. Padding/markers use the scalar path.
+            if self.count == 0 && pos + 4 <= input.len() {
+                let [a, b, c, d] =
+                    std::array::from_fn(|i| self.layout.decode[input[pos + i] as usize]);
+                if a != 255 && b != 255 && c != 255 && d != 255 {
+                    output.extend_from_slice(&[
+                        (a << 2) | (b >> 4),
+                        (b << 4) | (c >> 2),
+                        (c << 6) | d,
+                    ]);
+                    pos += 4;
+                    continue;
+                }
+            }
+            let byte = input[pos];
+            pos += 1;
+            let group = self.layout.decode[byte as usize];
+            if group == 255 {
+                if byte == self.layout.marker {
                     self.bits = 0;
                     self.count = 0;
                 }
                 continue;
             }
-            if self.packed {
-                self.bits = (self.bits << 6) | group as u32;
-                self.count += 6;
-                if self.count >= 8 {
-                    self.count -= 8;
-                    output.push((self.bits >> self.count) as u8);
-                    self.bits &= (1 << self.count) - 1;
-                }
-            } else {
-                self.hints[self.count as usize] = group;
-                self.count += 1;
-                if self.count == 4 {
-                    output.push(self.table.decode(self.hints)?);
-                    self.count = 0;
-                }
+            self.bits = (self.bits << 6) | group as u32;
+            self.count += 6;
+            if self.count >= 8 {
+                self.count -= 8;
+                output.push((self.bits >> self.count) as u8);
+                self.bits &= (1 << self.count) - 1;
             }
         }
-        Ok(())
     }
 }
 
@@ -351,8 +378,16 @@ pub(super) fn encode(
         output.push(layout.encode[group as usize]);
     };
     if packed {
+        let mut triples = input.chunks_exact(3);
+        for chunk in &mut triples {
+            let (a, b, c) = (chunk[0], chunk[1], chunk[2]);
+            emit(a >> 2);
+            emit(((a & 3) << 4) | (b >> 4));
+            emit(((b & 15) << 2) | (c >> 6));
+            emit(c & 63);
+        }
         let (mut bits, mut count) = (0u32, 0u8);
-        for &byte in input {
+        for &byte in triples.remainder() {
             bits = (bits << 8) | byte as u32;
             count += 8;
             while count >= 6 {
