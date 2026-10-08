@@ -241,29 +241,73 @@ async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
 
 type ReplayCache = Arc<Mutex<HashMap<(String, [u8; 16]), u64>>>;
 
+struct Credential {
+    value: String,
+    seed: String,
+    up: [u8; 32],
+    down: [u8; 32],
+    tables: Vec<Table>,
+}
+
+#[derive(Default)]
+struct CredentialCache {
+    entries: HashMap<String, Arc<Credential>>,
+}
+impl CredentialCache {
+    // This cache belongs to one listener with immutable protocol options.
+    // Reconcile against current users, and still authenticate against Core
+    // after verifying the PSK so concurrent revocation cannot use cached keys.
+    fn snapshot(
+        &mut self,
+        core: &ProxyCore,
+        options: &SudokuOptions,
+    ) -> Result<Vec<Arc<Credential>>> {
+        let values = core.known_credentials();
+        let active = values.iter().map(String::as_str).collect::<HashSet<_>>();
+        self.entries
+            .retain(|value, _| active.contains(value.as_str()));
+        values
+            .into_iter()
+            .map(|value| {
+                if let Some(entry) = self.entries.get(&value) {
+                    return Ok(entry.clone());
+                }
+                let seed = sudoku_key_seed(&value)?;
+                let (up, down) = bases(&seed, None, &[])?;
+                let tables = options.tables(&seed)?;
+                let entry = Arc::new(Credential {
+                    value: value.clone(),
+                    seed,
+                    up,
+                    down,
+                    tables,
+                });
+                self.entries.insert(value, entry.clone());
+                Ok(entry)
+            })
+            .collect()
+    }
+}
+
 async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     options: &SudokuOptions,
     core: &ProxyCore,
     peer: SocketAddr,
     replays: &ReplayCache,
+    credentials: Vec<Arc<Credential>>,
 ) -> Result<(Receiver, Sender, CoreSession)> {
-    let credentials = core.known_credentials();
     let mut candidates = Vec::new();
     for credential in credentials {
-        let seed = sudoku_key_seed(&credential)?;
-        let (up, down) = bases(&seed, None, &[])?;
-        for table in options.tables(&seed)? {
+        for table in &credential.tables {
             candidates.push((
                 credential.clone(),
-                seed.clone(),
                 table.clone(),
-                down,
-                Receiver::new(table, false, false, up, &options.aead),
+                Receiver::new(table.clone(), false, false, credential.up, &options.aead),
             ));
         }
     }
-    let (credential, seed, table, down, mut receiver) = loop {
+    let (credential, table, mut receiver) = loop {
         ensure!(
             !candidates.is_empty(),
             "Sudoku client credential did not authenticate"
@@ -273,19 +317,21 @@ async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         ensure!(n > 0, "truncated Sudoku handshake");
         let mut selected = None;
         let mut valid = Vec::new();
-        for (credential, seed, table, down, mut receiver) in candidates {
-            let decoded = match receiver.decoder.feed(&wire[..n]) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            receiver.decoded.extend(decoded);
+        for (credential, table, mut receiver) in candidates {
+            if receiver
+                .decoder
+                .feed_into(&wire[..n], &mut receiver.decoded)
+                .is_err()
+            {
+                continue;
+            }
             match receiver.take_record() {
                 Ok(Some(plain)) if plain.starts_with(b"kip\x01") => {
                     receiver.prepend(plain);
-                    selected = Some((credential, seed, table, down, receiver));
+                    selected = Some((credential, table, receiver));
                     break;
                 }
-                Ok(None) => valid.push((credential, seed, table, down, receiver)),
+                Ok(None) => valid.push((credential, table, receiver)),
                 _ => {}
             }
         }
@@ -307,22 +353,25 @@ async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         let mut cache = replays.lock().expect("Sudoku replay cache poisoned");
         cache.retain(|_, ts| now.saturating_sub(*ts) <= 120);
         ensure!(
-            cache.insert((seed.clone(), nonce), now).is_none(),
+            cache
+                .insert((credential.seed.clone(), nonce), now)
+                .is_none(),
             "replayed Sudoku handshake"
         );
     }
     let table = if hello.len() == 72 {
         let hint = u32::from_be_bytes(hello[68..72].try_into()?);
-        options
-            .tables(&seed)?
-            .into_iter()
+        credential
+            .tables
+            .iter()
             .find(|table| table.hint == hint)
             .context("unknown Sudoku table hint")?
+            .clone()
     } else {
         table
     };
     // Authenticate the verified key. UserHash is intentionally ignored.
-    let session = core.authenticate_from(&credential, peer).await?;
+    let session = core.authenticate_from(&credential.value, peer).await?;
     let ephemeral = secret()?;
     let shared = ephemeral.diffie_hellman(&PublicKey::from(<[u8; 32]>::try_from(&hello[32..64])?));
     ensure!(shared.was_contributory(), "invalid Sudoku client ECDH key");
@@ -330,7 +379,7 @@ async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         table,
         true,
         !options.enable_pure_downlink,
-        down,
+        credential.down,
         &options.aead,
         options.padding()?,
     )?;
@@ -338,7 +387,7 @@ async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     response.extend(PublicKey::from(&ephemeral).as_bytes());
     response.extend((u32::from_be_bytes(hello[64..68].try_into()?) & 7).to_be_bytes());
     sender.kip(stream, 2, &response).await?;
-    let (up, down) = bases(&seed, Some(shared.as_bytes()), &nonce)?;
+    let (up, down) = bases(&credential.seed, Some(shared.as_bytes()), &nonce)?;
     receiver.rekey(up);
     sender.rekey(down)?;
     Ok((receiver, sender, session))
@@ -542,15 +591,25 @@ pub async fn run_sudoku_server_listener_with_core(
     config.options.validate()?;
     tracing::info!("Sudoku server listening on {}", listener.local_addr()?);
     let replays = Arc::new(Mutex::new(HashMap::new()));
+    let mut credentials = CredentialCache::default();
+    credentials.snapshot(&core, &config.options)?;
     loop {
         let (stream, peer) = crate::listener::accept_tcp(&listener).await?;
         let options = config.options.clone();
         let core = core.clone();
         let replays = replays.clone();
+        let credentials = match credentials.snapshot(&core, &options) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!("Sudoku credential update: {error:#}");
+                continue;
+            }
+        };
         tokio::spawn(async move {
             let result=async {
-                let mut stream=tokio::time::timeout(Duration::from_secs(5),transport::server(stream,&options,&core.known_credentials())).await??;
-                let (mut receiver,sender,session)=tokio::time::timeout(Duration::from_secs(5),server_handshake(&mut stream,&options,&core,peer,&replays)).await??;
+                let transport_keys = if options.http_mask { core.known_credentials() } else { Vec::new() };
+                let mut stream=tokio::time::timeout(Duration::from_secs(5),transport::server(stream,&options,&transport_keys)).await??;
+                let (mut receiver,sender,session)=tokio::time::timeout(Duration::from_secs(5),server_handshake(&mut stream,&options,&core,peer,&replays,credentials)).await??;
                 let (kind,payload)=tokio::select! {
                     _=session.cancelled()=>return Ok(()),
                     result=tokio::time::timeout(Duration::from_secs(30),receiver.kip(&mut stream))=>result??,

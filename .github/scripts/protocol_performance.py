@@ -36,7 +36,7 @@ def build(root, destination, target):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--suite", choices=["codecs", "transport", "anytls"], default="codecs")
+    parser.add_argument("--suite", choices=["codecs", "transport", "anytls", "sudoku"], default="codecs")
     suite = parser.parse_args().suite
     current = Path.cwd()
     baseline = current / ".performance-baseline"
@@ -80,7 +80,10 @@ def main():
             path.write_text(source)
     if suite == "anytls":
         modules = {"anytls": "src/protocol/tests.rs"}
+    if suite == "sudoku":
+        modules = {"sudoku_transport": "src/sudoku/tests.rs"}
     test_filter = (
+        "sudoku_performance" if suite == "sudoku" else
         "protocol::tests::transport_performance" if suite == "anytls" else
         "transport_performance" if suite == "transport" else "protocol_performance"
     )
@@ -117,9 +120,11 @@ def main():
                 print(f"Round {round_number + 1} {name}\n{output}", flush=True)
                 for label, mib in re.findall(r"PERF (\S+) ([0-9.]+)", output):
                     samples[name].setdefault(label, []).append(float(mib))
-    assert len(samples["baseline"]) == (20 if suite == "anytls" else 57), "Missing benchmark cases"
+    assert len(samples["baseline"]) == (15 if suite == "sudoku" else 20 if suite == "anytls" else 57), "Missing benchmark cases"
     assert samples["baseline"].keys() == samples["optimized"].keys()
     scope = (
+        "Sudoku authenticated records over in-memory pipes and fresh TCP sessions with 1/128/2838 users. Handshake labels are sessions/s; other labels are plaintext MiB/s. Not Internet throughput."
+        if suite == "sudoku" else
         "AnyTLS TLS frames over in-memory pipes; not Internet throughput."
         if suite == "anytls" else
         "AnyTLS TLS frames, Mieru encrypted streams and WebSocket over in-memory pipes; counted relay over pipes/loopback TCP. Not Internet throughput."

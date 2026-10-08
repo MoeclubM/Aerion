@@ -1,4 +1,4 @@
-use super::table::{Decoder, Table, encode};
+use super::table::{Decoder, Encoder, Table};
 use aes_gcm::Aes128Gcm;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use anyhow::{Context, Result, ensure};
@@ -33,50 +33,78 @@ pub(super) fn bases(
     Ok((up, down))
 }
 
-fn crypt(
-    method: &str,
-    base: &[u8; 32],
-    header: &[u8],
-    input: &[u8],
-    encrypt: bool,
-) -> Result<Vec<u8>> {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(base).unwrap();
-    mac.update(b"sudoku-record:");
-    mac.update(method.as_bytes());
-    mac.update(&header[..4]);
-    let key = mac.finalize().into_bytes();
-    let payload = Payload {
-        msg: input,
-        aad: header,
-    };
-    let result = match method {
-        "aes-128-gcm" => {
-            let cipher = Aes128Gcm::new_from_slice(&key[..16]).unwrap();
-            if encrypt {
-                cipher.encrypt(header.into(), payload)
-            } else {
-                cipher.decrypt(header.into(), payload)
-            }
+enum Cipher {
+    Aes(Aes128Gcm),
+    ChaCha(ChaCha20Poly1305),
+}
+
+struct RecordCrypto {
+    base: [u8; 32],
+    method: String,
+    cipher: Option<(u32, Box<Cipher>)>,
+}
+impl RecordCrypto {
+    fn new(base: [u8; 32], method: &str) -> Self {
+        Self {
+            base,
+            method: method.into(),
+            cipher: None,
         }
-        "chacha20-poly1305" => {
-            let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
-            if encrypt {
-                cipher.encrypt(header.into(), payload)
-            } else {
-                cipher.decrypt(header.into(), payload)
-            }
+    }
+    fn rekey(&mut self, base: [u8; 32]) {
+        self.base = base;
+        self.cipher = None;
+    }
+    fn crypt(&mut self, header: &[u8], input: &[u8], encrypt: bool) -> Result<Vec<u8>> {
+        let epoch = u32::from_be_bytes(header[..4].try_into()?);
+        if self
+            .cipher
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != epoch)
+        {
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.base).unwrap();
+            mac.update(b"sudoku-record:");
+            mac.update(self.method.as_bytes());
+            mac.update(&header[..4]);
+            let key = mac.finalize().into_bytes();
+            let cipher = match self.method.as_str() {
+                "aes-128-gcm" => Cipher::Aes(Aes128Gcm::new_from_slice(&key[..16]).unwrap()),
+                "chacha20-poly1305" => {
+                    Cipher::ChaCha(ChaCha20Poly1305::new_from_slice(&key).unwrap())
+                }
+                method => anyhow::bail!("unsupported Sudoku AEAD {method}"),
+            };
+            self.cipher = Some((epoch, Box::new(cipher)));
         }
-        _ => anyhow::bail!("unsupported Sudoku AEAD {method}"),
-    };
-    result.map_err(|_| anyhow::anyhow!("Sudoku record authentication failed"))
+        let payload = Payload {
+            msg: input,
+            aad: header,
+        };
+        let result = match self.cipher.as_ref().unwrap().1.as_ref() {
+            Cipher::Aes(cipher) => {
+                if encrypt {
+                    cipher.encrypt(header.into(), payload)
+                } else {
+                    cipher.decrypt(header.into(), payload)
+                }
+            }
+            Cipher::ChaCha(cipher) => {
+                if encrypt {
+                    cipher.encrypt(header.into(), payload)
+                } else {
+                    cipher.decrypt(header.into(), payload)
+                }
+            }
+        };
+        result.map_err(|_| anyhow::anyhow!("Sudoku record authentication failed"))
+    }
 }
 
 pub(super) struct Receiver {
     pub decoder: Decoder,
     pub decoded: Vec<u8>,
     plain: Vec<u8>,
-    base: [u8; 32],
-    method: String,
+    crypto: RecordCrypto,
     counter: Option<(u32, u64)>,
 }
 impl Receiver {
@@ -85,13 +113,12 @@ impl Receiver {
             decoder: Decoder::new(table, down, packed),
             decoded: Vec::new(),
             plain: Vec::new(),
-            base,
-            method: method.into(),
+            crypto: RecordCrypto::new(base, method),
             counter: None,
         }
     }
     pub fn rekey(&mut self, base: [u8; 32]) {
-        self.base = base;
+        self.crypto.rekey(base);
         self.counter = None;
     }
     pub fn take_record(&mut self) -> Result<Option<Vec<u8>>> {
@@ -112,13 +139,9 @@ impl Receiver {
                 "replayed or out-of-order Sudoku record"
             );
         }
-        let plain = crypt(
-            &self.method,
-            &self.base,
-            header,
-            &self.decoded[14..length + 2],
-            false,
-        )?;
+        let plain = self
+            .crypto
+            .crypt(header, &self.decoded[14..length + 2], false)?;
         self.counter = Some((
             epoch,
             seq.checked_add(1).context("Sudoku sequence exhausted")?,
@@ -136,13 +159,13 @@ impl Receiver {
                     return Ok(plain);
                 }
             }
-            let mut wire = [0; 8192];
+            let mut wire = [0; 16384];
             let n = reader.read(&mut wire).await?;
             if n == 0 {
                 ensure!(self.decoded.is_empty(), "truncated Sudoku record");
                 return Ok(Vec::new());
             }
-            self.decoded.extend(self.decoder.feed(&wire[..n])?);
+            self.decoder.feed_into(&wire[..n], &mut self.decoded)?;
         }
     }
     pub async fn exact<R: AsyncRead + Unpin>(
@@ -171,11 +194,11 @@ impl Receiver {
 }
 
 pub(super) struct Sender {
+    encoder: Encoder,
     table: Table,
     down: bool,
     packed: bool,
-    base: [u8; 32],
-    method: String,
+    crypto: RecordCrypto,
     epoch: u32,
     seq: u64,
     bytes: u64,
@@ -191,11 +214,11 @@ impl Sender {
         padding: u8,
     ) -> Result<Self> {
         let mut value = Self {
+            encoder: Encoder::new()?,
             table,
             down,
             packed,
-            base,
-            method: method.into(),
+            crypto: RecordCrypto::new(base, method),
             epoch: 0,
             seq: 0,
             bytes: 0,
@@ -207,7 +230,7 @@ impl Sender {
     pub fn rekey(&mut self, base: [u8; 32]) -> Result<()> {
         let mut random = [0; 12];
         getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("Sudoku counters: {e}"))?;
-        self.base = base;
+        self.crypto.rekey(base);
         self.epoch = u32::from_be_bytes(random[..4].try_into()?).clamp(1, u32::MAX - 1);
         self.seq = u64::from_be_bytes(random[4..].try_into()?).clamp(1, u64::MAX - 1);
         self.bytes = 0;
@@ -221,7 +244,7 @@ impl Sender {
         for chunk in input.chunks(65507) {
             let mut header = self.epoch.to_be_bytes().to_vec();
             header.extend(self.seq.to_be_bytes());
-            let ciphertext = crypt(&self.method, &self.base, &header, chunk, true)?;
+            let ciphertext = self.crypto.crypt(&header, chunk, true)?;
             let mut frame = ((12 + ciphertext.len()) as u16).to_be_bytes().to_vec();
             frame.extend(header);
             frame.extend(ciphertext);
@@ -230,13 +253,13 @@ impl Sender {
                 .checked_add(1)
                 .context("Sudoku sequence exhausted")?;
             writer
-                .write_all(&encode(
+                .write_all(self.encoder.encode(
                     &self.table,
                     self.down,
                     self.packed,
                     &frame,
                     self.padding,
-                )?)
+                ))
                 .await?;
             self.bytes += chunk.len() as u64;
             if self.bytes >= 32 << 20 {
@@ -263,5 +286,74 @@ impl Sender {
         message.extend((payload.len() as u16).to_be_bytes());
         message.extend(payload);
         self.write(writer, &message).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cached_cipher_survives_epoch_rollover_and_rekey() -> Result<()> {
+        for method in ["aes-128-gcm", "chacha20-poly1305"] {
+            for packed in [false, true] {
+                let table = Table::new("record-cache", "prefer_entropy", "")?;
+                let mut sender = Sender::new(table.clone(), true, packed, [3; 32], method, 5)?;
+                let mut receiver = Receiver::new(table, true, packed, [3; 32], method);
+                let epoch = sender.epoch;
+                sender.bytes = (32 << 20) - 7;
+                for (index, payload) in [
+                    b"rollkey".as_slice(),
+                    b"next epoch",
+                    b"same epoch",
+                    b"new key",
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if index == 3 {
+                        // Keep the epoch the same to catch a stale cipher after rekey.
+                        let epoch = sender.epoch;
+                        sender.rekey([9; 32])?;
+                        sender.epoch = epoch;
+                        receiver.rekey([9; 32]);
+                    }
+                    let mut wire = Vec::new();
+                    sender.write(&mut wire, payload).await?;
+                    receiver.decoder.feed_into(&wire, &mut receiver.decoded)?;
+                    assert_eq!(receiver.take_record()?.as_deref(), Some(payload));
+                    if index == 0 {
+                        assert_eq!(sender.epoch, epoch + 1);
+                    }
+                    // Authenticated records still cannot be replayed with a cached AEAD.
+                    receiver.decoder.feed_into(&wire, &mut receiver.decoded)?;
+                    assert!(receiver.take_record().is_err());
+                    receiver.decoded.clear();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cached_cipher_authenticates_each_nonce_header_and_payload() -> Result<()> {
+        for method in ["aes-128-gcm", "chacha20-poly1305"] {
+            let mut sender = RecordCrypto::new([3; 32], method);
+            let mut receiver = RecordCrypto::new([3; 32], method);
+            for (seq, epoch) in [1u32, 1, 2, 2].into_iter().enumerate() {
+                let mut header = [0; 12];
+                header[..4].copy_from_slice(&epoch.to_be_bytes());
+                header[11] = seq as u8 + 1;
+                let wire = sender.crypt(&header, b"payload", true)?;
+                assert_eq!(receiver.crypt(&header, &wire, false)?, b"payload");
+                let mut bad_header = header;
+                bad_header[11] ^= 1;
+                assert!(receiver.crypt(&bad_header, &wire, false).is_err());
+                let mut bad_wire = wire;
+                bad_wire[0] ^= 1;
+                assert!(receiver.crypt(&header, &bad_wire, false).is_err());
+            }
+        }
+        Ok(())
     }
 }

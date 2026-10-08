@@ -14,7 +14,7 @@ on:
       performance_suite:
         description: Benchmark suite to compare
         type: choice
-        options: [codecs, transport, anytls]
+        options: [codecs, transport, anytls, sudoku]
         default: codecs
 
 
