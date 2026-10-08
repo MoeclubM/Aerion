@@ -1,7 +1,6 @@
 use crate::padding::{PADDING_CHECKPOINT, PaddingScheme};
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
-use std::io::IoSlice;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -326,23 +325,9 @@ where
     header[0] = cmd;
     header[1..5].copy_from_slice(&stream_id.to_be_bytes());
     header[5..].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-    let mut slices = [IoSlice::new(&header), IoSlice::new(payload)];
-    let mut remaining = &mut slices[..];
-    while !remaining.is_empty() {
-        let written = writer
-            .write_vectored(remaining)
-            .await
-            .context("write Aerion frame")?;
-        if written == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "write Aerion frame",
-            ))
-            .context("write Aerion frame");
-        }
-        IoSlice::advance_slices(&mut remaining, written);
-    }
-    Ok(())
+    crate::io_util::write_frame_parts(writer, &header, payload)
+        .await
+        .context("write Aerion frame")
 }
 
 pub async fn write_payload_chunks<W>(writer: &mut W, stream_id: u32, payload: &[u8]) -> Result<()>

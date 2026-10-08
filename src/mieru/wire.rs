@@ -1,11 +1,10 @@
 use super::crypto::{MieruCipher, check_user_from_hint, mieru_keys_for_password};
 use super::pattern::{MieruTrafficPattern, random_padding};
 use super::{AEAD_OVERHEAD, MieruUserSecret, NONCE_LEN};
+use crate::replay_cache::{ReplayCache, ReplayError};
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const METADATA_LEN: usize = 32;
@@ -32,30 +31,23 @@ pub(super) const ACK_SERVER_TO_CLIENT: u8 = 9;
 pub(super) const STATUS_OK: u8 = 0;
 
 pub(super) struct MieruReplayCache {
-    inner: Mutex<HashMap<[u8; 32], Instant>>,
+    inner: ReplayCache<[u8; 32]>,
 }
 
 impl MieruReplayCache {
     pub(super) fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: ReplayCache::new(REPLAY_CACHE_TTL, REPLAY_CACHE_MAX),
         }
     }
 
     pub(super) fn check_and_store(&self, ciphertext: &[u8]) -> Result<()> {
         let digest: [u8; 32] = Sha256::digest(ciphertext).into();
-        let now = Instant::now();
-        let mut inner = self.inner.lock().expect("Mieru replay cache lock poisoned");
-        inner.retain(|_, seen| now.duration_since(*seen) <= REPLAY_CACHE_TTL);
-        ensure!(
-            inner.len() < REPLAY_CACHE_MAX || inner.contains_key(&digest),
-            "Mieru replay cache is full"
-        );
-        ensure!(
-            inner.insert(digest, now).is_none(),
-            "Mieru first-segment replay detected"
-        );
-        Ok(())
+        match self.inner.check_and_store(digest) {
+            Ok(()) => Ok(()),
+            Err(ReplayError::Replayed) => bail!("Mieru first-segment replay detected"),
+            Err(ReplayError::Full) => bail!("Mieru replay cache is full"),
+        }
     }
 }
 

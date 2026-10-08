@@ -745,7 +745,7 @@ async fn credential_cache_reuses_tables_and_enforces_live_revocation() -> Result
     assert!(current.iter().any(|entry| entry.value == "carol-key"));
     // A handshake already holding an old snapshot must fail after revocation.
     let (mut client, mut server) = tokio::io::duplex(4096);
-    let replays = Arc::new(Mutex::new(HashMap::new()));
+    let replays = handshake_replays();
     let handshake = async {
         let result = server_handshake(
             &mut server,
@@ -798,7 +798,7 @@ async fn replayed_hello_is_rejected_and_user_hash_cannot_choose_identity() -> Re
     let key = "bob-key";
     let options = SudokuOptions::default();
     let core = ProxyCore::from_credentials("alice-key", &[key.into()]);
-    let replays = Arc::new(Mutex::new(HashMap::new()));
+    let replays = handshake_replays();
     let ephemeral = secret()?;
     let mut hello = timestamp()?.to_be_bytes().to_vec();
     hello.extend(&Sha256::digest(b"alice-key")[..8]); // Deliberately claim another user's hash.

@@ -1,4 +1,5 @@
 use super::*;
+use std::io::IoSlice;
 
 include!(concat!(
     env!("CARGO_MANIFEST_DIR"),

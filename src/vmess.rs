@@ -1,5 +1,6 @@
 use crate::core::{CoreSession, ProxyCore};
 use crate::protocol::{ProxyTarget, parse_uuid, resolve_target_addr, target_name};
+use crate::replay_cache::{ReplayCache, ReplayError};
 use crate::tls::{ServerTlsAcceptor, ServerTlsMaterial, TlsEchServerKeys};
 use crate::vless_transport::VlessTransportConfig;
 use crate::vmess_body::{BodyConfig, BodyReader, BodyWriter, RequestOptions, SecurityType};
@@ -16,7 +17,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::WriteHalf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -28,44 +29,32 @@ const SESSION_HISTORY_TTL: Duration = Duration::from_secs(180);
 const VERSION: u8 = 0x01;
 
 struct VmessReplayFilter {
-    auth_ids: std::sync::Mutex<HashMap<[u8; 16], Instant>>,
-    sessions: std::sync::Mutex<HashMap<([u8; 16], [u8; 16], [u8; 16]), Instant>>,
+    auth_ids: ReplayCache<[u8; 16]>,
+    sessions: ReplayCache<([u8; 16], [u8; 16], [u8; 16])>,
 }
 
 impl VmessReplayFilter {
     fn new() -> Self {
         Self {
-            auth_ids: std::sync::Mutex::new(HashMap::new()),
-            sessions: std::sync::Mutex::new(HashMap::new()),
+            auth_ids: ReplayCache::new(AUTH_ID_REPLAY_TTL, 65_536),
+            sessions: ReplayCache::new(SESSION_HISTORY_TTL, 65_536),
         }
     }
 
     fn check_auth_id(&self, auth_id: [u8; 16]) -> Result<()> {
-        let now = Instant::now();
-        let mut guard = self
-            .auth_ids
-            .lock()
-            .expect("VMess auth id replay lock poisoned");
-        guard.retain(|_, seen| now.duration_since(*seen) <= AUTH_ID_REPLAY_TTL);
-        ensure!(
-            guard.insert(auth_id, now).is_none(),
-            "VMess AuthID replay detected"
-        );
-        Ok(())
+        match self.auth_ids.check_and_store(auth_id) {
+            Ok(()) => Ok(()),
+            Err(ReplayError::Replayed) => bail!("VMess AuthID replay detected"),
+            Err(ReplayError::Full) => bail!("VMess AuthID replay cache is full"),
+        }
     }
 
     fn check_session(&self, user: [u8; 16], body_key: [u8; 16], body_iv: [u8; 16]) -> Result<()> {
-        let now = Instant::now();
-        let mut guard = self
-            .sessions
-            .lock()
-            .expect("VMess session history lock poisoned");
-        guard.retain(|_, seen| now.duration_since(*seen) <= SESSION_HISTORY_TTL);
-        ensure!(
-            guard.insert((user, body_key, body_iv), now).is_none(),
-            "VMess session replay detected"
-        );
-        Ok(())
+        match self.sessions.check_and_store((user, body_key, body_iv)) {
+            Ok(()) => Ok(()),
+            Err(ReplayError::Replayed) => bail!("VMess session replay detected"),
+            Err(ReplayError::Full) => bail!("VMess session replay cache is full"),
+        }
     }
 }
 const CMD_TCP: u8 = 0x01;

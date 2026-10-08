@@ -499,20 +499,9 @@ impl<W: AsyncWrite + Unpin> BodyWriter<W> {
                 std::io::IoSlice::new(plaintext),
                 std::io::IoSlice::new(&padding[..padding_len]),
             ];
-            let mut remaining = &mut buffers[..];
-            while !remaining.is_empty() {
-                let written = self
-                    .inner
-                    .write_vectored(remaining)
-                    .await
-                    .context("write VMess chunk")?;
-                if written == 0 {
-                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
-                        .context("write VMess chunk");
-                }
-                std::io::IoSlice::advance_slices(&mut remaining, written);
-            }
-            return Ok(());
+            return crate::io_util::write_all_vectored(&mut self.inner, &mut buffers)
+                .await
+                .context("write VMess chunk");
         }
         let size_len = self.state.size_field_len();
         self.frame.clear();
