@@ -41,7 +41,10 @@ mod sudoku_performance {
                         .map(|i| crate::CoreUser::password(format!("user-{i}"), format!("key-{i}")))
                         .collect(),
                 )?;
-                let key = format!("key-{}", users - 1);
+                // HashMap iteration is randomized per process. Use the same
+                // relative search position in both builds instead of timing
+                // whichever position a fixed credential happens to occupy.
+                let key = core.known_credentials()[users / 2].clone();
                 let options = SudokuOptions {
                     aead: "aes-128-gcm".into(),
                     ..Default::default()
