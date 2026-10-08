@@ -2,9 +2,9 @@ use crate::core::{CoreSession, ProxyCore};
 use crate::padding::PaddingScheme;
 use crate::protocol::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
-    CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, Frame,
-    PaddedFrameWriter, ProxyTarget, decode_target, encode_target, parse_settings,
-    read_auth_preface_user, read_frame, resolve_target_addr, target_name,
+    CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, Frame, ProxyTarget,
+    decode_target, encode_target, parse_settings, read_auth_preface_user, read_frame,
+    resolve_target_addr, target_name, write_frame, write_payload_chunks,
 };
 use crate::socket_protect;
 use crate::task_abort::TaskAbort;
@@ -25,8 +25,6 @@ use tokio::time::{Duration, interval};
 
 const MAX_PENDING_UOT: usize = 256;
 const MAX_UOT_BUFFER: usize = 64 * 1024;
-
-type SessionWriter = Arc<Mutex<PaddedFrameWriter<WriteHalf<EarlyDataTlsStream>>>>;
 
 struct StreamControl {
     sender: mpsc::Sender<Vec<u8>>,
@@ -225,7 +223,7 @@ async fn serve_session(
     connection_abort: Arc<TaskAbort>,
 ) -> Result<()> {
     let (mut reader, writer) = split(tls_stream);
-    let writer = Arc::new(Mutex::new(PaddedFrameWriter::new_unpadded(writer)));
+    let writer = Arc::new(Mutex::new(writer));
     let mut received_settings = false;
     let mut pending = HashSet::new();
     let mut pending_uot: HashMap<u32, (ProxyTarget, Vec<u8>)> = HashMap::new();
@@ -244,7 +242,7 @@ async fn serve_session(
                     _ = heartbeat.tick() => {
                         if received_settings {
                             let mut writer = writer.lock().await;
-                            writer.write_frame(CMD_HEART_REQUEST, 0, &[]).await?;
+                            write_frame(&mut *writer, CMD_HEART_REQUEST, 0, &[]).await?;
                         }
                     }
                 }
@@ -254,8 +252,7 @@ async fn serve_session(
             CMD_SYN => {
                 if !received_settings {
                     let mut writer = writer.lock().await;
-                    writer
-                        .write_frame(CMD_ALERT, 0, b"client did not send settings")
+                    write_frame(&mut *writer, CMD_ALERT, 0, b"client did not send settings")
                         .await?;
                     bail!("client did not send settings before SYN");
                 }
@@ -344,21 +341,23 @@ async fn serve_session(
             }
             CMD_HEART_REQUEST => {
                 let mut writer = writer.lock().await;
-                writer
-                    .write_frame(CMD_HEART_RESPONSE, frame.stream_id, &[])
-                    .await?;
+                write_frame(&mut *writer, CMD_HEART_RESPONSE, frame.stream_id, &[]).await?;
             }
             CMD_SETTINGS => {
                 let settings = parse_settings(&frame.payload);
                 received_settings = true;
                 if settings.get("padding-md5").map(String::as_str) != Some(padding.md5()) {
                     let mut writer = writer.lock().await;
-                    writer
-                        .write_frame(CMD_UPDATE_PADDING_SCHEME, 0, padding.raw_text().as_bytes())
-                        .await?;
+                    write_frame(
+                        &mut *writer,
+                        CMD_UPDATE_PADDING_SCHEME,
+                        0,
+                        padding.raw_text().as_bytes(),
+                    )
+                    .await?;
                 }
                 let mut writer = writer.lock().await;
-                writer.write_frame(CMD_SERVER_SETTINGS, 0, b"v=2").await?;
+                write_frame(&mut *writer, CMD_SERVER_SETTINGS, 0, b"v=2").await?;
             }
             CMD_WASTE | CMD_SERVER_SETTINGS | CMD_UPDATE_PADDING_SCHEME => {}
             CMD_ALERT => {
@@ -371,7 +370,7 @@ async fn serve_session(
 
 async fn open_stream(
     frame: Frame,
-    writer: SessionWriter,
+    writer: Arc<Mutex<WriteHalf<EarlyDataTlsStream>>>,
     session: CoreSession,
     connection_abort: Arc<TaskAbort>,
 ) -> Result<(u32, StreamControl)> {
@@ -392,16 +391,20 @@ async fn open_stream(
         Ok(remote) => remote,
         Err(error) => {
             let mut writer = writer.lock().await;
-            writer
-                .write_frame(CMD_SYNACK, stream_id, error.to_string().as_bytes())
-                .await?;
+            write_frame(
+                &mut *writer,
+                CMD_SYNACK,
+                stream_id,
+                error.to_string().as_bytes(),
+            )
+            .await?;
             return Err(error);
         }
     };
     let _ = remote.set_nodelay(true);
     {
         let mut writer = writer.lock().await;
-        writer.write_frame(CMD_SYNACK, stream_id, &[]).await?;
+        write_frame(&mut *writer, CMD_SYNACK, stream_id, &[]).await?;
     }
     let (mut remote_reader, mut remote_writer) = remote.into_split();
     let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(32);
@@ -433,7 +436,7 @@ async fn open_stream(
                 };
                 if read == 0 {
                     let mut writer = downlink_writer.lock().await;
-                    writer.write_frame(CMD_FIN, stream_id, &[]).await?;
+                    write_frame(&mut *writer, CMD_FIN, stream_id, &[]).await?;
                     return Ok(());
                 }
                 tokio::select! {
@@ -447,7 +450,7 @@ async fn open_stream(
                     };
                     // A stream FIN cannot cancel a partially written mux frame.
                     // Only closing the whole TLS connection may interrupt it.
-                    writer.write_payload_chunks(stream_id, &buffer[..read]).await?;
+                    write_payload_chunks(&mut *writer, stream_id, &buffer[..read]).await?;
                 }
             }
             } => result,
@@ -489,7 +492,7 @@ async fn open_uot_stream(
     stream_id: u32,
     target: &ProxyTarget,
     initial_payload: &[u8],
-    writer: SessionWriter,
+    writer: Arc<Mutex<WriteHalf<EarlyDataTlsStream>>>,
     session: CoreSession,
     connection_abort: Arc<TaskAbort>,
 ) -> Result<(u32, StreamControl)> {
@@ -505,7 +508,7 @@ async fn open_uot_stream(
     }
     {
         let mut writer = writer.lock().await;
-        writer.write_frame(CMD_SYNACK, stream_id, &[]).await?;
+        write_frame(&mut *writer, CMD_SYNACK, stream_id, &[]).await?;
     }
     let udp = Arc::new(udp);
     let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(32);
@@ -622,7 +625,7 @@ async fn open_uot_stream(
                         _ = downlink_abort.cancelled() => return Ok(()),
                         writer = downlink_writer.lock() => writer,
                     };
-                    writer.write_payload_chunks(stream_id, &packet).await?;
+                    write_payload_chunks(&mut *writer, stream_id, &packet).await?;
                 }
             }
             } => result,

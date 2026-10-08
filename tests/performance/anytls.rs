@@ -40,14 +40,17 @@ mod transport_performance {
         R: AsyncRead + Unpin,
     {
         let mut writer = PaddedFrameWriter::new(writer, PaddingScheme::default());
-        writer.send_padding = padded;
         let payload = vec![0x42; size];
         let mut iterations = 0;
         let mut start = Instant::now();
         loop {
             tokio::try_join!(
                 async {
-                    writer.write_payload_chunks(7, &payload).await?;
+                    if padded {
+                        writer.write_payload_chunks(7, &payload).await?;
+                    } else {
+                        write_payload_chunks(&mut writer.inner, 7, &payload).await?;
+                    }
                     Ok::<(), anyhow::Error>(())
                 },
                 async {
