@@ -1538,6 +1538,8 @@ struct PacketSendWindow {
     congestion_window: usize,
     slow_start_limit: usize,
     growth: usize,
+    duplicate_acks: u8,
+    fast_retransmit: bool,
     rto: Duration,
     srtt: Option<f64>,
     rtt_var: f64,
@@ -1551,6 +1553,8 @@ impl Default for PacketSendWindow {
             congestion_window: 32,
             slow_start_limit: 256,
             growth: 0,
+            duplicate_acks: 0,
+            fast_retransmit: false,
             rto: Duration::from_millis(PACKET_RETRANSMIT_INTERVAL_MS),
             srtt: None,
             rtt_var: 0.0,
@@ -1576,6 +1580,15 @@ impl PacketSendWindow {
             return;
         }
         self.peer_window = usize::from(window).min(MAX_PENDING_SEGMENTS);
+        if advance == 0 && unacked.contains_key(&ack) {
+            self.duplicate_acks = self.duplicate_acks.saturating_add(1);
+            if self.duplicate_acks == 3 {
+                self.fast_retransmit = true;
+            }
+        } else {
+            self.duplicate_acks = 0;
+            self.fast_retransmit = false;
+        }
         self.peer_ack = ack;
         let now = Instant::now();
         let mut acknowledged = 0;
@@ -1704,7 +1717,8 @@ async fn run_mieru_session_output(
                     // enough. Never resend the whole in-flight window at once.
                     if let Some(outstanding) = unacked.values_mut().next() {
                         let timeout = flow.rto * (1u32 << outstanding.attempts.saturating_sub(1).min(4));
-                        if outstanding.sent.elapsed() >= timeout.min(Duration::from_secs(3)) {
+                        if flow.fast_retransmit || outstanding.sent.elapsed() >= timeout.min(Duration::from_secs(3)) {
+                            flow.fast_retransmit = false;
                             ensure!(outstanding.attempts < PACKET_TX_COUNT_LIMIT,
                                 "too many retransmissions of Mieru segment {}", outstanding.segment.metadata.seq());
                             writer.lock().await.write_segment(outstanding.segment.clone()).await?;
