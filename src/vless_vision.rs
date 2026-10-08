@@ -401,7 +401,8 @@ pub fn encode_continue_frame(user: &[u8; 16], write_uuid: bool, payload: &[u8]) 
     encode_vision_frame(user, write_uuid, COMMAND_PADDING_CONTINUE, payload)
 }
 
-pub fn encode_direct_frame(user: &[u8; 16], write_uuid: bool, payload: &[u8]) -> Result<Vec<u8>> {
+#[cfg(test)]
+fn encode_direct_frame(user: &[u8; 16], write_uuid: bool, payload: &[u8]) -> Result<Vec<u8>> {
     encode_vision_frame(user, write_uuid, COMMAND_PADDING_DIRECT, payload)
 }
 
@@ -415,21 +416,19 @@ pub struct VisionEncoder {
 }
 
 impl VisionEncoder {
-    pub fn new(user: [u8; 16]) -> Self {
+    #[cfg(test)]
+    fn new(user: [u8; 16]) -> Self {
+        Self::with_control(user, Arc::new(VisionControl::default()))
+    }
+
+    pub(crate) fn with_control(user: [u8; 16], control: Arc<VisionControl>) -> Self {
         Self {
             user,
             uuid_written: false,
             direct: false,
             ended: false,
             blocks: 0,
-            control: Arc::new(VisionControl::default()),
-        }
-    }
-
-    pub(crate) fn with_control(user: [u8; 16], control: Arc<VisionControl>) -> Self {
-        Self {
             control,
-            ..Self::new(user)
         }
     }
 

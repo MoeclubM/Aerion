@@ -475,16 +475,10 @@ async fn connect_vless_server(
             .unwrap_or(utls::UtlsFingerprint::Chrome);
         let alpn = config.transport.alpn_protocols();
         let alpn = if alpn.is_empty() { None } else { Some(alpn) };
-        let stream = reality_tls_client::connect_with_vision(
-            tcp,
-            reality,
-            &config.sni,
-            fingerprint,
-            alpn,
-            vision,
-        )
-        .await
-        .context("REALITY connect to VLESS server")?;
+        let stream =
+            reality_tls_client::connect(tcp, reality, &config.sni, fingerprint, alpn, vision)
+                .await
+                .context("REALITY connect to VLESS server")?;
         return vless_transport::apply_client_transport(
             stream,
             &config.transport,

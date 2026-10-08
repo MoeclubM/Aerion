@@ -144,25 +144,7 @@ impl AsyncWrite for RealityTlsClientStream {
     }
 }
 
-pub async fn connect(
-    stream: TcpStream,
-    config: &RealityClientConfig,
-    server_name: &str,
-    fingerprint: UtlsFingerprint,
-    alpn_protocols: Option<Vec<Vec<u8>>>,
-) -> Result<RealityTlsClientStream> {
-    connect_with_vision(
-        stream,
-        config,
-        server_name,
-        fingerprint,
-        alpn_protocols,
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn connect_with_vision(
+pub(crate) async fn connect(
     mut stream: TcpStream,
     config: &RealityClientConfig,
     server_name: &str,
