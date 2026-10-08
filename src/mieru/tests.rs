@@ -88,6 +88,142 @@ fn packet_sender_honors_peer_window_and_rejects_stale_or_future_acks() {
     assert!(flow.can_send(2, 1));
 }
 
+#[test]
+fn packet_loss_recovery_retransmits_partial_ack_without_repeated_window_cuts() {
+    let mut flow = PacketSendWindow::default();
+    let mut unacked = (0..5)
+        .map(|seq| {
+            (
+                seq,
+                OutstandingSegment {
+                    segment: MieruSegment {
+                        metadata: MieruMetadata::Session(MieruSessionMetadata {
+                            protocol: OPEN_SESSION_REQUEST,
+                            session_id: 1,
+                            seq,
+                            status_code: STATUS_OK,
+                            payload_len: 0,
+                            suffix_len: 0,
+                        }),
+                        payload: Vec::new(),
+                    },
+                    attempts: 1,
+                    sent: Instant::now(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for _ in 0..3 {
+        flow.ack(0, 32, 5, &mut unacked);
+    }
+    assert!(flow.fast_retransmit);
+    flow.on_retransmit(5);
+    let recovery_window = flow.congestion_window;
+    unacked.get_mut(&0).unwrap().attempts += 1;
+    for _ in 0..4 {
+        flow.ack(0, 32, 5, &mut unacked);
+    }
+    assert!(
+        !flow.fast_retransmit,
+        "do not repeatedly retransmit the same hole"
+    );
+    flow.ack(2, 32, 5, &mut unacked);
+    assert!(
+        flow.fast_retransmit,
+        "partial ACK exposes the next hole immediately"
+    );
+    flow.on_retransmit(5);
+    assert_eq!(flow.congestion_window, recovery_window);
+    flow.ack(5, 32, 5, &mut unacked);
+    assert!(unacked.is_empty());
+    assert!(flow.recovery_until.is_none());
+}
+
+#[test]
+fn cumulative_packet_ack_removes_only_the_prefix_across_sequence_wraparound() {
+    let mut flow = PacketSendWindow {
+        peer_ack: u32::MAX - 1,
+        ..Default::default()
+    };
+    let mut unacked = [u32::MAX - 1, u32::MAX, 0, 1]
+        .into_iter()
+        .map(|seq| {
+            (
+                seq,
+                OutstandingSegment {
+                    segment: MieruSegment {
+                        metadata: MieruMetadata::Session(MieruSessionMetadata {
+                            protocol: OPEN_SESSION_REQUEST,
+                            session_id: 1,
+                            seq,
+                            status_code: STATUS_OK,
+                            payload_len: 0,
+                            suffix_len: 0,
+                        }),
+                        payload: Vec::new(),
+                    },
+                    attempts: 1,
+                    sent: Instant::now(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    flow.ack(1, 32, 2, &mut unacked);
+    assert_eq!(unacked.keys().copied().collect::<Vec<_>>(), vec![1]);
+    assert_eq!(flow.peer_ack, 1);
+}
+
+#[tokio::test]
+async fn cached_packet_cipher_preserves_authentication_hint_rotation_and_replay_checks()
+-> Result<()> {
+    let user = MieruUser::password("user", "secret").into_secret();
+    let key = current_mieru_key(&user.hashed_password)?;
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    configure_mieru_packet_socket(&socket)?;
+    let cipher = MieruCipher::new(key, false, user.username.clone(), None);
+    let mut peer = MieruPacketPeer {
+        writer: Arc::new(Mutex::new(MieruAnyWriter::Packet(MieruPacketWriter::new(
+            socket,
+            Some("127.0.0.1:1234".parse()?),
+            Vec::new(),
+            cipher.clone(),
+            1400,
+            None,
+        )))),
+        cipher,
+        user,
+        key_epoch: 7,
+        last_rx: Instant::now(),
+    };
+    let segment = MieruSegment {
+        metadata: MieruMetadata::Session(MieruSessionMetadata {
+            protocol: OPEN_SESSION_REQUEST,
+            session_id: 1,
+            seq: 0,
+            status_code: STATUS_OK,
+            payload_len: 4,
+            suffix_len: 0,
+        }),
+        payload: b"ping".to_vec(),
+    };
+    let mut send = peer.cipher.clone();
+    let packet = encode_mieru_packet_segment(&mut send, segment.clone(), 1400, None)?;
+    let replay = MieruReplayCache::new();
+    assert!(peer.decode(&packet, 8, true, &replay).is_err());
+    let mut corrupted = packet.clone();
+    corrupted[NONCE_LEN + 1] ^= 1;
+    assert!(peer.decode(&corrupted, 7, true, &replay).is_err());
+    let mut wrong_hint = MieruCipher::new(key, false, "another-user".to_string(), None);
+    let wrong_hint_packet = encode_mieru_packet_segment(&mut wrong_hint, segment, 1400, None)?;
+    assert!(peer.decode(&wrong_hint_packet, 7, true, &replay).is_err());
+    assert_eq!(peer.decode(&packet, 7, true, &replay)?.payload, b"ping");
+    assert!(
+        peer.decode(&packet, 7, true, &replay).is_err(),
+        "cached OPEN must still reject replay"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn session_write_applies_backpressure_without_blocking_control() -> Result<()> {
     let (_, inbound) = mpsc::unbounded_channel();

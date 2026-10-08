@@ -194,6 +194,13 @@ pub(super) fn current_mieru_key(hashed_password: &[u8; KEY_LEN]) -> Result<[u8; 
     Ok(keys[1])
 }
 
+pub(super) fn mieru_key_epoch() -> Result<u64> {
+    Ok(
+        (SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + KEY_REFRESH_SECS / 2)
+            / KEY_REFRESH_SECS,
+    )
+}
+
 pub(super) fn mieru_keys_for_password(
     hashed_password: &[u8; KEY_LEN],
 ) -> Result<Vec<[u8; KEY_LEN]>> {

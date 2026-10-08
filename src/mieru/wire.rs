@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const METADATA_LEN: usize = 32;
-const PACKET_METADATA_LEN: usize = NONCE_LEN + METADATA_LEN + AEAD_OVERHEAD;
+pub(super) const PACKET_METADATA_LEN: usize = NONCE_LEN + METADATA_LEN + AEAD_OVERHEAD;
 const REPLAY_CACHE_TTL: Duration = Duration::from_secs(6 * 60);
 const REPLAY_CACHE_MAX: usize = 65_536;
 
