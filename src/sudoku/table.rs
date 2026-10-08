@@ -1,6 +1,7 @@
 //! Wire-compatible 4x4 Sudoku appearance codec. The grid numbering and seeded
 //! shuffle are protocol constants, shared by the official Go implementation.
 use anyhow::{Result, bail, ensure};
+use rand::{RngCore, SeedableRng, rngs::StdRng};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -77,9 +78,19 @@ fn grids() -> &'static Grids {
     })
 }
 
-fn clue_key(mut hints: [u8; 4]) -> u32 {
-    hints.sort_unstable();
-    u32::from_be_bytes(hints)
+fn sorted_hints([a, b, c, d]: [u8; 4]) -> [u8; 4] {
+    // A fixed sorting network avoids unpredictable comparisons when every
+    // received byte uses a newly shuffled set of four clues.
+    let (a, b) = (a.min(b), a.max(b));
+    let (c, d) = (c.min(d), c.max(d));
+    let (a, c) = (a.min(c), a.max(c));
+    let (b, d) = (b.min(d), b.max(d));
+    let (b, c) = (b.min(c), b.max(c));
+    [a, b, c, d]
+}
+
+fn clue_key(hints: [u8; 4]) -> u32 {
+    u32::from_be_bytes(sorted_hints(hints))
 }
 
 const CLUE_RANK: [[usize; 4]; 64] = {
@@ -100,9 +111,8 @@ const CLUE_RANK: [[usize; 4]; 64] = {
     ranks
 };
 
-fn clue_index(mut hints: [u8; 4]) -> Option<usize> {
-    hints.sort_unstable();
-    let [a, b, c, d] = hints.map(usize::from);
+fn clue_index(hints: [u8; 4]) -> Option<usize> {
+    let [a, b, c, d] = sorted_hints(hints).map(usize::from);
     if a == b || b == c || c == d {
         return None;
     }
@@ -343,6 +353,102 @@ impl Decoder {
     }
 }
 
+pub(super) struct Encoder {
+    rng: StdRng,
+    random: Vec<u8>,
+    output: Vec<u8>,
+}
+impl Encoder {
+    pub fn new() -> Result<Self> {
+        let mut seed = [0; 32];
+        getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("Sudoku appearance seed: {e}"))?;
+        Ok(Self {
+            rng: StdRng::from_seed(seed),
+            random: Vec::new(),
+            output: Vec::new(),
+        })
+    }
+    // Appearance randomness is independent of AEAD keys/counters. Seed a
+    // standard CSPRNG once per direction instead of asking the OS for up to
+    // twelve random bytes for every plaintext byte. Keep padding unchanged.
+    pub fn encode(
+        &mut self,
+        table: &Table,
+        down: bool,
+        packed: bool,
+        input: &[u8],
+        padding: u8,
+    ) -> &[u8] {
+        let layout = if down { &table.down } else { &table.up };
+        let groups = if packed {
+            (input.len() * 8).div_ceil(6)
+        } else {
+            input.len() * 4
+        };
+        let draw_len = if padding == 0 { 0 } else { groups * 2 };
+        let puzzle_len = if packed { 0 } else { input.len() * 4 };
+        self.random.resize(draw_len + puzzle_len, 0);
+        self.rng.fill_bytes(&mut self.random);
+        let (padding_random, puzzle_random) = self.random.split_at(draw_len);
+        let mut draw = padding_random.iter().copied();
+        let pool = if packed {
+            &layout.packed_padding
+        } else {
+            &layout.padding
+        };
+        self.output.clear();
+        self.output
+            .reserve(groups * if padding == 0 { 1 } else { 2 } + usize::from(packed));
+        let output = &mut self.output;
+        let mut emit = |group: u8| {
+            if padding != 0 && draw.next().unwrap() as u16 * 100 < padding as u16 * 256 {
+                output.push(pool[draw.next().unwrap() as usize % pool.len()]);
+            }
+            output.push(layout.encode[group as usize]);
+        };
+        if packed {
+            let mut triples = input.chunks_exact(3);
+            for chunk in &mut triples {
+                let (a, b, c) = (chunk[0], chunk[1], chunk[2]);
+                emit(a >> 2);
+                emit(((a & 3) << 4) | (b >> 4));
+                emit(((b & 15) << 2) | (c >> 6));
+                emit(c & 63);
+            }
+            let (mut bits, mut count) = (0u32, 0u8);
+            for &byte in triples.remainder() {
+                bits = (bits << 8) | byte as u32;
+                count += 8;
+                while count >= 6 {
+                    count -= 6;
+                    emit(((bits >> count) & 63) as u8);
+                }
+                bits &= (1 << count) - 1;
+            }
+            if count > 0 {
+                emit((bits << (6 - count)) as u8);
+                output.push(layout.marker);
+            }
+        } else {
+            for (index, &byte) in input.iter().enumerate() {
+                let choices = &grids().encodings[table.order[byte as usize]];
+                let random = &puzzle_random[index * 4..index * 4 + 4];
+                let mut hints =
+                    choices[u16::from_be_bytes([random[0], random[1]]) as usize % choices.len()];
+                // Clue order has no meaning on the wire.
+                for i in (1..4).rev() {
+                    hints.swap(i, random[i] as usize % (i + 1));
+                }
+                for group in hints {
+                    emit(group);
+                }
+            }
+        }
+        &self.output
+    }
+}
+
+#[cfg(test)]
 pub(super) fn encode(
     table: &Table,
     down: bool,
@@ -350,70 +456,7 @@ pub(super) fn encode(
     input: &[u8],
     padding: u8,
 ) -> Result<Vec<u8>> {
-    let layout = if down { &table.down } else { &table.up };
-    let groups = if packed {
-        (input.len() * 8).div_ceil(6)
-    } else {
-        input.len() * 4
-    };
-    let draw_len = if padding == 0 { 0 } else { groups * 2 };
-    let puzzle_len = if packed { 0 } else { input.len() * 4 };
-    let mut random = vec![0; draw_len + puzzle_len];
-    if !random.is_empty() {
-        getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("Sudoku random source: {e}"))?;
-    }
-    let (padding_random, puzzle_random) = random.split_at(draw_len);
-    let mut draw = padding_random.iter().copied();
-    let pool = if packed {
-        &layout.packed_padding
-    } else {
-        &layout.padding
-    };
-    let mut output =
-        Vec::with_capacity(groups * if padding == 0 { 1 } else { 2 } + usize::from(packed));
-    let mut emit = |group: u8| {
-        if padding != 0 && draw.next().unwrap() as u16 * 100 < padding as u16 * 256 {
-            output.push(pool[draw.next().unwrap() as usize % pool.len()]);
-        }
-        output.push(layout.encode[group as usize]);
-    };
-    if packed {
-        let mut triples = input.chunks_exact(3);
-        for chunk in &mut triples {
-            let (a, b, c) = (chunk[0], chunk[1], chunk[2]);
-            emit(a >> 2);
-            emit(((a & 3) << 4) | (b >> 4));
-            emit(((b & 15) << 2) | (c >> 6));
-            emit(c & 63);
-        }
-        let (mut bits, mut count) = (0u32, 0u8);
-        for &byte in triples.remainder() {
-            bits = (bits << 8) | byte as u32;
-            count += 8;
-            while count >= 6 {
-                count -= 6;
-                emit(((bits >> count) & 63) as u8);
-            }
-            bits &= (1 << count) - 1;
-        }
-        if count > 0 {
-            emit((bits << (6 - count)) as u8);
-            output.push(layout.marker);
-        }
-    } else {
-        for (index, &byte) in input.iter().enumerate() {
-            let choices = &grids().encodings[table.order[byte as usize]];
-            let random = &puzzle_random[index * 4..index * 4 + 4];
-            let mut hints =
-                choices[u16::from_be_bytes([random[0], random[1]]) as usize % choices.len()];
-            // Clue order has no meaning on the wire.
-            for i in (1..4).rev() {
-                hints.swap(i, random[i] as usize % (i + 1));
-            }
-            for group in hints {
-                emit(group);
-            }
-        }
-    }
-    Ok(output)
+    let mut encoder = Encoder::new()?;
+    encoder.encode(table, down, packed, input, padding);
+    Ok(encoder.output)
 }

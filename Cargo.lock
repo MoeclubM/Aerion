@@ -38,6 +38,7 @@ dependencies = [
  "http",
  "md-5",
  "quinn",
+ "rand 0.9.5",
  "rcgen",
  "regex",
  "rustls",

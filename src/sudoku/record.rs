@@ -1,4 +1,4 @@
-use super::table::{Decoder, Table, encode};
+use super::table::{Decoder, Encoder, Table};
 use aes_gcm::Aes128Gcm;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use anyhow::{Context, Result, ensure};
@@ -194,6 +194,7 @@ impl Receiver {
 }
 
 pub(super) struct Sender {
+    encoder: Encoder,
     table: Table,
     down: bool,
     packed: bool,
@@ -213,6 +214,7 @@ impl Sender {
         padding: u8,
     ) -> Result<Self> {
         let mut value = Self {
+            encoder: Encoder::new()?,
             table,
             down,
             packed,
@@ -251,13 +253,13 @@ impl Sender {
                 .checked_add(1)
                 .context("Sudoku sequence exhausted")?;
             writer
-                .write_all(&encode(
+                .write_all(self.encoder.encode(
                     &self.table,
                     self.down,
                     self.packed,
                     &frame,
                     self.padding,
-                )?)
+                ))
                 .await?;
             self.bytes += chunk.len() as u64;
             if self.bytes >= 32 << 20 {

@@ -628,6 +628,32 @@ fn appearance_roundtrips_all_bytes_and_fragmented_packed_records() -> Result<()>
     Ok(())
 }
 
+#[test]
+fn appearance_encoder_stream_roundtrips_mixed_read_boundaries() -> Result<()> {
+    let table = Table::new("appearance-stream", "up_ascii_down_entropy", "xpxvvpvv")?;
+    for packed in [false, true] {
+        for padding in [0, 5, 100] {
+            let mut encoder = table::Encoder::new()?;
+            let mut wire = Vec::new();
+            let mut expected = Vec::new();
+            for size in [1, 2, 3, 17, 64, 257, 4097] {
+                let plain = (0..size).map(|i| (i * 7) as u8).collect::<Vec<_>>();
+                wire.extend_from_slice(encoder.encode(&table, true, packed, &plain, padding));
+                expected.extend(plain);
+            }
+            for fragment in [1, 4, 7, 31, 8192] {
+                let mut decoder = table::Decoder::new(table.clone(), true, packed);
+                let mut plain = Vec::new();
+                for chunk in wire.chunks(fragment) {
+                    decoder.feed_into(chunk, &mut plain)?;
+                }
+                assert_eq!(plain, expected);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn authenticated_handshake_and_revoked_users() -> Result<()> {
     let core = ProxyCore::from_credentials("alice-key", &["bob-key".into()]);
