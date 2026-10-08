@@ -699,8 +699,8 @@ where
                 .write_all(&encoded)
                 .await
                 .context("write VLESS Vision downlink")?;
+            client_writer.flush().await?;
             if encoder.direct() && !vision.write_direct() {
-                client_writer.flush().await?;
                 vision.start_write_direct();
             }
         }
@@ -746,8 +746,8 @@ async fn relay_vision_client_counted(
                 .write_all(&encoded)
                 .await
                 .context("write VLESS Vision payload")?;
+            server_writer.flush().await?;
             if encoder.direct() && !vision.write_direct() {
-                server_writer.flush().await?;
                 vision.start_write_direct();
             }
         }

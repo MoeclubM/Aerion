@@ -722,6 +722,7 @@ async fn vision_inner_tls_reaches_target_over_tls_and_reality() -> Result<()> {
                     break;
                 }
                 stream.write_all(&buffer[..read]).await?;
+                stream.flush().await?;
             }
             Ok::<(), std::io::Error>(())
         });
@@ -804,7 +805,10 @@ async fn vision_inner_tls_reaches_target_over_tls_and_reality() -> Result<()> {
                 .await?;
             let expected = vec![0x5a; 2 * 1024 * 1024];
             let (mut reader, mut writer) = tokio::io::split(&mut stream);
-            let send = async { writer.write_all(&expected).await };
+            let send = async {
+                writer.write_all(&expected).await?;
+                writer.flush().await
+            };
             let receive = async {
                 let mut echoed = vec![0; expected.len()];
                 reader.read_exact(&mut echoed).await?;
@@ -820,11 +824,7 @@ async fn vision_inner_tls_reaches_target_over_tls_and_reality() -> Result<()> {
 
         client_task.abort();
         server_task.abort();
-        if result.is_ok() {
-            echo_task.abort();
-        } else {
-            echo_task.abort();
-        }
+        echo_task.abort();
         result.with_context(|| format!("inner TLS Vision use_reality={use_reality}"))?;
     }
     Ok(())
