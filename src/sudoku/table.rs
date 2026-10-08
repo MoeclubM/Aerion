@@ -407,16 +407,8 @@ impl Encoder {
             output.push(layout.encode[group as usize]);
         };
         if packed {
-            let mut triples = input.chunks_exact(3);
-            for chunk in &mut triples {
-                let (a, b, c) = (chunk[0], chunk[1], chunk[2]);
-                emit(a >> 2);
-                emit(((a & 3) << 4) | (b >> 4));
-                emit(((b & 15) << 2) | (c >> 6));
-                emit(c & 63);
-            }
             let (mut bits, mut count) = (0u32, 0u8);
-            for &byte in triples.remainder() {
+            for &byte in input {
                 bits = (bits << 8) | byte as u32;
                 count += 8;
                 while count >= 6 {
