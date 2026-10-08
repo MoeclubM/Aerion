@@ -257,8 +257,10 @@ pub async fn run_vmess_server_with_core(config: VmessServerConfig, core: ProxyCo
         tokio::spawn(async move {
             let result = async {
                 let stream = accept_vmess_transport(stream, acceptor).await?;
-                let stream = vless_transport::apply_server_transport(stream, &transport).await?;
-                handle_vmess_client(stream, users, core, peer, replay).await
+                vless_transport::serve_server_transport(stream, &transport, |stream| {
+                    handle_vmess_client(stream, users.clone(), core.clone(), peer, replay.clone())
+                })
+                .await
             }
             .await;
             if let Err(error) = result {

@@ -98,87 +98,62 @@ where
     Ok(stream_from_client_parts(response, request_body, true))
 }
 
-pub async fn server<S>(stream: S, transport: &VlessTransportConfig) -> Result<H2TransportStream>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let (request, mut respond) = accept_first_request(stream, "VLESS HTTP/2").await?;
-    let (parts, body) = request.into_parts();
-    ensure_http2_request(&parts, transport)?;
-    let response = http::Response::builder()
-        .status(200)
-        .header("cache-control", "no-store")
-        .body(())
-        .context("build VLESS HTTP/2 response")?;
-    let response_body = respond
-        .send_response(response, false)
-        .context("write VLESS HTTP/2 response headers")?;
-    Ok(stream_from_h2_parts(body, response_body, false))
-}
-
-pub async fn grpc_server<S>(
+pub async fn serve<S, F, Fut>(
     stream: S,
     transport: &VlessTransportConfig,
-) -> Result<H2TransportStream>
+    mut handler: F,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    F: FnMut(H2TransportStream) -> Fut,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
 {
-    let (request, mut respond) = accept_first_request(stream, "VLESS gRPC").await?;
-    let (parts, body) = request.into_parts();
-    ensure_grpc_request(&parts, transport)?;
-    let response = http::Response::builder()
-        .status(200)
-        .header("content-type", "application/grpc")
-        .header("trailer", "grpc-status, grpc-message")
-        .body(())
-        .context("build VLESS gRPC response")?;
-    let response_body = respond
-        .send_response(response, false)
-        .context("write VLESS gRPC response headers")?;
-    Ok(stream_from_h2_parts(body, response_body, true))
-}
-
-async fn accept_first_request<S>(
-    stream: S,
-    name: &'static str,
-) -> Result<(
-    http::Request<h2::RecvStream>,
-    h2::server::SendResponse<Bytes>,
-)>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let mut connection = h2::server::handshake(stream)
+    let grpc = transport.kind == crate::vless_transport::VlessTransportKind::Grpc;
+    let mut connection = h2::server::Builder::new()
+        .max_concurrent_streams(128)
+        .handshake(stream)
         .await
-        .with_context(|| format!("accept {name} h2 connection"))?;
-    let (request, respond) = connection
-        .accept()
-        .await
-        .with_context(|| format!("{name} h2 connection closed before request"))?
-        .with_context(|| format!("accept {name} request"))?;
-    tokio::spawn(async move {
-        while let Some(result) = connection.accept().await {
-            match result {
-                Ok((_, mut respond)) => {
-                    let response = match http::Response::builder().status(404).body(()) {
-                        Ok(response) => response,
-                        Err(error) => {
-                            tracing::warn!("build extra {name} h2 404 response failed: {error:?}");
-                            continue;
-                        }
-                    };
-                    if let Err(error) = respond.send_response(response, true) {
-                        tracing::warn!("reject extra {name} h2 request failed: {error:?}");
-                    }
+        .context("accept proxy h2 connection")?;
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            request = connection.accept() => {
+                let Some(request) = request else { break };
+                let (request, mut respond) = request.context("accept proxy h2 request")?;
+                let (parts, body) = request.into_parts();
+                let valid = if grpc {
+                    ensure_grpc_request(&parts, transport)
+                } else {
+                    ensure_http2_request(&parts, transport)
+                };
+                if let Err(error) = valid {
+                    tracing::debug!("reject proxy h2 request: {error:?}");
+                    respond.send_response(http::Response::builder().status(404).body(())?, true)?;
+                    continue;
                 }
-                Err(error) => {
-                    tracing::warn!("{name} h2 connection failed: {error:?}");
-                    return;
+                let mut response = http::Response::builder().status(200);
+                if grpc {
+                    response = response.header("content-type", "application/grpc")
+                        .header("trailer", "grpc-status, grpc-message");
+                } else {
+                    response = response.header("cache-control", "no-store");
+                }
+                let sender = respond.send_response(response.body(())?, false)?;
+                tasks.spawn(handler(stream_from_h2_parts(body, sender, grpc)));
+            }
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(result) = result {
+                    match result {
+                        Ok(Ok(())) => {},
+                        Ok(Err(error)) => tracing::debug!("proxy h2 stream failed: {error:?}"),
+                        Err(error) => tracing::warn!("proxy h2 stream task failed: {error:?}"),
+                    }
                 }
             }
         }
-    });
-    Ok((request, respond))
+    }
+    // Dropping JoinSet cancels handlers when the physical connection closes.
+    Ok(())
 }
 
 fn build_client_request(

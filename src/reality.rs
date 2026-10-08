@@ -28,8 +28,6 @@ const REALITY_AUTH_PLAIN_LEN: usize = 16;
 
 type HmacSha512 = Hmac<Sha512>;
 
-const REALITY_MAX_CLIENT_VERSION: [u8; 4] = [0, 0, 0, 1];
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RealityFallbackLimit {
     pub after_bytes: u64,
@@ -122,7 +120,7 @@ impl RealityServerConfig {
             short_ids: parse_short_ids(short_ids)?,
             alpn_protocols,
             max_time_diff_secs: 0,
-            max_client_version: Some(REALITY_MAX_CLIENT_VERSION),
+            max_client_version: None,
             fallback_limit: RealityFallbackLimit::default(),
         })
     }

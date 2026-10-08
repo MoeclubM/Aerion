@@ -99,6 +99,39 @@ fn rejects_empty_short_ids() {
 }
 
 #[test]
+fn default_allows_modern_clients_but_explicit_version_limit_is_enforced() -> Result<()> {
+    let private = StaticSecret::from([17; 32]);
+    let public = PublicKey::from(&private).to_bytes();
+    let mut server = RealityServerConfig::from_strings(
+        "reality.example.com",
+        443,
+        vec![],
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(private.to_bytes()),
+        &["a1b2".into()],
+        vec![],
+    )?;
+    let client = RealityClientConfig {
+        public_key: public,
+        short_id: [0xa1, 0xb2, 0, 0, 0, 0, 0, 0],
+    };
+    let hello = build_reality_client_hello_with_time(
+        &client,
+        "reality.example.com",
+        UtlsFingerprint::Chrome,
+        None,
+        [1, 8, 2, 0],
+        unix_time_u32()?,
+    )?;
+    assert_eq!(
+        authenticate_client_hello(&hello.raw, &server)?.client_version,
+        [1, 8, 2, 0]
+    );
+    server.max_client_version = Some([1, 8, 1, 0]);
+    assert!(authenticate_client_hello(&hello.raw, &server).is_err());
+    Ok(())
+}
+
+#[test]
 fn rejects_client_hello_outside_time_window() -> Result<()> {
     let mut server_private_bytes = [0u8; 32];
     getrandom::fill(&mut server_private_bytes)?;

@@ -123,6 +123,13 @@ impl MieruMetadata {
         }
     }
 
+    pub(super) fn window_size(&self) -> u16 {
+        match self {
+            Self::DataAck(metadata) => metadata.window_size,
+            Self::Session(_) => ACK_WINDOW_SIZE,
+        }
+    }
+
     pub(super) fn marshal(&self) -> Result<[u8; METADATA_LEN]> {
         let mut bytes = [0u8; METADATA_LEN];
         let timestamp = unix_minutes()?;

@@ -4,7 +4,8 @@ use crate::socket_protect;
 use crate::task_abort::TaskAbort;
 use crate::uot;
 use anyhow::{Context, Result, bail, ensure};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -17,7 +18,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, split};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Instant;
 
 mod crypto;
@@ -127,18 +128,25 @@ enum MieruAnyWriter {
     Packet(MieruPacketWriter),
 }
 
-#[derive(Debug)]
 pub struct MieruSession {
     inbound: mpsc::UnboundedReceiver<Vec<u8>>,
     outbound: mpsc::UnboundedSender<SessionCommand>,
     read_buffer: Vec<u8>,
     read_pos: usize,
     close_sent: bool,
+    send_budget: Arc<Semaphore>,
+    send_permit: Option<
+        Pin<
+            Box<
+                dyn Future<Output = Result<OwnedSemaphorePermit, tokio::sync::AcquireError>> + Send,
+            >,
+        >,
+    >,
 }
 
 #[derive(Debug)]
 enum SessionCommand {
-    Data(Vec<u8>),
+    Data(Vec<u8>, OwnedSemaphorePermit),
     SendSegment(MieruSegment),
     SendAck {
         protocol: u8,
@@ -147,6 +155,7 @@ enum SessionCommand {
     },
     PeerAck {
         un_ack_seq: u32,
+        window_size: u16,
     },
     Close,
 }
@@ -515,6 +524,8 @@ impl MieruSession {
             read_buffer: Vec::new(),
             read_pos: 0,
             close_sent: false,
+            send_budget: Arc::new(Semaphore::new(8)),
+            send_permit: None,
         }
     }
 }
@@ -556,19 +567,38 @@ impl AsyncRead for MieruSession {
 
 impl AsyncWrite for MieruSession {
     fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut TaskContext<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
+        if self.outbound.is_closed() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Mieru session output closed",
+            )));
+        }
+        if self.send_permit.is_none() {
+            self.send_permit = Some(Box::pin(self.send_budget.clone().acquire_owned()));
+        }
+        let permit = match self.send_permit.as_mut().unwrap().as_mut().poll(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(result) => {
+                self.send_permit = None;
+                result.map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "Mieru send budget closed")
+                })?
+            }
+        };
+        let n = buf.len().min(MAX_PDU);
         self.outbound
-            .send(SessionCommand::Data(buf.to_vec()))
+            .send(SessionCommand::Data(buf[..n].to_vec(), permit))
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "Mieru session output closed")
             })?;
-        Poll::Ready(Ok(buf.len()))
+        Poll::Ready(Ok(n))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
@@ -1085,6 +1115,7 @@ async fn run_mieru_client_read_loop(
                                     &sessions,
                                     segment.metadata.session_id(),
                                     un_ack_seq,
+                                    segment.metadata.window_size(),
                                 )
                                 .await;
                             }
@@ -1104,6 +1135,7 @@ async fn run_mieru_client_read_loop(
                                 &sessions,
                                 segment.metadata.session_id(),
                                 segment.metadata.un_ack_seq().unwrap_or(0),
+                                segment.metadata.window_size(),
                             )
                             .await;
                         }
@@ -1251,6 +1283,7 @@ async fn run_mieru_packet_client_read_loop(
                                     &sessions,
                                     segment.metadata.session_id(),
                                     un_ack_seq,
+                                    segment.metadata.window_size(),
                                 )
                                 .await;
                             }
@@ -1271,6 +1304,7 @@ async fn run_mieru_packet_client_read_loop(
                                 &sessions,
                                 segment.metadata.session_id(),
                                 segment.metadata.un_ack_seq().unwrap_or(0),
+                                segment.metadata.window_size(),
                             )
                             .await;
                         }
@@ -1458,7 +1492,13 @@ async fn handle_server_segment(
         }
         DATA_CLIENT_TO_SERVER => {
             if let Some(un_ack_seq) = segment.metadata.un_ack_seq() {
-                ack_session_segments(&sessions, segment.metadata.session_id(), un_ack_seq).await;
+                ack_session_segments(
+                    &sessions,
+                    segment.metadata.session_id(),
+                    un_ack_seq,
+                    segment.metadata.window_size(),
+                )
+                .await;
             }
             route_session_segment(&sessions, segment, reliable.then_some(ACK_SERVER_TO_CLIENT))
                 .await?;
@@ -1476,6 +1516,7 @@ async fn handle_server_segment(
                 &sessions,
                 segment.metadata.session_id(),
                 segment.metadata.un_ack_seq().unwrap_or(0),
+                segment.metadata.window_size(),
             )
             .await;
         }
@@ -1483,6 +1524,94 @@ async fn handle_server_segment(
         other => bail!("unexpected Mieru server segment protocol {other}"),
     }
     Ok(())
+}
+
+struct OutstandingSegment {
+    segment: MieruSegment,
+    attempts: u8,
+    sent: Instant,
+}
+
+struct PacketSendWindow {
+    peer_ack: u32,
+    peer_window: usize,
+    congestion_window: usize,
+    slow_start_limit: usize,
+    growth: usize,
+    rto: Duration,
+    srtt: Option<f64>,
+    rtt_var: f64,
+}
+
+impl Default for PacketSendWindow {
+    fn default() -> Self {
+        Self {
+            peer_ack: 0,
+            peer_window: 32,
+            congestion_window: 32,
+            slow_start_limit: 256,
+            growth: 0,
+            rto: Duration::from_millis(PACKET_RETRANSMIT_INTERVAL_MS),
+            srtt: None,
+            rtt_var: 0.0,
+        }
+    }
+}
+
+impl PacketSendWindow {
+    fn can_send(&self, next_seq: u32, in_flight: usize) -> bool {
+        in_flight < self.congestion_window
+            && next_seq.wrapping_sub(self.peer_ack) < self.peer_window as u32
+    }
+
+    fn ack(
+        &mut self,
+        ack: u32,
+        window: u16,
+        next_seq: u32,
+        unacked: &mut BTreeMap<u32, OutstandingSegment>,
+    ) {
+        let advance = ack.wrapping_sub(self.peer_ack);
+        if advance >= (1 << 31) || ack.wrapping_sub(next_seq) < (1 << 31) && ack != next_seq {
+            return;
+        }
+        self.peer_window = usize::from(window).min(MAX_PENDING_SEGMENTS);
+        self.peer_ack = ack;
+        let now = Instant::now();
+        let mut acknowledged = 0;
+        let mut sample = None;
+        unacked.retain(|seq, segment| {
+            if ack.wrapping_sub(*seq) == 0 || ack.wrapping_sub(*seq) >= (1 << 31) {
+                return true;
+            }
+            acknowledged += 1;
+            if segment.attempts == 1 {
+                sample = Some(now.duration_since(segment.sent).as_secs_f64());
+            }
+            false
+        });
+        if let Some(sample) = sample {
+            if let Some(srtt) = self.srtt {
+                self.rtt_var = 0.75 * self.rtt_var + 0.25 * (srtt - sample).abs();
+                self.srtt = Some(0.875 * srtt + 0.125 * sample);
+            } else {
+                self.srtt = Some(sample);
+                self.rtt_var = sample / 2.0;
+            }
+            self.rto =
+                Duration::from_secs_f64((self.srtt.unwrap() + 4.0 * self.rtt_var).clamp(0.1, 3.0));
+        }
+        if self.congestion_window < self.slow_start_limit {
+            self.congestion_window =
+                (self.congestion_window + acknowledged).min(self.slow_start_limit);
+        } else {
+            self.growth += acknowledged;
+            if self.growth >= self.congestion_window {
+                self.growth -= self.congestion_window;
+                self.congestion_window = (self.congestion_window + 1).min(512);
+            }
+        }
+    }
 }
 
 async fn run_mieru_session_output(
@@ -1500,8 +1629,10 @@ async fn run_mieru_session_output(
     let result: Result<()> = async {
         let mut next_seq = if is_client { 0 } else { 1 };
         let mut opened = !is_client;
-        let mut unacked = BTreeMap::<u32, (MieruSegment, u8)>::new();
-        let retransmit_interval = Duration::from_millis(PACKET_RETRANSMIT_INTERVAL_MS);
+        let mut unacked = BTreeMap::<u32, OutstandingSegment>::new();
+        let mut pending = VecDeque::<(Vec<u8>, OwnedSemaphorePermit, usize)>::new();
+        let mut flow = PacketSendWindow::default();
+        let retransmit_interval = Duration::from_millis(25);
         let mut retransmit = tokio::time::interval_at(
             Instant::now() + retransmit_interval,
             retransmit_interval,
@@ -1515,69 +1646,8 @@ async fn run_mieru_session_output(
                         return Ok::<(), anyhow::Error>(());
                     };
                     match command {
-                        SessionCommand::Data(payload) => {
-                            let max_chunk = if reliable {
-                                mtu.checked_sub(PACKET_OVERHEAD)
-                                    .filter(|size| *size > 0)
-                                    .context("Mieru UDP packet MTU is too small")?
-                                    .min(MAX_PDU)
-                            } else {
-                                MAX_PDU
-                            };
-                            if is_client && !opened {
-                                let can_send_as_open_payload =
-                                    payload.len() <= MAX_SESSION_OPEN_PAYLOAD
-                                        && payload.len() <= max_chunk;
-                                let segment = MieruSegment {
-                                    metadata: MieruMetadata::Session(MieruSessionMetadata {
-                                        protocol: OPEN_SESSION_REQUEST,
-                                        session_id,
-                                        seq: next_seq,
-                                        status_code: STATUS_OK,
-                                        payload_len: 0,
-                                        suffix_len: 0,
-                                    }),
-                                    payload: if can_send_as_open_payload {
-                                        payload.clone()
-                                    } else {
-                                        Vec::new()
-                                    },
-                                };
-                                write_output_segment(&writer, segment, reliable, &mut unacked)
-                                    .await?;
-                                last_tx = Instant::now();
-                                heartbeat_at = last_tx + heartbeat_interval()?;
-                                next_seq = next_seq.wrapping_add(1);
-                                opened = true;
-                                if can_send_as_open_payload {
-                                    continue;
-                                }
-                            }
-                            for chunk in payload.chunks(max_chunk) {
-                                let protocol = if is_client {
-                                    DATA_CLIENT_TO_SERVER
-                                } else {
-                                    DATA_SERVER_TO_CLIENT
-                                };
-                                let segment = MieruSegment {
-                                    metadata: MieruMetadata::DataAck(MieruDataAckMetadata {
-                                        protocol,
-                                        session_id,
-                                        seq: next_seq,
-                                        un_ack_seq: un_ack_seq.load(Ordering::Relaxed),
-                                        window_size: ACK_WINDOW_SIZE,
-                                        fragment: 0,
-                                        prefix_len: 0,
-                                        payload_len: 0,
-                                        suffix_len: 0,
-                                    }),
-                                    payload: chunk.to_vec(),
-                                };
-                                write_output_segment(&writer, segment, reliable, &mut unacked).await?;
-                                last_tx = Instant::now();
-                                heartbeat_at = last_tx + heartbeat_interval()?;
-                                next_seq = next_seq.wrapping_add(1);
-                            }
+                        SessionCommand::Data(payload, permit) => {
+                            pending.push_back((payload, permit, 0));
                         }
                         SessionCommand::SendSegment(segment) => {
                             write_output_segment(&writer, segment, reliable, &mut unacked).await?;
@@ -1610,8 +1680,8 @@ async fn run_mieru_session_output(
                             last_tx = Instant::now();
                             heartbeat_at = last_tx + heartbeat_interval()?;
                         }
-                        SessionCommand::PeerAck { un_ack_seq } => {
-                            unacked.retain(|seq, _| *seq >= un_ack_seq);
+                        SessionCommand::PeerAck { un_ack_seq, window_size } => {
+                            flow.ack(un_ack_seq, window_size, next_seq, &mut unacked);
                         }
                         SessionCommand::Close => {
                             let _ = writer
@@ -1637,22 +1707,55 @@ async fn run_mieru_session_output(
                     }
                 }
                 _ = retransmit.tick(), if reliable && !unacked.is_empty() => {
-                    let mut over_limit = None;
-                    for (seq, (_, tx_count)) in unacked.iter_mut() {
-                        if *tx_count >= PACKET_TX_COUNT_LIMIT {
-                            over_limit = Some(*seq);
-                            break;
+                    // Cumulative ACKs mean retransmitting the first hole is
+                    // enough. Never resend the whole in-flight window at once.
+                    if let Some(outstanding) = unacked.values_mut().next() {
+                        let timeout = flow.rto * (1u32 << outstanding.attempts.saturating_sub(1).min(4));
+                        if outstanding.sent.elapsed() >= timeout.min(Duration::from_secs(3)) {
+                            ensure!(outstanding.attempts < PACKET_TX_COUNT_LIMIT,
+                                "too many retransmissions of Mieru segment {}", outstanding.segment.metadata.seq());
+                            writer.lock().await.write_segment(outstanding.segment.clone()).await?;
+                            outstanding.attempts += 1;
+                            outstanding.sent = Instant::now();
+                            flow.congestion_window = (flow.congestion_window / 2).max(4);
+                            flow.slow_start_limit = flow.congestion_window;
+                            last_tx = Instant::now();
+                            heartbeat_at = last_tx + heartbeat_interval()?;
                         }
-                        *tx_count = tx_count.saturating_add(1);
                     }
-                    if let Some(seq) = over_limit {
-                        bail!("too many retransmission of Mieru segment {seq}");
-                    }
-                    for (segment, _) in unacked.values().cloned().collect::<Vec<_>>() {
-                        writer.lock().await.write_segment(segment).await?;
-                    }
+                }
+                _ = std::future::ready(()), if !pending.is_empty() && (!reliable || flow.can_send(next_seq, unacked.len())) => {
+                    let (payload, _, offset) = pending.front_mut().unwrap();
+                    let max_chunk = if reliable {
+                        mtu.checked_sub(PACKET_OVERHEAD).filter(|size| *size > 0)
+                            .context("Mieru UDP packet MTU is too small")?.min(MAX_PDU)
+                    } else { MAX_PDU };
+                    let open = is_client && !opened;
+                    let n = if open && payload.len() > MAX_SESSION_OPEN_PAYLOAD.min(max_chunk) {
+                        0
+                    } else { (payload.len() - *offset).min(max_chunk) };
+                    let metadata = if open {
+                        MieruMetadata::Session(MieruSessionMetadata {
+                            protocol: OPEN_SESSION_REQUEST, session_id, seq: next_seq,
+                            status_code: STATUS_OK, payload_len: 0, suffix_len: 0,
+                        })
+                    } else {
+                        MieruMetadata::DataAck(MieruDataAckMetadata {
+                            protocol: if is_client { DATA_CLIENT_TO_SERVER } else { DATA_SERVER_TO_CLIENT },
+                            session_id, seq: next_seq, un_ack_seq: un_ack_seq.load(Ordering::Relaxed),
+                            window_size: ACK_WINDOW_SIZE, fragment: 0, prefix_len: 0, payload_len: 0, suffix_len: 0,
+                        })
+                    };
+                    let segment = MieruSegment { metadata, payload: payload[*offset..*offset+n].to_vec() };
+                    write_output_segment(&writer, segment, reliable, &mut unacked).await?;
+                    next_seq = next_seq.wrapping_add(1);
+                    opened = true;
+                    *offset += n;
+                    if *offset == payload.len() { pending.pop_front(); }
                     last_tx = Instant::now();
                     heartbeat_at = last_tx + heartbeat_interval()?;
+                    // Let receive and relay tasks consume each bounded burst.
+                    tokio::task::yield_now().await;
                 }
                 _ = tokio::time::sleep_until(heartbeat_at), if opened => {
                     writer
@@ -1700,7 +1803,7 @@ async fn write_output_segment(
     writer: &Arc<Mutex<MieruAnyWriter>>,
     segment: MieruSegment,
     reliable: bool,
-    unacked: &mut BTreeMap<u32, (MieruSegment, u8)>,
+    unacked: &mut BTreeMap<u32, OutstandingSegment>,
 ) -> Result<()> {
     let seq = segment.metadata.seq();
     let should_track = reliable
@@ -1713,7 +1816,14 @@ async fn write_output_segment(
         );
     writer.lock().await.write_segment(segment.clone()).await?;
     if should_track {
-        unacked.insert(seq, (segment, 1));
+        unacked.insert(
+            seq,
+            OutstandingSegment {
+                segment,
+                attempts: 1,
+                sent: Instant::now(),
+            },
+        );
     }
     Ok(())
 }
@@ -1821,10 +1931,18 @@ fn deliver_session_payload(sender: &mpsc::UnboundedSender<Vec<u8>>, payload: Vec
     }
 }
 
-async fn ack_session_segments(sessions: &MieruSessionMap, session_id: u32, un_ack_seq: u32) {
+async fn ack_session_segments(
+    sessions: &MieruSessionMap,
+    session_id: u32,
+    un_ack_seq: u32,
+    window_size: u16,
+) {
     let entry = sessions.lock().await.get(&session_id).cloned();
     if let Some(entry) = entry {
-        let _ = entry.outbound.send(SessionCommand::PeerAck { un_ack_seq });
+        let _ = entry.outbound.send(SessionCommand::PeerAck {
+            un_ack_seq,
+            window_size,
+        });
     }
 }
 

@@ -71,6 +71,46 @@ fn heartbeat_jitter_stays_in_original_window() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn packet_sender_honors_peer_window_and_rejects_stale_or_future_acks() {
+    let mut flow = PacketSendWindow::default();
+    let mut unacked = BTreeMap::new();
+    flow.ack(0, 2, 0, &mut unacked);
+    assert!(flow.can_send(1, 1));
+    assert!(!flow.can_send(2, 2));
+    flow.ack(1, 0, 2, &mut unacked);
+    assert!(!flow.can_send(2, 1));
+    flow.ack(0, 100, 2, &mut unacked);
+    assert_eq!(flow.peer_window, 0);
+    flow.ack(3, 100, 2, &mut unacked);
+    assert_eq!(flow.peer_ack, 1);
+    flow.ack(1, 8, 2, &mut unacked);
+    assert!(flow.can_send(2, 1));
+}
+
+#[tokio::test]
+async fn session_write_applies_backpressure_without_blocking_control() -> Result<()> {
+    let (_, inbound) = mpsc::unbounded_channel();
+    let (outbound, mut commands) = mpsc::unbounded_channel();
+    let mut session = MieruSession::new(inbound, outbound.clone());
+    for _ in 0..8 {
+        session.write_all(&vec![0; MAX_PDU]).await?;
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), session.write_all(b"blocked"))
+            .await
+            .is_err()
+    );
+    outbound.send(SessionCommand::SendAck {
+        protocol: ACK_CLIENT_TO_SERVER,
+        un_ack_seq: 1,
+        window_size: 32,
+    })?;
+    drop(commands.recv().await);
+    tokio::time::timeout(Duration::from_secs(1), session.write_all(b"released")).await??;
+    Ok(())
+}
+
 #[tokio::test]
 async fn idle_tcp_underlay_closes_after_last_session() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;

@@ -1,5 +1,31 @@
 use super::*;
 
+#[tokio::test]
+async fn legacy_httpmask_preserves_body_after_post_and_fake_websocket_headers() -> Result<()> {
+    for header in [
+        "POST /api/upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1048576\r\n\r\n",
+        "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        "", // raw clients remain accepted by a legacy listener
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let mut client = TcpStream::connect(listener.local_addr()?).await?;
+        let (server, _) = listener.accept().await?;
+        let mut packet = header.as_bytes().to_vec();
+        packet.extend(b"raw-encrypted-body");
+        client.write_all(&packet).await?;
+        let options = SudokuOptions {
+            http_mask: true,
+            http_mask_mode: "legacy".into(),
+            ..Default::default()
+        };
+        let mut server = transport::server(server, &options, &["test-user".into()]).await?;
+        let mut body = [0; 18];
+        tokio::time::timeout(Duration::from_secs(1), server.read_exact(&mut body)).await??;
+        assert_eq!(&body, b"raw-encrypted-body");
+    }
+    Ok(())
+}
+
 include!("../../tests/performance/sudoku.rs");
 include!("../../tests/performance/sudoku_transport.rs");
 

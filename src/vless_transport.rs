@@ -269,7 +269,26 @@ where
     }
 }
 
-pub async fn apply_server_transport<S>(
+pub async fn serve_server_transport<S, F, Fut>(
+    stream: S,
+    transport: &VlessTransportConfig,
+    mut handler: F,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    F: FnMut(BoxedTransportStream) -> Fut,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    if matches!(
+        transport.kind,
+        VlessTransportKind::Http2 | VlessTransportKind::Grpc
+    ) {
+        return vless_h2::serve(stream, transport, |stream| handler(Box::new(stream))).await;
+    }
+    handler(apply_server_transport(stream, transport).await?).await
+}
+
+async fn apply_server_transport<S>(
     stream: S,
     transport: &VlessTransportConfig,
 ) -> Result<BoxedTransportStream>
@@ -286,8 +305,9 @@ where
         VlessTransportKind::WebSocket => {
             Ok(Box::new(vless_websocket::server(stream, transport).await?))
         }
-        VlessTransportKind::Http2 => Ok(Box::new(vless_h2::server(stream, transport).await?)),
-        VlessTransportKind::Grpc => Ok(Box::new(vless_h2::grpc_server(stream, transport).await?)),
+        VlessTransportKind::Http2 | VlessTransportKind::Grpc => {
+            bail!("HTTP/2 transports require the connection dispatcher")
+        }
         VlessTransportKind::Xhttp => Ok(Box::new(vless_xhttp::server(stream, transport).await?)),
     }
 }

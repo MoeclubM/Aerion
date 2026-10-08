@@ -321,7 +321,18 @@ async fn handle_trojan_client(
     fallback: SocketAddr,
 ) -> Result<()> {
     let stream = acceptor.accept(stream).await.context("accept Trojan TLS")?;
-    let stream = vless_transport::apply_server_transport(stream, &transport).await?;
+    vless_transport::serve_server_transport(stream, &transport, |stream| {
+        handle_trojan_stream(stream, core.clone(), peer, fallback)
+    })
+    .await
+}
+
+async fn handle_trojan_stream(
+    stream: vless_transport::BoxedTransportStream,
+    core: ProxyCore,
+    peer: SocketAddr,
+    fallback: SocketAddr,
+) -> Result<()> {
     let mut stream = CapturingStream::new(stream);
     match read_authenticated_trojan_request(&mut stream, &core).await {
         Ok((credential, request)) => {
