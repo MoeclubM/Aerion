@@ -17,7 +17,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
 pub(super) struct MieruCipher {
-    key: [u8; KEY_LEN],
+    cipher: XChaCha20Poly1305,
     implicit_nonce: Option<[u8; NONCE_LEN]>,
     implicit: bool,
     username: String,
@@ -33,7 +33,7 @@ impl MieruCipher {
         traffic_pattern: Option<&MieruTrafficPattern>,
     ) -> Self {
         Self {
-            key,
+            cipher: XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key)),
             implicit_nonce: None,
             implicit,
             username,
@@ -44,7 +44,7 @@ impl MieruCipher {
 
     pub(super) fn clone_reset_implicit(&self) -> Self {
         Self {
-            key: self.key,
+            cipher: self.cipher.clone(),
             implicit_nonce: None,
             implicit: true,
             username: self.username.clone(),
@@ -75,15 +75,14 @@ impl MieruCipher {
             add_user_hint_to_nonce(&self.username, &mut nonce);
             (nonce, true)
         };
-        let cipher = <XChaCha20Poly1305 as KeyInit>::new_from_slice(&self.key)
-            .map_err(|_| anyhow::anyhow!("invalid Mieru XChaCha20-Poly1305 key"))?;
         output.reserve(if send_nonce { NONCE_LEN } else { 0 } + plaintext.len() + AEAD_OVERHEAD);
         if send_nonce {
             output.extend_from_slice(&nonce);
         }
         let start = output.len();
         output.extend_from_slice(plaintext);
-        let tag = cipher
+        let tag = self
+            .cipher
             .encrypt_in_place_detached(XNonce::from_slice(&nonce), &[], &mut output[start..])
             .map_err(|_| anyhow::anyhow!("Mieru XChaCha20-Poly1305 encrypt failed"))?;
         output.extend_from_slice(&tag);
@@ -126,9 +125,7 @@ impl MieruCipher {
         );
         let tag_offset = ciphertext.len() - AEAD_OVERHEAD;
         let tag = *chacha20poly1305::Tag::from_slice(&ciphertext[tag_offset..]);
-        let cipher = <XChaCha20Poly1305 as KeyInit>::new_from_slice(&self.key)
-            .map_err(|_| anyhow::anyhow!("invalid Mieru XChaCha20-Poly1305 key"))?;
-        cipher
+        self.cipher
             .decrypt_in_place_detached(
                 XNonce::from_slice(&nonce),
                 &[],
@@ -145,18 +142,14 @@ impl MieruCipher {
 
     pub(super) fn encrypt_with_nonce(&self, plaintext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
         ensure!(nonce.len() == NONCE_LEN, "invalid Mieru nonce length");
-        let cipher = <XChaCha20Poly1305 as KeyInit>::new_from_slice(&self.key)
-            .map_err(|_| anyhow::anyhow!("invalid Mieru XChaCha20-Poly1305 key"))?;
-        cipher
+        self.cipher
             .encrypt(XNonce::from_slice(nonce), plaintext)
             .map_err(|_| anyhow::anyhow!("Mieru XChaCha20-Poly1305 encrypt failed"))
     }
 
     pub(super) fn decrypt_with_nonce(&self, ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
         ensure!(nonce.len() == NONCE_LEN, "invalid Mieru nonce length");
-        let cipher = <XChaCha20Poly1305 as KeyInit>::new_from_slice(&self.key)
-            .map_err(|_| anyhow::anyhow!("invalid Mieru XChaCha20-Poly1305 key"))?;
-        cipher
+        self.cipher
             .decrypt(XNonce::from_slice(nonce), ciphertext)
             .map_err(|_| anyhow::anyhow!("Mieru XChaCha20-Poly1305 decrypt failed"))
     }

@@ -117,8 +117,8 @@ fn packet_loss_recovery_retransmits_partial_ack_without_repeated_window_cuts() {
         flow.ack(0, 32, 5, &mut unacked);
     }
     assert!(flow.fast_retransmit);
-    flow.on_retransmit(5);
-    let recovery_window = flow.congestion_window;
+    flow.on_retransmit(5, false);
+    let recovery_window = flow.congestion.window();
     unacked.get_mut(&0).unwrap().attempts += 1;
     for _ in 0..4 {
         flow.ack(0, 32, 5, &mut unacked);
@@ -132,8 +132,8 @@ fn packet_loss_recovery_retransmits_partial_ack_without_repeated_window_cuts() {
         flow.fast_retransmit,
         "partial ACK exposes the next hole immediately"
     );
-    flow.on_retransmit(5);
-    assert_eq!(flow.congestion_window, recovery_window);
+    flow.on_retransmit(5, false);
+    assert_eq!(flow.congestion.window(), recovery_window);
     flow.ack(5, 32, 5, &mut unacked);
     assert!(unacked.is_empty());
     assert!(flow.recovery_until.is_none());
@@ -171,6 +171,90 @@ fn cumulative_packet_ack_removes_only_the_prefix_across_sequence_wraparound() {
     flow.ack(1, 32, 2, &mut unacked);
     assert_eq!(unacked.keys().copied().collect::<Vec<_>>(), vec![1]);
     assert_eq!(flow.peer_ack, 1);
+}
+
+#[test]
+fn packet_rto_retains_a_margin_above_a_stable_rtt() {
+    let mut flow = PacketSendWindow {
+        srtt: Some(0.1),
+        rtt_var: 0.0,
+        ..Default::default()
+    };
+    let mut unacked = BTreeMap::new();
+    unacked.insert(
+        0,
+        OutstandingSegment {
+            segment: MieruSegment {
+                metadata: MieruMetadata::Session(MieruSessionMetadata {
+                    protocol: OPEN_SESSION_REQUEST,
+                    session_id: 1,
+                    seq: 0,
+                    status_code: STATUS_OK,
+                    payload_len: 0,
+                    suffix_len: 0,
+                }),
+                payload: Vec::new(),
+            },
+            attempts: 1,
+            sent: Instant::now() - Duration::from_millis(100),
+        },
+    );
+    flow.ack(1, ACK_WINDOW_SIZE, 1, &mut unacked);
+    assert!(flow.rto >= flow.rtt() + Duration::from_millis(10));
+}
+
+#[tokio::test]
+async fn packet_output_flushes_the_latest_delayed_ack_before_closing() -> Result<()> {
+    let receiver = UdpSocket::bind("127.0.0.1:0").await?;
+    let sender = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let key = [7; KEY_LEN];
+    let writer = Arc::new(Mutex::new(MieruAnyWriter::Packet(MieruPacketWriter::new(
+        sender,
+        Some(receiver.local_addr()?),
+        Vec::new(),
+        MieruCipher::new(key, false, "ack-test".into(), None),
+        1400,
+        None,
+    ))));
+    let (commands, output) = mpsc::unbounded_channel();
+    for un_ack_seq in 1..=3 {
+        commands.send(SessionCommand::SendAck {
+            protocol: ACK_SERVER_TO_CLIENT,
+            un_ack_seq,
+            window_size: ACK_WINDOW_SIZE,
+            immediate: false,
+        })?;
+    }
+    commands.send(SessionCommand::Close)?;
+    let task = tokio::spawn(run_mieru_session_output(
+        1,
+        false,
+        false,
+        writer,
+        output,
+        true,
+        1400,
+        Arc::new(AtomicU32::new(3)),
+        Arc::new(AtomicU32::new(u32::from(ACK_WINDOW_SIZE))),
+        Arc::new(Mutex::new(HashMap::new())),
+        None,
+    ));
+    let mut cipher = MieruCipher::new(key, false, "ack-test".into(), None);
+    let mut buffer = [0; 1500];
+    let mut last_ack = None;
+    loop {
+        let (read, _) =
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buffer)).await??;
+        let segment = decode_mieru_packet_segment(&mut cipher, &buffer[..read])?;
+        if segment.metadata.protocol() == CLOSE_SESSION_REQUEST {
+            break;
+        }
+        assert_eq!(segment.metadata.protocol(), ACK_SERVER_TO_CLIENT);
+        last_ack = segment.metadata.un_ack_seq();
+    }
+    assert_eq!(last_ack, Some(3));
+    tokio::time::timeout(Duration::from_secs(1), task).await??;
+    Ok(())
 }
 
 #[tokio::test]
@@ -323,6 +407,7 @@ async fn session_write_applies_backpressure_without_blocking_control() -> Result
         protocol: ACK_CLIENT_TO_SERVER,
         un_ack_seq: 1,
         window_size: 32,
+        immediate: false,
     })?;
     drop(commands.recv().await);
     tokio::time::timeout(Duration::from_secs(1), session.write_all(b"released")).await??;

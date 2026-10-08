@@ -21,11 +21,13 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Instant;
 
+mod congestion;
 mod crypto;
 mod pattern;
 mod socks;
 mod wire;
 
+use congestion::{Cubic, PacketPacer};
 use crypto::{
     MieruCipher, check_user_from_hint, current_mieru_key, hash_mieru_password, mieru_key_epoch,
 };
@@ -206,6 +208,7 @@ enum SessionCommand {
         protocol: u8,
         un_ack_seq: u32,
         window_size: u16,
+        immediate: bool,
     },
     PeerAck {
         un_ack_seq: u32,
@@ -1648,9 +1651,7 @@ struct OutstandingSegment {
 struct PacketSendWindow {
     peer_ack: u32,
     peer_window: usize,
-    congestion_window: usize,
-    slow_start_limit: usize,
-    growth: usize,
+    congestion: Cubic,
     duplicate_acks: u8,
     fast_retransmit: bool,
     recovery_until: Option<u32>,
@@ -1664,9 +1665,7 @@ impl Default for PacketSendWindow {
         Self {
             peer_ack: 0,
             peer_window: 32,
-            congestion_window: 32,
-            slow_start_limit: 256,
-            growth: 0,
+            congestion: Cubic::new(MAX_PENDING_SEGMENTS),
             duplicate_acks: 0,
             fast_retransmit: false,
             recovery_until: None,
@@ -1679,7 +1678,7 @@ impl Default for PacketSendWindow {
 
 impl PacketSendWindow {
     fn can_send(&self, next_seq: u32, in_flight: usize) -> bool {
-        in_flight < self.congestion_window
+        in_flight < self.congestion.window()
             && next_seq.wrapping_sub(self.peer_ack) < self.peer_window as u32
     }
 
@@ -1689,10 +1688,10 @@ impl PacketSendWindow {
         window: u16,
         next_seq: u32,
         unacked: &mut BTreeMap<u32, OutstandingSegment>,
-    ) {
+    ) -> usize {
         let advance = ack.wrapping_sub(self.peer_ack);
         if advance >= (1 << 31) || ack.wrapping_sub(next_seq) < (1 << 31) && ack != next_seq {
-            return;
+            return 0;
         }
         self.peer_window = usize::from(window).min(MAX_PENDING_SEGMENTS);
         if advance == 0 && unacked.contains_key(&ack) {
@@ -1705,6 +1704,7 @@ impl PacketSendWindow {
             self.fast_retransmit = false;
         }
         let now = Instant::now();
+        let window_limited = unacked.len() * 2 >= self.congestion.window();
         let mut acknowledged = 0;
         let mut sample = None;
         // Remove only the acknowledged prefix, including sequence wraparound.
@@ -1744,29 +1744,27 @@ impl PacketSendWindow {
                 self.srtt = Some(sample);
                 self.rtt_var = sample / 2.0;
             }
-            self.rto =
-                Duration::from_secs_f64((self.srtt.unwrap() + 4.0 * self.rtt_var).clamp(0.1, 3.0));
+            // Timer granularity and delayed ACKs must not make a stable RTT
+            // expire its oldest segment just before the next ACK is handled.
+            self.rto = Duration::from_secs_f64(
+                (self.srtt.unwrap() + (4.0 * self.rtt_var).max(0.01) + 0.001).clamp(0.1, 3.0),
+            );
         }
         if self.recovery_until.is_some() {
-            return;
+            return acknowledged;
         }
-        if self.congestion_window < self.slow_start_limit {
-            self.congestion_window =
-                (self.congestion_window + acknowledged).min(self.slow_start_limit);
-        } else {
-            self.growth += acknowledged;
-            if self.growth >= self.congestion_window {
-                self.growth -= self.congestion_window;
-                self.congestion_window = (self.congestion_window + 1).min(512);
-            }
-        }
+        let rtt = self.rtt();
+        self.congestion.ack(acknowledged, rtt, now, window_limited);
+        acknowledged
     }
 
-    fn on_retransmit(&mut self, next_seq: u32) {
+    fn rtt(&self) -> Duration {
+        Duration::from_secs_f64(self.srtt.unwrap_or(0.1).max(0.001))
+    }
+
+    fn on_retransmit(&mut self, next_seq: u32, timeout: bool) {
         if self.recovery_until.is_none() {
-            self.congestion_window = (self.congestion_window / 2).max(4);
-            self.slow_start_limit = self.congestion_window;
-            self.growth = 0;
+            self.congestion.loss(timeout);
             self.recovery_until = Some(next_seq);
         }
         self.fast_retransmit = false;
@@ -1786,12 +1784,17 @@ async fn run_mieru_session_output(
     sessions: MieruSessionMap,
     abort: Option<Arc<TaskAbort>>,
 ) {
+    let mut flow = PacketSendWindow::default();
+    let (mut data_packets, mut ack_packets, mut fast_retransmits, mut timeout_retransmits) =
+        (0u64, 0u64, 0u64, 0u64);
     let result: Result<()> = async {
         let mut next_seq = if is_client { 0 } else { 1 };
         let mut opened = !is_client;
         let mut unacked = BTreeMap::<u32, OutstandingSegment>::new();
         let mut pending = VecDeque::<(Vec<u8>, OwnedSemaphorePermit, usize)>::new();
-        let mut flow = PacketSendWindow::default();
+        let mut pacer = PacketPacer::new();
+        let mut pending_ack: Option<MieruDataAckMetadata> = None;
+        let mut ack_at = Instant::now();
         let mut closing = false;
         let mut last_tx = Instant::now();
         let mut heartbeat_at = last_tx + heartbeat_interval()?;
@@ -1805,7 +1808,7 @@ async fn run_mieru_session_output(
                         .min(Duration::from_secs(3))
                 }).unwrap_or(heartbeat_at)
             };
-            if closing && pending.is_empty() && unacked.is_empty() {
+            if closing && pending.is_empty() && unacked.is_empty() && pending_ack.is_none() {
                 let _ = writer.lock().await.write_segment(MieruSegment {
                     metadata: MieruMetadata::Session(MieruSessionMetadata {
                         protocol: CLOSE_SESSION_REQUEST, session_id, seq: next_seq,
@@ -1834,27 +1837,25 @@ async fn run_mieru_session_output(
                             protocol,
                             un_ack_seq,
                             window_size,
+                            immediate,
                         } => {
-                            writer
-                                .lock()
-                                .await
-                                .write_segment(MieruSegment {
-                                    metadata: MieruMetadata::DataAck(MieruDataAckMetadata {
-                                        protocol,
-                                        session_id,
-                                        seq: next_seq.saturating_sub(1),
-                                        un_ack_seq,
-                                        window_size,
-                                        fragment: 0,
-                                        prefix_len: 0,
-                                        payload_len: 0,
-                                        suffix_len: 0,
-                                    }),
-                                    payload: Vec::new(),
-                                })
-                                .await?;
-                            last_tx = Instant::now();
-                            heartbeat_at = last_tx + heartbeat_interval()?;
+                            let ack = MieruDataAckMetadata {
+                                protocol, session_id, seq: next_seq.wrapping_sub(1),
+                                un_ack_seq, window_size, fragment: 0, prefix_len: 0, payload_len: 0, suffix_len: 0,
+                            };
+                            if immediate {
+                                // Preserve duplicate ACKs for fast hole recovery.
+                                pending_ack = None;
+                                writer.lock().await.write_segment(MieruSegment {
+                                    metadata: MieruMetadata::DataAck(ack), payload: Vec::new(),
+                                }).await?;
+                                ack_packets += 1;
+                                last_tx = Instant::now();
+                                heartbeat_at = last_tx + heartbeat_interval()?;
+                            } else {
+                                if pending_ack.is_none() { ack_at = Instant::now() + Duration::from_millis(1); }
+                                pending_ack = Some(ack);
+                            }
                         }
                         SessionCommand::PeerAck { un_ack_seq, window_size } => {
                             flow.ack(un_ack_seq, window_size, next_seq, &mut unacked);
@@ -1862,6 +1863,15 @@ async fn run_mieru_session_output(
                         SessionCommand::Close => { closing = true; }
 
                     }
+                }
+                _ = tokio::time::sleep_until(ack_at), if pending_ack.is_some() => {
+                    let ack = pending_ack.take().unwrap();
+                    writer.lock().await.write_segment(MieruSegment {
+                        metadata: MieruMetadata::DataAck(ack), payload: Vec::new(),
+                    }).await?;
+                    ack_packets += 1;
+                    last_tx = Instant::now();
+                    heartbeat_at = last_tx + heartbeat_interval()?;
                 }
                 _ = tokio::time::sleep_until(retransmit_at), if reliable && !unacked.is_empty() => {
                     // Cumulative ACKs mean retransmitting the first hole is
@@ -1871,16 +1881,18 @@ async fn run_mieru_session_output(
                         if flow.fast_retransmit || outstanding.sent.elapsed() >= timeout.min(Duration::from_secs(3)) {
                             ensure!(outstanding.attempts < PACKET_TX_COUNT_LIMIT,
                                 "too many retransmissions of Mieru segment {}", outstanding.segment.metadata.seq());
+                            if flow.fast_retransmit { fast_retransmits += 1; } else { timeout_retransmits += 1; }
+                            let timeout = !flow.fast_retransmit;
                             writer.lock().await.write_segment(outstanding.segment.clone()).await?;
                             outstanding.attempts += 1;
                             outstanding.sent = Instant::now();
-                            flow.on_retransmit(next_seq);
+                            flow.on_retransmit(next_seq, timeout);
                             last_tx = Instant::now();
                             heartbeat_at = last_tx + heartbeat_interval()?;
                         }
                     }
                 }
-                _ = std::future::ready(()), if !pending.is_empty() && (!reliable || flow.can_send(next_seq, unacked.len())) => {
+                _ = async { if reliable { tokio::time::sleep_until(pacer.deadline()).await; } }, if !pending.is_empty() && (!reliable || flow.can_send(next_seq, unacked.len())) => {
                     let (payload, _, offset) = pending.front_mut().unwrap();
                     let max_chunk = if reliable {
                         mtu.checked_sub(PACKET_OVERHEAD).filter(|size| *size > 0)
@@ -1903,7 +1915,15 @@ async fn run_mieru_session_output(
                         })
                     };
                     let segment = MieruSegment { metadata, payload: payload[*offset..*offset+n].to_vec() };
+                    if reliable {
+                        let rtt = flow.rtt();
+                        flow.congestion.sent(Instant::now(), unacked.len(), rtt);
+                    }
                     write_output_segment(&writer, segment, reliable, &mut unacked).await?;
+                    data_packets += 1;
+                    if reliable { pacer.sent(Instant::now(), flow.rtt(), flow.congestion.window()); }
+                    // DATA carries the current cumulative ACK and receive window.
+                    if !open { pending_ack = None; }
                     next_seq = next_seq.wrapping_add(1);
                     opened = true;
                     *offset += n;
@@ -1943,6 +1963,19 @@ async fn run_mieru_session_output(
         }
     }
     .await;
+    if reliable {
+        tracing::debug!(
+            session_id,
+            data_packets,
+            ack_packets,
+            fast_retransmits,
+            timeout_retransmits,
+            congestion_window = flow.congestion.window(),
+            rto_ms = flow.rto.as_secs_f64() * 1000.0,
+            srtt_ms = flow.srtt.map(|rtt| rtt * 1000.0),
+            "Mieru UDP transport stats"
+        );
+    }
     close_mieru_session_entry(&sessions, session_id).await;
     if let Err(error) = result {
         tracing::debug!("Mieru session {session_id} output stopped: {error:?}");
@@ -2044,8 +2077,9 @@ async fn route_session_segment(
     let payload = segment.payload;
     let entry = sessions.lock().await.get(&session_id).cloned();
     if let Some(entry) = entry {
-        let (un_ack_seq, window_size) = if entry.ordered {
+        let (un_ack_seq, window_size, immediate) = if entry.ordered {
             let mut recv = entry.recv.lock().await;
+            let immediate = seq != recv.next_seq;
             if seq == recv.next_seq {
                 deliver_session_payload(&entry.inbound, payload);
                 recv.next_seq = recv.next_seq.wrapping_add(1);
@@ -2065,10 +2099,11 @@ async fn route_session_segment(
             (
                 recv.next_seq,
                 (MAX_PENDING_SEGMENTS - recv.pending.len()) as u16,
+                immediate,
             )
         } else {
             deliver_session_payload(&entry.inbound, payload);
-            (seq.wrapping_add(1), ACK_WINDOW_SIZE)
+            (seq.wrapping_add(1), ACK_WINDOW_SIZE, false)
         };
         entry.un_ack_seq.store(un_ack_seq, Ordering::Relaxed);
         entry
@@ -2079,6 +2114,7 @@ async fn route_session_segment(
                 protocol,
                 un_ack_seq,
                 window_size,
+                immediate,
             });
         }
     }

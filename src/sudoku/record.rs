@@ -203,6 +203,7 @@ pub(super) struct Sender {
     seq: u64,
     bytes: u64,
     padding: u8,
+    record_buffer: Vec<u8>,
 }
 impl Sender {
     pub fn new(
@@ -223,6 +224,7 @@ impl Sender {
             seq: 0,
             bytes: 0,
             padding,
+            record_buffer: Vec::new(),
         };
         value.rekey(base)?;
         Ok(value)
@@ -242,12 +244,15 @@ impl Sender {
         input: &[u8],
     ) -> Result<()> {
         for chunk in input.chunks(65507) {
-            let mut header = self.epoch.to_be_bytes().to_vec();
-            header.extend(self.seq.to_be_bytes());
+            let mut header = [0u8; 12];
+            header[..4].copy_from_slice(&self.epoch.to_be_bytes());
+            header[4..].copy_from_slice(&self.seq.to_be_bytes());
             let ciphertext = self.crypto.crypt(&header, chunk, true)?;
-            let mut frame = ((12 + ciphertext.len()) as u16).to_be_bytes().to_vec();
-            frame.extend(header);
-            frame.extend(ciphertext);
+            self.record_buffer.clear();
+            self.record_buffer
+                .extend_from_slice(&((12 + ciphertext.len()) as u16).to_be_bytes());
+            self.record_buffer.extend_from_slice(&header);
+            self.record_buffer.extend_from_slice(&ciphertext);
             self.seq = self
                 .seq
                 .checked_add(1)
@@ -257,7 +262,7 @@ impl Sender {
                     &self.table,
                     self.down,
                     self.packed,
-                    &frame,
+                    &self.record_buffer,
                     self.padding,
                 ))
                 .await?;

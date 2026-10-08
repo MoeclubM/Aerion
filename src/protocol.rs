@@ -54,6 +54,7 @@ pub struct PaddedFrameWriter<W> {
     padding: PaddingScheme,
     packet_counter: u32,
     send_padding: bool,
+    frame_buffer: Vec<u8>,
 }
 
 impl<W> PaddedFrameWriter<W>
@@ -66,6 +67,7 @@ where
             padding,
             packet_counter: 0,
             send_padding: true,
+            frame_buffer: Vec::new(),
         }
     }
 
@@ -124,10 +126,16 @@ where
             }
             return Ok(());
         }
-        let frame = encode_frame(cmd, stream_id, payload);
-        self.write_packet(&frame, flush)
+        let mut frame = std::mem::take(&mut self.frame_buffer);
+        frame.clear();
+        frame.extend_from_slice(&frame_header(cmd, stream_id, payload.len()));
+        frame.extend_from_slice(payload);
+        let result = self
+            .write_packet(&frame, flush)
             .await
-            .context("write Aerion frame")
+            .context("write Aerion frame");
+        self.frame_buffer = frame;
+        result
     }
 
     pub async fn write_payload_chunks(&mut self, stream_id: u32, payload: &[u8]) -> Result<()> {
@@ -321,10 +329,7 @@ async fn write_vectored_frame_bytes<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let mut header = [0u8; FRAME_HEADER_LEN];
-    header[0] = cmd;
-    header[1..5].copy_from_slice(&stream_id.to_be_bytes());
-    header[5..].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+    let header = frame_header(cmd, stream_id, payload.len());
     crate::io_util::write_frame_parts(writer, &header, payload)
         .await
         .context("write Aerion frame")
@@ -358,11 +363,17 @@ pub fn parse_settings(bytes: &[u8]) -> std::collections::HashMap<String, String>
 
 fn encode_frame(cmd: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
-    frame.push(cmd);
-    frame.extend_from_slice(&stream_id.to_be_bytes());
-    frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    frame.extend_from_slice(&frame_header(cmd, stream_id, payload.len()));
     frame.extend_from_slice(payload);
     frame
+}
+
+fn frame_header(cmd: u8, stream_id: u32, length: usize) -> [u8; FRAME_HEADER_LEN] {
+    let mut header = [0u8; FRAME_HEADER_LEN];
+    header[0] = cmd;
+    header[1..5].copy_from_slice(&stream_id.to_be_bytes());
+    header[5..].copy_from_slice(&(length as u16).to_be_bytes());
+    header
 }
 
 pub fn canonicalize_socket_addr(addr: SocketAddr) -> SocketAddr {
