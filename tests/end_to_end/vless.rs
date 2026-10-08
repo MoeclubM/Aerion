@@ -695,6 +695,142 @@ async fn socks_client_reaches_tcp_target_through_vless_vision() -> Result<()> {
 }
 
 #[tokio::test]
+async fn vision_inner_tls_reaches_target_over_tls_and_reality() -> Result<()> {
+    tls::init_crypto();
+    for use_reality in [false, true] {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
+        let inner_acceptor = tokio_rustls::TlsAcceptor::from(tls::server_config_from_material(
+            None,
+            None,
+            &[certified.cert.pem()],
+            Some(&certified.key_pair.serialize_pem()),
+            "inner TLS",
+        )?);
+        let private = StaticSecret::from([17; 32]);
+        let public = PublicKey::from(&private).to_bytes();
+        let short_id = [0xa1, 0xb2, 0, 0, 0, 0, 0, 0];
+
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let echo_addr = echo_listener.local_addr()?;
+        let echo_task = tokio::spawn(async move {
+            let (stream, _) = echo_listener.accept().await?;
+            let mut stream = inner_acceptor.accept(stream).await?;
+            let mut buffer = [0u8; 32 * 1024];
+            loop {
+                let read = stream.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                stream.write_all(&buffer[..read]).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        });
+
+        let temp = tempfile::tempdir()?;
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
+        let cert_path = temp.path().join("vless-vision.crt");
+        let key_path = temp.path().join("vless-vision.key");
+        std::fs::write(&cert_path, certified.cert.pem())?;
+        std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+
+        let user_id = "a3482e88-686a-4a58-8126-99c9df64b7bf".to_string();
+        let server_addr = unused_tcp_addr()?;
+        let server_task = tokio::spawn(run_vless_server(VlessServerConfig {
+            listen: server_addr,
+            user_id: user_id.clone(),
+            users: Vec::new(),
+            tls: true,
+            cert_path,
+            key_path,
+            certificates: Vec::new(),
+            key: None,
+            flow: "xtls-rprx-vision".to_string(),
+            reality: use_reality.then(|| RealityServerConfig {
+                server_name: "localhost".into(),
+                server_port: 443,
+                server_names: vec!["localhost".into()],
+                private_key: private.to_bytes(),
+                short_ids: vec![short_id],
+                alpn_protocols: vec![],
+                max_time_diff_secs: 0,
+                max_client_version: None,
+                fallback_limit: Default::default(),
+            }),
+            transport: VlessTransportConfig::tcp(),
+            ech: None,
+        }));
+
+        let client_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let client_addr = client_listener.local_addr()?;
+        let client_task = tokio::spawn(run_vless_client_listener(
+            client_listener,
+            VlessClientConfig {
+                listen: client_addr,
+                server_host: "127.0.0.1".to_string(),
+                server_port: server_addr.port(),
+                user_id,
+                tls: true,
+                sni: "localhost".to_string(),
+                insecure: true,
+                ca_cert_paths: Vec::new(),
+                ca_certificates: Vec::new(),
+                disable_system_roots: false,
+                pinned_cert_sha256: Vec::new(),
+                flow: "xtls-rprx-vision".to_string(),
+                packet_encoding: "packet".to_string(),
+                mux: false,
+                udp: true,
+                client_fingerprint: None,
+                reality: use_reality.then_some(RealityClientConfig {
+                    public_key: public,
+                    short_id,
+                }),
+                transport: VlessTransportConfig::tcp(),
+            },
+            None,
+        ));
+
+        let result = timeout(Duration::from_secs(20), async {
+            let mut socks = TcpStream::connect(client_addr).await?;
+            socks.write_all(&[5, 1, 0]).await?;
+            let mut greeting = [0; 2];
+            socks.read_exact(&mut greeting).await?;
+            write_socks_connect(&mut socks, echo_addr).await?;
+            let mut reply = [0; 10];
+            socks.read_exact(&mut reply).await?;
+            anyhow::ensure!(reply[1] == 0, "SOCKS CONNECT failed");
+            let mut stream = tokio_rustls::TlsConnector::from(tls::client_config(true))
+                .connect(rustls::pki_types::ServerName::try_from("localhost")?, socks)
+                .await?;
+            let expected = vec![0x5a; 2 * 1024 * 1024];
+            let (mut reader, mut writer) = tokio::io::split(&mut stream);
+            let send = async { writer.write_all(&expected).await };
+            let receive = async {
+                let mut echoed = vec![0; expected.len()];
+                reader.read_exact(&mut echoed).await?;
+                anyhow::ensure!(echoed == expected, "inner TLS payload changed");
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::try_join!(async { send.await.map_err(anyhow::Error::from) }, receive)?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("VLESS Vision TCP end-to-end test timed out")
+        .and_then(|inner| inner);
+
+        client_task.abort();
+        server_task.abort();
+        if result.is_ok() {
+            echo_task.abort();
+        } else {
+            echo_task.abort();
+        }
+        result.with_context(|| format!("inner TLS Vision use_reality={use_reality}"))?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn socks_client_reaches_tcp_target_through_vless_mux() -> Result<()> {
     tls::init_crypto();
 

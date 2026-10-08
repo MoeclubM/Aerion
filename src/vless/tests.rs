@@ -17,6 +17,7 @@ async fn revoked_idle_vision_closes_both_tcp_writers() -> Result<()> {
         remote,
         session,
         parse_uuid(UUID)?,
+        Arc::new(VisionControl::default()),
     ));
     core.cancel_all_sessions();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {

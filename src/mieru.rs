@@ -1637,9 +1637,21 @@ async fn run_mieru_session_output(
             Instant::now() + retransmit_interval,
             retransmit_interval,
         );
+        let mut closing = false;
         let mut last_tx = Instant::now();
         let mut heartbeat_at = last_tx + heartbeat_interval()?;
         loop {
+            if closing && pending.is_empty() && unacked.is_empty() {
+                let _ = writer.lock().await.write_segment(MieruSegment {
+                    metadata: MieruMetadata::Session(MieruSessionMetadata {
+                        protocol: CLOSE_SESSION_REQUEST, session_id, seq: next_seq,
+                        status_code: STATUS_OK, payload_len: 0, suffix_len: 0,
+                    }),
+                    payload: Vec::new(),
+                }).await;
+                if close_underlay_on_close { let _ = writer.lock().await.shutdown().await; }
+                return Ok::<(), anyhow::Error>(());
+            }
             tokio::select! {
                 command = outbound.recv() => {
                     let Some(command) = command else {
@@ -1683,27 +1695,8 @@ async fn run_mieru_session_output(
                         SessionCommand::PeerAck { un_ack_seq, window_size } => {
                             flow.ack(un_ack_seq, window_size, next_seq, &mut unacked);
                         }
-                        SessionCommand::Close => {
-                            let _ = writer
-                                .lock()
-                                .await
-                                .write_segment(MieruSegment {
-                                    metadata: MieruMetadata::Session(MieruSessionMetadata {
-                                        protocol: CLOSE_SESSION_REQUEST,
-                                        session_id,
-                                        seq: next_seq,
-                                        status_code: STATUS_OK,
-                                        payload_len: 0,
-                                        suffix_len: 0,
-                                    }),
-                                    payload: Vec::new(),
-                                })
-                                .await;
-                            if close_underlay_on_close {
-                                let _ = writer.lock().await.shutdown().await;
-                            }
-                            return Ok::<(), anyhow::Error>(());
-                        }
+                        SessionCommand::Close => { closing = true; }
+
                     }
                 }
                 _ = retransmit.tick(), if reliable && !unacked.is_empty() => {
@@ -1903,7 +1896,7 @@ async fn route_session_segment(
                 }
             } else if seq > recv.next_seq {
                 ensure!(
-                    recv.pending.len() < MAX_PENDING_SEGMENTS,
+                    recv.pending.contains_key(&seq) || recv.pending.len() < MAX_PENDING_SEGMENTS,
                     "Mieru pending receive window exceeded"
                 );
                 recv.pending.entry(seq).or_insert(payload);
