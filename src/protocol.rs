@@ -71,6 +71,12 @@ where
         }
     }
 
+    pub(crate) fn new_unpadded(inner: W) -> Self {
+        let mut writer = Self::new(inner, PaddingScheme::default());
+        writer.send_padding = false;
+        writer
+    }
+
     pub async fn write_auth_preface(&mut self, password: &str) -> Result<()> {
         let hash = password_hash(password);
         let padding_len = self.padding.preface_padding_len()?;
