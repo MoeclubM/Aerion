@@ -4,6 +4,8 @@ use tokio::time::Instant;
 const MIN_WINDOW: f64 = 16.0;
 const BETA: f64 = 0.7;
 const C: f64 = 0.4;
+const MAX_WINDOW: usize = 512;
+const INITIAL_THRESHOLD: f64 = 256.0;
 
 // Packet-based CUBIC growth (RFC 9438), independent of the encrypted wire format.
 // ACK credit counts newly delivered packets, never duplicate ACK messages.
@@ -19,10 +21,13 @@ pub(super) struct Cubic {
 
 impl Cubic {
     pub(super) fn new(limit: usize) -> Self {
+        // Keep the proven flight bounds when several sessions share an
+        // underlay. CUBIC's faster recovery must not enlarge startup bursts.
+        let limit = limit.min(MAX_WINDOW) as f64;
         Self {
             window: 32.0,
-            limit: limit as f64,
-            threshold: limit as f64,
+            limit,
+            threshold: limit.min(INITIAL_THRESHOLD),
             last_max: 0.0,
             epoch: None,
             reno_window: 32.0,
@@ -107,12 +112,12 @@ mod tests {
         cubic.ack(0, rtt, now, true);
         assert_eq!(cubic.window(), 32);
         cubic.ack(5000, rtt, now, true);
-        assert_eq!(cubic.window(), 1024);
+        assert_eq!(cubic.window(), 256);
         cubic.loss(false);
-        assert!((716..=717).contains(&cubic.window()));
+        assert_eq!(cubic.window(), 179);
         for second in 0..120 {
             cubic.ack(1024, rtt, now + Duration::from_secs(second), true);
-            assert!((16..=1024).contains(&cubic.window()));
+            assert!((16..=512).contains(&cubic.window()));
         }
         cubic.loss(true);
         assert_eq!(cubic.window(), 16);
