@@ -9,7 +9,7 @@ mod go_rand;
 
 struct Grids {
     values: Vec<[u8; 16]>,
-    clues: HashMap<u32, usize>,
+    clues: Vec<u16>,
     encodings: Vec<Vec<[u8; 4]>>,
 }
 
@@ -63,9 +63,15 @@ fn grids() -> &'static Grids {
         for entries in &mut encodings {
             entries.sort_unstable();
         }
+        // Rank sorted four-clue sets into C(64, 4) slots. The bounded 1.2 MiB
+        // lookup replaces a hash and pointer chase for every plaintext byte.
+        let mut lookup = vec![u16::MAX; 635_376];
+        for (key, index) in clues {
+            lookup[clue_index(key.to_be_bytes()).unwrap()] = index as u16;
+        }
         Grids {
             values,
-            clues,
+            clues: lookup,
             encodings,
         }
     })
@@ -76,11 +82,39 @@ fn clue_key(mut hints: [u8; 4]) -> u32 {
     u32::from_be_bytes(hints)
 }
 
+const CLUE_RANK: [[usize; 4]; 64] = {
+    let mut ranks = [[0; 4]; 64];
+    let mut n = 0;
+    while n < 64 {
+        let mut k = 1;
+        let mut value = 1;
+        while k <= 4 {
+            if n >= k {
+                value = value * (n + 1 - k) / k;
+                ranks[n][k - 1] = value;
+            }
+            k += 1;
+        }
+        n += 1;
+    }
+    ranks
+};
+
+fn clue_index(mut hints: [u8; 4]) -> Option<usize> {
+    hints.sort_unstable();
+    let [a, b, c, d] = hints.map(usize::from);
+    if a == b || b == c || c == d {
+        return None;
+    }
+    Some(CLUE_RANK[a][0] + CLUE_RANK[b][1] + CLUE_RANK[c][2] + CLUE_RANK[d][3])
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Layout {
     encode: [u8; 64],
     decode: [u8; 256],
     padding: Vec<u8>,
+    packed_padding: Vec<u8>,
     marker: u8,
 }
 
@@ -90,6 +124,7 @@ impl Layout {
             encode: [0; 64],
             decode: [255; 256],
             padding: Vec::new(),
+            packed_padding: Vec::new(),
             marker: 0,
         };
         if ascii {
@@ -151,6 +186,12 @@ impl Layout {
             out.padding.dedup();
             out.marker = out.padding[0];
         }
+        out.packed_padding = out
+            .padding
+            .iter()
+            .copied()
+            .filter(|b| *b != out.marker)
+            .collect();
         Ok(out)
     }
 }
@@ -159,8 +200,8 @@ impl Layout {
 pub(super) struct Table {
     order: Arc<Vec<usize>>,
     inverse: Arc<Vec<u16>>,
-    pub up: Layout,
-    pub down: Layout,
+    pub up: Arc<Layout>,
+    pub down: Arc<Layout>,
     pub hint: u32,
 }
 
@@ -195,17 +236,16 @@ impl Table {
         Ok(Self {
             order: Arc::new(order),
             inverse: Arc::new(inverse),
-            up: Layout::new(up, up_pattern)?,
-            down: Layout::new(down, down_pattern)?,
+            up: Arc::new(Layout::new(up, up_pattern)?),
+            down: Arc::new(Layout::new(down, down_pattern)?),
             hint,
         })
     }
     fn decode(&self, hints: [u8; 4]) -> Result<u8> {
-        let index = grids()
-            .clues
-            .get(&clue_key(hints))
-            .ok_or_else(|| anyhow::anyhow!("invalid Sudoku puzzle"))?;
-        let value = self.inverse[*index];
+        let slot = clue_index(hints).ok_or_else(|| anyhow::anyhow!("invalid Sudoku puzzle"))?;
+        let index = grids().clues[slot];
+        ensure!(index != u16::MAX, "invalid Sudoku puzzle");
+        let value = self.inverse[index as usize];
         ensure!(value < 256, "Sudoku puzzle is outside byte mapping");
         Ok(value as u8)
     }
@@ -213,9 +253,9 @@ impl Table {
 
 pub(super) struct Decoder {
     table: Table,
-    layout: Layout,
+    layout: Arc<Layout>,
     packed: bool,
-    hints: Vec<u8>,
+    hints: [u8; 4],
     bits: u32,
     count: u8,
 }
@@ -230,13 +270,22 @@ impl Decoder {
             table,
             layout,
             packed,
-            hints: Vec::new(),
+            hints: [0; 4],
             bits: 0,
             count: 0,
         }
     }
+    #[cfg(test)]
     pub fn feed(&mut self, input: &[u8]) -> Result<Vec<u8>> {
-        let mut output = Vec::new();
+        let mut output = Vec::with_capacity(if self.packed {
+            input.len() * 3 / 4 + 1
+        } else {
+            input.len() / 4 + 1
+        });
+        self.feed_into(input, &mut output)?;
+        Ok(output)
+    }
+    pub fn feed_into(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<()> {
         for &byte in input {
             let group = self.layout.decode[byte as usize];
             if group == 255 {
@@ -255,14 +304,15 @@ impl Decoder {
                     self.bits &= (1 << self.count) - 1;
                 }
             } else {
-                self.hints.push(group);
-                if self.hints.len() == 4 {
-                    output.push(self.table.decode(self.hints.as_slice().try_into()?)?);
-                    self.hints.clear();
+                self.hints[self.count as usize] = group;
+                self.count += 1;
+                if self.count == 4 {
+                    output.push(self.table.decode(self.hints)?);
+                    self.count = 0;
                 }
             }
         }
-        Ok(output)
+        Ok(())
     }
 }
 
@@ -287,18 +337,8 @@ pub(super) fn encode(
     }
     let (padding_random, puzzle_random) = random.split_at(draw_len);
     let mut draw = padding_random.iter().copied();
-    let packed_padding = if packed && padding != 0 {
-        layout
-            .padding
-            .iter()
-            .copied()
-            .filter(|b| *b != layout.marker)
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
     let pool = if packed {
-        &packed_padding
+        &layout.packed_padding
     } else {
         &layout.padding
     };

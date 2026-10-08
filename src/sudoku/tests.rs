@@ -1,6 +1,7 @@
 use super::*;
 
 include!("../../tests/performance/sudoku.rs");
+include!("../../tests/performance/sudoku_transport.rs");
 
 #[tokio::test]
 async fn record_tunnel_half_close_drains_backpressured_write() -> Result<()> {
@@ -646,7 +647,8 @@ async fn authenticated_handshake_and_revoked_users() -> Result<()> {
                     &options,
                     &core,
                     "127.0.0.1:1234".parse()?,
-                    &cache
+                    &cache,
+                    CredentialCache::default().snapshot(&core, &options)?
                 )
             );
             let (mut client_recv, mut client_send) = client_result?;
@@ -660,6 +662,63 @@ async fn authenticated_handshake_and_revoked_users() -> Result<()> {
     }
     core.replace_users(vec![crate::CoreUser::password("alice", "alice-key")])?;
     assert!(core.authenticate("bob-key").await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn credential_cache_reuses_tables_and_enforces_live_revocation() -> Result<()> {
+    let options = SudokuOptions {
+        custom_tables: vec!["xpxvvpvv".into(), "xxppvvvv".into()],
+        ..Default::default()
+    };
+    let core = ProxyCore::from_credentials("alice-key", &["bob-key".into()]);
+    let mut cache = CredentialCache::default();
+    let first = cache.snapshot(&core, &options)?;
+    let bob = first.iter().find(|entry| entry.value == "bob-key").unwrap();
+    let second = cache.snapshot(&core, &options)?;
+    assert!(Arc::ptr_eq(
+        bob,
+        second
+            .iter()
+            .find(|entry| entry.value == "bob-key")
+            .unwrap()
+    ));
+    core.replace_users(vec![
+        crate::CoreUser::password("alice", "alice-key"),
+        crate::CoreUser::password("carol", "carol-key"),
+    ])?;
+    let current = cache.snapshot(&core, &options)?;
+    assert_eq!(cache.entries.len(), 2);
+    assert!(!cache.entries.contains_key("bob-key"));
+    assert!(current.iter().any(|entry| entry.value == "carol-key"));
+    // A handshake already holding an old snapshot must fail after revocation.
+    let (mut client, mut server) = tokio::io::duplex(4096);
+    let replays = Arc::new(Mutex::new(HashMap::new()));
+    let handshake = async {
+        let result = server_handshake(
+            &mut server,
+            &options,
+            &core,
+            "127.0.0.1:1234".parse()?,
+            &replays,
+            first,
+        )
+        .await;
+        drop(server);
+        result
+    };
+    let (client_result, server_result) = tokio::join!(
+        client_handshake(&mut client, "bob-key", &options),
+        handshake
+    );
+    assert!(client_result.is_err());
+    assert!(
+        server_result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("core authentication failed")
+    );
     Ok(())
 }
 
@@ -708,6 +767,7 @@ async fn replayed_hello_is_rejected_and_user_hash_cannot_choose_identity() -> Re
                 &core,
                 "127.0.0.1:1234".parse().unwrap(),
                 &replays,
+                CredentialCache::default().snapshot(&core, &options)?,
             )
             .await
             .map(|(_, _, session)| session.user_id().to_string())
