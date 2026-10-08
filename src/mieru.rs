@@ -236,6 +236,7 @@ struct MieruSessionEntry {
     ordered: bool,
     recv: Arc<Mutex<MieruReceiveState>>,
     un_ack_seq: Arc<AtomicU32>,
+    recv_window: Arc<AtomicU32>,
     writer: Arc<Mutex<MieruAnyWriter>>,
 }
 
@@ -1070,6 +1071,7 @@ impl ClientUnderlay {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         let un_ack_seq = Arc::new(AtomicU32::new(0));
+        let recv_window = Arc::new(AtomicU32::new(u32::from(ACK_WINDOW_SIZE)));
         self.sessions.lock().await.insert(
             session_id,
             MieruSessionEntry {
@@ -1078,6 +1080,7 @@ impl ClientUnderlay {
                 ordered: self.reliable,
                 recv: Arc::new(Mutex::new(MieruReceiveState::default())),
                 un_ack_seq: un_ack_seq.clone(),
+                recv_window: recv_window.clone(),
                 writer: self.writer.clone(),
             },
         );
@@ -1091,6 +1094,7 @@ impl ClientUnderlay {
             self.reliable,
             mtu,
             un_ack_seq,
+            recv_window,
             self.sessions.clone(),
             Some(self.abort.clone()),
         ));
@@ -1545,6 +1549,7 @@ async fn handle_server_segment(
             let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
             let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
             let un_ack_seq = Arc::new(AtomicU32::new(0));
+            let recv_window = Arc::new(AtomicU32::new(u32::from(ACK_WINDOW_SIZE)));
             sessions.lock().await.insert(
                 session_id,
                 MieruSessionEntry {
@@ -1553,6 +1558,7 @@ async fn handle_server_segment(
                     ordered: reliable,
                     recv: Arc::new(Mutex::new(MieruReceiveState::default())),
                     un_ack_seq: un_ack_seq.clone(),
+                    recv_window: recv_window.clone(),
                     writer: writer.clone(),
                 },
             );
@@ -1568,6 +1574,7 @@ async fn handle_server_segment(
                 reliable,
                 mtu,
                 un_ack_seq,
+                recv_window,
                 sessions.clone(),
                 abort,
             ));
@@ -1775,6 +1782,7 @@ async fn run_mieru_session_output(
     reliable: bool,
     mtu: usize,
     un_ack_seq: Arc<AtomicU32>,
+    recv_window: Arc<AtomicU32>,
     sessions: MieruSessionMap,
     abort: Option<Arc<TaskAbort>>,
 ) {
@@ -1891,7 +1899,7 @@ async fn run_mieru_session_output(
                         MieruMetadata::DataAck(MieruDataAckMetadata {
                             protocol: if is_client { DATA_CLIENT_TO_SERVER } else { DATA_SERVER_TO_CLIENT },
                             session_id, seq: next_seq, un_ack_seq: un_ack_seq.load(Ordering::Relaxed),
-                            window_size: ACK_WINDOW_SIZE, fragment: 0, prefix_len: 0, payload_len: 0, suffix_len: 0,
+                            window_size: recv_window.load(Ordering::Relaxed) as u16, fragment: 0, prefix_len: 0, payload_len: 0, suffix_len: 0,
                         })
                     };
                     let segment = MieruSegment { metadata, payload: payload[*offset..*offset+n].to_vec() };
@@ -1919,7 +1927,7 @@ async fn run_mieru_session_output(
                                 session_id,
                                 seq: next_seq.saturating_sub(1),
                                 un_ack_seq: un_ack_seq.load(Ordering::Relaxed),
-                                window_size: ACK_WINDOW_SIZE,
+                                window_size: recv_window.load(Ordering::Relaxed) as u16,
                                 fragment: 0,
                                 prefix_len: 0,
                                 payload_len: 0,
@@ -2036,7 +2044,7 @@ async fn route_session_segment(
     let payload = segment.payload;
     let entry = sessions.lock().await.get(&session_id).cloned();
     if let Some(entry) = entry {
-        let un_ack_seq = if entry.ordered {
+        let (un_ack_seq, window_size) = if entry.ordered {
             let mut recv = entry.recv.lock().await;
             if seq == recv.next_seq {
                 deliver_session_payload(&entry.inbound, payload);
@@ -2049,24 +2057,28 @@ async fn route_session_segment(
                     deliver_session_payload(&entry.inbound, payload);
                     recv.next_seq = recv.next_seq.wrapping_add(1);
                 }
-            } else if seq > recv.next_seq {
-                ensure!(
-                    recv.pending.contains_key(&seq) || recv.pending.len() < MAX_PENDING_SEGMENTS,
-                    "Mieru pending receive window exceeded"
-                );
+            } else if seq.wrapping_sub(recv.next_seq) < MAX_PENDING_SEGMENTS as u32 {
+                // Keep the receive window bounded. Late packets are duplicates;
+                // packets beyond it are retried after the cumulative ACK advances.
                 recv.pending.entry(seq).or_insert(payload);
             }
-            recv.next_seq
+            (
+                recv.next_seq,
+                (MAX_PENDING_SEGMENTS - recv.pending.len()) as u16,
+            )
         } else {
             deliver_session_payload(&entry.inbound, payload);
-            seq.wrapping_add(1)
+            (seq.wrapping_add(1), ACK_WINDOW_SIZE)
         };
         entry.un_ack_seq.store(un_ack_seq, Ordering::Relaxed);
+        entry
+            .recv_window
+            .store(u32::from(window_size), Ordering::Relaxed);
         if let Some(protocol) = ack_protocol {
             let _ = entry.outbound.send(SessionCommand::SendAck {
                 protocol,
                 un_ack_seq,
-                window_size: ACK_WINDOW_SIZE,
+                window_size,
             });
         }
     }

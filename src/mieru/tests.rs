@@ -225,6 +225,88 @@ async fn cached_packet_cipher_preserves_authentication_hint_rotation_and_replay_
 }
 
 #[tokio::test]
+async fn packet_receive_window_drops_future_packets_and_recovers_without_closing() -> Result<()> {
+    let (inbound, mut received) = mpsc::unbounded_channel();
+    let (outbound, mut commands) = mpsc::unbounded_channel();
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let entry = MieruSessionEntry {
+        inbound,
+        outbound,
+        ordered: true,
+        recv: Arc::new(Mutex::new(MieruReceiveState::default())),
+        un_ack_seq: Arc::new(AtomicU32::new(0)),
+        recv_window: Arc::new(AtomicU32::new(u32::from(ACK_WINDOW_SIZE))),
+        writer: Arc::new(Mutex::new(MieruAnyWriter::Packet(MieruPacketWriter::new(
+            socket,
+            Some("127.0.0.1:1234".parse()?),
+            Vec::new(),
+            MieruCipher::new([0; KEY_LEN], false, "user".to_string(), None),
+            1400,
+            None,
+        )))),
+    };
+    let sessions = Arc::new(Mutex::new(HashMap::from([(1, entry.clone())])));
+    let segment = |seq| MieruSegment {
+        metadata: MieruMetadata::DataAck(MieruDataAckMetadata {
+            protocol: DATA_CLIENT_TO_SERVER,
+            session_id: 1,
+            seq,
+            un_ack_seq: 0,
+            window_size: ACK_WINDOW_SIZE,
+            fragment: 0,
+            prefix_len: 0,
+            payload_len: 4,
+            suffix_len: 0,
+        }),
+        payload: seq.to_be_bytes().to_vec(),
+    };
+    for seq in 1..=(MAX_PENDING_SEGMENTS as u32 + 2) {
+        route_session_segment(&sessions, segment(seq), Some(ACK_SERVER_TO_CLIENT)).await?;
+    }
+    assert_eq!(
+        entry.recv.lock().await.pending.len(),
+        MAX_PENDING_SEGMENTS - 1
+    );
+    assert_eq!(entry.recv_window.load(Ordering::Relaxed), 1);
+    route_session_segment(&sessions, segment(0), Some(ACK_SERVER_TO_CLIENT)).await?;
+    for seq in 0..MAX_PENDING_SEGMENTS as u32 {
+        assert_eq!(
+            received.recv().await.context("ordered payload")?,
+            seq.to_be_bytes()
+        );
+    }
+    assert!(entry.recv.lock().await.pending.is_empty());
+    assert_eq!(
+        entry.un_ack_seq.load(Ordering::Relaxed),
+        MAX_PENDING_SEGMENTS as u32
+    );
+    assert_eq!(
+        entry.recv_window.load(Ordering::Relaxed),
+        u32::from(ACK_WINDOW_SIZE)
+    );
+    // A packet dropped outside the earlier window can now be retransmitted.
+    route_session_segment(
+        &sessions,
+        segment(MAX_PENDING_SEGMENTS as u32),
+        Some(ACK_SERVER_TO_CLIENT),
+    )
+    .await?;
+    assert_eq!(
+        received.recv().await.context("retried payload")?,
+        (MAX_PENDING_SEGMENTS as u32).to_be_bytes()
+    );
+    let mut last_ack = None;
+    while let Ok(command) = commands.try_recv() {
+        last_ack = Some(command);
+    }
+    assert!(
+        matches!(last_ack, Some(SessionCommand::SendAck { un_ack_seq, window_size: ACK_WINDOW_SIZE, .. })
+        if un_ack_seq == MAX_PENDING_SEGMENTS as u32 + 1)
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn session_write_applies_backpressure_without_blocking_control() -> Result<()> {
     let (_, inbound) = mpsc::unbounded_channel();
     let (outbound, mut commands) = mpsc::unbounded_channel();

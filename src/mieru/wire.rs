@@ -16,7 +16,7 @@ const REPLAY_CACHE_MAX: usize = 65_536;
 pub(super) const MAX_PDU: usize = 32 * 1024;
 pub(super) const MAX_SESSION_OPEN_PAYLOAD: usize = 1024;
 pub(super) const PACKET_OVERHEAD: usize = PACKET_METADATA_LEN + AEAD_OVERHEAD;
-pub(super) const ACK_WINDOW_SIZE: u16 = 4096;
+pub(super) const ACK_WINDOW_SIZE: u16 = super::MAX_PENDING_SEGMENTS as u16;
 pub(super) const PACKET_RETRANSMIT_INTERVAL_MS: u64 = 250;
 
 pub(super) const CLOSE_CONN_REQUEST: u8 = 0;
