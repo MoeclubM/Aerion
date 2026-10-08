@@ -93,30 +93,6 @@ impl Cubic {
     }
 }
 
-pub(super) struct PacketPacer {
-    next: Instant,
-}
-
-impl PacketPacer {
-    pub(super) fn new() -> Self {
-        Self {
-            next: Instant::now(),
-        }
-    }
-
-    pub(super) fn deadline(&self) -> Instant {
-        self.next
-    }
-
-    pub(super) fn sent(&mut self, now: Instant, rtt: Duration, window: usize) {
-        let spacing = rtt.div_f64(window as f64 * 1.25);
-        // Bounded catch-up credit tolerates timer granularity and lets an idle
-        // small datagram send without waiting for a new pacing epoch.
-        let earliest = now - spacing * 16;
-        self.next = self.next.max(earliest) + spacing;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,21 +135,5 @@ mod tests {
         idle.sent(now + rtt + Duration::from_secs(60), 0, rtt);
         idle.ack(1, rtt, now + rtt + Duration::from_secs(60), true);
         assert_eq!(active.window(), idle.window());
-    }
-
-    #[test]
-    fn pacing_bounds_catch_up_bursts_and_tracks_the_window_rate() {
-        let now = Instant::now();
-        let rtt = Duration::from_millis(100);
-        let mut pacer = PacketPacer {
-            next: now - Duration::from_secs(5),
-        };
-        pacer.sent(now, rtt, 32);
-        let first = pacer.deadline();
-        for _ in 0..15 {
-            pacer.sent(now, rtt, 32);
-        }
-        assert!(pacer.deadline() >= now);
-        assert_eq!(pacer.deadline() - first, Duration::from_micros(37500));
     }
 }

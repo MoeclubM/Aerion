@@ -27,7 +27,7 @@ mod pattern;
 mod socks;
 mod wire;
 
-use congestion::{Cubic, PacketPacer};
+use congestion::Cubic;
 use crypto::{
     MieruCipher, check_user_from_hint, current_mieru_key, hash_mieru_password, mieru_key_epoch,
 };
@@ -1792,7 +1792,6 @@ async fn run_mieru_session_output(
         let mut opened = !is_client;
         let mut unacked = BTreeMap::<u32, OutstandingSegment>::new();
         let mut pending = VecDeque::<(Vec<u8>, OwnedSemaphorePermit, usize)>::new();
-        let mut pacer = PacketPacer::new();
         let mut pending_ack: Option<MieruDataAckMetadata> = None;
         let mut ack_at = Instant::now();
         let mut closing = false;
@@ -1892,7 +1891,7 @@ async fn run_mieru_session_output(
                         }
                     }
                 }
-                _ = async { if reliable { tokio::time::sleep_until(pacer.deadline()).await; } }, if !pending.is_empty() && (!reliable || flow.can_send(next_seq, unacked.len())) => {
+                _ = std::future::ready(()), if !pending.is_empty() && (!reliable || flow.can_send(next_seq, unacked.len())) => {
                     let (payload, _, offset) = pending.front_mut().unwrap();
                     let max_chunk = if reliable {
                         mtu.checked_sub(PACKET_OVERHEAD).filter(|size| *size > 0)
@@ -1921,7 +1920,6 @@ async fn run_mieru_session_output(
                     }
                     write_output_segment(&writer, segment, reliable, &mut unacked).await?;
                     data_packets += 1;
-                    if reliable { pacer.sent(Instant::now(), flow.rtt(), flow.congestion.window()); }
                     // DATA carries the current cumulative ACK and receive window.
                     if !open { pending_ack = None; }
                     next_seq = next_seq.wrapping_add(1);
