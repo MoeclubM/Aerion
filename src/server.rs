@@ -437,6 +437,7 @@ async fn run_tcp_stream(
         _ = abort.cancelled() => return Ok(()),
         remote = tokio::time::timeout(Duration::from_secs(15), async {
             let _permit = dial_budget.acquire_owned().await.context("AnyTLS dial budget closed")?;
+            ensure!(!abort.is_triggered(), "AnyTLS stream cancelled");
             socket_protect::connect_proxy_target(&target).await
         }) => remote.context("AnyTLS dial timed out").and_then(|r| r),
     } {
