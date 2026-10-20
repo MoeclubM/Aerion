@@ -144,6 +144,11 @@ fn pbkdf2_vector_matches_rfc6070_shape() -> Result<()> {
         hex::encode(key),
         "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
     );
+    // Independent hashlib/OpenSSL vector covers HMAC-state reuse and two blocks.
+    assert_eq!(
+        hex::encode(pbkdf2_hmac_sha256(b"password", b"salt", 64, 64)?),
+        "40113618313af3bc3fd970da09741d51a0ff7d13e6085e4da0b00b984307a6a2c397fb440a78d688741c79b6e3a8df2094a69ee9c05f16e8d4b508ece5a0540f"
+    );
     Ok(())
 }
 

@@ -476,7 +476,7 @@ async fn packet_receive_window_drops_future_packets_and_recovers_without_closing
         .with_receive_flow(&entry, ACK_SERVER_TO_CLIENT);
     let full = entry
         .flow
-        .reserve_stream(vec![0x42; SESSION_RECEIVE_BYTES])
+        .reserve_stream(vec![0x42; SESSION_RECEIVE_BYTES - RECEIVE_ITEM_OVERHEAD])
         .await
         .context("reserve receive budget")?;
     entry.inbound.send(full)?;
@@ -489,7 +489,7 @@ async fn packet_receive_window_drops_future_packets_and_recovers_without_closing
     );
     assert_eq!(entry.flow.window.load(Ordering::Relaxed), 0);
     while commands.try_recv().is_ok() {}
-    let mut payload = vec![0; SESSION_RECEIVE_BYTES];
+    let mut payload = vec![0; SESSION_RECEIVE_BYTES - RECEIVE_ITEM_OVERHEAD];
     session.read_exact(&mut payload).await?;
     assert!(payload.iter().all(|b| *b == 0x42));
     assert!(matches!(
@@ -512,7 +512,7 @@ async fn packet_receive_window_drops_future_packets_and_recovers_without_closing
 async fn receive_budget_bounds_tcp_and_keeps_room_for_missing_udp_head() -> Result<()> {
     let flow = ReceiveFlow::new(1400);
     let full = flow
-        .reserve_stream(vec![0; SESSION_RECEIVE_BYTES])
+        .reserve_stream(vec![0; SESSION_RECEIVE_BYTES - RECEIVE_ITEM_OVERHEAD])
         .await
         .context("receive budget")?;
     assert!(
@@ -522,16 +522,28 @@ async fn receive_budget_bounds_tcp_and_keeps_room_for_missing_udp_head() -> Resu
     );
     assert!(flow.reserve_packet(vec![0], false).is_none());
     drop(full);
+    let headroom = u16::MAX as usize + AEAD_OVERHEAD + RECEIVE_ITEM_OVERHEAD;
     let tail = flow
-        .reserve_packet(vec![0; SESSION_RECEIVE_BYTES - u16::MAX as usize], true)
+        .reserve_packet(
+            vec![0; SESSION_RECEIVE_BYTES - headroom - RECEIVE_ITEM_OVERHEAD],
+            true,
+        )
         .context("reorder budget")?;
     assert!(flow.reserve_packet(vec![0], true).is_none());
     let head = flow
-        .reserve_packet(vec![0; u16::MAX as usize], false)
+        .reserve_packet(vec![0; headroom - RECEIVE_ITEM_OVERHEAD], false)
         .context("missing head must fit")?;
     assert_eq!(flow.budget.available_permits(), 0);
     drop((head, tail));
     assert_eq!(flow.budget.available_permits(), SESSION_RECEIVE_BYTES);
+    let tiny = flow
+        .reserve_packet(vec![0], false)
+        .context("small packet")?;
+    assert_eq!(
+        SESSION_RECEIVE_BYTES - flow.budget.available_permits(),
+        1 + RECEIVE_ITEM_OVERHEAD
+    );
+    drop(tiny);
     Ok(())
 }
 

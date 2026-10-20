@@ -68,6 +68,7 @@ const PACKET_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
 const MAX_PACKET_PEERS: usize = 1024;
 const PACKET_PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SESSION_RECEIVE_BYTES: usize = 1024 * 1024;
+const RECEIVE_ITEM_OVERHEAD: usize = std::mem::size_of::<ReceivedPayload>() + 64;
 
 #[derive(Clone, Debug)]
 pub struct MieruUser {
@@ -265,7 +266,9 @@ impl ReceiveFlow {
             pending: AtomicU32::new(0),
             un_ack_seq: AtomicU32::new(0),
             window: AtomicU32::new(0),
-            packet_size: mtu.saturating_sub(PACKET_OVERHEAD).clamp(1, MAX_PDU),
+            packet_size: mtu.saturating_sub(PACKET_OVERHEAD).clamp(1, MAX_PDU)
+                + AEAD_OVERHEAD
+                + RECEIVE_ITEM_OVERHEAD,
             refresh_lock: std::sync::Mutex::new(()),
         });
         flow.refresh();
@@ -291,10 +294,14 @@ impl ReceiveFlow {
     }
 
     fn reserve_packet(&self, payload: Vec<u8>, reordered: bool) -> Option<ReceivedPayload> {
-        let bytes = u32::try_from(payload.len()).ok()?;
+        let bytes = u32::try_from(payload.capacity().checked_add(RECEIVE_ITEM_OVERHEAD)?).ok()?;
         // Keep room for a missing head packet. Otherwise a full reorder queue
         // could prevent the very packet needed to drain it from being accepted.
-        let headroom = if reordered { u16::MAX as u32 } else { 0 };
+        let headroom = if reordered {
+            (u16::MAX as usize + AEAD_OVERHEAD + RECEIVE_ITEM_OVERHEAD) as u32
+        } else {
+            0
+        };
         let mut reservation = self
             .budget
             .clone()
@@ -304,10 +311,22 @@ impl ReceiveFlow {
         Some(ReceivedPayload { payload, permit })
     }
 
-    async fn reserve_stream(&self, payload: Vec<u8>) -> Option<ReceivedPayload> {
-        let bytes = u32::try_from(payload.len()).ok()?;
-        let permit = self.budget.clone().acquire_many_owned(bytes).await.ok()?;
-        Some(ReceivedPayload { payload, permit })
+    async fn reserve_stream(&self, payload: Vec<u8>) -> Result<ReceivedPayload> {
+        let bytes = payload
+            .capacity()
+            .checked_add(RECEIVE_ITEM_OVERHEAD)
+            .context("Mieru receive size overflow")?;
+        ensure!(
+            bytes <= SESSION_RECEIVE_BYTES,
+            "Mieru receive payload exceeds buffer budget"
+        );
+        let permit = self
+            .budget
+            .clone()
+            .acquire_many_owned(bytes as u32)
+            .await
+            .context("Mieru receive budget closed")?;
+        Ok(ReceivedPayload { payload, permit })
     }
 }
 
@@ -2190,9 +2209,8 @@ async fn route_session_segment(
             entry.flow.refresh();
             (recv.next_seq, immediate)
         } else {
-            if let Some(payload) = entry.flow.reserve_stream(payload).await {
-                deliver_session_payload(&entry.inbound, payload);
-            }
+            let payload = entry.flow.reserve_stream(payload).await?;
+            deliver_session_payload(&entry.inbound, payload);
             (seq.wrapping_add(1), false)
         };
         entry.flow.un_ack_seq.store(un_ack_seq, Ordering::Relaxed);
