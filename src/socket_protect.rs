@@ -45,14 +45,18 @@ pub fn protect_socket_fd(fd: i32) -> Result<()> {
 }
 
 pub async fn connect_proxy_target(target: &ProxyTarget) -> Result<TcpStream> {
-    match target {
-        ProxyTarget::Ip(addr) => connect_tcp_addr(*addr)
-            .await
-            .with_context(|| format!("connect target {addr}")),
-        ProxyTarget::Domain(host, port) => connect_tcp_host_port(host, *port)
-            .await
-            .with_context(|| format!("connect target {host}:{port}")),
-    }
+    tokio::time::timeout(Duration::from_secs(15), async {
+        match target {
+            ProxyTarget::Ip(addr) => connect_tcp_addr(*addr)
+                .await
+                .with_context(|| format!("connect target {addr}")),
+            ProxyTarget::Domain(host, port) => connect_tcp_host_port(host, *port)
+                .await
+                .with_context(|| format!("connect target {host}:{port}")),
+        }
+    })
+    .await
+    .context("connect target timed out")?
 }
 
 pub async fn connect_tcp_host_port(host: &str, port: u16) -> Result<TcpStream> {

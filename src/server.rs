@@ -20,10 +20,12 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, WriteHalf, split};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::time::{Duration, interval};
 
 const MAX_PENDING_UOT: usize = 256;
+const MAX_SESSION_STREAMS: usize = 1024;
+const MAX_PENDING_DIALS: usize = 32;
 const MAX_UOT_BUFFER: usize = 64 * 1024;
 
 struct StreamControl {
@@ -231,6 +233,7 @@ async fn serve_session(
     let mut pending = HashSet::new();
     let mut pending_uot: HashMap<u32, (ProxyTarget, Vec<u8>)> = HashMap::new();
     let mut streams: HashMap<u32, StreamControl> = HashMap::new();
+    let dial_budget = Arc::new(Semaphore::new(MAX_PENDING_DIALS));
     let mut heartbeat = interval(Duration::from_secs(heartbeat_interval_secs));
     heartbeat.tick().await;
 
@@ -243,6 +246,7 @@ async fn serve_session(
                     _ = session.cancelled() => bail!("core session cancelled"),
                     frame = &mut next_frame => break frame?,
                     _ = heartbeat.tick() => {
+                        streams.retain(|_, control| !control.abort.is_triggered());
                         if received_settings {
                             let mut writer = writer.lock().await;
                             write_frame(&mut *writer, CMD_HEART_REQUEST, 0, &[]).await?;
@@ -253,6 +257,10 @@ async fn serve_session(
         };
         match frame.cmd {
             CMD_SYN => {
+                ensure!(
+                    streams.len() + pending.len() + pending_uot.len() < MAX_SESSION_STREAMS,
+                    "AnyTLS session stream limit exceeded"
+                );
                 if !received_settings {
                     let mut writer = writer.lock().await;
                     write_frame(&mut *writer, CMD_ALERT, 0, b"client did not send settings")
@@ -296,6 +304,7 @@ async fn serve_session(
                         writer.clone(),
                         session.clone(),
                         connection_abort.clone(),
+                        dial_budget.clone(),
                     )
                     .await
                     {
@@ -326,6 +335,7 @@ async fn serve_session(
                     writer.clone(),
                     session.clone(),
                     connection_abort.clone(),
+                    dial_budget.clone(),
                 )
                 .await
                 {
@@ -376,6 +386,7 @@ async fn open_stream(
     writer: Arc<Mutex<WriteHalf<EarlyDataTlsStream>>>,
     session: CoreSession,
     connection_abort: Arc<TaskAbort>,
+    dial_budget: Arc<Semaphore>,
 ) -> Result<(u32, StreamControl)> {
     let stream_id = frame.stream_id;
     let (target, initial_payload) = decode_target(&frame.payload)?;
@@ -390,10 +401,51 @@ async fn open_stream(
         )
         .await;
     }
-    let remote = match socket_protect::connect_proxy_target(&target).await {
+    let (sender, receiver) = mpsc::channel::<Vec<u8>>(32);
+    let abort = Arc::new(TaskAbort::new());
+    if !initial_payload.is_empty() {
+        sender
+            .send(initial_payload.to_vec())
+            .await
+            .context("queue initial stream payload")?;
+    }
+    let task_abort = abort.clone();
+    tokio::spawn(async move {
+        let result = tokio::select! {
+            _ = connection_abort.cancelled() => Ok(()),
+            result = run_tcp_stream(stream_id, target, writer, session, connection_abort.clone(), task_abort.clone(), receiver, dial_budget) => result,
+        };
+        task_abort.trigger();
+        if let Err(error) = result {
+            tracing::warn!("open stream {stream_id} failed: {error:#}");
+        }
+    });
+    Ok((stream_id, StreamControl { sender, abort }))
+}
+
+async fn run_tcp_stream(
+    stream_id: u32,
+    target: ProxyTarget,
+    writer: Arc<Mutex<WriteHalf<EarlyDataTlsStream>>>,
+    session: CoreSession,
+    connection_abort: Arc<TaskAbort>,
+    abort: Arc<TaskAbort>,
+    mut receiver: mpsc::Receiver<Vec<u8>>,
+    dial_budget: Arc<Semaphore>,
+) -> Result<()> {
+    let remote = match tokio::select! {
+        _ = abort.cancelled() => return Ok(()),
+        remote = tokio::time::timeout(Duration::from_secs(15), async {
+            let _permit = dial_budget.acquire_owned().await.context("AnyTLS dial budget closed")?;
+            socket_protect::connect_proxy_target(&target).await
+        }) => remote.context("AnyTLS dial timed out").and_then(|r| r),
+    } {
         Ok(remote) => remote,
         Err(error) => {
-            let mut writer = writer.lock().await;
+            let mut writer = tokio::select! {
+                _ = abort.cancelled() => return Ok(()),
+                writer = writer.lock() => writer,
+            };
             write_frame(
                 &mut *writer,
                 CMD_SYNACK,
@@ -406,20 +458,14 @@ async fn open_stream(
     };
     let _ = remote.set_nodelay(true);
     {
-        let mut writer = writer.lock().await;
+        let mut writer = tokio::select! {
+            _ = abort.cancelled() => return Ok(()),
+            writer = writer.lock() => writer,
+        };
         write_frame(&mut *writer, CMD_SYNACK, stream_id, &[]).await?;
     }
     let (mut remote_reader, mut remote_writer) = remote.into_split();
-    let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(32);
-    let abort = Arc::new(TaskAbort::new());
     tracing::info!("opened stream {stream_id} to {}", target_name(&target));
-
-    if !initial_payload.is_empty() {
-        sender
-            .send(initial_payload.to_vec())
-            .await
-            .context("queue initial stream payload")?;
-    }
 
     let downlink_writer = writer.clone();
     let downlink_session = session.clone();
@@ -466,29 +512,26 @@ async fn open_stream(
 
     let uplink_session = session;
     let uplink_abort = abort.clone();
-    tokio::spawn(async move {
-        let result = tokio::select! {
-            _ = connection_abort.cancelled() => Ok(()),
-            _ = uplink_abort.cancelled() => Ok(()),
-            result = async {
-            while let Some(payload) = receiver.recv().await {
-                uplink_session.record_upload(payload.len()).await?;
-                remote_writer
-                    .write_all(&payload)
-                    .await
-                    .context("write target payload")?;
-            }
-            Ok::<(), anyhow::Error>(())
-            } => result,
-        };
-        let _ = tokio::time::timeout(Duration::from_secs(5), remote_writer.shutdown()).await;
-        uplink_abort.trigger();
-        if let Err(error) = result {
-            tracing::warn!("stream {stream_id} uplink failed: {error:?}");
+    let result = tokio::select! {
+        _ = connection_abort.cancelled() => Ok(()),
+        _ = uplink_abort.cancelled() => Ok(()),
+        result = async {
+        while let Some(payload) = receiver.recv().await {
+            uplink_session.record_upload(payload.len()).await?;
+            remote_writer
+                .write_all(&payload)
+                .await
+                .context("write target payload")?;
         }
-    });
-
-    Ok((stream_id, StreamControl { sender, abort }))
+        Ok::<(), anyhow::Error>(())
+        } => result,
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(5), remote_writer.shutdown()).await;
+    uplink_abort.trigger();
+    if let Err(error) = result {
+        tracing::warn!("stream {stream_id} uplink failed: {error:?}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
