@@ -434,6 +434,7 @@ async fn run_tcp_stream(
     dial_budget: Arc<Semaphore>,
 ) -> Result<()> {
     let remote = match tokio::select! {
+        biased;
         _ = abort.cancelled() => return Ok(()),
         remote = tokio::time::timeout(Duration::from_secs(15), async {
             let _permit = dial_budget.acquire_owned().await.context("AnyTLS dial budget closed")?;
@@ -444,6 +445,7 @@ async fn run_tcp_stream(
         Ok(remote) => remote,
         Err(error) => {
             let mut writer = tokio::select! {
+                biased;
                 _ = abort.cancelled() => return Ok(()),
                 writer = writer.lock() => writer,
             };
@@ -460,6 +462,7 @@ async fn run_tcp_stream(
     let _ = remote.set_nodelay(true);
     {
         let mut writer = tokio::select! {
+            biased;
             _ = abort.cancelled() => return Ok(()),
             writer = writer.lock() => writer,
         };
