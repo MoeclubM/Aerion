@@ -252,8 +252,8 @@ struct ReceivedPayload {
 struct ReceiveFlow {
     budget: Arc<Semaphore>,
     pending: AtomicU32,
-    un_ack_seq: Arc<AtomicU32>,
-    window: Arc<AtomicU32>,
+    un_ack_seq: AtomicU32,
+    window: AtomicU32,
     packet_size: usize,
     refresh_lock: std::sync::Mutex<()>,
 }
@@ -263,8 +263,8 @@ impl ReceiveFlow {
         let flow = Arc::new(Self {
             budget: Arc::new(Semaphore::new(SESSION_RECEIVE_BYTES)),
             pending: AtomicU32::new(0),
-            un_ack_seq: Arc::new(AtomicU32::new(0)),
-            window: Arc::new(AtomicU32::new(0)),
+            un_ack_seq: AtomicU32::new(0),
+            window: AtomicU32::new(0),
             packet_size: mtu.saturating_sub(PACKET_OVERHEAD).clamp(1, MAX_PDU),
             refresh_lock: std::sync::Mutex::new(()),
         });
@@ -277,9 +277,10 @@ impl ReceiveFlow {
             .refresh_lock
             .lock()
             .expect("Mieru receive window lock poisoned");
-        let window = (self.budget.available_permits() / self.packet_size)
-            .min(MAX_PENDING_SEGMENTS.saturating_sub(self.pending.load(Ordering::Relaxed) as usize))
-            as u32;
+        let window = (self.budget.available_permits() / self.packet_size).min(
+            usize::from(ACK_WINDOW_SIZE)
+                .saturating_sub(self.pending.load(Ordering::Relaxed) as usize),
+        ) as u32;
         (self.window.swap(window, Ordering::Relaxed), window)
     }
 

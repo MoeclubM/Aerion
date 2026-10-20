@@ -67,10 +67,12 @@ async fn queued_dial_does_not_block_mux_parser_and_fin_cancels_it() -> Result<()
     let peer = TcpStream::connect(listener.local_addr()?).await?;
     let (stream, _) = listener.accept().await?;
     let connector = tokio_rustls::TlsConnector::from(tls::client_config(true));
-    let (stream, mut peer) = tokio::try_join!(
+    let (stream, peer) = tokio::join!(
         acceptor.accept(stream),
         connector.connect(rustls::pki_types::ServerName::try_from("localhost")?, peer)
-    )?;
+    );
+    let stream = stream?;
+    let mut peer = peer?;
     let (_reader, writer) = split(EarlyDataTlsStream::new(stream, Vec::new()));
     let writer = Arc::new(Mutex::new(writer));
     let core = ProxyCore::from_credentials("secret", &[]);
