@@ -5,13 +5,44 @@ use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const PBKDF2_CACHE_MAX: usize = 1024;
-static PBKDF2_CACHE: Mutex<Option<HashMap<([u8; KEY_LEN], [u8; KEY_LEN]), [u8; KEY_LEN]>>> =
-    Mutex::new(None);
+// Bound users, not individual time keys. A full authentication scan must not
+// flush the keys used by every other connection in the process.
+const PBKDF2_CACHE_MAX: usize = 4096;
+static PBKDF2_CACHE: Mutex<Option<KeyCache>> = Mutex::new(None);
+
+#[derive(Clone, Copy)]
+struct TimeKeys {
+    epoch: u64,
+    keys: [[u8; KEY_LEN]; 3],
+}
+
+fn key_epochs(epoch: u64) -> [u64; 3] {
+    [epoch.saturating_sub(1), epoch, epoch.saturating_add(1)]
+}
+
+#[derive(Default)]
+struct KeyCache {
+    entries: HashMap<[u8; KEY_LEN], TimeKeys>,
+    order: VecDeque<[u8; KEY_LEN]>,
+    salts: Option<(u64, [[u8; KEY_LEN]; 3])>,
+}
+
+impl KeyCache {
+    fn insert(&mut self, password: [u8; KEY_LEN], keys: TimeKeys) {
+        if !self.entries.contains_key(&password) {
+            if self.entries.len() == PBKDF2_CACHE_MAX {
+                let oldest = self.order.pop_front().expect("key cache eviction order");
+                self.entries.remove(&oldest);
+            }
+            self.order.push_back(password);
+        }
+        self.entries.insert(password, keys);
+    }
+}
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -196,10 +227,64 @@ pub(super) fn mieru_key_epoch() -> Result<u64> {
 
 pub(super) fn mieru_keys_for_password(
     hashed_password: &[u8; KEY_LEN],
-) -> Result<Vec<[u8; KEY_LEN]>> {
-    let mut keys = Vec::with_capacity(3);
-    for salt in salt_from_time(SystemTime::now())? {
-        keys.push(pbkdf2_cached(hashed_password, &salt)?);
+) -> Result<[[u8; KEY_LEN]; 3]> {
+    let epoch = mieru_key_epoch()?;
+    let (salts, previous) = {
+        let mut cache = PBKDF2_CACHE
+            .lock()
+            .expect("Mieru PBKDF2 cache lock poisoned");
+        let cache = cache.get_or_insert_with(KeyCache::default);
+        let previous = cache.entries.get(hashed_password).copied();
+        if let Some(previous) = previous
+            && previous.epoch == epoch
+        {
+            return Ok(previous.keys);
+        }
+        if cache
+            .salts
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != epoch)
+        {
+            cache.salts = Some((epoch, salt_from_epoch(epoch)));
+        }
+        (cache.salts.as_ref().unwrap().1, previous)
+    };
+    let keys = derive_time_keys(hashed_password, epoch, salts, previous)?;
+    PBKDF2_CACHE
+        .lock()
+        .expect("Mieru PBKDF2 cache lock poisoned")
+        .as_mut()
+        .unwrap()
+        .insert(*hashed_password, TimeKeys { epoch, keys });
+    Ok(keys)
+}
+
+fn derive_time_keys(
+    hashed_password: &[u8; KEY_LEN],
+    epoch: u64,
+    salts: [[u8; KEY_LEN]; 3],
+    previous: Option<TimeKeys>,
+) -> Result<[[u8; KEY_LEN]; 3]> {
+    // Key rotation overlaps two of the three accepted epochs. Reuse those
+    // keys, and keep the expensive derivation outside the process-wide lock.
+    let epochs = key_epochs(epoch);
+    let mut keys = [[0; KEY_LEN]; 3];
+    for (index, salt) in salts.iter().enumerate() {
+        if let Some((previous, old_index)) = previous.and_then(|old| {
+            key_epochs(old.epoch)
+                .iter()
+                .position(|e| *e == epochs[index])
+                .map(|i| (old, i))
+        }) {
+            keys[index] = previous.keys[old_index];
+        } else {
+            keys[index].copy_from_slice(&pbkdf2_hmac_sha256(
+                hashed_password,
+                salt,
+                KEY_ITER,
+                KEY_LEN,
+            )?);
+        }
     }
     Ok(keys)
 }
@@ -217,45 +302,14 @@ pub(super) fn increment_nonce(nonce: &[u8]) -> Result<[u8; NONCE_LEN]> {
     Ok(next)
 }
 
-fn pbkdf2_cached(password: &[u8; KEY_LEN], salt: &[u8; KEY_LEN]) -> Result<[u8; KEY_LEN]> {
-    {
-        let cache = PBKDF2_CACHE
-            .lock()
-            .expect("Mieru PBKDF2 cache lock poisoned");
-        if let Some(cache) = cache.as_ref()
-            && let Some(key) = cache.get(&(*password, *salt))
-        {
-            return Ok(*key);
-        }
-    }
-    let derived = pbkdf2_hmac_sha256(password, salt, KEY_ITER, KEY_LEN)?;
-    let mut key = [0u8; KEY_LEN];
-    key.copy_from_slice(&derived);
-    let mut cache = PBKDF2_CACHE
-        .lock()
-        .expect("Mieru PBKDF2 cache lock poisoned");
-    let cache = cache.get_or_insert_with(HashMap::new);
-    if cache.len() >= PBKDF2_CACHE_MAX {
-        cache.clear();
-    }
-    cache.insert((*password, *salt), key);
-    Ok(key)
-}
-
-fn salt_from_time(time: SystemTime) -> Result<[[u8; KEY_LEN]; 3]> {
-    let seconds = time.duration_since(UNIX_EPOCH)?.as_secs();
-    let rounded = ((seconds + KEY_REFRESH_SECS / 2) / KEY_REFRESH_SECS) * KEY_REFRESH_SECS;
-    let times = [
-        rounded.saturating_sub(KEY_REFRESH_SECS),
-        rounded,
-        rounded + KEY_REFRESH_SECS,
-    ];
+fn salt_from_epoch(epoch: u64) -> [[u8; KEY_LEN]; 3] {
     let mut salts = [[0u8; KEY_LEN]; 3];
-    for (salt, unix) in salts.iter_mut().zip(times) {
+    for (salt, epoch) in salts.iter_mut().zip(key_epochs(epoch)) {
+        let unix = epoch.saturating_mul(KEY_REFRESH_SECS);
         let digest = Sha256::digest(unix.to_be_bytes());
         salt.copy_from_slice(&digest);
     }
-    Ok(salts)
+    salts
 }
 
 fn pbkdf2_hmac_sha256(
@@ -267,16 +321,17 @@ fn pbkdf2_hmac_sha256(
     ensure!(!password.is_empty(), "Mieru password is empty");
     let blocks = key_len.div_ceil(KEY_LEN);
     let mut derived = Vec::with_capacity(blocks * KEY_LEN);
+    let base = <HmacSha256 as Mac>::new_from_slice(password)?;
     for block_index in 1..=blocks {
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(password)?;
+        let mut mac = base.clone();
         mac.update(salt);
         mac.update(&(block_index as u32).to_be_bytes());
-        let mut u = mac.finalize().into_bytes().to_vec();
-        let mut t = u.clone();
+        let mut u: [u8; KEY_LEN] = mac.finalize().into_bytes().into();
+        let mut t = u;
         for _ in 1..iterations {
-            let mut mac = <HmacSha256 as Mac>::new_from_slice(password)?;
+            let mut mac = base.clone();
             mac.update(&u);
-            u = mac.finalize().into_bytes().to_vec();
+            u = mac.finalize().into_bytes().into();
             for (left, right) in t.iter_mut().zip(&u) {
                 *left ^= *right;
             }

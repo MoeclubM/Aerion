@@ -6,6 +6,92 @@ use tokio::net::TcpListener;
 
 include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
+    "/tests/performance/mieru_auth.rs"
+));
+
+#[test]
+fn authentication_hint_is_prioritized_but_optional_fallback_still_checks_aead() -> Result<()> {
+    let users = (0..3000)
+        .map(|i| MieruUserSecret {
+            username: format!("user-{i}"),
+            password: String::new(),
+            hashed_password: crypto::hash_mieru_password(b"secret", format!("user-{i}").as_bytes()),
+        })
+        .collect::<Vec<_>>();
+    let selected = &users[2999];
+    let key = crypto::current_mieru_key(&selected.hashed_password)?;
+    let mut cipher = MieruCipher::new(key, false, selected.username.clone(), None);
+    let nonce = cipher.encrypt(b"nonce hint")?;
+    let candidates = wire::authentication_candidates(&users, &nonce[..NONCE_LEN], false);
+    assert_eq!(candidates.len(), users.len());
+    assert!(std::ptr::eq(candidates[0], selected));
+    assert_eq!(
+        wire::authentication_candidates(&users, &nonce[..NONCE_LEN], true).len(),
+        1
+    );
+    let mut cipher = MieruCipher::new(key, false, "legacy-hint".into(), None);
+    let packet = encode_mieru_packet_segment(
+        &mut cipher,
+        MieruSegment {
+            metadata: MieruMetadata::DataAck(MieruDataAckMetadata {
+                protocol: DATA_CLIENT_TO_SERVER,
+                session_id: 1,
+                seq: 1,
+                un_ack_seq: 0,
+                window_size: 32,
+                fragment: 0,
+                prefix_len: 0,
+                payload_len: 0,
+                suffix_len: 0,
+            }),
+            payload: b"payload".to_vec(),
+        },
+        1400,
+        None,
+    )?;
+    let replay = MieruReplayCache::new();
+    let (segment, user, _) =
+        decode_mieru_packet_segment_for_server(&packet, &users, false, None, &replay)?;
+    assert_eq!(user.username, selected.username);
+    assert_eq!(segment.payload, b"payload");
+    assert!(decode_mieru_packet_segment_for_server(&packet, &users, true, None, &replay).is_err());
+    let mut corrupted = packet;
+    corrupted[NONCE_LEN] ^= 1;
+    assert!(
+        decode_mieru_packet_segment_for_server(&corrupted, &users, false, None, &replay).is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn silent_tcp_peer_is_closed_before_authentication() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let mut peer = TcpStream::connect(listener.local_addr()?).await?;
+    let (stream, addr) = listener.accept().await?;
+    let task = tokio::spawn(handle_mieru_underlay_server(
+        stream,
+        Arc::from([]),
+        ProxyCore::empty(),
+        1400,
+        false,
+        None,
+        addr,
+        Arc::new(MieruReplayCache::new()),
+    ));
+    let error = tokio::time::timeout(
+        crate::io_util::HANDSHAKE_TIMEOUT + Duration::from_secs(3),
+        task,
+    )
+    .await??
+    .unwrap_err();
+    assert!(error.to_string().contains("Mieru authentication timed out"));
+    let mut byte = [0];
+    assert_eq!(peer.read(&mut byte).await?, 0);
+    Ok(())
+}
+
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
     "/tests/performance/mieru_stream.rs"
 ));
 

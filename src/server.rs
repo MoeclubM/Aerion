@@ -3,7 +3,7 @@ use crate::padding::PaddingScheme;
 use crate::protocol::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
     CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, Frame, ProxyTarget,
-    decode_target, encode_target, parse_settings, read_auth_preface_user, read_frame,
+    decode_target, encode_target, parse_settings, read_auth_preface_hash, read_frame,
     resolve_target_addr, target_name, write_frame, write_payload_chunks,
 };
 use crate::socket_protect;
@@ -197,17 +197,20 @@ async fn handle_client(
     heartbeat_interval_secs: u64,
     peer: SocketAddr,
 ) -> Result<()> {
-    let mut tls_stream = acceptor.accept(stream).await.context("accept TLS client")?;
-    let mut early_data = Vec::new();
-    if let Some(mut data) = tls_stream.rustls_early_data() {
-        data.read_to_end(&mut early_data)
-            .context("read TLS early data")?;
-    }
-    let mut tls_stream = EarlyDataTlsStream::new(tls_stream, early_data);
-    let passwords = core.known_credentials();
-    let password_refs = passwords.iter().map(String::as_str).collect::<Vec<_>>();
-    let credential = read_auth_preface_user(&mut tls_stream, &password_refs).await?;
-    let session = core.authenticate_from(&credential, peer).await?;
+    let (tls_stream, session) = tokio::time::timeout(crate::io_util::HANDSHAKE_TIMEOUT, async {
+        let mut tls_stream = acceptor.accept(stream).await.context("accept TLS client")?;
+        let mut early_data = Vec::new();
+        if let Some(mut data) = tls_stream.rustls_early_data() {
+            data.read_to_end(&mut early_data)
+                .context("read TLS early data")?;
+        }
+        let mut tls_stream = EarlyDataTlsStream::new(tls_stream, early_data);
+        let hash = read_auth_preface_hash(&mut tls_stream).await?;
+        let session = core.authenticate_password_hash_from(&hash, peer).await?;
+        Ok::<_, anyhow::Error>((tls_stream, session))
+    })
+    .await
+    .context("AnyTLS authentication timed out")??;
     let connection = ConnectionAbortGuard(Arc::new(TaskAbort::new()));
     tokio::select! {
         _ = session.cancelled() => bail!("core session cancelled"),
@@ -487,6 +490,9 @@ async fn open_stream(
 
     Ok((stream_id, StreamControl { sender, abort }))
 }
+
+#[cfg(test)]
+mod tests;
 
 async fn open_uot_stream(
     stream_id: u32,

@@ -216,24 +216,9 @@ where
         .await
         .context("read first Mieru metadata")?;
     let nonce = &encrypted_metadata[..NONCE_LEN];
-    let mut candidates = Vec::new();
-    for user in users {
-        if check_user_from_hint(user.username.as_bytes(), nonce) {
-            candidates.push(user.clone());
-        }
-    }
+    let candidates = authentication_candidates(users, nonce, user_hint_mandatory);
     if candidates.is_empty() && user_hint_mandatory {
         bail!("Mieru user hint did not match any configured user");
-    }
-    if !user_hint_mandatory {
-        for user in users {
-            if !candidates
-                .iter()
-                .any(|candidate| candidate.username == user.username)
-            {
-                candidates.push(user.clone());
-            }
-        }
     }
     for user in candidates {
         for key in mieru_keys_for_password(&user.hashed_password)? {
@@ -247,7 +232,7 @@ where
             let metadata = MieruMetadata::parse(&plain)?;
             replay.check_and_store(&encrypted_metadata)?;
             let payload = read_mieru_payload(reader, &metadata, &mut stateful).await?;
-            return Ok((stateful, user, MieruSegment { metadata, payload }));
+            return Ok((stateful, user.clone(), MieruSegment { metadata, payload }));
         }
     }
     bail!("Mieru authentication failed")
@@ -436,24 +421,9 @@ pub(super) fn decode_mieru_packet_segment_for_server(
         "Mieru UDP packet is shorter than encrypted metadata"
     );
     let nonce = &packet[..NONCE_LEN];
-    let mut candidates = Vec::new();
-    for user in users {
-        if check_user_from_hint(user.username.as_bytes(), nonce) {
-            candidates.push(user.clone());
-        }
-    }
+    let candidates = authentication_candidates(users, nonce, user_hint_mandatory);
     if candidates.is_empty() && user_hint_mandatory {
         bail!("Mieru UDP user hint did not match any configured user");
-    }
-    if !user_hint_mandatory {
-        for user in users {
-            if !candidates
-                .iter()
-                .any(|candidate| candidate.username == user.username)
-            {
-                candidates.push(user.clone());
-            }
-        }
     }
     for user in candidates {
         for key in mieru_keys_for_password(&user.hashed_password)? {
@@ -462,11 +432,29 @@ pub(super) fn decode_mieru_packet_segment_for_server(
                 if segment.metadata.protocol() == OPEN_SESSION_REQUEST {
                     replay.check_and_store(&packet[..PACKET_METADATA_LEN])?;
                 }
-                return Ok((segment, user, cipher));
+                return Ok((segment, user.clone(), cipher));
             }
         }
     }
     bail!("Mieru UDP authentication failed")
+}
+
+pub(super) fn authentication_candidates<'a>(
+    users: &'a [MieruUserSecret],
+    nonce: &[u8],
+    mandatory: bool,
+) -> Vec<&'a MieruUserSecret> {
+    let mut hinted = Vec::new();
+    let mut fallback = Vec::new();
+    for user in users {
+        if check_user_from_hint(user.username.as_bytes(), nonce) {
+            hinted.push(user);
+        } else if !mandatory {
+            fallback.push(user);
+        }
+    }
+    hinted.extend(fallback);
+    hinted
 }
 
 fn decode_mieru_packet_payload(

@@ -1,6 +1,35 @@
 use super::*;
 
 #[tokio::test]
+async fn password_hash_index_tracks_credential_replacement_and_revocation() -> Result<()> {
+    let core = ProxyCore::new(vec![CoreUser::password("alice", "old-secret")])?;
+    let peer = "127.0.0.1:1234".parse()?;
+    let old_hash = crate::protocol::password_hash("old-secret");
+    let old = core
+        .authenticate_password_hash_from(&old_hash, peer)
+        .await?;
+    core.replace_users(vec![CoreUser::password("alice", "new-secret")])?;
+    assert!(old.is_cancelled());
+    assert!(
+        core.authenticate_password_hash_from(&old_hash, peer)
+            .await
+            .is_err()
+    );
+    let new_hash = crate::protocol::password_hash("new-secret");
+    let new = core
+        .authenticate_password_hash_from(&new_hash, peer)
+        .await?;
+    core.replace_users(Vec::new())?;
+    assert!(new.is_cancelled());
+    assert!(
+        core.authenticate_password_hash_from(&new_hash, peer)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn records_per_user_traffic() -> Result<()> {
     let core = ProxyCore::new(vec![CoreUser::password("u1", "secret")])?;
     let session = core.authenticate("secret").await?;

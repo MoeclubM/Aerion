@@ -747,7 +747,7 @@ pub async fn run_mieru_server_listener_with_core(
     config: MieruServerConfig,
     core: ProxyCore,
 ) -> Result<()> {
-    let users = config.effective_users();
+    let users: Arc<[MieruUserSecret]> = config.effective_users().into();
     ensure!(!users.is_empty(), "Mieru server has no configured users");
     ensure!(
         config.transport != MieruTransport::Udp,
@@ -1107,7 +1107,7 @@ impl ClientUnderlay {
 
 async fn handle_mieru_underlay_server(
     stream: TcpStream,
-    users: Vec<MieruUserSecret>,
+    users: Arc<[MieruUserSecret]>,
     core: ProxyCore,
     mtu: usize,
     user_hint_mandatory: bool,
@@ -1225,7 +1225,7 @@ async fn run_mieru_server_read_loop(
     mut reader: OwnedReadHalf,
     writer: Arc<Mutex<MieruAnyWriter>>,
     sessions: MieruSessionMap,
-    users: Vec<MieruUserSecret>,
+    users: Arc<[MieruUserSecret]>,
     core: ProxyCore,
     mtu: usize,
     user_hint_mandatory: bool,
@@ -1241,13 +1241,13 @@ async fn run_mieru_server_read_loop(
         if recv.is_none() {
             let (cipher, matched_user, segment) = tokio::select! {
                 _ = abort.cancelled() => return Ok(()),
-                result = read_first_server_segment(
+                result = tokio::time::timeout(crate::io_util::HANDSHAKE_TIMEOUT, read_first_server_segment(
                     &mut reader,
                     &users,
                     user_hint_mandatory,
                     traffic_pattern.as_ref(),
                     replay.as_ref(),
-                ) => result?,
+                )) => result.context("Mieru authentication timed out")??,
             };
             writer
                 .lock()
