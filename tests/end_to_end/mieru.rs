@@ -4,6 +4,94 @@ use aerion::{
     run_mieru_server,
 };
 
+async fn bulk_with_slow_consumers(transport: MieruTransport) -> Result<()> {
+    let payload = (0..3 * 1024 * 1024)
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>();
+    let digest = Sha256::digest(&payload);
+    let target = TcpListener::bind("127.0.0.1:0").await?;
+    let target_addr = target.local_addr()?;
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) = target.accept().await?;
+        let mut received = vec![0; 3 * 1024 * 1024];
+        for chunk in received.chunks_mut(8192) {
+            stream.read_exact(chunk).await?;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        anyhow::ensure!(Sha256::digest(&received) == digest, "upload was corrupted");
+        stream.write_all(&received).await?;
+        // Keep the target open until the client has consumed every queued byte.
+        let mut end = [0];
+        let _ = stream.read(&mut end).await?;
+        Ok::<(), anyhow::Error>(())
+    });
+    let server_addr = if transport == MieruTransport::Tcp {
+        unused_tcp_addr()?
+    } else {
+        unused_udp_addr()?
+    };
+    let server = tokio::spawn(run_mieru_server(MieruServerConfig {
+        listen: server_addr,
+        username: "bulk".into(),
+        password: "secret".into(),
+        users: Vec::new(),
+        mtu: 1400,
+        user_hint_mandatory: false,
+        traffic_pattern: None,
+        transport,
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let client_addr = listener.local_addr()?;
+    let client = tokio::spawn(run_mieru_client_listener(
+        listener,
+        MieruClientConfig {
+            listen: client_addr,
+            server_host: "127.0.0.1".into(),
+            server_port: server_addr.port(),
+            username: "bulk".into(),
+            password: "secret".into(),
+            hashed_password: None,
+            mtu: 1400,
+            traffic_pattern: None,
+            transport,
+        },
+    ));
+    let result = timeout(Duration::from_secs(30), async {
+        let mut stream = TcpStream::connect(client_addr).await?;
+        stream.write_all(&[5, 1, 0]).await?;
+        let mut greeting = [0; 2];
+        stream.read_exact(&mut greeting).await?;
+        anyhow::ensure!(greeting == [5, 0], "SOCKS greeting failed");
+        write_socks_connect(&mut stream, target_addr).await?;
+        read_socks_reply_addr(&mut stream).await?;
+        stream.write_all(&payload).await?;
+        let mut received = vec![0; payload.len()];
+        for chunk in received.chunks_mut(8192) {
+            stream.read_exact(chunk).await?;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        anyhow::ensure!(received == payload, "download was corrupted");
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("slow-consumer Mieru transfer timed out")
+    .and_then(|r| r);
+    client.abort();
+    server.abort();
+    target_task.abort();
+    result
+}
+
+#[tokio::test]
+async fn tcp_underlay_drains_bounded_receive_queues() -> Result<()> {
+    bulk_with_slow_consumers(MieruTransport::Tcp).await
+}
+
+#[tokio::test]
+async fn udp_underlay_drains_bounded_receive_queues() -> Result<()> {
+    bulk_with_slow_consumers(MieruTransport::Udp).await
+}
+
 #[tokio::test]
 async fn socks_client_reaches_tcp_target_through_mieru_server() -> Result<()> {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await?;

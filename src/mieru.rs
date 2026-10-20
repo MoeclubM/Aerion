@@ -67,6 +67,8 @@ const PACKET_TX_COUNT_LIMIT: u8 = 20;
 const PACKET_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
 const MAX_PACKET_PEERS: usize = 1024;
 const PACKET_PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const SESSION_RECEIVE_BYTES: usize = 1024 * 1024;
+const RECEIVE_ITEM_OVERHEAD: usize = std::mem::size_of::<ReceivedPayload>() + 64;
 
 #[derive(Clone, Debug)]
 pub struct MieruUser {
@@ -185,10 +187,12 @@ enum MieruAnyWriter {
 }
 
 pub struct MieruSession {
-    inbound: mpsc::UnboundedReceiver<Vec<u8>>,
+    inbound: mpsc::UnboundedReceiver<ReceivedPayload>,
     outbound: mpsc::UnboundedSender<SessionCommand>,
     read_buffer: Vec<u8>,
     read_pos: usize,
+    read_permit: Option<OwnedSemaphorePermit>,
+    receive_flow: Option<(Arc<ReceiveFlow>, u8)>,
     close_sent: bool,
     send_budget: Arc<Semaphore>,
     send_permit: Option<
@@ -204,16 +208,8 @@ pub struct MieruSession {
 enum SessionCommand {
     Data(Vec<u8>, OwnedSemaphorePermit),
     SendSegment(MieruSegment),
-    SendAck {
-        protocol: u8,
-        un_ack_seq: u32,
-        window_size: u16,
-        immediate: bool,
-    },
-    PeerAck {
-        un_ack_seq: u32,
-        window_size: u16,
-    },
+    SendAck { protocol: u8, immediate: bool },
+    PeerAck { un_ack_seq: u32, window_size: u16 },
     Close,
 }
 
@@ -234,19 +230,104 @@ struct SharedMieruClientSession {
 
 #[derive(Clone)]
 struct MieruSessionEntry {
-    inbound: mpsc::UnboundedSender<Vec<u8>>,
+    inbound: mpsc::UnboundedSender<ReceivedPayload>,
     outbound: mpsc::UnboundedSender<SessionCommand>,
     ordered: bool,
     recv: Arc<Mutex<MieruReceiveState>>,
-    un_ack_seq: Arc<AtomicU32>,
-    recv_window: Arc<AtomicU32>,
+    flow: Arc<ReceiveFlow>,
     writer: Arc<Mutex<MieruAnyWriter>>,
 }
 
 #[derive(Debug, Default)]
 struct MieruReceiveState {
     next_seq: u32,
-    pending: BTreeMap<u32, Vec<u8>>,
+    pending: BTreeMap<u32, ReceivedPayload>,
+}
+
+#[derive(Debug)]
+struct ReceivedPayload {
+    payload: Vec<u8>,
+    permit: OwnedSemaphorePermit,
+}
+
+struct ReceiveFlow {
+    budget: Arc<Semaphore>,
+    pending: AtomicU32,
+    un_ack_seq: AtomicU32,
+    window: AtomicU32,
+    packet_size: usize,
+    refresh_lock: std::sync::Mutex<()>,
+}
+
+impl ReceiveFlow {
+    fn new(mtu: usize) -> Arc<Self> {
+        let flow = Arc::new(Self {
+            budget: Arc::new(Semaphore::new(SESSION_RECEIVE_BYTES)),
+            pending: AtomicU32::new(0),
+            un_ack_seq: AtomicU32::new(0),
+            window: AtomicU32::new(0),
+            packet_size: mtu.saturating_sub(PACKET_OVERHEAD).clamp(1, MAX_PDU)
+                + AEAD_OVERHEAD
+                + RECEIVE_ITEM_OVERHEAD,
+            refresh_lock: std::sync::Mutex::new(()),
+        });
+        flow.refresh();
+        flow
+    }
+
+    fn refresh(&self) -> (u32, u32) {
+        let _guard = self
+            .refresh_lock
+            .lock()
+            .expect("Mieru receive window lock poisoned");
+        let window = (self.budget.available_permits() / self.packet_size).min(
+            usize::from(ACK_WINDOW_SIZE)
+                .saturating_sub(self.pending.load(Ordering::Relaxed) as usize),
+        ) as u32;
+        (self.window.swap(window, Ordering::Relaxed), window)
+    }
+
+    fn ack(&self, mut ack: MieruDataAckMetadata) -> MieruDataAckMetadata {
+        ack.un_ack_seq = self.un_ack_seq.load(Ordering::Relaxed);
+        ack.window_size = self.refresh().1 as u16;
+        ack
+    }
+
+    fn reserve_packet(&self, payload: Vec<u8>, reordered: bool) -> Option<ReceivedPayload> {
+        let bytes = u32::try_from(payload.capacity().checked_add(RECEIVE_ITEM_OVERHEAD)?).ok()?;
+        // Keep room for a missing head packet. Otherwise a full reorder queue
+        // could prevent the very packet needed to drain it from being accepted.
+        let headroom = if reordered {
+            (u16::MAX as usize + AEAD_OVERHEAD + RECEIVE_ITEM_OVERHEAD) as u32
+        } else {
+            0
+        };
+        let mut reservation = self
+            .budget
+            .clone()
+            .try_acquire_many_owned(bytes + headroom)
+            .ok()?;
+        let permit = reservation.split(bytes as usize)?;
+        Some(ReceivedPayload { payload, permit })
+    }
+
+    async fn reserve_stream(&self, payload: Vec<u8>) -> Result<ReceivedPayload> {
+        let bytes = payload
+            .capacity()
+            .checked_add(RECEIVE_ITEM_OVERHEAD)
+            .context("Mieru receive size overflow")?;
+        ensure!(
+            bytes <= SESSION_RECEIVE_BYTES,
+            "Mieru receive payload exceeds buffer budget"
+        );
+        let permit = self
+            .budget
+            .clone()
+            .acquire_many_owned(bytes as u32)
+            .await
+            .context("Mieru receive budget closed")?;
+        Ok(ReceivedPayload { payload, permit })
+    }
 }
 
 type MieruSessionMap = Arc<Mutex<HashMap<u32, MieruSessionEntry>>>;
@@ -573,7 +654,7 @@ impl MieruAnyWriter {
 
 impl MieruSession {
     fn new(
-        inbound: mpsc::UnboundedReceiver<Vec<u8>>,
+        inbound: mpsc::UnboundedReceiver<ReceivedPayload>,
         outbound: mpsc::UnboundedSender<SessionCommand>,
     ) -> Self {
         Self {
@@ -581,9 +662,33 @@ impl MieruSession {
             outbound,
             read_buffer: Vec::new(),
             read_pos: 0,
+            read_permit: None,
+            receive_flow: None,
             close_sent: false,
             send_budget: Arc::new(Semaphore::new(8)),
             send_permit: None,
+        }
+    }
+
+    fn with_receive_flow(mut self, entry: &MieruSessionEntry, protocol: u8) -> Self {
+        if entry.ordered {
+            self.receive_flow = Some((entry.flow.clone(), protocol));
+        }
+        self
+    }
+
+    fn release_received_payload(&mut self) {
+        self.read_permit.take();
+        if let Some((flow, protocol)) = &self.receive_flow {
+            let (previous, window) = flow.refresh();
+            if previous == 0 && window > 0 {
+                // Reopen a zero window without waiting for traffic from a
+                // sender that is correctly waiting for receive credit.
+                let _ = self.outbound.send(SessionCommand::SendAck {
+                    protocol: *protocol,
+                    immediate: false,
+                });
+            }
         }
     }
 }
@@ -605,15 +710,17 @@ impl AsyncRead for MieruSession {
                 if self.read_pos == self.read_buffer.len() {
                     self.read_buffer.clear();
                     self.read_pos = 0;
+                    self.release_received_payload();
                 }
                 return Poll::Ready(Ok(()));
             }
             match Pin::new(&mut self.inbound).poll_recv(cx) {
                 Poll::Ready(Some(payload)) => {
-                    if payload.is_empty() {
+                    if payload.payload.is_empty() {
                         continue;
                     }
-                    self.read_buffer = payload;
+                    self.read_buffer = payload.payload;
+                    self.read_permit = Some(payload.permit);
                     self.read_pos = 0;
                 }
                 Poll::Ready(None) => return Poll::Ready(Ok(())),
@@ -747,7 +854,7 @@ pub async fn run_mieru_server_listener_with_core(
     config: MieruServerConfig,
     core: ProxyCore,
 ) -> Result<()> {
-    let users = config.effective_users();
+    let users: Arc<[MieruUserSecret]> = config.effective_users().into();
     ensure!(!users.is_empty(), "Mieru server has no configured users");
     ensure!(
         config.transport != MieruTransport::Udp,
@@ -1073,20 +1180,19 @@ impl ClientUnderlay {
         }
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-        let un_ack_seq = Arc::new(AtomicU32::new(0));
-        let recv_window = Arc::new(AtomicU32::new(u32::from(ACK_WINDOW_SIZE)));
-        self.sessions.lock().await.insert(
-            session_id,
-            MieruSessionEntry {
-                inbound: inbound_tx,
-                outbound: outbound_tx.clone(),
-                ordered: self.reliable,
-                recv: Arc::new(Mutex::new(MieruReceiveState::default())),
-                un_ack_seq: un_ack_seq.clone(),
-                recv_window: recv_window.clone(),
-                writer: self.writer.clone(),
-            },
-        );
+        let flow = ReceiveFlow::new(mtu);
+        let receive_flow = flow.clone();
+        let entry = MieruSessionEntry {
+            inbound: inbound_tx,
+            outbound: outbound_tx.clone(),
+            ordered: self.reliable,
+            recv: Arc::new(Mutex::new(MieruReceiveState::default())),
+            flow,
+            writer: self.writer.clone(),
+        };
+        let session = MieruSession::new(inbound_rx, outbound_tx)
+            .with_receive_flow(&entry, ACK_CLIENT_TO_SERVER);
+        self.sessions.lock().await.insert(session_id, entry);
         self.had_session.store(true, Ordering::Relaxed);
         tokio::spawn(run_mieru_session_output(
             session_id,
@@ -1096,18 +1202,17 @@ impl ClientUnderlay {
             outbound_rx,
             self.reliable,
             mtu,
-            un_ack_seq,
-            recv_window,
+            receive_flow,
             self.sessions.clone(),
             Some(self.abort.clone()),
         ));
-        Ok(MieruSession::new(inbound_rx, outbound_tx))
+        Ok(session)
     }
 }
 
 async fn handle_mieru_underlay_server(
     stream: TcpStream,
-    users: Vec<MieruUserSecret>,
+    users: Arc<[MieruUserSecret]>,
     core: ProxyCore,
     mtu: usize,
     user_hint_mandatory: bool,
@@ -1225,7 +1330,7 @@ async fn run_mieru_server_read_loop(
     mut reader: OwnedReadHalf,
     writer: Arc<Mutex<MieruAnyWriter>>,
     sessions: MieruSessionMap,
-    users: Vec<MieruUserSecret>,
+    users: Arc<[MieruUserSecret]>,
     core: ProxyCore,
     mtu: usize,
     user_hint_mandatory: bool,
@@ -1241,13 +1346,13 @@ async fn run_mieru_server_read_loop(
         if recv.is_none() {
             let (cipher, matched_user, segment) = tokio::select! {
                 _ = abort.cancelled() => return Ok(()),
-                result = read_first_server_segment(
+                result = tokio::time::timeout(crate::io_util::HANDSHAKE_TIMEOUT, read_first_server_segment(
                     &mut reader,
                     &users,
                     user_hint_mandatory,
                     traffic_pattern.as_ref(),
                     replay.as_ref(),
-                ) => result?,
+                )) => result.context("Mieru authentication timed out")??,
             };
             writer
                 .lock()
@@ -1551,20 +1656,19 @@ async fn handle_server_segment(
                 .await?;
             let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
             let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-            let un_ack_seq = Arc::new(AtomicU32::new(0));
-            let recv_window = Arc::new(AtomicU32::new(u32::from(ACK_WINDOW_SIZE)));
-            sessions.lock().await.insert(
-                session_id,
-                MieruSessionEntry {
-                    inbound: inbound_tx.clone(),
-                    outbound: outbound_tx.clone(),
-                    ordered: reliable,
-                    recv: Arc::new(Mutex::new(MieruReceiveState::default())),
-                    un_ack_seq: un_ack_seq.clone(),
-                    recv_window: recv_window.clone(),
-                    writer: writer.clone(),
-                },
-            );
+            let flow = ReceiveFlow::new(mtu);
+            let receive_flow = flow.clone();
+            let entry = MieruSessionEntry {
+                inbound: inbound_tx.clone(),
+                outbound: outbound_tx.clone(),
+                ordered: reliable,
+                recv: Arc::new(Mutex::new(MieruReceiveState::default())),
+                flow,
+                writer: writer.clone(),
+            };
+            let session = MieruSession::new(inbound_rx, outbound_tx.clone())
+                .with_receive_flow(&entry, ACK_SERVER_TO_CLIENT);
+            sessions.lock().await.insert(session_id, entry);
             if let Some(had_session) = had_session.as_ref() {
                 had_session.store(true, Ordering::Relaxed);
             }
@@ -1576,8 +1680,7 @@ async fn handle_server_segment(
                 outbound_rx,
                 reliable,
                 mtu,
-                un_ack_seq,
-                recv_window,
+                receive_flow,
                 sessions.clone(),
                 abort,
             ));
@@ -1599,7 +1702,6 @@ async fn handle_server_segment(
             }
             route_session_segment(&sessions, segment, reliable.then_some(ACK_SERVER_TO_CLIENT))
                 .await?;
-            let session = MieruSession::new(inbound_rx, outbound_tx);
             tokio::spawn(async move {
                 if let Err(error) = handle_mieru_server_socks_session(session, core_session).await {
                     tracing::warn!("Mieru session {session_id} failed: {error:?}");
@@ -1779,8 +1881,7 @@ async fn run_mieru_session_output(
     mut outbound: mpsc::UnboundedReceiver<SessionCommand>,
     reliable: bool,
     mtu: usize,
-    un_ack_seq: Arc<AtomicU32>,
-    recv_window: Arc<AtomicU32>,
+    receive_flow: Arc<ReceiveFlow>,
     sessions: MieruSessionMap,
     abort: Option<Arc<TaskAbort>>,
 ) {
@@ -1834,19 +1935,17 @@ async fn run_mieru_session_output(
                         }
                         SessionCommand::SendAck {
                             protocol,
-                            un_ack_seq,
-                            window_size,
                             immediate,
                         } => {
                             let ack = MieruDataAckMetadata {
                                 protocol, session_id, seq: next_seq.wrapping_sub(1),
-                                un_ack_seq, window_size, fragment: 0, prefix_len: 0, payload_len: 0, suffix_len: 0,
+                                un_ack_seq: 0, window_size: 0, fragment: 0, prefix_len: 0, payload_len: 0, suffix_len: 0,
                             };
                             if immediate {
                                 // Preserve duplicate ACKs for fast hole recovery.
                                 pending_ack = None;
                                 writer.lock().await.write_segment(MieruSegment {
-                                    metadata: MieruMetadata::DataAck(ack), payload: Vec::new(),
+                                    metadata: MieruMetadata::DataAck(receive_flow.ack(ack)), payload: Vec::new(),
                                 }).await?;
                                 ack_packets += 1;
                                 last_tx = Instant::now();
@@ -1866,7 +1965,7 @@ async fn run_mieru_session_output(
                 _ = tokio::time::sleep_until(ack_at), if pending_ack.is_some() => {
                     let ack = pending_ack.take().unwrap();
                     writer.lock().await.write_segment(MieruSegment {
-                        metadata: MieruMetadata::DataAck(ack), payload: Vec::new(),
+                        metadata: MieruMetadata::DataAck(receive_flow.ack(ack)), payload: Vec::new(),
                     }).await?;
                     ack_packets += 1;
                     last_tx = Instant::now();
@@ -1909,8 +2008,8 @@ async fn run_mieru_session_output(
                     } else {
                         MieruMetadata::DataAck(MieruDataAckMetadata {
                             protocol: if is_client { DATA_CLIENT_TO_SERVER } else { DATA_SERVER_TO_CLIENT },
-                            session_id, seq: next_seq, un_ack_seq: un_ack_seq.load(Ordering::Relaxed),
-                            window_size: recv_window.load(Ordering::Relaxed) as u16, fragment: 0, prefix_len: 0, payload_len: 0, suffix_len: 0,
+                            session_id, seq: next_seq, un_ack_seq: receive_flow.un_ack_seq.load(Ordering::Relaxed),
+                            window_size: receive_flow.refresh().1 as u16, fragment: 0, prefix_len: 0, payload_len: 0, suffix_len: 0,
                         })
                     };
                     let segment = MieruSegment { metadata, payload: payload[*offset..*offset+n].to_vec() };
@@ -1944,8 +2043,8 @@ async fn run_mieru_session_output(
                                 },
                                 session_id,
                                 seq: next_seq.saturating_sub(1),
-                                un_ack_seq: un_ack_seq.load(Ordering::Relaxed),
-                                window_size: recv_window.load(Ordering::Relaxed) as u16,
+                                un_ack_seq: receive_flow.un_ack_seq.load(Ordering::Relaxed),
+                                window_size: receive_flow.refresh().1 as u16,
                                 fragment: 0,
                                 prefix_len: 0,
                                 payload_len: 0,
@@ -2075,43 +2174,49 @@ async fn route_session_segment(
     let payload = segment.payload;
     let entry = sessions.lock().await.get(&session_id).cloned();
     if let Some(entry) = entry {
-        let (un_ack_seq, window_size, immediate) = if entry.ordered {
+        let (un_ack_seq, immediate) = if entry.ordered {
             let mut recv = entry.recv.lock().await;
-            let immediate = seq != recv.next_seq;
+            let mut immediate = seq != recv.next_seq;
             if seq == recv.next_seq {
-                deliver_session_payload(&entry.inbound, payload);
-                recv.next_seq = recv.next_seq.wrapping_add(1);
-                loop {
-                    let next_seq = recv.next_seq;
-                    let Some(payload) = recv.pending.remove(&next_seq) else {
-                        break;
-                    };
+                if let Some(payload) = entry.flow.reserve_packet(payload, false) {
                     deliver_session_payload(&entry.inbound, payload);
                     recv.next_seq = recv.next_seq.wrapping_add(1);
+                    loop {
+                        let next_seq = recv.next_seq;
+                        let Some(payload) = recv.pending.remove(&next_seq) else {
+                            break;
+                        };
+                        deliver_session_payload(&entry.inbound, payload);
+                        recv.next_seq = recv.next_seq.wrapping_add(1);
+                    }
+                } else {
+                    // Do not acknowledge bytes that could not be retained.
+                    immediate = true;
                 }
             } else if seq.wrapping_sub(recv.next_seq) < MAX_PENDING_SEGMENTS as u32 {
                 // Keep the receive window bounded. Late packets are duplicates;
                 // packets beyond it are retried after the cumulative ACK advances.
-                recv.pending.entry(seq).or_insert(payload);
+                if !recv.pending.contains_key(&seq)
+                    && let Some(payload) = entry.flow.reserve_packet(payload, true)
+                {
+                    recv.pending.insert(seq, payload);
+                }
             }
-            (
-                recv.next_seq,
-                (MAX_PENDING_SEGMENTS - recv.pending.len()) as u16,
-                immediate,
-            )
+            entry
+                .flow
+                .pending
+                .store(recv.pending.len() as u32, Ordering::Relaxed);
+            entry.flow.refresh();
+            (recv.next_seq, immediate)
         } else {
+            let payload = entry.flow.reserve_stream(payload).await?;
             deliver_session_payload(&entry.inbound, payload);
-            (seq.wrapping_add(1), ACK_WINDOW_SIZE, false)
+            (seq.wrapping_add(1), false)
         };
-        entry.un_ack_seq.store(un_ack_seq, Ordering::Relaxed);
-        entry
-            .recv_window
-            .store(u32::from(window_size), Ordering::Relaxed);
+        entry.flow.un_ack_seq.store(un_ack_seq, Ordering::Relaxed);
         if let Some(protocol) = ack_protocol {
             let _ = entry.outbound.send(SessionCommand::SendAck {
                 protocol,
-                un_ack_seq,
-                window_size,
                 immediate,
             });
         }
@@ -2119,8 +2224,11 @@ async fn route_session_segment(
     Ok(())
 }
 
-fn deliver_session_payload(sender: &mpsc::UnboundedSender<Vec<u8>>, payload: Vec<u8>) {
-    if !payload.is_empty() {
+fn deliver_session_payload(
+    sender: &mpsc::UnboundedSender<ReceivedPayload>,
+    payload: ReceivedPayload,
+) {
+    if !payload.payload.is_empty() {
         let _ = sender.send(payload);
     }
 }
@@ -2162,7 +2270,12 @@ async fn handle_mieru_server_socks_session(
     mut session: MieruSession,
     core_session: CoreSession,
 ) -> Result<()> {
-    match read_socks_request(&mut session).await? {
+    let request = tokio::select! {
+        _ = core_session.cancelled() => bail!("core session cancelled"),
+        result = tokio::time::timeout(crate::io_util::HANDSHAKE_TIMEOUT, read_socks_request(&mut session)) =>
+            result.context("Mieru SOCKS request timed out")??,
+    };
+    match request {
         SocksRequest::Connect(target) => {
             let mut remote = socket_protect::connect_proxy_target(&target).await?;
             let _ = remote.set_nodelay(true);

@@ -6,6 +6,92 @@ use tokio::net::TcpListener;
 
 include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
+    "/tests/performance/mieru_auth.rs"
+));
+
+#[test]
+fn authentication_hint_is_prioritized_but_optional_fallback_still_checks_aead() -> Result<()> {
+    let users = (0..3000)
+        .map(|i| MieruUserSecret {
+            username: format!("user-{i}"),
+            password: String::new(),
+            hashed_password: crypto::hash_mieru_password(b"secret", format!("user-{i}").as_bytes()),
+        })
+        .collect::<Vec<_>>();
+    let selected = &users[2999];
+    let key = crypto::current_mieru_key(&selected.hashed_password)?;
+    let mut cipher = MieruCipher::new(key, false, selected.username.clone(), None);
+    let nonce = cipher.encrypt(b"nonce hint")?;
+    let candidates = wire::authentication_candidates(&users, &nonce[..NONCE_LEN], false);
+    assert_eq!(candidates.len(), users.len());
+    assert!(std::ptr::eq(candidates[0], selected));
+    assert_eq!(
+        wire::authentication_candidates(&users, &nonce[..NONCE_LEN], true).len(),
+        1
+    );
+    let mut cipher = MieruCipher::new(key, false, "legacy-hint".into(), None);
+    let packet = encode_mieru_packet_segment(
+        &mut cipher,
+        MieruSegment {
+            metadata: MieruMetadata::DataAck(MieruDataAckMetadata {
+                protocol: DATA_CLIENT_TO_SERVER,
+                session_id: 1,
+                seq: 1,
+                un_ack_seq: 0,
+                window_size: 32,
+                fragment: 0,
+                prefix_len: 0,
+                payload_len: 0,
+                suffix_len: 0,
+            }),
+            payload: b"payload".to_vec(),
+        },
+        1400,
+        None,
+    )?;
+    let replay = MieruReplayCache::new();
+    let (segment, user, _) =
+        decode_mieru_packet_segment_for_server(&packet, &users, false, None, &replay)?;
+    assert_eq!(user.username, selected.username);
+    assert_eq!(segment.payload, b"payload");
+    assert!(decode_mieru_packet_segment_for_server(&packet, &users, true, None, &replay).is_err());
+    let mut corrupted = packet;
+    corrupted[NONCE_LEN] ^= 1;
+    assert!(
+        decode_mieru_packet_segment_for_server(&corrupted, &users, false, None, &replay).is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn silent_tcp_peer_is_closed_before_authentication() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let mut peer = TcpStream::connect(listener.local_addr()?).await?;
+    let (stream, addr) = listener.accept().await?;
+    let task = tokio::spawn(handle_mieru_underlay_server(
+        stream,
+        Arc::from([]),
+        ProxyCore::empty(),
+        1400,
+        false,
+        None,
+        addr,
+        Arc::new(MieruReplayCache::new()),
+    ));
+    let error = tokio::time::timeout(
+        crate::io_util::HANDSHAKE_TIMEOUT + Duration::from_secs(3),
+        task,
+    )
+    .await??
+    .unwrap_err();
+    assert!(error.to_string().contains("Mieru authentication timed out"));
+    let mut byte = [0];
+    assert_eq!(peer.read(&mut byte).await?, 0);
+    Ok(())
+}
+
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
     "/tests/performance/mieru_stream.rs"
 ));
 
@@ -217,11 +303,11 @@ async fn packet_output_flushes_the_latest_delayed_ack_before_closing() -> Result
         None,
     ))));
     let (commands, output) = mpsc::unbounded_channel();
+    let receive_flow = ReceiveFlow::new(1400);
     for un_ack_seq in 1..=3 {
+        receive_flow.un_ack_seq.store(un_ack_seq, Ordering::Relaxed);
         commands.send(SessionCommand::SendAck {
             protocol: ACK_SERVER_TO_CLIENT,
-            un_ack_seq,
-            window_size: ACK_WINDOW_SIZE,
             immediate: false,
         })?;
     }
@@ -234,8 +320,7 @@ async fn packet_output_flushes_the_latest_delayed_ack_before_closing() -> Result
         output,
         true,
         1400,
-        Arc::new(AtomicU32::new(3)),
-        Arc::new(AtomicU32::new(u32::from(ACK_WINDOW_SIZE))),
+        receive_flow,
         Arc::new(Mutex::new(HashMap::new())),
         None,
     ));
@@ -318,8 +403,7 @@ async fn packet_receive_window_drops_future_packets_and_recovers_without_closing
         outbound,
         ordered: true,
         recv: Arc::new(Mutex::new(MieruReceiveState::default())),
-        un_ack_seq: Arc::new(AtomicU32::new(0)),
-        recv_window: Arc::new(AtomicU32::new(u32::from(ACK_WINDOW_SIZE))),
+        flow: ReceiveFlow::new(1400),
         writer: Arc::new(Mutex::new(MieruAnyWriter::Packet(MieruPacketWriter::new(
             socket,
             Some("127.0.0.1:1234".parse()?),
@@ -329,6 +413,7 @@ async fn packet_receive_window_drops_future_packets_and_recovers_without_closing
             None,
         )))),
     };
+    let initial_window = entry.flow.window.load(Ordering::Relaxed);
     let sessions = Arc::new(Mutex::new(HashMap::from([(1, entry.clone())])));
     let segment = |seq| MieruSegment {
         metadata: MieruMetadata::DataAck(MieruDataAckMetadata {
@@ -351,23 +436,20 @@ async fn packet_receive_window_drops_future_packets_and_recovers_without_closing
         entry.recv.lock().await.pending.len(),
         MAX_PENDING_SEGMENTS - 1
     );
-    assert_eq!(entry.recv_window.load(Ordering::Relaxed), 1);
+    assert_eq!(entry.flow.window.load(Ordering::Relaxed), 1);
     route_session_segment(&sessions, segment(0), Some(ACK_SERVER_TO_CLIENT)).await?;
     for seq in 0..MAX_PENDING_SEGMENTS as u32 {
         assert_eq!(
-            received.recv().await.context("ordered payload")?,
+            received.recv().await.context("ordered payload")?.payload,
             seq.to_be_bytes()
         );
     }
     assert!(entry.recv.lock().await.pending.is_empty());
     assert_eq!(
-        entry.un_ack_seq.load(Ordering::Relaxed),
+        entry.flow.un_ack_seq.load(Ordering::Relaxed),
         MAX_PENDING_SEGMENTS as u32
     );
-    assert_eq!(
-        entry.recv_window.load(Ordering::Relaxed),
-        u32::from(ACK_WINDOW_SIZE)
-    );
+    assert_eq!(entry.flow.refresh().1, initial_window);
     // A packet dropped outside the earlier window can now be retransmitted.
     route_session_segment(
         &sessions,
@@ -376,17 +458,92 @@ async fn packet_receive_window_drops_future_packets_and_recovers_without_closing
     )
     .await?;
     assert_eq!(
-        received.recv().await.context("retried payload")?,
+        received.recv().await.context("retried payload")?.payload,
         (MAX_PENDING_SEGMENTS as u32).to_be_bytes()
     );
     let mut last_ack = None;
     while let Ok(command) = commands.try_recv() {
         last_ack = Some(command);
     }
-    assert!(
-        matches!(last_ack, Some(SessionCommand::SendAck { un_ack_seq, window_size: ACK_WINDOW_SIZE, .. })
-        if un_ack_seq == MAX_PENDING_SEGMENTS as u32 + 1)
+    assert!(matches!(
+        last_ack,
+        Some(SessionCommand::SendAck {
+            protocol: ACK_SERVER_TO_CLIENT,
+            ..
+        })
+    ));
+    let mut session = MieruSession::new(received, entry.outbound.clone())
+        .with_receive_flow(&entry, ACK_SERVER_TO_CLIENT);
+    let full = entry
+        .flow
+        .reserve_stream(vec![0x42; SESSION_RECEIVE_BYTES - RECEIVE_ITEM_OVERHEAD])
+        .await
+        .context("reserve receive budget")?;
+    entry.inbound.send(full)?;
+    let next = entry.flow.un_ack_seq.load(Ordering::Relaxed);
+    route_session_segment(&sessions, segment(next), Some(ACK_SERVER_TO_CLIENT)).await?;
+    assert_eq!(
+        entry.flow.un_ack_seq.load(Ordering::Relaxed),
+        next,
+        "unretained payload must not be acknowledged"
     );
+    assert_eq!(entry.flow.window.load(Ordering::Relaxed), 0);
+    while commands.try_recv().is_ok() {}
+    let mut payload = vec![0; SESSION_RECEIVE_BYTES - RECEIVE_ITEM_OVERHEAD];
+    session.read_exact(&mut payload).await?;
+    assert!(payload.iter().all(|b| *b == 0x42));
+    assert!(matches!(
+        commands.recv().await,
+        Some(SessionCommand::SendAck {
+            protocol: ACK_SERVER_TO_CLIENT,
+            ..
+        })
+    ));
+    assert!(entry.flow.window.load(Ordering::Relaxed) > 0);
+    assert_eq!(entry.flow.un_ack_seq.load(Ordering::Relaxed), next);
+    route_session_segment(&sessions, segment(next), Some(ACK_SERVER_TO_CLIENT)).await?;
+    let mut retry = [0; 4];
+    session.read_exact(&mut retry).await?;
+    assert_eq!(retry, next.to_be_bytes());
+    Ok(())
+}
+
+#[tokio::test]
+async fn receive_budget_bounds_tcp_and_keeps_room_for_missing_udp_head() -> Result<()> {
+    let flow = ReceiveFlow::new(1400);
+    let full = flow
+        .reserve_stream(vec![0; SESSION_RECEIVE_BYTES - RECEIVE_ITEM_OVERHEAD])
+        .await
+        .context("receive budget")?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), flow.reserve_stream(vec![0]))
+            .await
+            .is_err()
+    );
+    assert!(flow.reserve_packet(vec![0], false).is_none());
+    drop(full);
+    let headroom = u16::MAX as usize + AEAD_OVERHEAD + RECEIVE_ITEM_OVERHEAD;
+    let tail = flow
+        .reserve_packet(
+            vec![0; SESSION_RECEIVE_BYTES - headroom - RECEIVE_ITEM_OVERHEAD],
+            true,
+        )
+        .context("reorder budget")?;
+    assert!(flow.reserve_packet(vec![0], true).is_none());
+    let head = flow
+        .reserve_packet(vec![0; headroom - RECEIVE_ITEM_OVERHEAD], false)
+        .context("missing head must fit")?;
+    assert_eq!(flow.budget.available_permits(), 0);
+    drop((head, tail));
+    assert_eq!(flow.budget.available_permits(), SESSION_RECEIVE_BYTES);
+    let tiny = flow
+        .reserve_packet(vec![0], false)
+        .context("small packet")?;
+    assert_eq!(
+        SESSION_RECEIVE_BYTES - flow.budget.available_permits(),
+        1 + RECEIVE_ITEM_OVERHEAD
+    );
+    drop(tiny);
     Ok(())
 }
 
@@ -405,8 +562,6 @@ async fn session_write_applies_backpressure_without_blocking_control() -> Result
     );
     outbound.send(SessionCommand::SendAck {
         protocol: ACK_CLIENT_TO_SERVER,
-        un_ack_seq: 1,
-        window_size: 32,
         immediate: false,
     })?;
     drop(commands.recv().await);

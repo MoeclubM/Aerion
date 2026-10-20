@@ -92,9 +92,15 @@ pub struct ProxyCore {
 #[derive(Debug)]
 struct CoreInner {
     users: RwLock<HashMap<String, Arc<UserState>>>,
-    credentials: RwLock<HashMap<String, String>>,
+    credentials: RwLock<CredentialIndex>,
     session_seq: AtomicU64,
     events: Arc<CoreEventBus>,
+}
+
+#[derive(Debug, Default)]
+struct CredentialIndex {
+    users: HashMap<String, String>,
+    password_hashes: HashMap<[u8; 32], String>,
 }
 
 #[derive(Debug)]
@@ -139,7 +145,7 @@ impl Default for CoreInner {
     fn default() -> Self {
         Self {
             users: RwLock::new(HashMap::new()),
-            credentials: RwLock::new(HashMap::new()),
+            credentials: RwLock::new(CredentialIndex::default()),
             session_seq: AtomicU64::new(0),
             events: Arc::new(CoreEventBus::default()),
         }
@@ -226,6 +232,7 @@ impl ProxyCore {
         let mut users_by_id: HashMap<String, CoreUser> = HashMap::new();
         let mut credentials_by_id = HashMap::<String, HashSet<String>>::new();
         let mut credential_map = HashMap::new();
+        let mut password_hashes = HashMap::new();
         let mut event_user_ids = Vec::new();
         for user in users {
             ensure!(!user.id.trim().is_empty(), "core user id is empty");
@@ -239,6 +246,10 @@ impl ProxyCore {
                 user.id
             );
             credential_map.insert(user.credential.clone(), user.id.clone());
+            password_hashes.insert(
+                crate::protocol::password_hash(&user.credential),
+                user.credential.clone(),
+            );
             credentials_by_id
                 .entry(user.id.clone())
                 .or_default()
@@ -250,9 +261,7 @@ impl ProxyCore {
                     user.id
                 );
             } else {
-                if !event_user_ids.contains(&user.id) {
-                    event_user_ids.push(user.id.clone());
-                }
+                event_user_ids.push(user.id.clone());
                 users_by_id.insert(user.id.clone(), user);
             }
         }
@@ -292,7 +301,10 @@ impl ProxyCore {
             .inner
             .credentials
             .write()
-            .expect("core credentials lock poisoned") = credential_map;
+            .expect("core credentials lock poisoned") = CredentialIndex {
+            users: credential_map,
+            password_hashes,
+        };
         self.inner.events.send(CoreEvent::UsersReplaced {
             user_ids: event_user_ids,
         });
@@ -323,10 +335,28 @@ impl ProxyCore {
             .credentials
             .read()
             .expect("core credentials lock poisoned")
+            .users
             .get(credential)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("core authentication failed"))?;
         self.open_session_with_source(&user_id, source_ip).await
+    }
+
+    pub(crate) async fn authenticate_password_hash_from(
+        &self,
+        hash: &[u8; 32],
+        source: SocketAddr,
+    ) -> Result<CoreSession> {
+        let credential = self
+            .inner
+            .credentials
+            .read()
+            .expect("core credentials lock poisoned")
+            .password_hashes
+            .get(hash)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("authentication failed"))?;
+        self.authenticate_from(&credential, source).await
     }
 
     pub async fn open_session(&self, user_id: &str) -> Result<CoreSession> {
@@ -347,6 +377,7 @@ impl ProxyCore {
             .credentials
             .read()
             .expect("core credentials lock poisoned")
+            .users
             .keys()
             .cloned()
             .collect()

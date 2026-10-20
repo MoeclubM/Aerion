@@ -4,6 +4,48 @@ use crate::mieru::{MieruNoncePattern, MieruNonceType, MieruTrafficPattern};
 include!("../../../tests/performance/mieru.rs");
 
 #[test]
+fn time_keys_match_pbkdf2_across_forward_and_backward_clock_changes() -> Result<()> {
+    let password = [0x63; KEY_LEN];
+    let mut previous = None;
+    for epoch in [100, 101, 100, 103, 90] {
+        let salts = salt_from_epoch(epoch);
+        let keys = derive_time_keys(&password, epoch, salts, previous)?;
+        for (key, salt) in keys.iter().zip(salts) {
+            assert_eq!(
+                key.as_slice(),
+                pbkdf2_hmac_sha256(&password, &salt, KEY_ITER, KEY_LEN)?
+            );
+        }
+        previous = Some(TimeKeys { epoch, keys });
+    }
+    Ok(())
+}
+
+#[test]
+fn cache_overflow_evicts_one_user_and_rotation_does_not_flush_other_users() {
+    let mut cache = KeyCache::default();
+    let keys = TimeKeys {
+        epoch: 100,
+        keys: [[0x41; KEY_LEN]; 3],
+    };
+    let password = |i: usize| {
+        let mut value = [0; KEY_LEN];
+        value[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        value
+    };
+    for i in 0..PBKDF2_CACHE_MAX {
+        cache.insert(password(i), keys);
+    }
+    cache.insert(password(1), TimeKeys { epoch: 101, ..keys });
+    cache.insert(password(PBKDF2_CACHE_MAX), keys);
+    assert_eq!(cache.entries.len(), PBKDF2_CACHE_MAX);
+    assert_eq!(cache.order.len(), PBKDF2_CACHE_MAX);
+    assert!(!cache.entries.contains_key(&password(0)));
+    assert_eq!(cache.entries[&password(1)].epoch, 101);
+    assert!(cache.entries.contains_key(&password(PBKDF2_CACHE_MAX - 1)));
+}
+
+#[test]
 fn appended_encryption_and_in_place_decryption_preserve_nonces_and_authentication() -> Result<()> {
     let key = [0x37; KEY_LEN];
     let reference = XChaCha20Poly1305::new((&key).into());
@@ -101,6 +143,11 @@ fn pbkdf2_vector_matches_rfc6070_shape() -> Result<()> {
     assert_eq!(
         hex::encode(key),
         "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
+    );
+    // Independent hashlib/OpenSSL vector covers HMAC-state reuse and two blocks.
+    assert_eq!(
+        hex::encode(pbkdf2_hmac_sha256(b"password", b"salt", 64, 64)?),
+        "40113618313af3bc3fd970da09741d51a0ff7d13e6085e4da0b00b984307a6a2c397fb440a78d688741c79b6e3a8df2094a69ee9c05f16e8d4b508ece5a0540f"
     );
     Ok(())
 }

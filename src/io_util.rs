@@ -1,6 +1,8 @@
 use std::io::{self, IoSlice};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+pub(crate) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 // Callers retain their writer lock for the whole frame and decide when to flush.
 // Handles partial writes and writers whose default write_vectored is scalar.
 pub(crate) async fn write_all_vectored<W: AsyncWrite + Unpin>(

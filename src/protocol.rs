@@ -241,6 +241,19 @@ pub async fn read_auth_preface_user<R>(
 where
     R: AsyncRead + Unpin,
 {
+    let hash = read_auth_preface_hash(reader).await?;
+    let mut found = None;
+    for password in expected_passwords {
+        if constant_time_eq(&hash, &password_hash(password)) {
+            found = Some((*password).to_string());
+        }
+    }
+    found.ok_or_else(|| anyhow::anyhow!("authentication failed"))
+}
+
+pub(crate) async fn read_auth_preface_hash<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<[u8; 32]> {
     let mut hash = [0u8; 32];
     reader
         .read_exact(&mut hash)
@@ -259,13 +272,7 @@ where
             .await
             .context("read authentication padding")?;
     }
-    let mut found = None;
-    for password in expected_passwords {
-        if constant_time_eq(&hash, &password_hash(password)) {
-            found = Some((*password).to_string());
-        }
-    }
-    found.ok_or_else(|| anyhow::anyhow!("authentication failed"))
+    Ok(hash)
 }
 
 pub async fn read_frame<R>(reader: &mut R) -> Result<Frame>

@@ -36,7 +36,7 @@ def build(root, destination, target):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--suite", choices=["codecs", "transport", "anytls", "sudoku"], default="codecs")
+    parser.add_argument("--suite", choices=["codecs", "transport", "anytls", "sudoku", "authentication"], default="codecs")
     suite = parser.parse_args().suite
     current = Path.cwd()
     baseline = current / ".performance-baseline"
@@ -82,7 +82,10 @@ def main():
         modules = {"anytls": "src/protocol/tests.rs"}
     if suite == "sudoku":
         modules = {"sudoku_transport": "src/sudoku/tests.rs"}
+    if suite == "authentication":
+        modules = {"mieru_auth": "src/mieru/tests.rs"}
     test_filter = (
+        "authentication_performance" if suite == "authentication" else
         "sudoku_performance" if suite == "sudoku" else
         "protocol::tests::transport_performance" if suite == "anytls" else
         "transport_performance" if suite == "transport" else "protocol_performance"
@@ -120,9 +123,11 @@ def main():
                 print(f"Round {round_number + 1} {name}\n{output}", flush=True)
                 for label, mib in re.findall(r"PERF (\S+) ([0-9.]+)", output):
                     samples[name].setdefault(label, []).append(float(mib))
-    assert len(samples["baseline"]) == (15 if suite == "sudoku" else 20 if suite == "anytls" else 57), "Missing benchmark cases"
+    assert len(samples["baseline"]) == (9 if suite == "authentication" else 15 if suite == "sudoku" else 20 if suite == "anytls" else 57), "Missing benchmark cases"
     assert samples["baseline"].keys() == samples["optimized"].keys()
     scope = (
+        "Mieru time-key scans and packet authentication with 128/365/2855 users, with matched and unmatched optional hints. Rates are scans/s or authentications/s, not network throughput."
+        if suite == "authentication" else
         "Sudoku authenticated records over in-memory pipes and fresh TCP sessions with 1/128/2838 users. Handshake labels are sessions/s; other labels are plaintext MiB/s. Not Internet throughput."
         if suite == "sudoku" else
         "AnyTLS TLS frames over in-memory pipes; not Internet throughput."
@@ -132,7 +137,8 @@ def main():
         "These are in-memory codec benchmarks, not end-to-end network measurements."
     )
     report = [f"# Protocol {suite} performance", "",
-              "Same runner, release build, six alternating rounds; median MiB/s of plaintext.",
+              ("Same runner, release build, six alternating rounds; median operations/s."
+               if suite == "authentication" else "Same runner, release build, six alternating rounds; median MiB/s of plaintext."),
               scope, "",
               "| Case | Baseline | Optimized | Change |", "|---|---:|---:|---:|"]
     for label in sorted(samples["baseline"]):
