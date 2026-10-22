@@ -7,7 +7,7 @@ fn test_acceptor() -> Result<ServerTlsAcceptor> {
         cert_path: None,
         key_path: None,
         certificates: vec![cert.cert.pem()],
-        key: Some(cert.key_pair.serialize_pem()),
+        key: Some(cert.signing_key.serialize_pem()),
         label: "authentication deadline test".into(),
         alpn_protocols: Vec::new(),
         early_data: false,

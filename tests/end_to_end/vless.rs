@@ -25,7 +25,7 @@ async fn socks_client_reaches_tcp_target_through_vless_server() -> Result<()> {
     let cert_path = temp.path().join("vless.crt");
     let key_path = temp.path().join("vless.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let user_id = "a3482e88-686a-4a58-8126-99c9df64b7bf".to_string();
     let server_addr = unused_tcp_addr()?;
@@ -108,7 +108,7 @@ async fn socks_client_reaches_tcp_target_through_vless_websocket() -> Result<()>
     let cert_path = temp.path().join("vless-ws.crt");
     let key_path = temp.path().join("vless-ws.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let user_id = "a3482e88-686a-4a58-8126-99c9df64b7bf".to_string();
     let server_addr = unused_tcp_addr()?;
@@ -192,7 +192,7 @@ async fn socks_client_reaches_tcp_target_through_vless_httpupgrade() -> Result<(
     let cert_path = temp.path().join("vless-httpupgrade.crt");
     let key_path = temp.path().join("vless-httpupgrade.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let user_id = "a3482e88-686a-4a58-8126-99c9df64b7bf".to_string();
     let server_addr = unused_tcp_addr()?;
@@ -277,7 +277,7 @@ async fn socks_client_reaches_tcp_target_through_vless_http2() -> Result<()> {
     let cert_path = temp.path().join("vless-h2.crt");
     let key_path = temp.path().join("vless-h2.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let user_id = "a3482e88-686a-4a58-8126-99c9df64b7bf".to_string();
     let server_addr = unused_tcp_addr()?;
@@ -361,7 +361,7 @@ async fn socks_client_reaches_tcp_target_through_vless_grpc() -> Result<()> {
     let cert_path = temp.path().join("vless-grpc.crt");
     let key_path = temp.path().join("vless-grpc.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let user_id = "a3482e88-686a-4a58-8126-99c9df64b7bf".to_string();
     let server_addr = unused_tcp_addr()?;
@@ -445,7 +445,7 @@ async fn socks_client_reaches_tcp_target_through_vless_xhttp() -> Result<()> {
     let cert_path = temp.path().join("vless-xhttp.crt");
     let key_path = temp.path().join("vless-xhttp.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let user_id = "a3482e88-686a-4a58-8126-99c9df64b7bf".to_string();
     let server_addr = unused_tcp_addr()?;
@@ -630,7 +630,7 @@ async fn socks_client_reaches_tcp_target_through_vless_vision() -> Result<()> {
     let cert_path = temp.path().join("vless-vision.crt");
     let key_path = temp.path().join("vless-vision.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let user_id = "a3482e88-686a-4a58-8126-99c9df64b7bf".to_string();
     let server_addr = unused_tcp_addr()?;
@@ -703,7 +703,7 @@ async fn vision_inner_tls_reaches_target_over_tls_and_reality() -> Result<()> {
             None,
             None,
             &[certified.cert.pem()],
-            Some(&certified.key_pair.serialize_pem()),
+            Some(&certified.signing_key.serialize_pem()),
             "inner TLS",
         )?);
         let private = StaticSecret::from([17; 32]);
@@ -732,7 +732,7 @@ async fn vision_inner_tls_reaches_target_over_tls_and_reality() -> Result<()> {
         let cert_path = temp.path().join("vless-vision.crt");
         let key_path = temp.path().join("vless-vision.key");
         std::fs::write(&cert_path, certified.cert.pem())?;
-        std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+        std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
         let user_id = "a3482e88-686a-4a58-8126-99c9df64b7bf".to_string();
         let server_addr = unused_tcp_addr()?;
@@ -849,7 +849,7 @@ async fn socks_client_reaches_tcp_target_through_vless_mux() -> Result<()> {
     let cert_path = temp.path().join("vless-mux.crt");
     let key_path = temp.path().join("vless-mux.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let user_id = "a3482e88-686a-4a58-8126-99c9df64b7bf".to_string();
     let server_addr = unused_tcp_addr()?;
@@ -933,7 +933,7 @@ async fn vless_mux_server_finishes_when_tcp_target_fins() -> Result<()> {
     let cert_path = temp.path().join("vless-mux-fin.crt");
     let key_path = temp.path().join("vless-mux-fin.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let user_id = "a3482e88-686a-4a58-8126-99c9df64b7bf".to_string();
     let server_addr = unused_tcp_addr()?;
@@ -1030,7 +1030,7 @@ async fn socks_udp_associate_reaches_udp_target_through_vless_xudp() -> Result<(
     let cert_path = temp.path().join("vless-xudp.crt");
     let key_path = temp.path().join("vless-xudp.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let user_id = "a3482e88-686a-4a58-8126-99c9df64b7bf".to_string();
     let server_addr = unused_tcp_addr()?;

@@ -10,7 +10,7 @@ async fn reused_sessions_reclaim_streams_and_cancelled_open_cannot_be_reused() -
     let cert_path = temp.path().join("server.crt");
     let key_path = temp.path().join("server.key");
     std::fs::write(&cert_path, cert.cert.pem())?;
-    std::fs::write(&key_path, cert.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, cert.signing_key.serialize_pem())?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let server = tokio::spawn(run_server_listener(
