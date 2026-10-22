@@ -14,7 +14,7 @@ async fn heartbeat_preserves_partial_frames_and_revocation_closes_idle_sessions(
     let cert_path = temp.path().join("server.crt");
     let key_path = temp.path().join("server.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let core = aerion::ProxyCore::from_credentials("secret", &[]);
@@ -89,7 +89,7 @@ async fn fin_and_connection_close_interrupt_rate_limited_streams() -> Result<()>
     let cert_path = temp.path().join("server.crt");
     let key_path = temp.path().join("server.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let mut user = aerion::CoreUser::password("user", "secret");
@@ -217,7 +217,7 @@ async fn socks_client_reaches_tcp_target_through_aerion_server() -> Result<()> {
     let ca_cert_pem = certified.cert.pem();
     let ca_cert_sha256 = hex::encode(Sha256::digest(certified.cert.der().as_ref()));
     std::fs::write(&cert_path, &ca_cert_pem)?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let server_listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = server_listener.local_addr()?;
@@ -300,7 +300,7 @@ async fn anytls_server_rejects_tls_early_data() -> Result<()> {
     let cert_path = temp.path().join("anytls-0rtt.crt");
     let key_path = temp.path().join("anytls-0rtt.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let server_listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = server_listener.local_addr()?;
@@ -356,7 +356,7 @@ async fn anytls_server_finishes_when_tcp_target_fins() -> Result<()> {
     let key_path = temp.path().join("anytls-fin.key");
     let ca_cert_pem = certified.cert.pem();
     std::fs::write(&cert_path, &ca_cert_pem)?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let server_listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = server_listener.local_addr()?;

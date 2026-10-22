@@ -23,7 +23,7 @@ async fn socks_udp_associate_reaches_udp_target_through_uot() -> Result<()> {
     let cert_path = temp.path().join("server.crt");
     let key_path = temp.path().join("server.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let server_listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = server_listener.local_addr()?;

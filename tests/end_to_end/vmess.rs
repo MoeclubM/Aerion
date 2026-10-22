@@ -170,7 +170,7 @@ async fn socks_client_reaches_tcp_target_through_vmess_tls_server() -> Result<()
     let cert_path = temp.path().join("vmess-tls.crt");
     let key_path = temp.path().join("vmess-tls.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let user_id = "a3482e88-686a-4a58-8126-99c9df64b7bf".to_string();
     let server_addr = unused_tcp_addr()?;

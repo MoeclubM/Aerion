@@ -37,7 +37,7 @@ async fn naive_tcp_accounting_and_idle_revocation(quic: bool) -> Result<()> {
     let cert_path = temp.path().join("naive.crt");
     let key_path = temp.path().join("naive.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
     let ca_cert_path = cert_path.clone();
 
     let server_addr = unused_tcp_addr()?;

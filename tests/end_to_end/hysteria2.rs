@@ -24,7 +24,7 @@ async fn socks_client_reaches_tcp_target_through_hysteria2_server() -> Result<()
     let key_path = temp.path().join("hy2.key");
     let certificate_fingerprint = hex::encode(Sha256::digest(certified.cert.der().as_ref()));
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let server_addr = unused_udp_addr()?;
     let server_task = tokio::spawn(run_hysteria2_server(Hysteria2ServerConfig {
@@ -122,7 +122,7 @@ async fn hysteria2_server_finishes_when_tcp_target_fins() -> Result<()> {
     let key_path = temp.path().join("hy2-fin.key");
     let certificate_fingerprint = hex::encode(Sha256::digest(certified.cert.der().as_ref()));
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let server_addr = unused_udp_addr()?;
     let server_task = tokio::spawn(run_hysteria2_server(Hysteria2ServerConfig {
@@ -219,7 +219,7 @@ async fn socks_udp_associate_reaches_udp_target_through_hysteria2_datagrams() ->
     let key_path = temp.path().join("hy2-udp.key");
     let ca_cert_path = cert_path.clone();
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let server_addr = unused_udp_addr()?;
     let server_task = tokio::spawn(run_hysteria2_server(Hysteria2ServerConfig {

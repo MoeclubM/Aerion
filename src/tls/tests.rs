@@ -14,7 +14,7 @@ async fn accepts_tls13_early_data_after_ticket_resumption() -> Result<()> {
     let cert_path = temp.path().join("early.crt");
     let key_path = temp.path().join("early.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -67,7 +67,7 @@ async fn accepts_inline_server_certificate_material() -> Result<()> {
 
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     let cert_pem = certified.cert.pem();
-    let key_pem = certified.key_pair.serialize_pem();
+    let key_pem = certified.signing_key.serialize_pem();
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let acceptor = TlsAcceptor::from(server_config_from_material(
@@ -99,6 +99,157 @@ async fn accepts_inline_server_certificate_material() -> Result<()> {
     stream.read_exact(&mut echoed).await?;
     assert_eq!(&echoed, b"hello");
     server_task.await??;
+    Ok(())
+}
+
+struct CertificateChain {
+    root: String,
+    intermediate: String,
+    leaf: String,
+    key: String,
+}
+
+fn certificate_chain(expired: bool) -> Result<CertificateChain> {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    };
+
+    let ca_params = |name: &str| -> Result<CertificateParams> {
+        let mut params = CertificateParams::new(Vec::<String>::new())?;
+        params.distinguished_name.push(DnType::CommonName, name);
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        Ok(params)
+    };
+    let root_params = ca_params("TLS regression root")?;
+    let root_key = KeyPair::generate()?;
+    let root = root_params.self_signed(&root_key)?;
+    let root_issuer = Issuer::from_params(&root_params, &root_key);
+    let intermediate_params = ca_params("TLS regression intermediate")?;
+    let intermediate_key = KeyPair::generate()?;
+    let intermediate = intermediate_params.signed_by(&intermediate_key, &root_issuer)?;
+    let intermediate_issuer = Issuer::from_params(&intermediate_params, &intermediate_key);
+    let mut leaf_params = CertificateParams::new(vec!["chain.test".to_owned()])?;
+    leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    if expired {
+        leaf_params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        leaf_params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+    }
+    let leaf_key = KeyPair::generate()?;
+    let leaf = leaf_params.signed_by(&leaf_key, &intermediate_issuer)?;
+    Ok(CertificateChain {
+        root: root.pem(),
+        intermediate: intermediate.pem(),
+        leaf: leaf.pem(),
+        key: leaf_key.serialize_pem(),
+    })
+}
+
+async fn certificate_chain_error(
+    chain: &CertificateChain,
+    include_intermediate: bool,
+    trusted_root: &str,
+    server_name: &str,
+) -> Result<Option<rustls::CertificateError>> {
+    init_crypto();
+    let mut certificates = vec![chain.leaf.clone()];
+    if include_intermediate {
+        certificates.push(chain.intermediate.clone());
+    }
+    let server_config = server_config_from_material(
+        None,
+        None,
+        &certificates,
+        Some(&chain.key),
+        "certificate chain regression",
+    )?;
+    let client_config = client_config_with_custom_root_material_options(
+        false,
+        &[],
+        &[trusted_root.to_owned()],
+        true,
+        &[],
+    )?;
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let connector = TlsConnector::from(client_config);
+    let acceptor = TlsAcceptor::from(server_config);
+    let name = ServerName::try_from(server_name.to_owned())?;
+    let (client, server) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(
+            connector.connect(name, client_io),
+            acceptor.accept(server_io)
+        )
+    })
+    .await
+    .context("certificate chain handshake timed out")?;
+    match client {
+        Ok(_) => {
+            server.context("server certificate chain handshake failed")?;
+            Ok(None)
+        }
+        Err(error) => match error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<RustlsError>())
+        {
+            Some(RustlsError::InvalidCertificate(reason)) => Ok(Some(reason.clone())),
+            _ => bail!("unexpected certificate chain handshake error: {error}"),
+        },
+    }
+}
+
+#[tokio::test]
+async fn accepts_complete_intermediate_certificate_chain() -> Result<()> {
+    let chain = certificate_chain(false)?;
+    assert!(
+        certificate_chain_error(&chain, true, &chain.root, "chain.test")
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_missing_intermediate_certificate() -> Result<()> {
+    let chain = certificate_chain(false)?;
+    assert!(
+        certificate_chain_error(&chain, false, &chain.root, "chain.test")
+            .await?
+            .is_some()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_untrusted_certificate_chain() -> Result<()> {
+    let chain = certificate_chain(false)?;
+    let unrelated = certificate_chain(false)?;
+    assert!(
+        certificate_chain_error(&chain, true, &unrelated.root, "chain.test")
+            .await?
+            .is_some()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_certificate_chain_for_wrong_hostname() -> Result<()> {
+    let chain = certificate_chain(false)?;
+    assert!(
+        certificate_chain_error(&chain, true, &chain.root, "other.test")
+            .await?
+            .is_some()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_expired_certificate_in_chain() -> Result<()> {
+    let chain = certificate_chain(true)?;
+    assert!(
+        certificate_chain_error(&chain, true, &chain.root, "chain.test")
+            .await?
+            .is_some()
+    );
     Ok(())
 }
 

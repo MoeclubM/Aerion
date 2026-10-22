@@ -23,7 +23,7 @@ async fn socks_client_reaches_tcp_target_through_trojan_server() -> Result<()> {
     let cert_path = temp.path().join("trojan.crt");
     let key_path = temp.path().join("trojan.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
 
     let server_addr = unused_tcp_addr()?;
     let server_task = tokio::spawn(run_trojan_server(TrojanServerConfig {
@@ -98,7 +98,7 @@ async fn socks_client_reaches_tcp_target_through_trojan_websocket_server() -> Re
     let cert_path = temp.path().join("trojan-ws.crt");
     let key_path = temp.path().join("trojan-ws.key");
     std::fs::write(&cert_path, certified.cert.pem())?;
-    std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+    std::fs::write(&key_path, certified.signing_key.serialize_pem())?;
     let transport = VlessTransportConfig::websocket(Some("/trojan".to_string()), None, Vec::new());
 
     let server_addr = unused_tcp_addr()?;

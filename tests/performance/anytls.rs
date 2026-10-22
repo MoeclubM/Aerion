@@ -16,7 +16,7 @@ mod transport_performance {
             .with_no_client_auth()
             .with_single_cert(
                 vec![identity.cert.der().clone()],
-                rustls::pki_types::PrivateKeyDer::Pkcs8(identity.key_pair.serialize_der().into()),
+                rustls::pki_types::PrivateKeyDer::Pkcs8(identity.signing_key.serialize_der().into()),
             )?;
         let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
         let connector = tokio_rustls::TlsConnector::from(crate::tls::client_config(true));

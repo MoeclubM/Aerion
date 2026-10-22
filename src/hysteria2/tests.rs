@@ -26,7 +26,7 @@ async fn dropping_last_client_closes_quic_and_background_tasks() -> Result<()> {
             cert_path: PathBuf::new(),
             key_path: PathBuf::new(),
             certificates: vec![certificate.cert.pem()],
-            key: Some(certificate.key_pair.serialize_pem()),
+            key: Some(certificate.signing_key.serialize_pem()),
             obfs: None,
             obfs_password: None,
             upload_bandwidth: None,
