@@ -55,5 +55,9 @@ regex = "1.13.1"
 boring = { version = "5.3.0", optional = true }
 tokio-boring = { version = "5.3.0", optional = true }
 
+[target.'cfg(target_os = "ios")'.dependencies]
+# nix uses iOS kernel-control definitions removed in libc 0.2.190.
+libc = "=0.2.189"
+
 [dev-dependencies]
 tempfile = "3.27.0"
