@@ -228,6 +228,7 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
             udp_socket.set_nonblocking(true)?;
             udp_socket.connect(addr)?;
             let mut streams = Vec::new();
+            let mut uot_streams = Vec::new();
             for (index, key) in keys.iter().enumerate() {
                 eprintln!("SS2022 {method}, external core {external_core}, user {index}");
                 let client = ServerConfig::new(
@@ -281,6 +282,7 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
                     .context("SS2022 UoT echo timed out")??;
                 let (_, echoed) = aerion::uot::decode_associate_packet(&response)?;
                 anyhow::ensure!(echoed == payload, "SS2022 UoT payload mismatch");
+                uot_streams.push(uot);
 
                 if external_core {
                     let snapshots = core.snapshot().await;
@@ -316,9 +318,27 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
                     ),
                     "removed SS2022 user kept an active TCP connection"
                 );
+                anyhow::ensure!(
+                    matches!(
+                        timeout(Duration::from_secs(3), uot_streams[0].read(&mut buffer))
+                            .await
+                            .context("removed SS2022 user kept an idle UoT connection")?,
+                        Ok(0) | Err(_)
+                    ),
+                    "removed SS2022 user kept an active UoT connection"
+                );
                 streams[1].write_all(b"live").await?;
                 streams[1].read_exact(&mut buffer).await?;
                 anyhow::ensure!(&buffer == b"live", "removing alice disconnected bob");
+                core.cancel_all_sessions();
+                tasks.abort_all();
+                timeout(Duration::from_secs(3), async {
+                    while std::net::UdpSocket::bind(addr).is_err() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .context("cancelled SS2022 UDP sessions kept the listener bound")?;
             }
         }
         Ok::<_, anyhow::Error>(())

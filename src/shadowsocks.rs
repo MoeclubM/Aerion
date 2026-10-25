@@ -426,12 +426,12 @@ async fn relay_shadowsocks_udp_responses(
     entry: Arc<SsUdpNat>,
 ) -> Result<()> {
     let mut buffer = vec![0u8; MAXIMUM_UDP_PAYLOAD_SIZE];
-    while let Ok(read) = timeout(
-        SHADOWSOCKS_UDP_SESSION_TIMEOUT,
-        entry.socket.recv_from(&mut buffer),
-    )
-    .await
-    {
+    loop {
+        let read = tokio::select! {
+            _ = session.cancelled() => break,
+            read = timeout(SHADOWSOCKS_UDP_SESSION_TIMEOUT, entry.socket.recv_from(&mut buffer)) => read,
+        };
+        let Ok(read) = read else { break };
         let (read, source) = read.context("receive Shadowsocks UDP response")?;
         let source = canonicalize_ss_address(ShadowsocksAddress::SocketAddress(source));
         session.record_download(read).await?;
@@ -717,6 +717,7 @@ where
     tracing::info!("Shadowsocks serving UDP-over-TCP");
     let (mut reader, mut writer) = tokio::io::split(inbound);
     let downlink_is_connect = request.is_connect;
+    let cancellation = session.clone();
 
     let uplink = {
         let udp = udp.clone();
@@ -793,6 +794,7 @@ where
     };
 
     tokio::select! {
+        _ = cancellation.cancelled() => bail!("core session cancelled"),
         result = uplink => result,
         result = downlink => result,
     }
