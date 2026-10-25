@@ -158,6 +158,7 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
     use shadowsocks::relay::socks5::Address;
     use shadowsocks::relay::tcprelay::ProxyClientStream;
     use shadowsocks::relay::udprelay::ProxySocket;
+    use shadowsocks::relay::udprelay::proxy_socket::UdpSocketType;
 
     timeout(Duration::from_secs(15), async {
         for (method, key_len, external_core) in [
@@ -222,6 +223,10 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
                 tokio::task::yield_now().await;
             }
 
+            // Both users share the same client address and session ID.
+            let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            udp_socket.set_nonblocking(true)?;
+            udp_socket.connect(addr)?;
             let mut streams = Vec::new();
             for (index, key) in keys.iter().enumerate() {
                 let client = ServerConfig::new(
@@ -239,7 +244,13 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
                 anyhow::ensure!(echoed == payload, "SS2022 TCP payload mismatch");
                 streams.push(stream);
 
-                let udp = ProxySocket::connect(context.clone(), &client).await?;
+                let socket = tokio::net::UdpSocket::from_std(udp_socket.try_clone()?)?;
+                let udp = ProxySocket::from_socket(
+                    UdpSocketType::Client,
+                    context.clone(),
+                    &client,
+                    shadowsocks::net::UdpSocket::from(socket),
+                );
                 udp.send(&Address::SocketAddress(udp_target), &payload)
                     .await?;
                 let mut buffer = [0; 1024];
@@ -249,7 +260,7 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
                 let mut uot = ProxyClientStream::connect(
                     context,
                     &client,
-                    Address::DomainName(aerion::uot::MAGIC_ADDRESS.into(), 0),
+                    Address::DomainNameAddress(aerion::uot::MAGIC_ADDRESS.into(), 0),
                 )
                 .await?;
                 let packet = aerion::uot::encode_associate_packet(

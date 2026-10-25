@@ -34,6 +34,8 @@ use tokio::time::timeout;
 
 const SHADOWSOCKS_UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 
+type SsUdpNatTable = Arc<Mutex<HashMap<(String, SocketAddr, u64), Arc<SsUdpNat>>>>;
+
 #[derive(Clone, Debug)]
 pub struct ShadowsocksClientConfig {
     pub listen: SocketAddr,
@@ -76,7 +78,7 @@ struct ShadowsocksServerRuntime {
     tcp: bool,
     udp: bool,
     udp_over_tcp: bool,
-    udp_nat: Arc<Mutex<HashMap<(SocketAddr, u64), Arc<SsUdpNat>>>>,
+    udp_nat: SsUdpNatTable,
 }
 
 struct SsUdpNat {
@@ -344,7 +346,7 @@ async fn relay_shadowsocks_udp_packet(
     control: Option<UdpSocketControlData>,
     payload: Vec<u8>,
     session: CoreSession,
-    nat: Arc<Mutex<HashMap<(SocketAddr, u64), Arc<SsUdpNat>>>>,
+    nat: SsUdpNatTable,
 ) -> Result<()> {
     let target_addr = resolve_shadowsocks_address(&target).await?;
     let client_session_id = control
@@ -368,14 +370,14 @@ async fn relay_shadowsocks_udp_packet(
 }
 
 async fn get_or_create_ss_udp_nat(
-    nat: Arc<Mutex<HashMap<(SocketAddr, u64), Arc<SsUdpNat>>>>,
+    nat: SsUdpNatTable,
     proxy: Arc<ProxySocket<ShadowsocksUdpSocket>>,
     peer: SocketAddr,
     client_session_id: u64,
     control: Option<UdpSocketControlData>,
     session: CoreSession,
 ) -> Result<Arc<SsUdpNat>> {
-    let key = (peer, client_session_id);
+    let key = (session.user_id().to_string(), peer, client_session_id);
     {
         let table = nat.lock().await;
         if let Some(entry) = table.get(&key) {
@@ -402,7 +404,7 @@ async fn get_or_create_ss_udp_nat(
         if let Some(existing) = table.get(&key) {
             return Ok(existing.clone());
         }
-        table.insert(key, entry.clone());
+        table.insert(key.clone(), entry.clone());
     }
     let recv_entry = entry.clone();
     tokio::spawn(async move {
