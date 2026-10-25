@@ -166,6 +166,8 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
             ("2022-blake3-aes-128-gcm", 16, true),
             ("2022-blake3-aes-256-gcm", 32, true),
             ("2022-blake3-aes-128-gcm", 16, false),
+            ("2022-blake3-chacha20-poly1305", 32, true),
+            ("2022-blake3-chacha20-poly1305", 32, false),
         ] {
             let mut tasks = tokio::task::JoinSet::new();
             let tcp_echo = TcpListener::bind("127.0.0.1:0").await?;
@@ -237,7 +239,12 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
             let clients = keys
                 .iter()
                 .map(|key| {
-                    ServerConfig::new(addr, format!("{server_key}:{key}"), method.parse().unwrap())
+                    let password = if method == "2022-blake3-chacha20-poly1305" {
+                        key.clone()
+                    } else {
+                        format!("{server_key}:{key}")
+                    };
+                    ServerConfig::new(addr, password, method.parse().unwrap())
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             let mut streams = Vec::new();
@@ -257,6 +264,9 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
                 streams.push(stream);
 
                 let mut encrypted = BytesMut::new();
+                if index == 1 {
+                    udp_socket.send(b"invalid").await?;
+                }
                 encrypt_client_payload(
                     &context,
                     client.method(),
