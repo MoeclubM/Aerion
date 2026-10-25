@@ -1,7 +1,9 @@
-use crate::core::{CoreSession, ProxyCore, relay_bidirectional_counted};
+use crate::core::{CoreSession, CoreUser, ProxyCore, relay_bidirectional_counted};
 use crate::protocol::{ProxyTarget, resolve_target_addr, target_name};
 use crate::{socket_protect, socks, uot};
 use anyhow::{Context, Result, bail, ensure};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use shadowsocks::config::{
     ServerAddr as ShadowsocksServerAddr, ServerConfig as ShadowsocksInnerConfig, ServerType,
     ServerUser, ServerUserManager,
@@ -13,7 +15,6 @@ use shadowsocks::crypto::CipherKind;
 use shadowsocks::net::UdpSocket as ShadowsocksUdpSocket;
 use shadowsocks::relay::socks5::Address as ShadowsocksAddress;
 use shadowsocks::relay::tcprelay::ProxyClientStream;
-use shadowsocks::relay::tcprelay::ProxyListener;
 use shadowsocks::relay::tcprelay::ProxyServerStream;
 use shadowsocks::relay::udprelay::options::UdpSocketControlData;
 use shadowsocks::relay::udprelay::proxy_socket::{ProxySocketError, UdpSocketType};
@@ -30,7 +31,12 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
+mod multi_user;
+use multi_user::ServerUdpSocket;
+
 const SHADOWSOCKS_UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+
+type SsUdpNatTable = Arc<Mutex<HashMap<(String, SocketAddr, u64), Arc<SsUdpNat>>>>;
 
 #[derive(Clone, Debug)]
 pub struct ShadowsocksClientConfig {
@@ -67,15 +73,15 @@ struct ShadowsocksRuntime {
 
 #[derive(Clone)]
 struct ShadowsocksServerRuntime {
+    listen: SocketAddr,
     server: ShadowsocksInnerConfig,
     context: ShadowsocksSharedContext,
     core: ProxyCore,
     password: String,
-    tcp_multi_user: bool,
     tcp: bool,
     udp: bool,
     udp_over_tcp: bool,
-    udp_nat: Arc<Mutex<HashMap<(SocketAddr, u64), Arc<SsUdpNat>>>>,
+    udp_nat: SsUdpNatTable,
 }
 
 struct SsUdpNat {
@@ -157,7 +163,6 @@ impl ShadowsocksServerRuntime {
             .parse::<CipherKind>()
             .map_err(|_| anyhow::anyhow!("unsupported Shadowsocks cipher {}", config.method))?;
         let password = config.password.clone();
-        let tcp_multi_user = config.tcp && !config.users.is_empty();
         let mut server = ShadowsocksInnerConfig::new(
             ShadowsocksServerAddr::SocketAddr(config.listen),
             config.password,
@@ -165,24 +170,37 @@ impl ShadowsocksServerRuntime {
         )
         .context("build Shadowsocks server config")?;
         if !config.users.is_empty() {
+            ensure!(
+                matches!(
+                    method,
+                    CipherKind::AEAD2022_BLAKE3_AES_128_GCM
+                        | CipherKind::AEAD2022_BLAKE3_AES_256_GCM
+                        | CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305
+                ),
+                "Shadowsocks multi-user requires a Shadowsocks 2022 cipher"
+            );
             let mut users = ServerUserManager::new();
             for user in config.users {
                 let (name, key) = user
                     .split_once(':')
                     .unwrap_or((user.as_str(), user.as_str()));
-                users.add_user(
-                    ServerUser::with_encoded_key(name, key)
-                        .with_context(|| format!("decode Shadowsocks server user {name}"))?,
+                let user = ServerUser::with_encoded_key(name, key)
+                    .with_context(|| format!("decode Shadowsocks server user {name}"))?;
+                ensure!(
+                    user.key().len() == method.key_len(),
+                    "Shadowsocks server user {name} key must be {} bytes",
+                    method.key_len()
                 );
+                users.add_user(user);
             }
             server.set_user_manager(users);
         }
         Ok(Self {
+            listen: config.listen,
             server,
             context: ShadowsocksContext::new_shared(ServerType::Server),
             core,
             password,
-            tcp_multi_user,
             tcp: config.tcp,
             udp: config.udp,
             udp_over_tcp: config.udp_over_tcp,
@@ -192,7 +210,21 @@ impl ShadowsocksServerRuntime {
 }
 
 pub async fn run_shadowsocks_server(config: ShadowsocksServerConfig) -> Result<()> {
-    let core = ProxyCore::from_credentials(&config.password, &config.users);
+    let core = if config.users.is_empty() {
+        ProxyCore::from_credentials(&config.password, &[])
+    } else {
+        let users = config
+            .users
+            .iter()
+            .map(|user| {
+                let (name, key) = user.split_once(':').unwrap_or((user, user));
+                let user = ServerUser::with_encoded_key(name, key)
+                    .with_context(|| format!("decode Shadowsocks server user {name}"))?;
+                Ok(CoreUser::password(name, user.encoded_key()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ProxyCore::new(users)?
+    };
     run_shadowsocks_server_with_core(config, core).await
 }
 
@@ -205,14 +237,10 @@ pub async fn run_shadowsocks_server_with_core(
         runtime.tcp || runtime.udp,
         "Shadowsocks server must enable TCP or UDP"
     );
-    ensure!(
-        !runtime.tcp_multi_user,
-        "Aerion Shadowsocks TCP multi-user accounting requires authenticated user exposure from the shadowsocks crate"
-    );
     if runtime.udp && !runtime.tcp {
         return run_shadowsocks_udp_server(runtime).await;
     }
-    let listener = ProxyListener::bind(runtime.context.clone(), &runtime.server)
+    let listener = TcpListener::bind(runtime.listen)
         .await
         .context("bind Shadowsocks server TCP listener")?;
     tracing::info!("Shadowsocks server listening on {}", listener.local_addr()?);
@@ -223,18 +251,21 @@ pub async fn run_shadowsocks_server_with_core(
     }
     loop {
         let (stream, peer) = tokio::select! {
-            accepted = listener.accept() => accepted.context("accept Shadowsocks client")?,
+            accepted = crate::listener::accept_tcp(&listener) => accepted.context("accept Shadowsocks client")?,
             result = udp_task.join_next(), if !udp_task.is_empty() => {
                 return result.context("Shadowsocks UDP task missing")?.context("Shadowsocks UDP task panicked")?;
             }
         };
-        let udp_over_tcp = runtime.udp_over_tcp;
-        let core = runtime.core.clone();
-        let password = runtime.password.clone();
+        let runtime = runtime.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                handle_shadowsocks_tcp_client(stream, udp_over_tcp, core, password, peer).await
-            {
+            let result = async {
+                let (stream, credential) =
+                    multi_user::tcp_stream(stream, &runtime.server, runtime.context.clone())
+                        .await?;
+                handle_shadowsocks_tcp_client(stream, runtime, peer, credential).await
+            }
+            .await;
+            if let Err(error) = result {
                 tracing::warn!("Shadowsocks TCP client {peer} failed: {error:?}");
             }
         });
@@ -243,10 +274,9 @@ pub async fn run_shadowsocks_server_with_core(
 
 async fn handle_shadowsocks_tcp_client<S>(
     mut inbound: ProxyServerStream<S>,
-    udp_over_tcp: bool,
-    core: ProxyCore,
-    password: String,
+    runtime: ShadowsocksServerRuntime,
     peer: SocketAddr,
+    authenticated_credential: Option<String>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -255,16 +285,26 @@ where
         .handshake()
         .await
         .context("read Shadowsocks TCP target")?;
+    let credential = if let Some(credential) = authenticated_credential {
+        credential
+    } else if let Some(key) = inbound.user_key() {
+        STANDARD.encode(key)
+    } else {
+        ensure!(
+            runtime.server.user_manager().is_none(),
+            "Shadowsocks multi-user TCP connection is missing an authenticated user"
+        );
+        runtime.password
+    };
+    let session = runtime.core.authenticate_from(&credential, peer).await?;
     let target = proxy_target(&target);
     if uot::is_magic_target(&target) {
         ensure!(
-            udp_over_tcp,
+            runtime.udp_over_tcp,
             "Shadowsocks UDP-over-TCP is disabled by server config"
         );
-        let session = core.authenticate_from(&password, peer).await?;
         return relay_shadowsocks_uot_stream(inbound, target, session).await;
     }
-    let session = core.authenticate_from(&password, peer).await?;
     let mut outbound = socket_protect::connect_proxy_target(&target).await?;
     tracing::info!("Shadowsocks serving TCP {}", target_name(&target));
     relay_bidirectional_counted(&mut inbound, &mut outbound, session, "Shadowsocks").await
@@ -272,7 +312,7 @@ where
 
 async fn run_shadowsocks_udp_server(runtime: ShadowsocksServerRuntime) -> Result<()> {
     let proxy = Arc::new(
-        ProxySocket::bind(runtime.context.clone(), &runtime.server)
+        ServerUdpSocket::bind(runtime.listen, runtime.context.clone(), &runtime.server)
             .await
             .context("bind Shadowsocks server UDP socket")?,
     );
@@ -283,7 +323,7 @@ async fn run_shadowsocks_udp_server(runtime: ShadowsocksServerRuntime) -> Result
     let buffer_len = MAXIMUM_UDP_PAYLOAD_SIZE + ShadowsocksAddress::max_serialized_len();
     let mut buffer = vec![0u8; buffer_len];
     loop {
-        let (read, peer, target, _, control) = match proxy.recv_from_with_ctrl(&mut buffer).await {
+        let (read, peer, target, control) = match proxy.recv_from(&mut buffer).await {
             Ok(packet) => packet,
             Err(error @ ProxySocketError::IoError(_)) => {
                 return Err(error).context("receive Shadowsocks UDP packet");
@@ -315,13 +355,13 @@ async fn run_shadowsocks_udp_server(runtime: ShadowsocksServerRuntime) -> Result
 }
 
 async fn relay_shadowsocks_udp_packet(
-    proxy: Arc<ProxySocket<ShadowsocksUdpSocket>>,
+    proxy: Arc<ServerUdpSocket>,
     peer: SocketAddr,
     target: ShadowsocksAddress,
     control: Option<UdpSocketControlData>,
     payload: Vec<u8>,
     session: CoreSession,
-    nat: Arc<Mutex<HashMap<(SocketAddr, u64), Arc<SsUdpNat>>>>,
+    nat: SsUdpNatTable,
 ) -> Result<()> {
     let target_addr = resolve_shadowsocks_address(&target).await?;
     let client_session_id = control
@@ -337,6 +377,7 @@ async fn relay_shadowsocks_udp_packet(
         session.clone(),
     )
     .await?;
+    proxy.remember_user(peer, control.as_ref());
     session.record_upload(payload.len()).await?;
     socket_protect::send_to_dual_stack(&entry.socket, &payload, target_addr)
         .await
@@ -345,14 +386,14 @@ async fn relay_shadowsocks_udp_packet(
 }
 
 async fn get_or_create_ss_udp_nat(
-    nat: Arc<Mutex<HashMap<(SocketAddr, u64), Arc<SsUdpNat>>>>,
-    proxy: Arc<ProxySocket<ShadowsocksUdpSocket>>,
+    nat: SsUdpNatTable,
+    proxy: Arc<ServerUdpSocket>,
     peer: SocketAddr,
     client_session_id: u64,
     control: Option<UdpSocketControlData>,
     session: CoreSession,
 ) -> Result<Arc<SsUdpNat>> {
-    let key = (peer, client_session_id);
+    let key = (session.user_id().to_string(), peer, client_session_id);
     {
         let table = nat.lock().await;
         if let Some(entry) = table.get(&key) {
@@ -379,34 +420,36 @@ async fn get_or_create_ss_udp_nat(
         if let Some(existing) = table.get(&key) {
             return Ok(existing.clone());
         }
-        table.insert(key, entry.clone());
+        table.insert(key.clone(), entry.clone());
     }
     let recv_entry = entry.clone();
     tokio::spawn(async move {
+        let cleanup_proxy = proxy.clone();
         if let Err(error) =
             relay_shadowsocks_udp_responses(proxy, peer, control, session, recv_entry).await
         {
             tracing::debug!("Shadowsocks UDP NAT {peer} closed: {error:?}");
         }
         nat.lock().await.remove(&key);
+        cleanup_proxy.forget_user(peer, &key.0);
     });
     Ok(entry)
 }
 
 async fn relay_shadowsocks_udp_responses(
-    proxy: Arc<ProxySocket<ShadowsocksUdpSocket>>,
+    proxy: Arc<ServerUdpSocket>,
     peer: SocketAddr,
     control: Option<UdpSocketControlData>,
     session: CoreSession,
     entry: Arc<SsUdpNat>,
 ) -> Result<()> {
     let mut buffer = vec![0u8; MAXIMUM_UDP_PAYLOAD_SIZE];
-    while let Ok(read) = timeout(
-        SHADOWSOCKS_UDP_SESSION_TIMEOUT,
-        entry.socket.recv_from(&mut buffer),
-    )
-    .await
-    {
+    loop {
+        let read = tokio::select! {
+            _ = session.cancelled() => break,
+            read = timeout(SHADOWSOCKS_UDP_SESSION_TIMEOUT, entry.socket.recv_from(&mut buffer)) => read,
+        };
+        let Ok(read) = read else { break };
         let (read, source) = read.context("receive Shadowsocks UDP response")?;
         let source = canonicalize_ss_address(ShadowsocksAddress::SocketAddress(source));
         session.record_download(read).await?;
@@ -692,6 +735,7 @@ where
     tracing::info!("Shadowsocks serving UDP-over-TCP");
     let (mut reader, mut writer) = tokio::io::split(inbound);
     let downlink_is_connect = request.is_connect;
+    let cancellation = session.clone();
 
     let uplink = {
         let udp = udp.clone();
@@ -768,6 +812,7 @@ where
     };
 
     tokio::select! {
+        _ = cancellation.cancelled() => bail!("core session cancelled"),
         result = uplink => result,
         result = downlink => result,
     }
