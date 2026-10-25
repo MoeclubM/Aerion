@@ -229,6 +229,7 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
             udp_socket.connect(addr)?;
             let mut streams = Vec::new();
             for (index, key) in keys.iter().enumerate() {
+                eprintln!("SS2022 {method}, external core {external_core}, user {index}");
                 let client = ServerConfig::new(
                     addr,
                     format!("{server_key}:{key}"),
@@ -240,7 +241,9 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
                     ProxyClientStream::connect(context.clone(), &client, tcp_target).await?;
                 stream.write_all(&payload).await?;
                 let mut echoed = vec![0; payload.len()];
-                stream.read_exact(&mut echoed).await?;
+                timeout(Duration::from_secs(3), stream.read_exact(&mut echoed))
+                    .await
+                    .context("SS2022 TCP echo timed out")??;
                 anyhow::ensure!(echoed == payload, "SS2022 TCP payload mismatch");
                 streams.push(stream);
 
@@ -254,7 +257,9 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
                 udp.send(&Address::SocketAddress(udp_target), &payload)
                     .await?;
                 let mut buffer = [0; 1024];
-                let (read, _, _) = udp.recv(&mut buffer).await?;
+                let (read, _, _) = timeout(Duration::from_secs(3), udp.recv(&mut buffer))
+                    .await
+                    .context("SS2022 UDP echo timed out")??;
                 anyhow::ensure!(&buffer[..read] == payload, "SS2022 UDP payload mismatch");
 
                 let mut uot = ProxyClientStream::connect(
@@ -271,7 +276,9 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
                 request.extend_from_slice(&packet);
                 uot.write_all(&request).await?;
                 let mut response = vec![0; packet.len()];
-                uot.read_exact(&mut response).await?;
+                timeout(Duration::from_secs(3), uot.read_exact(&mut response))
+                    .await
+                    .context("SS2022 UoT echo timed out")??;
                 let (_, echoed) = aerion::uot::decode_associate_packet(&response)?;
                 anyhow::ensure!(echoed == payload, "SS2022 UoT payload mismatch");
 
@@ -301,7 +308,12 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
                 core.replace_users(vec![users[1].clone()])?;
                 let mut buffer = [0; 4];
                 anyhow::ensure!(
-                    matches!(streams[0].read(&mut buffer).await, Ok(0) | Err(_)),
+                    matches!(
+                        timeout(Duration::from_secs(3), streams[0].read(&mut buffer))
+                            .await
+                            .context("removed SS2022 user did not disconnect")?,
+                        Ok(0) | Err(_)
+                    ),
                     "removed SS2022 user kept an active TCP connection"
                 );
                 streams[1].write_all(b"live").await?;
