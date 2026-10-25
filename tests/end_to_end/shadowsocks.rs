@@ -227,19 +227,27 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
             // Both users share the same client address and session ID.
             let udp_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
             udp_socket.connect(addr).await?;
+            let mut session_id = [0; 8];
+            getrandom::fill(&mut session_id)?;
+            let mut control = UdpSocketControlData::default();
+            control.client_session_id = u64::from_be_bytes(session_id);
+            control.packet_id = 1;
+            // The dependency's UDP cipher cache identifies keys by their address.
+            // Keep every client config alive while sharing the session ID.
+            let clients = keys
+                .iter()
+                .map(|key| {
+                    ServerConfig::new(addr, format!("{server_key}:{key}"), method.parse().unwrap())
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             let mut streams = Vec::new();
             let mut uot_streams = Vec::new();
-            for (index, key) in keys.iter().enumerate() {
+            for (index, client) in clients.iter().enumerate() {
                 eprintln!("SS2022 {method}, external core {external_core}, user {index}");
-                let client = ServerConfig::new(
-                    addr,
-                    format!("{server_key}:{key}"),
-                    method.parse().unwrap(),
-                )?;
                 let context = SsContext::new_shared(ServerType::Local);
                 let payload = vec![index as u8 + 1; 7 + index];
                 let mut stream =
-                    ProxyClientStream::connect(context.clone(), &client, tcp_target).await?;
+                    ProxyClientStream::connect(context.clone(), client, tcp_target).await?;
                 stream.write_all(&payload).await?;
                 let mut echoed = vec![0; payload.len()];
                 timeout(Duration::from_secs(3), stream.read_exact(&mut echoed))
@@ -254,7 +262,7 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
                     client.method(),
                     client.key(),
                     &Address::SocketAddress(udp_target),
-                    &UdpSocketControlData::default(),
+                    &control,
                     &client.clone_identity_keys(),
                     &payload,
                     &mut encrypted,
@@ -274,7 +282,7 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
 
                 let mut uot = ProxyClientStream::connect(
                     context,
-                    &client,
+                    client,
                     Address::DomainNameAddress(aerion::uot::MAGIC_ADDRESS.into(), 0),
                 )
                 .await?;
