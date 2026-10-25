@@ -1,7 +1,9 @@
-use crate::core::{CoreSession, ProxyCore, relay_bidirectional_counted};
+use crate::core::{CoreSession, CoreUser, ProxyCore, relay_bidirectional_counted};
 use crate::protocol::{ProxyTarget, resolve_target_addr, target_name};
 use crate::{socket_protect, socks, uot};
 use anyhow::{Context, Result, bail, ensure};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use shadowsocks::config::{
     ServerAddr as ShadowsocksServerAddr, ServerConfig as ShadowsocksInnerConfig, ServerType,
     ServerUser, ServerUserManager,
@@ -71,7 +73,6 @@ struct ShadowsocksServerRuntime {
     context: ShadowsocksSharedContext,
     core: ProxyCore,
     password: String,
-    tcp_multi_user: bool,
     tcp: bool,
     udp: bool,
     udp_over_tcp: bool,
@@ -157,7 +158,6 @@ impl ShadowsocksServerRuntime {
             .parse::<CipherKind>()
             .map_err(|_| anyhow::anyhow!("unsupported Shadowsocks cipher {}", config.method))?;
         let password = config.password.clone();
-        let tcp_multi_user = config.tcp && !config.users.is_empty();
         let mut server = ShadowsocksInnerConfig::new(
             ShadowsocksServerAddr::SocketAddr(config.listen),
             config.password,
@@ -165,15 +165,27 @@ impl ShadowsocksServerRuntime {
         )
         .context("build Shadowsocks server config")?;
         if !config.users.is_empty() {
+            ensure!(
+                matches!(
+                    method,
+                    CipherKind::AEAD2022_BLAKE3_AES_128_GCM
+                        | CipherKind::AEAD2022_BLAKE3_AES_256_GCM
+                ),
+                "Shadowsocks multi-user requires a Shadowsocks 2022 AES cipher"
+            );
             let mut users = ServerUserManager::new();
             for user in config.users {
                 let (name, key) = user
                     .split_once(':')
                     .unwrap_or((user.as_str(), user.as_str()));
-                users.add_user(
-                    ServerUser::with_encoded_key(name, key)
-                        .with_context(|| format!("decode Shadowsocks server user {name}"))?,
+                let user = ServerUser::with_encoded_key(name, key)
+                    .with_context(|| format!("decode Shadowsocks server user {name}"))?;
+                ensure!(
+                    user.key().len() == method.key_len(),
+                    "Shadowsocks server user {name} key must be {} bytes",
+                    method.key_len()
                 );
+                users.add_user(user);
             }
             server.set_user_manager(users);
         }
@@ -182,7 +194,6 @@ impl ShadowsocksServerRuntime {
             context: ShadowsocksContext::new_shared(ServerType::Server),
             core,
             password,
-            tcp_multi_user,
             tcp: config.tcp,
             udp: config.udp,
             udp_over_tcp: config.udp_over_tcp,
@@ -192,7 +203,21 @@ impl ShadowsocksServerRuntime {
 }
 
 pub async fn run_shadowsocks_server(config: ShadowsocksServerConfig) -> Result<()> {
-    let core = ProxyCore::from_credentials(&config.password, &config.users);
+    let core = if config.users.is_empty() {
+        ProxyCore::from_credentials(&config.password, &[])
+    } else {
+        let users = config
+            .users
+            .iter()
+            .map(|user| {
+                let (name, key) = user.split_once(':').unwrap_or((user, user));
+                let user = ServerUser::with_encoded_key(name, key)
+                    .with_context(|| format!("decode Shadowsocks server user {name}"))?;
+                Ok(CoreUser::password(name, user.encoded_key()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ProxyCore::new(users)?
+    };
     run_shadowsocks_server_with_core(config, core).await
 }
 
@@ -204,10 +229,6 @@ pub async fn run_shadowsocks_server_with_core(
     ensure!(
         runtime.tcp || runtime.udp,
         "Shadowsocks server must enable TCP or UDP"
-    );
-    ensure!(
-        !runtime.tcp_multi_user,
-        "Aerion Shadowsocks TCP multi-user accounting requires authenticated user exposure from the shadowsocks crate"
     );
     if runtime.udp && !runtime.tcp {
         return run_shadowsocks_udp_server(runtime).await;
@@ -228,13 +249,9 @@ pub async fn run_shadowsocks_server_with_core(
                 return result.context("Shadowsocks UDP task missing")?.context("Shadowsocks UDP task panicked")?;
             }
         };
-        let udp_over_tcp = runtime.udp_over_tcp;
-        let core = runtime.core.clone();
-        let password = runtime.password.clone();
+        let runtime = runtime.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                handle_shadowsocks_tcp_client(stream, udp_over_tcp, core, password, peer).await
-            {
+            if let Err(error) = handle_shadowsocks_tcp_client(stream, runtime, peer).await {
                 tracing::warn!("Shadowsocks TCP client {peer} failed: {error:?}");
             }
         });
@@ -243,9 +260,7 @@ pub async fn run_shadowsocks_server_with_core(
 
 async fn handle_shadowsocks_tcp_client<S>(
     mut inbound: ProxyServerStream<S>,
-    udp_over_tcp: bool,
-    core: ProxyCore,
-    password: String,
+    runtime: ShadowsocksServerRuntime,
     peer: SocketAddr,
 ) -> Result<()>
 where
@@ -255,16 +270,24 @@ where
         .handshake()
         .await
         .context("read Shadowsocks TCP target")?;
+    let credential = if let Some(key) = inbound.user_key() {
+        STANDARD.encode(key)
+    } else {
+        ensure!(
+            runtime.server.user_manager().is_none(),
+            "Shadowsocks multi-user TCP connection is missing an authenticated user"
+        );
+        runtime.password
+    };
+    let session = runtime.core.authenticate_from(&credential, peer).await?;
     let target = proxy_target(&target);
     if uot::is_magic_target(&target) {
         ensure!(
-            udp_over_tcp,
+            runtime.udp_over_tcp,
             "Shadowsocks UDP-over-TCP is disabled by server config"
         );
-        let session = core.authenticate_from(&password, peer).await?;
         return relay_shadowsocks_uot_stream(inbound, target, session).await;
     }
-    let session = core.authenticate_from(&password, peer).await?;
     let mut outbound = socket_protect::connect_proxy_target(&target).await?;
     tracing::info!("Shadowsocks serving TCP {}", target_name(&target));
     relay_bidirectional_counted(&mut inbound, &mut outbound, session, "Shadowsocks").await
