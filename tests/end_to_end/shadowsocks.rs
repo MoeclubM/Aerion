@@ -153,12 +153,13 @@ async fn shadowsocks_server_with_core_records_tcp_traffic() -> Result<()> {
 #[tokio::test]
 async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
     use aerion::{CoreUser, ProxyCore};
+    use bytes::BytesMut;
     use shadowsocks::config::{ServerConfig, ServerType};
     use shadowsocks::context::Context as SsContext;
     use shadowsocks::relay::socks5::Address;
     use shadowsocks::relay::tcprelay::ProxyClientStream;
-    use shadowsocks::relay::udprelay::ProxySocket;
-    use shadowsocks::relay::udprelay::proxy_socket::UdpSocketType;
+    use shadowsocks::relay::udprelay::crypto_io::{decrypt_server_payload, encrypt_client_payload};
+    use shadowsocks::relay::udprelay::options::UdpSocketControlData;
 
     timeout(Duration::from_secs(15), async {
         for (method, key_len, external_core) in [
@@ -224,9 +225,8 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
             }
 
             // Both users share the same client address and session ID.
-            let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
-            udp_socket.set_nonblocking(true)?;
-            udp_socket.connect(addr)?;
+            let udp_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+            udp_socket.connect(addr).await?;
             let mut streams = Vec::new();
             let mut uot_streams = Vec::new();
             for (index, key) in keys.iter().enumerate() {
@@ -248,19 +248,28 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
                 anyhow::ensure!(echoed == payload, "SS2022 TCP payload mismatch");
                 streams.push(stream);
 
-                let socket = tokio::net::UdpSocket::from_std(udp_socket.try_clone()?)?;
-                let udp = ProxySocket::from_socket(
-                    UdpSocketType::Client,
-                    context.clone(),
-                    &client,
-                    shadowsocks::net::UdpSocket::from(socket),
+                let mut encrypted = BytesMut::new();
+                encrypt_client_payload(
+                    &context,
+                    client.method(),
+                    client.key(),
+                    &Address::SocketAddress(udp_target),
+                    &UdpSocketControlData::default(),
+                    &client.clone_identity_keys(),
+                    &payload,
+                    &mut encrypted,
                 );
-                udp.send(&Address::SocketAddress(udp_target), &payload)
-                    .await?;
+                udp_socket.send(&encrypted).await?;
                 let mut buffer = [0; 1024];
-                let (read, _, _) = timeout(Duration::from_secs(3), udp.recv(&mut buffer))
+                let read = timeout(Duration::from_secs(3), udp_socket.recv(&mut buffer))
                     .await
                     .context("SS2022 UDP echo timed out")??;
+                let (read, _, _) = decrypt_server_payload(
+                    &context,
+                    client.method(),
+                    client.key(),
+                    &mut buffer[..read],
+                )?;
                 anyhow::ensure!(&buffer[..read] == payload, "SS2022 UDP payload mismatch");
 
                 let mut uot = ProxyClientStream::connect(
