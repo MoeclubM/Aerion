@@ -257,6 +257,9 @@ async fn ss2022_multi_user_tcp_udp_and_uot_accounting() -> Result<()> {
                 streams.push(stream);
 
                 let mut encrypted = BytesMut::new();
+                if index == 1 {
+                    udp_socket.send(b"invalid").await?;
+                }
                 encrypt_client_payload(
                     &context,
                     client.method(),
