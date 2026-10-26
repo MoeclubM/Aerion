@@ -49,7 +49,7 @@ Local SOCKS CONNECT over HTTPS CONNECT. HTTP/1.1, HTTP/2, and HTTP/3 on both sid
 
 ### Shadowsocks
 
-TCP and UDP relay through `shadowsocks-rust` (AEAD, AEAD extra, AEAD-2022, AEAD-2022 extra). All three Shadowsocks 2022 ciphers support multiple users over TCP, UDP, and UoT, with per-user accounting and core limits. Server users use `name:base64-key`. AES clients use `server-key:user-key`; ChaCha20 clients use only their user key. ChaCha20 has no extensible identity header: the server authenticates the initial TCP header against configured keys and remembers authenticated UDP peer keys for subsequent packets. Unknown keys are rejected. SIP003 UoT over the TCP stream is implemented; SIP003 *plugins* are not.
+TCP and UDP relay through `shadowsocks-rust` (AEAD, AEAD extra, AEAD-2022, AEAD-2022 extra). Shadowsocks 2022 AES-128/AES-256 supports multiple users over TCP, UDP, and UoT, with per-user accounting and core limits. Server users use `name:base64-key`; clients use `server-key:user-key`. The ChaCha20 variant supports a single user. SIP003 UoT over the TCP stream is implemented; SIP003 *plugins* are not.
 
 ### Trojan
 
