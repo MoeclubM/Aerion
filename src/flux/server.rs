@@ -1346,3 +1346,66 @@ async fn get_or_create_server_udp_assoc(
     assocs.insert(assoc_id, assoc.clone());
     Ok(assoc)
 }
+
+#[cfg(test)]
+mod authentication_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejected_credentials_do_not_consume_replay_capacity() -> Result<()> {
+        let core = ProxyCore::new(vec![crate::core::CoreUser::password("u", "valid")])?;
+        let registry = Arc::new(FluxServerRegistry {
+            core,
+            udp_enabled: AtomicBool::new(true),
+            hello_replay: ReplayCache::new(Duration::from_secs(auth::HELLO_REPLAY_TTL_SECS), 1),
+            sessions: Mutex::new(HashMap::new()),
+            next_channel_uid: AtomicU64::new(1),
+        });
+        for (nonce, password, accepted) in
+            [(1, "wrong", false), (2, "wrong", false), (3, "valid", true)]
+        {
+            let (client, server) = tokio::io::duplex(4096);
+            let (mut reader, mut writer, _) = split_boxed_stream(Box::new(client));
+            let (server_reader, server_writer, guard) = split_boxed_stream(Box::new(server));
+            let registry = registry.clone();
+            let server_task = tokio::spawn(async move {
+                handle_server_channel(
+                    server_reader,
+                    server_writer,
+                    guard,
+                    "127.0.0.1:1234".parse().unwrap(),
+                    FluxTransportKind::Tcp,
+                    FluxSecurityMode::Tls,
+                    None,
+                    None,
+                    registry,
+                )
+                .await
+            });
+            let session_id = [nonce; 16];
+            let ephemeral = [nonce; 32];
+            let credential = crate::protocol::password_hash(password);
+            let blind = derive_blind_key(&[0; 32], &session_id, &ephemeral)?;
+            let key = handshake_key(&blind, &credential, &[0; 32])?;
+            let mut hello = FluxFrame::SessionHello {
+                session_id,
+                client_ephemeral_pub: ephemeral,
+                timestamp_secs: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+                channel_id: "test".into(),
+                blinded_credential: xor_32(&blind, &credential),
+                client_proof: [0; 32],
+            };
+            let proof = auth::client_proof(&key, &hello)?;
+            if let FluxFrame::SessionHello { client_proof, .. } = &mut hello {
+                *client_proof = proof;
+            }
+            writer.write_frame(&hello, true).await?;
+            let response = reader.read_frame().await?;
+            assert_eq!(response.is_some(), accepted);
+            drop(reader);
+            drop(writer);
+            assert_eq!(server_task.await?.is_ok(), accepted);
+        }
+        Ok(())
+    }
+}
