@@ -521,7 +521,8 @@ impl FluxClientPool {
         self: &Arc<Self>,
         failed: &ClientChannelHandle,
     ) -> Result<Arc<ClientChannelHandle>> {
-        for attempt in 0..4 {
+        let deadline = tokio::time::Instant::now() + super::config::SESSION_RESUME_TIMEOUT;
+        while tokio::time::Instant::now() < deadline {
             let candidates = self
                 .usable_channels()
                 .into_iter()
@@ -549,10 +550,16 @@ impl FluxClientPool {
                 self.warmer_wake.notify_one();
                 return Ok(best);
             }
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(80 * attempt as u64)).await;
+            if tokio::time::timeout_at(deadline, self.ensure_usable_channel(Some(failed.uid)))
+                .await
+                .is_err()
+            {
+                break;
             }
-            let _ = self.ensure_usable_channel(Some(failed.uid)).await;
+            tokio::select! {
+                _ = self.stop.stopped() => bail!("Flux client stopped"),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
         }
         bail!("all Flux channels unavailable for stream migration")
     }

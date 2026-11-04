@@ -1,3 +1,4 @@
+pub(crate) const SESSION_RESUME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 use crate::reality::{RealityClientConfig, RealityServerConfig};
 use crate::tls::ServerTlsMaterial;
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};

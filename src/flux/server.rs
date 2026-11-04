@@ -31,7 +31,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const MAX_UDP_SLICE_BYTES: usize = 1100;
-const SESSION_ORPHAN_GRACE: Duration = Duration::from_secs(20);
+const SESSION_ORPHAN_GRACE: Duration = super::config::SESSION_RESUME_TIMEOUT;
 const UDP_ASSOC_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const UDP_FRAG_TIMEOUT: Duration = Duration::from_secs(20);
 const CLOSED_STREAM_RING_CAP: usize = 512;

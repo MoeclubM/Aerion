@@ -2,7 +2,7 @@ use super::*;
 use crate::core::{CoreUser, ProxyCore};
 use crate::listener::ListenerStopToken;
 use crate::protocol::ProxyTarget;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -177,13 +177,19 @@ async fn replacing_listeners_preserves_the_target_connection() -> Result<()> {
         let mut stream = crate::socks::connect_tcp(addr, &ProxyTarget::Ip(target_addr)).await?;
         stream.write_all(b"before").await?;
         let mut response = [0; 6];
-        stream.read_exact(&mut response).await?;
+        stream
+            .read_exact(&mut response)
+            .await
+            .context("read echo before reload")?;
         stop.stop();
         server.wait().await?;
         config.listeners[0].ports = vec![port];
         let replacement = start_flux_server_with_state(config, &state, ListenerStopToken::new())?;
         stream.write_all(b"after!").await?;
-        tokio::time::timeout(Duration::from_secs(8), stream.read_exact(&mut response)).await??;
+        tokio::time::timeout(Duration::from_secs(8), stream.read_exact(&mut response))
+            .await
+            .context("resume timeout after listener replacement")?
+            .with_context(|| format!("resume echo after {transport:?} listener replacement"))?;
         assert_eq!(&response, b"after!");
         client.abort();
         let _ = client.await;
