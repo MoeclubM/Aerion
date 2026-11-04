@@ -147,6 +147,8 @@ pub struct ClientChannelHandle {
     smoothed_rtt_ms: AtomicU64,
     degraded_strikes: AtomicUsize,
     bytes_transferred: AtomicU64,
+    throughput_sample: StdMutex<(Instant, u64, u64)>,
+    throughput_degraded: AtomicBool,
     created_at: Instant,
     rotate_after: Option<Duration>,
     rotate_bytes_limit: Option<u64>,
@@ -383,6 +385,17 @@ impl FluxClientPool {
             .collect()
     }
 
+    fn new_stream_candidates(&self) -> Vec<Arc<ClientChannelHandle>> {
+        let mut channels = self.usable_channels();
+        if channels
+            .iter()
+            .any(|ch| ch.role == FluxChannelRole::Primary)
+        {
+            channels.retain(|ch| ch.role == FluxChannelRole::Primary);
+        }
+        channels
+    }
+
     fn has_usable_channel_excluding(&self, excluded_uid: Option<u64>) -> bool {
         self.channels
             .lock()
@@ -460,7 +473,7 @@ impl FluxClientPool {
 
     async fn pick_channel_for_new_stream(self: &Arc<Self>) -> Result<Arc<ClientChannelHandle>> {
         if let Some(best) = self
-            .usable_channels()
+            .new_stream_candidates()
             .into_iter()
             .min_by_key(|ch| self.score_channel_for_stream(ch))
         {
@@ -468,14 +481,14 @@ impl FluxClientPool {
             return Ok(best);
         }
         self.ensure_usable_channel(None).await?;
-        self.usable_channels()
+        self.new_stream_candidates()
             .into_iter()
             .min_by_key(|ch| self.score_channel_for_stream(ch))
             .context("no healthy Flux channel available")
     }
 
     async fn pick_channel_for_udp(self: &Arc<Self>) -> Result<Arc<ClientChannelHandle>> {
-        let usable = self.usable_channels();
+        let usable = self.new_stream_candidates();
         if let Some(best) = usable
             .iter()
             .filter(|ch| ch.transport == FluxTransportKind::Udp)
@@ -490,7 +503,7 @@ impl FluxClientPool {
             return Ok(best);
         }
         self.ensure_usable_channel(None).await?;
-        let usable = self.usable_channels();
+        let usable = self.new_stream_candidates();
         usable
             .iter()
             .filter(|ch| ch.transport == FluxTransportKind::Udp)
@@ -759,6 +772,8 @@ impl FluxClientPool {
             smoothed_rtt_ms: AtomicU64::new(init_rtt_ms),
             degraded_strikes: AtomicUsize::new(0),
             bytes_transferred: AtomicU64::new(0),
+            throughput_sample: StdMutex::new((Instant::now(), 0, 0)),
+            throughput_degraded: AtomicBool::new(false),
             created_at: Instant::now(),
             rotate_after,
             rotate_bytes_limit,
@@ -813,21 +828,44 @@ impl FluxClientPool {
     }
 
     async fn run_maintenance_loop(self: Arc<Self>, stop: ListenerStopToken) {
-        tokio::select! {
-            _ = stop.stopped() => return,
-            _ = self.warm_channels_now() => {},
-        }
+        let mut warming = JoinSet::new();
+        let mut tick = tokio::time::interval(Duration::from_millis(200));
+        let mut last_probe = Instant::now() - PROBE_INTERVAL;
         loop {
             tokio::select! {
                 _ = stop.stopped() => return,
-                _ = self.warmer_wake.notified() => {
-                    tokio::select! {
-                        _ = stop.stopped() => return,
-                        _ = self.warm_channels_now() => {},
+                _ = warming.join_next(), if !warming.is_empty() => {},
+                _ = self.warmer_wake.notified() => {},
+                _ = tick.tick() => {
+                    self.expire_unanswered_probes();
+                    if last_probe.elapsed() >= PROBE_INTERVAL {
+                        self.probe_and_rotate_channels().await;
+                        last_probe = Instant::now();
                     }
                 }
-                _ = tokio::time::sleep(PROBE_INTERVAL) => {
-                    self.probe_and_rotate_channels().await;
+            }
+            if warming.is_empty() && self.usable_channels().len() < self.target_warm_count() {
+                let pool = self.clone();
+                warming.spawn(async move { pool.warm_channels_now().await });
+            }
+        }
+    }
+
+    fn expire_unanswered_probes(&self) {
+        let now = self.now_micros();
+        for ch in self
+            .channels
+            .lock()
+            .expect("Flux client channels poisoned")
+            .values()
+        {
+            let pending = *ch.pending_ping.lock().expect("Flux ping poisoned");
+            if let Some((_, sent)) = pending {
+                let timeout_us = (ch.rtt_ms() * 3).max(600) * 1000;
+                if now.saturating_sub(sent) > timeout_us
+                    && now.saturating_sub(ch.last_rx_micros.load(Ordering::Relaxed)) > timeout_us
+                {
+                    ch.mark_dead();
                 }
             }
         }
@@ -842,12 +880,24 @@ impl FluxClientPool {
             .cloned()
             .collect::<Vec<_>>();
 
-        let mut need_warm =
-            snapshot.iter().filter(|ch| ch.is_usable_for_new()).count() < self.target_warm_count();
-
         for ch in &snapshot {
             if ch.is_dead() {
                 continue;
+            }
+            {
+                let total = ch.bytes_transferred.load(Ordering::Relaxed);
+                let mut sample = ch
+                    .throughput_sample
+                    .lock()
+                    .expect("Flux throughput poisoned");
+                let rate = (total.saturating_sub(sample.1) as f64
+                    / sample.0.elapsed().as_secs_f64().max(0.001))
+                    as u64;
+                ch.throughput_degraded.store(
+                    sample.2 > 0 && rate > 0 && rate < sample.2 / 2,
+                    Ordering::Relaxed,
+                );
+                *sample = (Instant::now(), total, sample.2.max(rate));
             }
             if ch.is_draining() {
                 if ch.active_streams.load(Ordering::Relaxed) == 0 {
@@ -856,7 +906,6 @@ impl FluxClientPool {
                 continue;
             }
             if ch.should_proactively_rotate() {
-                need_warm = true;
                 let others_usable = snapshot
                     .iter()
                     .filter(|other| other.uid != ch.uid && other.is_usable_for_new())
@@ -875,7 +924,6 @@ impl FluxClientPool {
                     && now.saturating_sub(ch.last_rx_micros.load(Ordering::Relaxed)) > timeout_us
                 {
                     ch.mark_dead();
-                    need_warm = true;
                 }
                 continue;
             }
@@ -892,10 +940,6 @@ impl FluxClientPool {
                 sent_micros: now,
                 padding: Bytes::from(pad),
             });
-        }
-
-        if need_warm {
-            let _ = self.warm_channels_now().await;
         }
     }
 }
@@ -1052,7 +1096,7 @@ async fn run_client_reader_loop(
                 let now = pool.now_micros();
                 let rtt_ms = now.saturating_sub(echo_micros) / 1000;
                 let degraded = ch.record_rtt_sample(rtt_ms.max(1));
-                if degraded {
+                if degraded && ch.throughput_degraded.load(Ordering::Relaxed) {
                     let healthier_exists = pool
                         .usable_channels()
                         .iter()
