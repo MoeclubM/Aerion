@@ -250,7 +250,7 @@ pub struct FluxChannelWireConfig {
         alias = "skip_cert_verify",
         alias = "allow_insecure"
     )]
-    pub insecure: bool,
+    pub insecure: Option<bool>,
     #[serde(alias = "reality-opts")]
     pub reality_opts: Option<FluxRealityWireOpts>,
     #[serde(alias = "public-key", alias = "public_key")]
@@ -334,6 +334,9 @@ impl FluxChannelWireConfig {
             .or_else(|| default_sni.map(str::trim).filter(|v| !v.is_empty()))
             .unwrap_or(&server_host)
             .to_string();
+        let inherited_sid = default_reality
+            .map(|r| hex::encode(r.short_id))
+            .unwrap_or_default();
         let reality = match security {
             FluxSecurityMode::Reality => {
                 if let Some(opts) = self
@@ -343,11 +346,19 @@ impl FluxChannelWireConfig {
                 {
                     Some(RealityClientConfig::from_strings(
                         &opts.public_key,
-                        &opts.short_id,
+                        if opts.short_id.is_empty() {
+                            &inherited_sid
+                        } else {
+                            &opts.short_id
+                        },
                     )?)
                 } else if let Some(pk) = self.public_key.as_deref().filter(|v| !v.trim().is_empty())
                 {
-                    let sid = self.short_id.as_deref().unwrap_or("");
+                    let sid = self
+                        .short_id
+                        .as_deref()
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or(&inherited_sid);
                     Some(RealityClientConfig::from_strings(pk, sid)?)
                 } else {
                     Some(default_reality.cloned().with_context(|| {
@@ -400,7 +411,7 @@ impl FluxChannelWireConfig {
             sni,
             alpn: self.alpn,
             fingerprint: self.fingerprint.or(default_fingerprint),
-            insecure: self.insecure || default_insecure,
+            insecure: self.insecure.unwrap_or(default_insecure),
             ca_cert_paths: Vec::new(),
             ca_certificates: Vec::new(),
             pinned_cert_sha256: Vec::new(),
