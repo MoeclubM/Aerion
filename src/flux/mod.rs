@@ -19,9 +19,8 @@ pub use config::{
     parse_transport_and_mode,
 };
 pub use server::{
-    RunningFluxServer, run_flux_server, run_flux_server_with_core,
-    run_flux_server_with_core_until, start_flux_server_with_core,
-    start_flux_server_with_core_and_stop,
+    RunningFluxServer, run_flux_server, run_flux_server_with_core, run_flux_server_with_core_until,
+    start_flux_server_with_core, start_flux_server_with_core_and_stop,
 };
 
 #[cfg(test)]

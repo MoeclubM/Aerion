@@ -235,7 +235,7 @@ fn hmac_tag(key: &[u8], parts: &[&[u8]]) -> Result<[u8; 32]> {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
         .map_err(|_| anyhow::anyhow!("init Flux obfs HMAC"))?;
     for part in parts {
-        mac.update(part);
+        Mac::update(&mut mac, part);
     }
     Ok(mac.finalize().into_bytes().into())
 }
@@ -332,7 +332,10 @@ pub async fn client_obfs_handshake(
         "Flux obfs server authentication failed"
     );
     let shared = secret.diffie_hellman(&PublicKey::from(server_pub));
-    ensure!(shared.was_contributory(), "invalid Flux obfs server ECDH key");
+    ensure!(
+        shared.was_contributory(),
+        "invalid Flux obfs server ECDH key"
+    );
     let (c2s_key, c2s_iv, s2c_key, s2c_iv) =
         derive_stream_keys(key_bytes, shared.as_bytes(), &client_pub, &server_pub)?;
     Ok(Box::new(spawn_obfs_stream(
@@ -388,7 +391,10 @@ pub async fn server_obfs_handshake(
     let secret = StaticSecret::from(secret_bytes);
     let server_pub = PublicKey::from(&secret).to_bytes();
     let shared = secret.diffie_hellman(&PublicKey::from(client_pub));
-    ensure!(shared.was_contributory(), "invalid Flux obfs client ECDH key");
+    ensure!(
+        shared.was_contributory(),
+        "invalid Flux obfs client ECDH key"
+    );
 
     let mut pad_seed = [0u8; 1];
     getrandom::fill(&mut pad_seed).map_err(|e| anyhow::anyhow!("Flux obfs pad random: {e}"))?;
@@ -508,7 +514,10 @@ fn spawn_obfs_stream(
                 .write_all(&ct)
                 .await
                 .context("write Flux obfs ciphertext")?;
-            wire_writer.flush().await.context("flush Flux obfs stream")?;
+            wire_writer
+                .flush()
+                .await
+                .context("flush Flux obfs stream")?;
             if read == 0 {
                 let _ = wire_writer.shutdown().await;
                 return Ok(());

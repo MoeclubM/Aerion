@@ -73,12 +73,8 @@ impl FluxFrameReader {
     pub async fn read_frame(&mut self) -> Result<Option<FluxFrame>> {
         loop {
             if self.buf.len() >= 4 {
-                let len = u32::from_be_bytes([
-                    self.buf[0],
-                    self.buf[1],
-                    self.buf[2],
-                    self.buf[3],
-                ]) as usize;
+                let len = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
+                    as usize;
                 ensure!(
                     (1..=MAX_FLUX_FRAME_LEN).contains(&len),
                     "invalid Flux frame length {len}"
@@ -129,7 +125,10 @@ impl FluxFrameWriter {
             && let Some(conn) = &self.quic_conn
         {
             let body = encode_frame_body(frame)?;
-            if conn.max_datagram_size().is_some_and(|max| body.len() <= max) {
+            if conn
+                .max_datagram_size()
+                .is_some_and(|max| body.len() <= max)
+            {
                 conn.send_datagram(body)
                     .context("send Flux QUIC datagram")?;
                 return Ok(());
@@ -387,16 +386,10 @@ async fn connect_client_stream_channel(
                     Some(tp_alpn)
                 }
             };
-            let tls_stream = reality_tls_client::connect(
-                tcp,
-                reality,
-                &channel.sni,
-                fingerprint,
-                alpn,
-                None,
-            )
-            .await
-            .with_context(|| format!("Flux REALITY handshake on channel {}", channel.id))?;
+            let tls_stream =
+                reality_tls_client::connect(tcp, reality, &channel.sni, fingerprint, alpn, None)
+                    .await
+                    .with_context(|| format!("Flux REALITY handshake on channel {}", channel.id))?;
             vless_transport::apply_client_transport(tls_stream, &vless_tp, &channel.server_host)
                 .await
         }
@@ -583,10 +576,7 @@ impl PreparedStreamListener {
                         .tls_acceptor
                         .as_ref()
                         .context("missing Flux TLS acceptor")?;
-                    let tls_stream = acceptor
-                        .accept(stream)
-                        .await
-                        .context("accept Flux TLS")?;
+                    let tls_stream = acceptor.accept(stream).await.context("accept Flux TLS")?;
                     vless_transport::serve_server_transport(
                         tls_stream,
                         &self.vless_transport,
@@ -605,7 +595,7 @@ impl PreparedStreamListener {
                     .obfs_replay
                     .clone()
                     .context("missing Flux server obfs replay")?;
-                let mut inner_handler = handler;
+                let inner_handler = handler;
                 vless_transport::serve_server_transport(
                     stream,
                     &self.vless_transport,
@@ -614,7 +604,8 @@ impl PreparedStreamListener {
                         let replay = replay.clone();
                         let mut next = inner_handler.clone();
                         async move {
-                            let decrypted = server_obfs_handshake(outer, &obfs_key, &replay).await?;
+                            let decrypted =
+                                server_obfs_handshake(outer, &obfs_key, &replay).await?;
                             next(decrypted).await
                         }
                     },
@@ -712,8 +703,8 @@ pub fn build_server_quic_endpoint(
                 reality.alpn_protocols.clone()
             };
             let tls_cfg = generate_ephemeral_quic_server_tls(&reality.server_name, alpn)?;
-            let crypto =
-                QuicServerConfig::try_from(tls_cfg).context("build Flux REALITY QUIC server TLS")?;
+            let crypto = QuicServerConfig::try_from(tls_cfg)
+                .context("build Flux REALITY QUIC server TLS")?;
             let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
             server_cfg.transport_config(transport_cfg);
             let reality_sock = RealityUdpSocket::new(udp_std, reality, listener.reality_fallback)?;

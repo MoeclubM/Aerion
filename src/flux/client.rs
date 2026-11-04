@@ -6,7 +6,9 @@ use super::frame::{
     DEFAULT_STREAM_WINDOW_BYTES, FluxFrame, MAX_FLUX_CHUNK_LEN, RecvOffsetAssembler,
     SendWindowBuffer, compute_server_proof, derive_reality_blind_key, xor_32,
 };
-use super::transport::{FluxChannelGuard, FluxFrameReader, FluxFrameWriter, connect_client_channel};
+use super::transport::{
+    FluxChannelGuard, FluxFrameReader, FluxFrameWriter, connect_client_channel,
+};
 use crate::core::{CoreSession, ProxyCore};
 use crate::listener::{self, ListenerStopToken};
 use crate::protocol::{ProxyTarget, constant_time_eq, password_hash};
@@ -23,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, Notify, mpsc};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinSet;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const MAX_UDP_SLICE_BYTES: usize = 1100;
@@ -293,12 +295,8 @@ impl FluxClientPool {
     }
 
     pub fn shutdown_all(&self) {
-        let channels = std::mem::take(
-            &mut *self
-                .channels
-                .lock()
-                .expect("Flux client channels poisoned"),
-        );
+        let channels =
+            std::mem::take(&mut *self.channels.lock().expect("Flux client channels poisoned"));
         for (_, ch) in channels {
             ch.mark_dead();
         }
@@ -454,7 +452,7 @@ impl FluxClientPool {
         }
 
         let candidates = self.discover_candidates().await?;
-        let mut selected = Vec::new();
+        let mut selected: Vec<CandidateEndpoint> = Vec::new();
         let needed = (target - active.len()).min(candidates.len());
 
         let mut remaining = candidates
@@ -575,8 +573,7 @@ impl FluxClientPool {
         .with_context(|| format!("Flux dial timed out for {} ({})", spec.id, cand.addr))??;
 
         let mut eph_bytes = [0u8; 32];
-        getrandom::fill(&mut eph_bytes)
-            .map_err(|e| anyhow::anyhow!("Flux hello random: {e}"))?;
+        getrandom::fill(&mut eph_bytes).map_err(|e| anyhow::anyhow!("Flux hello random: {e}"))?;
 
         let (client_ephemeral_pub, blind_key) = if spec.security == FluxSecurityMode::Reality {
             let reality = spec
@@ -631,7 +628,10 @@ impl FluxClientPool {
         else {
             bail!("expected Flux SessionOk frame");
         };
-        ensure!(status == 0, "Flux SessionHello rejected with status {status}");
+        ensure!(
+            status == 0,
+            "Flux SessionHello rejected with status {status}"
+        );
         ensure!(
             constant_time_eq(&server_proof, &expected_proof),
             "Flux server proof verification failed"
@@ -733,11 +733,8 @@ impl FluxClientPool {
             .cloned()
             .collect::<Vec<_>>();
 
-        let mut need_warm = snapshot
-            .iter()
-            .filter(|ch| ch.is_usable_for_new())
-            .count()
-            < self.target_warm_count();
+        let mut need_warm =
+            snapshot.iter().filter(|ch| ch.is_usable_for_new()).count() < self.target_warm_count();
 
         for ch in &snapshot {
             if ch.is_dead() {
@@ -1006,13 +1003,7 @@ async fn run_client_reader_loop(
                 ch.bytes_transferred
                     .fetch_add(payload.len() as u64, Ordering::Relaxed);
                 handle_client_udp_datagram(
-                    pool,
-                    assoc_id,
-                    packet_id,
-                    frag_index,
-                    frag_total,
-                    target,
-                    payload,
+                    pool, assoc_id, packet_id, frag_index, frag_total, target, payload,
                 )
                 .await;
             }
@@ -1147,10 +1138,7 @@ async fn handle_flux_socks_client(
                     .expect("Flux client streams poisoned")
                     .remove(&stream_id);
                 let _ = active_ch
-                    .send_stream(FluxFrame::StreamRst {
-                        stream_id,
-                        code: 0,
-                    })
+                    .send_stream(FluxFrame::StreamRst { stream_id, code: 0 })
                     .await;
                 return Err(err);
             }

@@ -359,8 +359,8 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
     let pkt = uot::encode_socks_udp_packet(&ProxyTarget::Ip(udp_target_addr), &udp_payload)?;
     assoc.udp.send_to(&pkt, assoc.bind).await?;
     let mut udp_resp = vec![0u8; 4096];
-    let (n, _) = tokio::time::timeout(Duration::from_secs(5), assoc.udp.recv_from(&mut udp_resp))
-        .await??;
+    let (n, _) =
+        tokio::time::timeout(Duration::from_secs(5), assoc.udp.recv_from(&mut udp_resp)).await??;
     let (_, decoded_udp) = uot::parse_socks_udp_packet(&udp_resp[..n])?;
     assert_eq!(decoded_udp, udp_payload.as_slice());
     drop(assoc);
@@ -564,7 +564,9 @@ async fn flux_hot_stream_migration_survives_mid_transfer_channel_cut() -> Result
     let mut inner_conn = socks::connect_tcp(socks_addr, &ProxyTarget::Ip(target_addr)).await?;
 
     // Phase 1: 64 KiB over primary TCP channel
-    let phase1 = (0..65536).map(|i| ((i * 7 + 3) % 256) as u8).collect::<Vec<_>>();
+    let phase1 = (0..65536)
+        .map(|i| ((i * 7 + 3) % 256) as u8)
+        .collect::<Vec<_>>();
     inner_conn.write_all(&phase1).await?;
     let mut recv1 = vec![0u8; phase1.len()];
     inner_conn.read_exact(&mut recv1).await?;
@@ -611,10 +613,7 @@ async fn flux_reality_tcp_and_udp_fallback_forwards_unauthenticated_probes() -> 
             let mut req = [0u8; 64];
             let _ = s.read(&mut req).await;
             let _ = s
-                .write_all(b"HTTP/1.1 200 OK
-Content-Length: 15
-
-BORROWED-ORIGIN")
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\nBORROWED-ORIGIN")
                 .await;
             let _ = s.shutdown().await;
         }
@@ -694,10 +693,7 @@ BORROWED-ORIGIN")
     // 1. Unauthenticated TCP HTTP probe -> forwarded to origin_tcp
     let mut probe_tcp = TcpStream::connect(running.tcp_addrs()[0]).await?;
     probe_tcp
-        .write_all(b"GET / HTTP/1.1
-Host: 127.0.0.1
-
-")
+        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
         .await?;
     let mut resp = Vec::new();
     probe_tcp.read_to_end(&mut resp).await?;

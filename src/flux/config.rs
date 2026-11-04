@@ -306,7 +306,10 @@ impl FluxChannelWireConfig {
         } else {
             self.server.trim().to_string()
         };
-        ensure!(!server_host.is_empty(), "Flux channel {id} server host is empty");
+        ensure!(
+            !server_host.is_empty(),
+            "Flux channel {id} server host is empty"
+        );
         let port_spec = self.ports.to_spec_string();
         let ports = if port_spec.is_empty() || port_spec == "0" {
             ensure!(default_port > 0, "Flux channel {id} port is missing");
@@ -341,19 +344,14 @@ impl FluxChannelWireConfig {
                         &opts.public_key,
                         &opts.short_id,
                     )?)
-                } else if let Some(pk) = self
-                    .public_key
-                    .as_deref()
-                    .filter(|v| !v.trim().is_empty())
+                } else if let Some(pk) = self.public_key.as_deref().filter(|v| !v.trim().is_empty())
                 {
                     let sid = self.short_id.as_deref().unwrap_or("");
                     Some(RealityClientConfig::from_strings(pk, sid)?)
                 } else {
-                    Some(
-                        default_reality.cloned().with_context(|| {
-                            format!("Flux channel {id} requires REALITY public_key")
-                        })?,
-                    )
+                    Some(default_reality.cloned().with_context(|| {
+                        format!("Flux channel {id} requires REALITY public_key")
+                    })?)
                 }
             }
             _ => None,
@@ -572,10 +570,7 @@ impl FluxClientConfig {
     pub fn all_static_ips(&self) -> Vec<IpAddr> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        if let Ok(ip) = self
-            .server_host
-            .trim_matches(['[', ']'])
-            .parse::<IpAddr>()
+        if let Ok(ip) = self.server_host.trim_matches(['[', ']']).parse::<IpAddr>()
             && seen.insert(ip)
         {
             out.push(ip);

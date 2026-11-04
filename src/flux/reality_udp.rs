@@ -335,7 +335,7 @@ impl RealityUdpSocket {
         }
     }
 
-    fn forward_probe(&self, peer: SocketAddr, datagram: Vec<u8>) {
+    fn forward_probe(&self, peer: SocketAddr, mut datagram: Vec<u8>) {
         if !self.enable_fallback {
             return;
         }
@@ -347,8 +347,11 @@ impl RealityUdpSocket {
             .lock()
             .expect("REALITY UDP fallback_relays lock poisoned");
         if let Some(tx) = relays.get(&peer) {
-            if tx.try_send(datagram).is_ok() {
-                return;
+            match tx.try_send(datagram) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => return,
+                Err(mpsc::error::TrySendError::Closed(returned)) => {
+                    datagram = returned;
+                }
             }
             relays.remove(&peer);
         }
@@ -361,15 +364,9 @@ impl RealityUdpSocket {
         let server_io = self.io.clone();
         let relays_map = self.fallback_relays.clone();
         tokio::spawn(async move {
-            let _ = run_udp_fallback_relay(
-                peer,
-                target_host,
-                target_port,
-                limit,
-                server_io,
-                &mut rx,
-            )
-            .await;
+            let _ =
+                run_udp_fallback_relay(peer, target_host, target_port, limit, server_io, &mut rx)
+                    .await;
             relays_map
                 .lock()
                 .expect("REALITY UDP fallback_relays lock poisoned")

@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -237,15 +237,11 @@ async fn run_quic_listener_loop(
                 }
             };
             let peer_addr = connection.remote_address();
-            let (send, recv) = match tokio::time::timeout(
-                Duration::from_secs(10),
-                connection.accept_bi(),
-            )
-            .await
-            {
-                Ok(Ok(pair)) => pair,
-                _ => return,
-            };
+            let (send, recv) =
+                match tokio::time::timeout(Duration::from_secs(10), connection.accept_bi()).await {
+                    Ok(Ok(pair)) => pair,
+                    _ => return,
+                };
             let (reader, writer, guard) = split_quic_channel(send, recv, connection, None);
             if let Err(err) = handle_server_channel(
                 reader,
@@ -448,10 +444,7 @@ impl FluxServerSession {
         if !preferred.is_dead() {
             return Some(preferred.clone());
         }
-        let channels = self
-            .channels
-            .lock()
-            .expect("Flux server channels poisoned");
+        let channels = self.channels.lock().expect("Flux server channels poisoned");
         channels
             .values()
             .find(|ch| !ch.is_dead() && ch.transport == FluxTransportKind::Udp)
@@ -601,8 +594,8 @@ async fn handle_server_channel(
 
     let blind_key = if security == FluxSecurityMode::Reality {
         let priv_key = reality_private_key.context("missing Flux REALITY private key")?;
-        let shared = StaticSecret::from(priv_key)
-            .diffie_hellman(&PublicKey::from(client_ephemeral_pub));
+        let shared =
+            StaticSecret::from(priv_key).diffie_hellman(&PublicKey::from(client_ephemeral_pub));
         ensure!(shared.was_contributory(), "invalid Flux REALITY ECDH key");
         derive_reality_blind_key(shared.as_bytes(), &session_id)?
     } else {
@@ -646,8 +639,9 @@ async fn handle_server_channel(
     let writer_ch = ch_handle.clone();
     let writer_cancel = session.core_session.clone();
     let writer_task = tokio::spawn(async move {
-        let res = run_channel_writer_loop(&mut writer, &mut prio_rx, &mut stream_rx, &writer_cancel)
-            .await;
+        let res =
+            run_channel_writer_loop(&mut writer, &mut prio_rx, &mut stream_rx, &writer_cancel)
+                .await;
         writer_ch.mark_dead();
         let _ = writer.shutdown().await;
         res
@@ -743,15 +737,8 @@ async fn run_server_channel_reader(
                 if session.is_stream_closed(stream_id) {
                     continue;
                 }
-                spawn_or_get_server_stream(
-                    session,
-                    ch,
-                    stream_id,
-                    epoch,
-                    target,
-                    initial_payload,
-                )
-                .await;
+                spawn_or_get_server_stream(session, ch, stream_id, epoch, target, initial_payload)
+                    .await;
             }
             FluxFrame::StreamData {
                 stream_id,
@@ -798,10 +785,7 @@ async fn run_server_channel_reader(
             } => {
                 if session.is_stream_closed(stream_id) {
                     let _ = ch
-                        .send_stream(FluxFrame::StreamRst {
-                            stream_id,
-                            code: 1,
-                        })
+                        .send_stream(FluxFrame::StreamRst { stream_id, code: 1 })
                         .await;
                     continue;
                 }
@@ -820,21 +804,11 @@ async fn run_server_channel_reader(
                         })
                         .await;
                 } else if resume_offset == 0 {
-                    spawn_or_get_server_stream(
-                        session,
-                        ch,
-                        stream_id,
-                        epoch,
-                        target,
-                        Bytes::new(),
-                    )
-                    .await;
+                    spawn_or_get_server_stream(session, ch, stream_id, epoch, target, Bytes::new())
+                        .await;
                 } else {
                     let _ = ch
-                        .send_stream(FluxFrame::StreamRst {
-                            stream_id,
-                            code: 2,
-                        })
+                        .send_stream(FluxFrame::StreamRst { stream_id, code: 2 })
                         .await;
                 }
             }
@@ -879,14 +853,7 @@ async fn run_server_channel_reader(
             } => {
                 if udp_enabled {
                     let _ = handle_server_udp_datagram(
-                        session,
-                        ch,
-                        assoc_id,
-                        packet_id,
-                        frag_index,
-                        frag_total,
-                        target,
-                        payload,
+                        session, ch, assoc_id, packet_id, frag_index, frag_total, target, payload,
                     )
                     .await;
                 }
@@ -907,23 +874,30 @@ async fn spawn_or_get_server_stream(
     initial_payload: Bytes,
 ) {
     let (tx, rx) = mpsc::channel::<ServerStreamEvent>(128);
-    {
-        let mut streams = session.streams.lock().expect("Flux server streams poisoned");
+    let existing = {
+        let mut streams = session
+            .streams
+            .lock()
+            .expect("Flux server streams poisoned");
         if let Some(existing) = streams.get(&stream_id).cloned() {
-            drop(streams);
-            if !initial_payload.is_empty() {
-                let _ = existing
-                    .send(ServerStreamEvent::Data {
-                        epoch,
-                        offset: 0,
-                        payload: initial_payload,
-                        reply_ch: ch.clone(),
-                    })
-                    .await;
-            }
-            return;
+            Some(existing)
+        } else {
+            streams.insert(stream_id, tx);
+            None
         }
-        streams.insert(stream_id, tx);
+    };
+    if let Some(existing) = existing {
+        if !initial_payload.is_empty() {
+            let _ = existing
+                .send(ServerStreamEvent::Data {
+                    epoch,
+                    offset: 0,
+                    payload: initial_payload,
+                    reply_ch: ch.clone(),
+                })
+                .await;
+        }
+        return;
     }
 
     let session_clone = session.clone();
@@ -959,10 +933,7 @@ async fn run_server_stream(
         Ok(stream) => stream,
         Err(err) => {
             let _ = active_ch
-                .send_stream(FluxFrame::StreamRst {
-                    stream_id,
-                    code: 1,
-                })
+                .send_stream(FluxFrame::StreamRst { stream_id, code: 1 })
                 .await;
             return Err(err);
         }
@@ -1144,7 +1115,10 @@ async fn handle_server_udp_datagram(
     target: ProxyTarget,
     payload: Bytes,
 ) -> Result<()> {
-    ensure!(frag_total >= 1 && frag_index < frag_total, "invalid Flux UDP fragment header");
+    ensure!(
+        frag_total >= 1 && frag_index < frag_total,
+        "invalid Flux UDP fragment header"
+    );
     let complete = if frag_total == 1 {
         (target, payload.to_vec())
     } else {
@@ -1186,10 +1160,7 @@ async fn handle_server_udp_datagram(
         .preferred_ch
         .lock()
         .expect("Flux UDP preferred_ch poisoned") = ch.clone();
-    *assoc
-        .last_seen
-        .lock()
-        .expect("Flux UDP last_seen poisoned") = Instant::now();
+    *assoc.last_seen.lock().expect("Flux UDP last_seen poisoned") = Instant::now();
     socket_protect::send_to_dual_stack(&assoc.socket, &data, dest_addr)
         .await
         .context("send Flux outbound UDP")?;
@@ -1290,10 +1261,7 @@ async fn get_or_create_server_udp_assoc(
             }
         }
     });
-    *assoc
-        .recv_task
-        .lock()
-        .expect("Flux UDP recv_task poisoned") = Some(task);
+    *assoc.recv_task.lock().expect("Flux UDP recv_task poisoned") = Some(task);
     assocs.insert(assoc_id, assoc.clone());
     Ok(assoc)
 }

@@ -243,7 +243,9 @@ mod windows_udp {
 }
 
 #[cfg(windows)]
-pub(crate) fn disable_windows_udp_connreset<S: std::os::windows::io::AsRawSocket>(socket: &S) -> Result<()> {
+pub(crate) fn disable_windows_udp_connreset<S: std::os::windows::io::AsRawSocket>(
+    socket: &S,
+) -> Result<()> {
     windows_udp::disable_connreset(socket)
 }
 

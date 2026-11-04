@@ -134,7 +134,10 @@ pub fn encode_frame_body(frame: &FluxFrame) -> Result<Bytes> {
             blinded_credential,
         } => {
             let id_bytes = channel_id.as_bytes();
-            ensure!(id_bytes.len() <= u8::MAX as usize, "Flux channel_id too long");
+            ensure!(
+                id_bytes.len() <= u8::MAX as usize,
+                "Flux channel_id too long"
+            );
             buf.put_u8(FRAME_SESSION_HELLO);
             buf.put_u8(FLUX_WIRE_VERSION);
             buf.put_slice(session_id);
@@ -282,7 +285,10 @@ pub fn decode_frame_body(body: &[u8]) -> Result<FluxFrame> {
     let rest = &body[1..];
     match kind {
         FRAME_SESSION_HELLO => {
-            ensure!(rest.len() >= 1 + 16 + 32 + 8 + 1 + 32, "short Flux SessionHello");
+            ensure!(
+                rest.len() >= 1 + 16 + 32 + 8 + 1 + 32,
+                "short Flux SessionHello"
+            );
             ensure!(
                 rest[0] == FLUX_WIRE_VERSION,
                 "unsupported Flux wire version {}",
@@ -351,7 +357,10 @@ pub fn decode_frame_body(body: &[u8]) -> Result<FluxFrame> {
             let (target, tail) = decode_target(&rest[8..])?;
             ensure!(tail.len() >= 2, "short Flux StreamOpen initial length");
             let init_len = usize::from(u16::from_be_bytes([tail[0], tail[1]]));
-            ensure!(tail.len() == 2 + init_len, "invalid Flux StreamOpen payload");
+            ensure!(
+                tail.len() == 2 + init_len,
+                "invalid Flux StreamOpen payload"
+            );
             Ok(FluxFrame::StreamOpen {
                 stream_id,
                 epoch,
