@@ -1,7 +1,8 @@
+use super::auth::{self, derive_blind_key, handshake_key, xor_32};
 use super::config::{FluxSecurityMode, FluxServerConfig, FluxTransportKind};
 use super::frame::{
     DEFAULT_STREAM_WINDOW_BYTES, FluxFrame, MAX_FLUX_CHUNK_LEN, RecvOffsetAssembler,
-    SendWindowBuffer, compute_server_proof, derive_reality_blind_key, xor_32,
+    SendWindowBuffer,
 };
 use super::transport::{
     FluxChannelGuard, FluxFrameReader, FluxFrameWriter, PreparedStreamListener,
@@ -35,6 +36,20 @@ const UDP_ASSOC_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const UDP_FRAG_TIMEOUT: Duration = Duration::from_secs(20);
 const CLOSED_STREAM_RING_CAP: usize = 512;
 
+/// Session state is owned by the node controller and survives listener replacement.
+#[derive(Clone)]
+pub struct FluxServerState {
+    registry: Arc<FluxServerRegistry>,
+}
+
+impl FluxServerState {
+    pub fn new(core: ProxyCore, udp_enabled: bool) -> Self {
+        Self {
+            registry: Arc::new(FluxServerRegistry::new(core, udp_enabled)),
+        }
+    }
+}
+
 pub struct RunningFluxServer {
     tcp_addrs: Vec<SocketAddr>,
     udp_addrs: Vec<SocketAddr>,
@@ -67,8 +82,7 @@ impl RunningFluxServer {
             match res {
                 Ok(Ok(())) => {
                     if self.stop.is_stopped() {
-                        self.tasks.shutdown().await;
-                        return Ok(());
+                        continue;
                     }
                 }
                 Ok(Err(err)) => {
@@ -118,8 +132,18 @@ pub fn start_flux_server_with_core_and_stop(
     core: ProxyCore,
     stop: ListenerStopToken,
 ) -> Result<RunningFluxServer> {
+    let state = FluxServerState::new(core, config.udp);
+    start_flux_server_with_state(config, &state, stop)
+}
+
+pub fn start_flux_server_with_state(
+    config: FluxServerConfig,
+    state: &FluxServerState,
+    stop: ListenerStopToken,
+) -> Result<RunningFluxServer> {
     config.validate()?;
-    let registry = Arc::new(FluxServerRegistry::new(core, config.udp));
+    let registry = state.registry.clone();
+    registry.udp_enabled.store(config.udp, Ordering::Release);
 
     let mut explicit_v4_ports = HashSet::<(u16, bool)>::new();
     for listener in &config.listeners {
@@ -154,9 +178,17 @@ pub fn start_flux_server_with_core_and_stop(
                     let stop_token = stop.clone();
                     let security = listener_cfg.security;
                     let reality_priv = listener_cfg.reality.as_ref().map(|r| r.private_key);
+                    let obfs_key = listener_cfg.obfs_key.clone();
                     tasks.spawn(async move {
-                        run_quic_listener_loop(endpoint, security, reality_priv, reg, stop_token)
-                            .await
+                        run_quic_listener_loop(
+                            endpoint,
+                            security,
+                            reality_priv,
+                            obfs_key,
+                            reg,
+                            stop_token,
+                        )
+                        .await
                     });
                 }
             }
@@ -217,6 +249,7 @@ async fn run_quic_listener_loop(
     endpoint: quinn::Endpoint,
     security: FluxSecurityMode,
     reality_private_key: Option<[u8; 32]>,
+    obfs_key: Option<String>,
     registry: Arc<FluxServerRegistry>,
     stop: ListenerStopToken,
 ) -> Result<()> {
@@ -245,6 +278,7 @@ async fn run_quic_listener_loop(
             }
         };
         let reg = registry.clone();
+        let obfs_key = obfs_key.clone();
         tokio::spawn(async move {
             let connection = match incoming.await {
                 Ok(conn) => conn,
@@ -268,6 +302,7 @@ async fn run_quic_listener_loop(
                 FluxTransportKind::Udp,
                 security,
                 reality_private_key,
+                obfs_key,
                 reg,
             )
             .await
@@ -302,9 +337,11 @@ async fn run_stream_listener_loop(
             let transport_kind = prepared.config.transport;
             let security = prepared.config.security;
             let reality_priv = prepared.config.reality.as_ref().map(|r| r.private_key);
+            let obfs_key = prepared.config.obfs_key.clone();
             let res = prepared
                 .accept_and_serve(stream, local_port, move |boxed_stream| {
                     let reg = reg.clone();
+                    let obfs_key = obfs_key.clone();
                     async move {
                         let (reader, writer, guard) = split_boxed_stream(boxed_stream);
                         handle_server_channel(
@@ -315,6 +352,7 @@ async fn run_stream_listener_loop(
                             transport_kind,
                             security,
                             reality_priv,
+                            obfs_key,
                             reg,
                         )
                         .await
@@ -355,7 +393,14 @@ impl ServerChannelHandle {
         if self.is_dead() {
             return false;
         }
-        self.stream_tx.send(frame).await.is_ok()
+        tokio::select! {
+            _ = self.guard.closed() => false,
+            _ = tokio::time::sleep(Duration::from_millis(600)) => {
+                self.mark_dead();
+                false
+            }
+            result = self.stream_tx.send(frame) => result.is_ok(),
+        }
     }
 }
 
@@ -472,7 +517,7 @@ impl FluxServerSession {
 
 struct FluxServerRegistry {
     core: ProxyCore,
-    udp_enabled: bool,
+    udp_enabled: AtomicBool,
     hello_replay: ReplayCache<[u8; 48]>,
     sessions: Mutex<HashMap<[u8; 16], Arc<FluxServerSession>>>,
     next_channel_uid: AtomicU64,
@@ -482,8 +527,8 @@ impl FluxServerRegistry {
     fn new(core: ProxyCore, udp_enabled: bool) -> Self {
         Self {
             core,
-            udp_enabled,
-            hello_replay: ReplayCache::new(Duration::from_secs(240), 16384),
+            udp_enabled: AtomicBool::new(udp_enabled),
+            hello_replay: ReplayCache::new(Duration::from_secs(auth::HELLO_REPLAY_TTL_SECS), 16384),
             sessions: Mutex::new(HashMap::new()),
             next_channel_uid: AtomicU64::new(1),
         }
@@ -574,6 +619,7 @@ async fn handle_server_channel(
     transport: FluxTransportKind,
     security: FluxSecurityMode,
     reality_private_key: Option<[u8; 32]>,
+    obfs_key: Option<String>,
     registry: Arc<FluxServerRegistry>,
 ) -> Result<()> {
     let first_frame = tokio::time::timeout(Duration::from_secs(10), reader.read_frame())
@@ -584,9 +630,10 @@ async fn handle_server_channel(
         session_id,
         client_ephemeral_pub,
         timestamp_secs,
-        channel_id: _channel_id,
+        channel_id: _,
         blinded_credential,
-    } = first_frame
+        client_proof,
+    } = first_frame.clone()
     else {
         bail!("expected Flux SessionHello as first frame");
     };
@@ -596,10 +643,31 @@ async fn handle_server_channel(
         .unwrap_or_default()
         .as_secs();
     ensure!(
-        now_secs.abs_diff(timestamp_secs) <= 180,
+        now_secs.abs_diff(timestamp_secs) <= auth::HELLO_CLOCK_SKEW_SECS,
         "Flux SessionHello timestamp outside allowed window"
     );
 
+    let binding = guard.channel_binding()?;
+    let blind_key = if security == FluxSecurityMode::Reality {
+        let priv_key = reality_private_key.context("missing Flux REALITY private key")?;
+        let shared =
+            StaticSecret::from(priv_key).diffie_hellman(&PublicKey::from(client_ephemeral_pub));
+        ensure!(shared.was_contributory(), "invalid Flux REALITY ECDH key");
+        derive_blind_key(shared.as_bytes(), &session_id, &binding)?
+    } else {
+        derive_blind_key(
+            obfs_key.as_deref().map(str::as_bytes).unwrap_or(&binding),
+            &session_id,
+            &client_ephemeral_pub,
+        )?
+    };
+    let cred_hash = xor_32(&blinded_credential, &blind_key);
+    let auth_key = handshake_key(&blind_key, &cred_hash, &binding)?;
+    ensure!(
+        constant_time_eq(&client_proof, &auth::client_proof(&auth_key, &first_frame)?),
+        "Flux client proof verification failed"
+    );
+    registry.core.validate_password_hash(&cred_hash)?;
     let mut replay_key = [0u8; 48];
     replay_key[..16].copy_from_slice(&session_id);
     replay_key[16..].copy_from_slice(&client_ephemeral_pub);
@@ -609,28 +677,18 @@ async fn handle_server_channel(
         Err(ReplayError::Full) => bail!("Flux SessionHello replay cache full"),
     }
 
-    let blind_key = if security == FluxSecurityMode::Reality {
-        let priv_key = reality_private_key.context("missing Flux REALITY private key")?;
-        let shared =
-            StaticSecret::from(priv_key).diffie_hellman(&PublicKey::from(client_ephemeral_pub));
-        ensure!(shared.was_contributory(), "invalid Flux REALITY ECDH key");
-        derive_reality_blind_key(shared.as_bytes(), &session_id)?
-    } else {
-        derive_reality_blind_key(&client_ephemeral_pub, &session_id)?
-    };
-    let cred_hash = xor_32(&blinded_credential, &blind_key);
     let session = registry
         .get_or_open_session(session_id, cred_hash, peer_addr)
         .await?;
 
-    let verify_key = xor_32(&blind_key, &cred_hash);
-    let server_proof = compute_server_proof(&verify_key, &session_id, &client_ephemeral_pub)?;
+    let udp_enabled = registry.udp_enabled.load(Ordering::Acquire);
+    let server_proof = auth::server_proof(&auth_key, &first_frame, udp_enabled)?;
     writer
         .write_frame(
             &FluxFrame::SessionOk {
                 status: 0,
                 server_proof,
-                udp_enabled: registry.udp_enabled,
+                udp_enabled,
             },
             true,
         )
@@ -656,16 +714,22 @@ async fn handle_server_channel(
     let writer_ch = ch_handle.clone();
     let writer_cancel = session.core_session.clone();
     let writer_task = tokio::spawn(async move {
-        let res =
-            run_channel_writer_loop(&mut writer, &mut prio_rx, &mut stream_rx, &writer_cancel)
-                .await;
+        let res = tokio::select! {
+            _ = writer_ch.guard.closed() => Ok(()),
+            res = run_channel_writer_loop(&mut writer, &mut prio_rx, &mut stream_rx, &writer_cancel) => res,
+        };
         writer_ch.mark_dead();
         let _ = writer.shutdown().await;
         res
     });
 
-    let read_res =
-        run_server_channel_reader(&mut reader, &ch_handle, &session, registry.udp_enabled).await;
+    let read_res = run_server_channel_reader(
+        &mut reader,
+        &ch_handle,
+        &session,
+        registry.udp_enabled.load(Ordering::Acquire),
+    )
+    .await;
     ch_handle.mark_dead();
     writer_task.abort();
     session

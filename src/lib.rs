@@ -62,12 +62,12 @@ pub use core::{
 pub use flux::{
     FluxCertMode, FluxChannelClientConfig, FluxChannelRole, FluxChannelServerConfig,
     FluxChannelWireConfig, FluxClientConfig, FluxClientPool, FluxHttpMode, FluxIpStrategy,
-    FluxOptions, FluxRealityWireOpts, FluxSecurityMode, FluxServerConfig, FluxTransportKind,
-    MAX_FLUX_EXPANDED_PORTS, PortSpecInput, RunningFluxServer, parse_port_spec, run_flux_client,
-    run_flux_client_listener, run_flux_client_listener_with_core,
+    FluxOptions, FluxRealityWireOpts, FluxSecurityMode, FluxServerConfig, FluxServerState,
+    FluxTransportKind, MAX_FLUX_EXPANDED_PORTS, PortSpecInput, RunningFluxServer, parse_port_spec,
+    run_flux_client, run_flux_client_listener, run_flux_client_listener_with_core,
     run_flux_client_listener_with_core_until, run_flux_server, run_flux_server_with_core,
     run_flux_server_with_core_until, start_flux_server_with_core,
-    start_flux_server_with_core_and_stop,
+    start_flux_server_with_core_and_stop, start_flux_server_with_state,
 };
 pub use http_connect::{
     HttpConnectInboundConfig, HttpProxyClientConfig, handle_http_connect,

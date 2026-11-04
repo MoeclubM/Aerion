@@ -342,6 +342,19 @@ impl ProxyCore {
         self.open_session_with_source(&user_id, source_ip).await
     }
 
+    pub(crate) fn validate_password_hash(&self, hash: &[u8; 32]) -> Result<()> {
+        ensure!(
+            self.inner
+                .credentials
+                .read()
+                .expect("core credentials lock poisoned")
+                .password_hashes
+                .contains_key(hash),
+            "authentication failed"
+        );
+        Ok(())
+    }
+
     pub(crate) async fn authenticate_password_hash_from(
         &self,
         hash: &[u8; 32],

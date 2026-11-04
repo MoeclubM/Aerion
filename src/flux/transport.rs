@@ -11,6 +11,7 @@ use super::reality_udp::{
     RealityCidGenerator, RealityQuicCertVerifier, RealityUdpSocket,
     generate_ephemeral_quic_server_tls,
 };
+use crate::listener::ListenerStopToken;
 use crate::quic;
 use crate::reality::{self, RealityCertificateState, RealityServerConfig};
 use crate::reality_tls_client;
@@ -38,15 +39,30 @@ const QUIC_CONN_WINDOW: u32 = 20 * 1024 * 1024;
 const QUIC_DATAGRAM_BUF: usize = 4 * 1024 * 1024;
 
 pub struct FluxChannelGuard {
+    stop: ListenerStopToken,
     quic_conn: Option<quinn::Connection>,
     _quic_endpoint: Option<Endpoint>,
 }
 
 impl FluxChannelGuard {
     pub fn close(&self) {
+        self.stop.stop();
         if let Some(conn) = &self.quic_conn {
             conn.close(VarInt::from_u32(0), b"flux channel closed");
         }
+    }
+
+    pub async fn closed(&self) {
+        self.stop.stopped().await;
+    }
+
+    pub fn channel_binding(&self) -> Result<[u8; 32]> {
+        let mut binding = [0; 32];
+        if let Some(conn) = &self.quic_conn {
+            conn.export_keying_material(&mut binding, b"EXPORTER-Flux-v2", b"")
+                .map_err(|_| anyhow::anyhow!("export Flux QUIC channel binding"))?;
+        }
+        Ok(binding)
     }
 }
 
@@ -71,6 +87,14 @@ pub struct FluxFrameWriter {
 
 impl FluxFrameReader {
     pub async fn read_frame(&mut self) -> Result<Option<FluxFrame>> {
+        let guard = self._guard.clone();
+        tokio::select! {
+            _ = guard.closed() => Ok(None),
+            result = self.read_frame_inner() => result,
+        }
+    }
+
+    async fn read_frame_inner(&mut self) -> Result<Option<FluxFrame>> {
         loop {
             if self.buf.len() >= 4 {
                 let len = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
@@ -121,6 +145,14 @@ impl FluxFrameReader {
 
 impl FluxFrameWriter {
     pub async fn write_frame(&mut self, frame: &FluxFrame, flush: bool) -> Result<()> {
+        let guard = self._guard.clone();
+        tokio::select! {
+            _ = guard.closed() => bail!("Flux channel closed"),
+            result = self.write_frame_inner(frame, flush) => result,
+        }
+    }
+
+    async fn write_frame_inner(&mut self, frame: &FluxFrame, flush: bool) -> Result<()> {
         if matches!(frame, FluxFrame::UdpDatagram { .. })
             && let Some(conn) = &self.quic_conn
         {
@@ -145,14 +177,14 @@ impl FluxFrameWriter {
     }
 
     pub async fn flush(&mut self) -> Result<()> {
-        self.writer
-            .flush()
-            .await
-            .context("flush Flux channel stream")
+        tokio::select! {
+            _ = self._guard.closed() => bail!("Flux channel closed"),
+            result = self.writer.flush() => result.context("flush Flux channel stream"),
+        }
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
-        let _ = self.writer.shutdown().await;
+        self._guard.close();
         Ok(())
     }
 }
@@ -162,6 +194,7 @@ pub fn split_boxed_stream(
 ) -> (FluxFrameReader, FluxFrameWriter, Arc<FluxChannelGuard>) {
     let (reader, writer) = tokio::io::split(stream);
     let guard = Arc::new(FluxChannelGuard {
+        stop: ListenerStopToken::new(),
         quic_conn: None,
         _quic_endpoint: None,
     });
@@ -188,6 +221,7 @@ pub fn split_quic_channel(
     endpoint: Option<Endpoint>,
 ) -> (FluxFrameReader, FluxFrameWriter, Arc<FluxChannelGuard>) {
     let guard = Arc::new(FluxChannelGuard {
+        stop: ListenerStopToken::new(),
         quic_conn: Some(connection.clone()),
         _quic_endpoint: endpoint,
     });

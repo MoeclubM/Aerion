@@ -1,13 +1,10 @@
 use crate::protocol::{ProxyTarget, decode_target, encode_target};
 use anyhow::{Context, Result, bail, ensure};
 use bytes::{BufMut, Bytes, BytesMut};
-use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use std::collections::VecDeque;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const FLUX_WIRE_VERSION: u8 = 1;
+pub const FLUX_WIRE_VERSION: u8 = 2;
 pub const MAX_FLUX_FRAME_LEN: usize = 128 * 1024;
 pub const MAX_FLUX_CHUNK_LEN: usize = 32 * 1024;
 pub const DEFAULT_STREAM_WINDOW_BYTES: usize = 256 * 1024;
@@ -24,8 +21,6 @@ const FRAME_STREAM_FIN: u8 = 0x14;
 const FRAME_STREAM_RST: u8 = 0x15;
 const FRAME_UDP_DATAGRAM: u8 = 0x20;
 
-type HmacSha256 = Hmac<Sha256>;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FluxFrame {
     SessionHello {
@@ -34,6 +29,7 @@ pub enum FluxFrame {
         timestamp_secs: u64,
         channel_id: String,
         blinded_credential: [u8; 32],
+        client_proof: [u8; 32],
     },
     SessionOk {
         status: u8,
@@ -91,38 +87,6 @@ pub enum FluxFrame {
     },
 }
 
-pub fn derive_reality_blind_key(
-    shared_secret: &[u8; 32],
-    session_id: &[u8; 16],
-) -> Result<[u8; 32]> {
-    let hkdf = Hkdf::<Sha256>::new(Some(session_id), shared_secret);
-    let mut out = [0u8; 32];
-    hkdf.expand(b"flux-reality-blind-v1", &mut out)
-        .map_err(|_| anyhow::anyhow!("derive Flux REALITY blind key failed"))?;
-    Ok(out)
-}
-
-pub fn xor_32(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    for ((dst, a), b) in out.iter_mut().zip(left.iter()).zip(right.iter()) {
-        *dst = *a ^ *b;
-    }
-    out
-}
-
-pub fn compute_server_proof(
-    verify_key: &[u8; 32],
-    session_id: &[u8; 16],
-    client_ephemeral_pub: &[u8; 32],
-) -> Result<[u8; 32]> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(verify_key)
-        .map_err(|_| anyhow::anyhow!("init Flux server proof HMAC"))?;
-    mac.update(b"flux-server-ok-v1");
-    mac.update(session_id);
-    mac.update(client_ephemeral_pub);
-    Ok(mac.finalize().into_bytes().into())
-}
-
 pub fn encode_frame_body(frame: &FluxFrame) -> Result<Bytes> {
     let mut buf = BytesMut::with_capacity(128);
     match frame {
@@ -132,6 +96,7 @@ pub fn encode_frame_body(frame: &FluxFrame) -> Result<Bytes> {
             timestamp_secs,
             channel_id,
             blinded_credential,
+            client_proof,
         } => {
             let id_bytes = channel_id.as_bytes();
             ensure!(
@@ -146,6 +111,7 @@ pub fn encode_frame_body(frame: &FluxFrame) -> Result<Bytes> {
             buf.put_u8(id_bytes.len() as u8);
             buf.put_slice(id_bytes);
             buf.put_slice(blinded_credential);
+            buf.put_slice(client_proof);
         }
         FluxFrame::SessionOk {
             status,
@@ -301,20 +267,23 @@ pub fn decode_frame_body(body: &[u8]) -> Result<FluxFrame> {
             let timestamp_secs = u64::from_be_bytes(rest[49..57].try_into().unwrap());
             let id_len = usize::from(rest[57]);
             ensure!(
-                rest.len() == 58 + id_len + 32,
+                rest.len() == 58 + id_len + 64,
                 "invalid Flux SessionHello length"
             );
             let channel_id = std::str::from_utf8(&rest[58..58 + id_len])
                 .context("decode Flux channel_id")?
                 .to_string();
             let mut blinded_credential = [0u8; 32];
-            blinded_credential.copy_from_slice(&rest[58 + id_len..]);
+            blinded_credential.copy_from_slice(&rest[58 + id_len..90 + id_len]);
+            let mut client_proof = [0u8; 32];
+            client_proof.copy_from_slice(&rest[90 + id_len..]);
             Ok(FluxFrame::SessionHello {
                 session_id,
                 client_ephemeral_pub,
                 timestamp_secs,
                 channel_id,
                 blinded_credential,
+                client_proof,
             })
         }
         FRAME_SESSION_OK => {
@@ -529,6 +498,9 @@ impl SendWindowBuffer {
     pub fn ack(&mut self, ack_offset: u64) -> usize {
         if ack_offset <= self.acked_offset {
             return 0;
+        }
+        if self.buffered_bytes >= self.max_bytes / 2 {
+            self.max_bytes = self.max_bytes.saturating_mul(2).min(8 * 1024 * 1024);
         }
         let target = ack_offset.min(self.next_offset);
         let mut freed = 0usize;

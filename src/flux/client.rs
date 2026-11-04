@@ -1,10 +1,11 @@
+use super::auth::{self, derive_blind_key, handshake_key, xor_32};
 use super::config::{
     FluxChannelClientConfig, FluxChannelRole, FluxClientConfig, FluxIpStrategy, FluxSecurityMode,
     FluxTransportKind,
 };
 use super::frame::{
     DEFAULT_STREAM_WINDOW_BYTES, FluxFrame, MAX_FLUX_CHUNK_LEN, RecvOffsetAssembler,
-    SendWindowBuffer, compute_server_proof, derive_reality_blind_key, xor_32,
+    SendWindowBuffer,
 };
 use super::transport::{
     FluxChannelGuard, FluxFrameReader, FluxFrameWriter, connect_client_channel,
@@ -64,12 +65,17 @@ pub async fn run_flux_client_listener_with_core_until(
 ) -> Result<()> {
     config.validate()?;
     let pool = FluxClientPool::new(config)?;
-    let bg_stop = stop.clone();
+    let mut handlers = JoinSet::new();
+    let bg_stop = pool.stop.clone();
     let bg_pool = pool.clone();
     let bg_handle = tokio::spawn(async move {
         bg_pool.run_maintenance_loop(bg_stop).await;
     });
 
+    let _cleanup = ClientListenerGuard {
+        pool: pool.clone(),
+        maintenance: bg_handle.abort_handle(),
+    };
     tracing::info!(
         "Flux client listening on socks5://{}",
         listener.local_addr()?
@@ -78,6 +84,7 @@ pub async fn run_flux_client_listener_with_core_until(
     let res = loop {
         let (stream, peer) = tokio::select! {
             _ = stop.stopped() => break Ok(()),
+            _ = handlers.join_next(), if !handlers.is_empty() => continue,
             accepted = listener::accept_client(&listener) => match accepted {
                 Ok(pair) => pair,
                 Err(listener::AcceptError::Cancelled) => break Ok(()),
@@ -88,7 +95,7 @@ pub async fn run_flux_client_listener_with_core_until(
         };
         let pool = pool.clone();
         let core = core.clone();
-        tokio::spawn(async move {
+        handlers.spawn(async move {
             if let Err(err) = handle_flux_socks_client(stream, peer, pool, core).await {
                 tracing::debug!("Flux SOCKS client {peer} ended: {err:#}");
             }
@@ -98,6 +105,19 @@ pub async fn run_flux_client_listener_with_core_until(
     bg_handle.abort();
     pool.shutdown_all();
     res
+}
+
+struct ClientListenerGuard {
+    pool: Arc<FluxClientPool>,
+    maintenance: tokio::task::AbortHandle,
+}
+
+impl Drop for ClientListenerGuard {
+    fn drop(&mut self) {
+        self.pool.stop.stop();
+        self.maintenance.abort();
+        self.pool.shutdown_all();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +141,8 @@ pub struct ClientChannelHandle {
     draining: AtomicBool,
     state_notify: Notify,
     active_streams: AtomicUsize,
+    last_rx_micros: AtomicU64,
+    pending_ping: StdMutex<Option<(u64, u64)>>,
     baseline_rtt_ms: AtomicU64,
     smoothed_rtt_ms: AtomicU64,
     degraded_strikes: AtomicUsize,
@@ -213,7 +235,20 @@ impl ClientChannelHandle {
     }
 
     async fn send_stream(&self, frame: FluxFrame) -> bool {
-        if self.is_dead() {
+        let notified = self.wait_needs_migration();
+        let permit = tokio::select! {
+            _ = notified => return false,
+            _ = self.guard.closed() => return false,
+            _ = tokio::time::sleep(Duration::from_millis((self.rtt_ms() * 3).max(600))) => {
+                self.mark_draining();
+                return false;
+            }
+            permit = self.stream_tx.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return false,
+            },
+        };
+        if self.is_dead() || self.is_draining() {
             return false;
         }
         if let FluxFrame::StreamData { payload, .. } | FluxFrame::UdpDatagram { payload, .. } =
@@ -222,7 +257,8 @@ impl ClientChannelHandle {
             self.bytes_transferred
                 .fetch_add(payload.len() as u64, Ordering::Relaxed);
         }
-        self.stream_tx.send(frame).await.is_ok()
+        permit.send(frame);
+        true
     }
 }
 
@@ -252,6 +288,8 @@ struct ClientUdpFragmentEntry {
 
 pub struct FluxClientPool {
     config: FluxClientConfig,
+    stop: ListenerStopToken,
+    failed_endpoints: StdMutex<HashMap<(usize, SocketAddr), (Instant, u32)>>,
     session_id: [u8; 16],
     cred_hash: [u8; 32],
     started_at: Instant,
@@ -278,6 +316,8 @@ impl FluxClientPool {
         let cred_hash = password_hash(config.key.trim());
         Ok(Arc::new(Self {
             config,
+            stop: ListenerStopToken::new(),
+            failed_endpoints: StdMutex::new(HashMap::new()),
             session_id,
             cred_hash,
             started_at: Instant::now(),
@@ -309,7 +349,7 @@ impl FluxClientPool {
     }
 
     fn target_warm_count(&self) -> usize {
-        (1 + self.config.options.standby_channels).clamp(1, 8)
+        1 + self.config.options.standby_channels
     }
 
     async fn discover_candidates(&self) -> Result<Vec<CandidateEndpoint>> {
@@ -371,8 +411,12 @@ impl FluxClientPool {
                         return res;
                     }
                     _ = &mut notified => {
+                        let stop = self.stop.clone();
                         tokio::spawn(async move {
-                            let _ = warm_fut.await;
+                            tokio::select! {
+                                _ = stop.stopped() => {},
+                                _ = warm_fut => {},
+                            }
                         });
                         if self.has_usable_channel_excluding(excluded_uid) {
                             return Ok(());
@@ -502,6 +546,7 @@ impl FluxClientPool {
 
     async fn warm_channels_now(self: &Arc<Self>) -> Result<()> {
         let _guard = self.dial_mutex.lock().await;
+        ensure!(!self.stop.is_stopped(), "Flux client stopped");
         let target = self.target_warm_count();
         let mut active = self.usable_channels();
         if active.len() >= target {
@@ -509,8 +554,6 @@ impl FluxClientPool {
         }
 
         let candidates = self.discover_candidates().await?;
-        let mut selected: Vec<CandidateEndpoint> = Vec::new();
-        let needed = (target - active.len()).min(candidates.len());
 
         let mut remaining = candidates
             .into_iter()
@@ -520,98 +563,83 @@ impl FluxClientPool {
                     .any(|ch| ch.spec_idx == cand.spec_idx && ch.remote_addr == cand.addr)
             })
             .collect::<Vec<_>>();
-
-        while selected.len() < needed && !remaining.is_empty() {
-            let best_pos = remaining
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, cand)| {
-                    let spec = &self.config.channels[cand.spec_idx];
-                    let mut div = match spec.role {
-                        FluxChannelRole::Primary => 25i64,
-                        FluxChannelRole::Backup => 0i64,
-                    };
-                    div += i64::from(spec.weight) / 10;
-                    for existing in &active {
-                        if existing.remote_addr.is_ipv6() != cand.addr.is_ipv6() {
-                            div += 100;
-                        }
-                        if existing.transport != spec.transport {
-                            div += 80;
-                        }
-                        if existing.security != spec.security {
-                            div += 40;
-                        }
-                        if existing.spec_idx != cand.spec_idx {
-                            div += 30;
-                        }
-                        if existing.remote_addr.port() != cand.addr.port() {
-                            div += 10;
-                        }
-                    }
-                    for chosen in &selected {
-                        let chosen_spec = &self.config.channels[chosen.spec_idx];
-                        if chosen.addr.is_ipv6() != cand.addr.is_ipv6() {
-                            div += 100;
-                        }
-                        if chosen_spec.transport != spec.transport {
-                            div += 80;
-                        }
-                        if chosen_spec.security != spec.security {
-                            div += 40;
-                        }
-                        if chosen.spec_idx != cand.spec_idx {
-                            div += 30;
-                        }
-                    }
-                    div
-                })
-                .map(|(idx, _)| idx)
-                .unwrap();
-            selected.push(remaining.swap_remove(best_pos));
-        }
-
-        if selected.is_empty() && !active.is_empty() {
-            return Ok(());
-        }
-
+        remaining.retain(|cand| {
+            self.failed_endpoints
+                .lock()
+                .expect("Flux failures poisoned")
+                .get(&(cand.spec_idx, cand.addr))
+                .is_none_or(|(until, _)| *until <= Instant::now())
+        });
         let mut dial_set = JoinSet::new();
-        for cand in selected {
-            let pool = self.clone();
-            dial_set.spawn(async move { pool.dial_and_register_channel(cand).await });
-        }
-        // Also keep extra candidates ready if first batch fails when pool is completely empty
         let mut last_err = None;
-        while let Some(res) = dial_set.join_next().await {
-            match res {
-                Ok(Ok(ch)) => {
+        loop {
+            while active.len() + dial_set.len() < target && !remaining.is_empty() {
+                let best = remaining
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, cand)| {
+                        let spec = &self.config.channels[cand.spec_idx];
+                        let mut score = i64::from(spec.weight) / 10;
+                        if spec.role == FluxChannelRole::Primary {
+                            score += 25;
+                        }
+                        for ch in &active {
+                            if ch.remote_addr.is_ipv6() != cand.addr.is_ipv6() {
+                                score += 100;
+                            }
+                            if ch.transport != spec.transport {
+                                score += 80;
+                            }
+                            if ch.spec_idx != cand.spec_idx {
+                                score += 30;
+                            }
+                        }
+                        score
+                    })
+                    .map(|(idx, _)| idx)
+                    .unwrap();
+                let cand = remaining.swap_remove(best);
+                let pool = self.clone();
+                dial_set.spawn(async move {
+                    let result = pool.dial_and_register_channel(cand.clone()).await;
+                    (cand, result)
+                });
+            }
+            let next = tokio::select! {
+                _ = self.stop.stopped() => bail!("Flux client stopped"),
+                next = dial_set.join_next() => next,
+            };
+            let Some(next) = next else {
+                break;
+            };
+            match next {
+                Ok((cand, Ok(ch))) => {
+                    self.failed_endpoints
+                        .lock()
+                        .expect("Flux failures poisoned")
+                        .remove(&(cand.spec_idx, cand.addr));
                     active.push(ch);
                 }
-                Ok(Err(err)) => {
+                Ok((cand, Err(err))) => {
+                    tracing::debug!(channel = %self.config.channels[cand.spec_idx].id, "Flux channel dial failed: {err:#}");
+                    let mut failed = self
+                        .failed_endpoints
+                        .lock()
+                        .expect("Flux failures poisoned");
+                    let entry = failed
+                        .entry((cand.spec_idx, cand.addr))
+                        .or_insert((Instant::now(), 0));
+                    entry.1 = entry.1.saturating_add(1);
+                    entry.0 = Instant::now() + Duration::from_secs(1u64 << entry.1.min(5));
                     last_err = Some(err);
                 }
-                Err(join_err) => {
-                    last_err = Some(anyhow::anyhow!("Flux dial task panicked: {join_err}"));
-                }
+                Err(err) => last_err = Some(anyhow::anyhow!("Flux dial task failed: {err}")),
             }
         }
-
         if active.is_empty() {
-            for cand in remaining {
-                match self.dial_and_register_channel(cand).await {
-                    Ok(ch) => {
-                        active.push(ch);
-                        break;
-                    }
-                    Err(err) => last_err = Some(err),
-                }
-            }
-        }
-
-        if active.is_empty() {
-            return Err(
-                last_err.unwrap_or_else(|| anyhow::anyhow!("failed to connect any Flux channel"))
-            );
+            return Err(last_err.unwrap_or_else(|| {
+                anyhow::anyhow!("no Flux channel available; failed entrances are awaiting retry")
+            }));
         }
         Ok(())
     }
@@ -632,6 +660,7 @@ impl FluxClientPool {
         let mut eph_bytes = [0u8; 32];
         getrandom::fill(&mut eph_bytes).map_err(|e| anyhow::anyhow!("Flux hello random: {e}"))?;
 
+        let client_binding = guard.channel_binding()?;
         let (client_ephemeral_pub, blind_key) = if spec.security == FluxSecurityMode::Reality {
             let reality = spec
                 .reality
@@ -644,34 +673,38 @@ impl FluxClientPool {
                 shared.was_contributory(),
                 "non-contributory Flux REALITY public key"
             );
-            let bkey = derive_reality_blind_key(shared.as_bytes(), &self.session_id)?;
+            let bkey = derive_blind_key(shared.as_bytes(), &self.session_id, &client_binding)?;
             (pub_bytes, bkey)
         } else {
-            let bkey = derive_reality_blind_key(&eph_bytes, &self.session_id)?;
+            let secret = spec
+                .obfs_key
+                .as_deref()
+                .map(str::as_bytes)
+                .unwrap_or(&client_binding);
+            let bkey = derive_blind_key(secret, &self.session_id, &eph_bytes)?;
             (eph_bytes, bkey)
         };
 
         let blinded_credential = xor_32(&self.cred_hash, &blind_key);
-        let verify_key = xor_32(&blind_key, &self.cred_hash);
-        let expected_proof =
-            compute_server_proof(&verify_key, &self.session_id, &client_ephemeral_pub)?;
+        let auth_key = handshake_key(&blind_key, &self.cred_hash, &client_binding)?;
         let timestamp_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        writer
-            .write_frame(
-                &FluxFrame::SessionHello {
-                    session_id: self.session_id,
-                    client_ephemeral_pub,
-                    timestamp_secs,
-                    channel_id: spec.id.clone(),
-                    blinded_credential,
-                },
-                true,
-            )
-            .await?;
+        let mut hello = FluxFrame::SessionHello {
+            session_id: self.session_id,
+            client_ephemeral_pub,
+            timestamp_secs,
+            channel_id: spec.id.clone(),
+            blinded_credential,
+            client_proof: [0; 32],
+        };
+        let proof = auth::client_proof(&auth_key, &hello)?;
+        if let FluxFrame::SessionHello { client_proof, .. } = &mut hello {
+            *client_proof = proof;
+        }
+        writer.write_frame(&hello, true).await?;
 
         let ok_frame = tokio::time::timeout(CHANNEL_DIAL_TIMEOUT, reader.read_frame())
             .await
@@ -680,7 +713,7 @@ impl FluxClientPool {
         let FluxFrame::SessionOk {
             status,
             server_proof,
-            udp_enabled: _,
+            udp_enabled,
         } = ok_frame
         else {
             bail!("expected Flux SessionOk frame");
@@ -690,7 +723,10 @@ impl FluxClientPool {
             "Flux SessionHello rejected with status {status}"
         );
         ensure!(
-            constant_time_eq(&server_proof, &expected_proof),
+            constant_time_eq(
+                &server_proof,
+                &auth::server_proof(&auth_key, &hello, udp_enabled)?
+            ),
             "Flux server proof verification failed"
         );
 
@@ -717,6 +753,8 @@ impl FluxClientPool {
             draining: AtomicBool::new(false),
             state_notify: Notify::new(),
             active_streams: AtomicUsize::new(0),
+            last_rx_micros: AtomicU64::new(self.now_micros()),
+            pending_ping: StdMutex::new(None),
             baseline_rtt_ms: AtomicU64::new(init_rtt_ms),
             smoothed_rtt_ms: AtomicU64::new(init_rtt_ms),
             degraded_strikes: AtomicUsize::new(0),
@@ -727,6 +765,10 @@ impl FluxClientPool {
             guard,
         });
 
+        if self.stop.is_stopped() {
+            handle.mark_dead();
+            bail!("Flux client stopped during dial");
+        }
         self.channels
             .lock()
             .expect("Flux client channels poisoned")
@@ -735,7 +777,10 @@ impl FluxClientPool {
 
         let writer_handle = handle.clone();
         let writer_task = tokio::spawn(async move {
-            let res = run_client_writer_loop(&mut writer, &mut prio_rx, &mut stream_rx).await;
+            let res = tokio::select! {
+                _ = writer_handle.guard.closed() => Ok(()),
+                res = run_client_writer_loop(&mut writer, &mut prio_rx, &mut stream_rx) => res,
+            };
             writer_handle.mark_dead();
             let _ = writer.shutdown().await;
             res
@@ -768,12 +813,18 @@ impl FluxClientPool {
     }
 
     async fn run_maintenance_loop(self: Arc<Self>, stop: ListenerStopToken) {
-        let _ = self.warm_channels_now().await;
+        tokio::select! {
+            _ = stop.stopped() => return,
+            _ = self.warm_channels_now() => {},
+        }
         loop {
             tokio::select! {
                 _ = stop.stopped() => return,
                 _ = self.warmer_wake.notified() => {
-                    let _ = self.warm_channels_now().await;
+                    tokio::select! {
+                        _ = stop.stopped() => return,
+                        _ = self.warm_channels_now() => {},
+                    }
                 }
                 _ = tokio::time::sleep(PROBE_INTERVAL) => {
                     self.probe_and_rotate_channels().await;
@@ -816,7 +867,21 @@ impl FluxClientPool {
                 }
             }
 
+            let now = self.now_micros();
+            let mut pending = ch.pending_ping.lock().expect("Flux ping poisoned");
+            if let Some((_, sent)) = *pending {
+                let timeout_us = (ch.rtt_ms() * 3).max(600) * 1000;
+                if now.saturating_sub(sent) > timeout_us
+                    && now.saturating_sub(ch.last_rx_micros.load(Ordering::Relaxed)) > timeout_us
+                {
+                    ch.mark_dead();
+                    need_warm = true;
+                }
+                continue;
+            }
             let seq = self.next_ping_seq.fetch_add(1, Ordering::Relaxed);
+            *pending = Some((seq, now));
+            drop(pending);
             let mut pad_byte = [0u8; 1];
             let _ = getrandom::fill(&mut pad_byte);
             let pad_len = usize::from(pad_byte[0] % 48);
@@ -824,7 +889,7 @@ impl FluxClientPool {
             let _ = getrandom::fill(&mut pad);
             let _ = ch.send_prio(FluxFrame::Ping {
                 seq,
-                sent_micros: self.now_micros(),
+                sent_micros: now,
                 padding: Bytes::from(pad),
             });
         }
@@ -955,6 +1020,8 @@ async fn run_client_reader_loop(
     pool: &Arc<FluxClientPool>,
 ) -> Result<()> {
     while let Some(frame) = reader.read_frame().await? {
+        ch.last_rx_micros
+            .store(pool.now_micros(), Ordering::Relaxed);
         match frame {
             FluxFrame::Ping {
                 seq,
@@ -967,7 +1034,21 @@ async fn run_client_reader_loop(
                     padding,
                 });
             }
-            FluxFrame::Pong { echo_micros, .. } => {
+            FluxFrame::Pong {
+                seq, echo_micros, ..
+            } => {
+                let valid = {
+                    let mut pending = ch.pending_ping.lock().expect("Flux ping poisoned");
+                    if *pending == Some((seq, echo_micros)) {
+                        *pending = None;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !valid {
+                    continue;
+                }
                 let now = pool.now_micros();
                 let rtt_ms = now.saturating_sub(echo_micros) / 1000;
                 let degraded = ch.record_rtt_sample(rtt_ms.max(1));

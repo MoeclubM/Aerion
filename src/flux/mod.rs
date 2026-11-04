@@ -1,3 +1,4 @@
+mod auth;
 mod client;
 pub mod config;
 pub mod frame;
@@ -19,9 +20,12 @@ pub use config::{
     parse_transport_and_mode,
 };
 pub use server::{
-    RunningFluxServer, run_flux_server, run_flux_server_with_core, run_flux_server_with_core_until,
-    start_flux_server_with_core, start_flux_server_with_core_and_stop,
+    FluxServerState, RunningFluxServer, run_flux_server, run_flux_server_with_core,
+    run_flux_server_with_core_until, start_flux_server_with_core,
+    start_flux_server_with_core_and_stop, start_flux_server_with_state,
 };
 
+#[cfg(test)]
+mod regressions;
 #[cfg(test)]
 mod tests;
