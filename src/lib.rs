@@ -3,6 +3,7 @@ pub mod client_hello;
 pub mod config;
 pub mod config_compat;
 pub mod core;
+pub mod flux;
 pub mod http_connect;
 pub mod hysteria2;
 mod io_util;
@@ -57,6 +58,16 @@ pub use config_compat::singbox::{
 pub use config_compat::xray::{XrayClientConfig, XrayConfig, XrayOutbound, XrayServerConfig};
 pub use core::{
     CoreEvent, CoreSession, CoreUser, CoreUserLimits, ProxyCore, TrafficDirection, TrafficSnapshot,
+};
+pub use flux::{
+    FluxCertMode, FluxChannelClientConfig, FluxChannelRole, FluxChannelServerConfig,
+    FluxChannelWireConfig, FluxClientConfig, FluxClientPool, FluxHttpMode, FluxIpStrategy,
+    FluxOptions, FluxRealityWireOpts, FluxSecurityMode, FluxServerConfig, FluxTransportKind,
+    MAX_FLUX_EXPANDED_PORTS, PortSpecInput, RunningFluxServer, parse_port_spec, run_flux_client,
+    run_flux_client_listener, run_flux_client_listener_with_core,
+    run_flux_client_listener_with_core_until, run_flux_server, run_flux_server_with_core,
+    run_flux_server_with_core_until, start_flux_server_with_core,
+    start_flux_server_with_core_and_stop,
 };
 pub use http_connect::{
     HttpConnectInboundConfig, HttpProxyClientConfig, handle_http_connect,

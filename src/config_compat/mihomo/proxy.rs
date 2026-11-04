@@ -16,6 +16,7 @@ impl MihomoProxy {
             Self::AnyTls(proxy) => &proxy.name,
             Self::Mieru(proxy) => &proxy.name,
             Self::Sudoku(proxy) => &proxy.name,
+            Self::Flux(proxy) => &proxy.name,
             Self::Naive(proxy) => &proxy.name,
             Self::Tuic(proxy) => &proxy.name,
             Self::Unsupported(proxy) => &proxy.name,
@@ -38,6 +39,7 @@ impl MihomoProxy {
             Self::AnyTls(proxy) => MihomoClientConfig::AnyTls(proxy.to_client_config(listen)?),
             Self::Mieru(proxy) => MihomoClientConfig::Mieru(proxy.to_client_config(listen)?),
             Self::Sudoku(proxy) => MihomoClientConfig::Sudoku(proxy.to_client_config(listen)?),
+            Self::Flux(proxy) => MihomoClientConfig::Flux(proxy.to_client_config(listen)?),
             Self::Naive(proxy) => MihomoClientConfig::Naive(proxy.to_client_config(listen)?),
             Self::Tuic(proxy) => MihomoClientConfig::Tuic(proxy.to_client_config(listen)?),
             Self::Unsupported(proxy) => proxy.to_client_config(listen)?,
@@ -337,6 +339,11 @@ impl MihomoUnsupportedProxy {
             "sudoku" => MihomoClientConfig::Sudoku(
                 serde_yaml::from_value::<MihomoSudokuProxy>(value)
                     .with_context(|| format!("parse mihomo Sudoku proxy {}", self.name))?
+                    .to_client_config(listen)?,
+            ),
+            "flux" => MihomoClientConfig::Flux(
+                serde_yaml::from_value::<MihomoFluxProxy>(value)
+                    .with_context(|| format!("parse mihomo Flux proxy {}", self.name))?
                     .to_client_config(listen)?,
             ),
             "mieru" => MihomoClientConfig::Mieru(
@@ -766,6 +773,137 @@ impl MihomoAnyTlsProxy {
             },
             heartbeat_interval_secs: 30,
         })
+    }
+}
+
+impl MihomoFluxProxy {
+    pub fn to_client_config(&self, listen: SocketAddr) -> Result<FluxClientConfig> {
+        ensure_no_proxy_extra_fields(&format!("mihomo Flux proxy {}", self.name), &self.fields)?;
+        ensure!(
+            !self.key.trim().is_empty(),
+            "mihomo Flux proxy {} is missing key",
+            self.name
+        );
+        self.options.validate()?;
+        let default_reality = if let Some(opts) = &self.reality_opts {
+            Some(opts.to_client_config()?)
+        } else if let Some(pk) = self
+            .public_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            Some(RealityClientConfig::from_strings(
+                pk,
+                self.short_id.as_deref().unwrap_or(""),
+            )?)
+        } else {
+            None
+        };
+        let default_security = self.security.unwrap_or_else(|| {
+            if default_reality.is_some() {
+                FluxSecurityMode::Reality
+            } else if self
+                .obfs_key
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty())
+            {
+                FluxSecurityMode::Obfs
+            } else {
+                FluxSecurityMode::Tls
+            }
+        });
+        let default_alpn = alpn_values(self.alpn.as_ref());
+        let default_sni = sni_or_server(self.servername.as_deref(), &self.server);
+
+        let mut built_channels = Vec::new();
+        if self.channels.is_empty() {
+            ensure!(
+                self.port > 0,
+                "mihomo Flux proxy {} is missing port",
+                self.name
+            );
+            for (id, transport) in [
+                ("ch-tcp", FluxTransportKind::Tcp),
+                ("ch-udp", FluxTransportKind::Udp),
+            ] {
+                built_channels.push(FluxChannelClientConfig {
+                    id: id.to_string(),
+                    server_host: self.server.clone(),
+                    ports: vec![self.port],
+                    ip_version: "auto".to_string(),
+                    resolved_v4: self.resolved_v4.clone(),
+                    resolved_v6: self.resolved_v6.clone(),
+                    transport,
+                    http_mode: FluxHttpMode::Ws,
+                    http_host: None,
+                    http_path: "/".to_string(),
+                    http_headers: BTreeMap::new(),
+                    security: default_security,
+                    sni: default_sni.clone(),
+                    alpn: default_alpn.clone(),
+                    fingerprint: self.client_fingerprint,
+                    insecure: self.skip_cert_verify,
+                    ca_cert_paths: Vec::new(),
+                    ca_certificates: Vec::new(),
+                    pinned_cert_sha256: Vec::new(),
+                    reality: if default_security == FluxSecurityMode::Reality {
+                        default_reality.clone()
+                    } else {
+                        None
+                    },
+                    obfs_key: if default_security == FluxSecurityMode::Obfs {
+                        self.obfs_key.clone()
+                    } else {
+                        None
+                    },
+                    role: FluxChannelRole::Primary,
+                    weight: 100,
+                });
+            }
+        } else {
+            let mut used_ports = 0usize;
+            for (idx, wire_ch) in self.channels.iter().cloned().enumerate() {
+                let remaining = MAX_FLUX_EXPANDED_PORTS.saturating_sub(used_ports);
+                if let Some(mut ch) = wire_ch.into_client_channel(
+                    idx,
+                    &self.server,
+                    self.port,
+                    default_security,
+                    Some(&default_sni),
+                    self.client_fingerprint,
+                    self.skip_cert_verify,
+                    default_reality.as_ref(),
+                    self.obfs_key.as_deref(),
+                    remaining,
+                )? {
+                    used_ports += ch.ports.len();
+                    if ch.alpn.is_empty() && !default_alpn.is_empty() {
+                        ch.alpn = default_alpn.clone();
+                    }
+                    if ch.server_host.eq_ignore_ascii_case(&self.server)
+                        && ch.resolved_v4.is_empty()
+                        && ch.resolved_v6.is_empty()
+                    {
+                        ch.resolved_v4 = self.resolved_v4.clone();
+                        ch.resolved_v6 = self.resolved_v6.clone();
+                    }
+                    built_channels.push(ch);
+                }
+            }
+        }
+
+        let cfg = FluxClientConfig {
+            listen,
+            server_host: self.server.clone(),
+            server_port: self.port,
+            key: self.key.clone(),
+            udp: self.udp,
+            options: self.options.clone(),
+            channels: built_channels,
+        };
+        cfg.validate()?;
+        Ok(cfg)
     }
 }
 

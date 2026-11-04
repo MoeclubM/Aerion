@@ -1,4 +1,8 @@
 use crate::client::ClientConfig;
+use crate::flux::{
+    FluxChannelClientConfig, FluxChannelRole, FluxChannelWireConfig, FluxClientConfig,
+    FluxHttpMode, FluxOptions, FluxSecurityMode, FluxTransportKind, MAX_FLUX_EXPANDED_PORTS,
+};
 use crate::http_connect::HttpProxyClientConfig;
 use crate::hysteria2::Hysteria2ClientConfig;
 use crate::mieru::{MieruClientConfig, MieruTrafficPattern, MieruTransport};
@@ -25,7 +29,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, de};
 use serde_yaml::{Mapping, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use crate::config_compat::common::alpn_values;
@@ -147,6 +151,7 @@ pub enum MihomoProxy {
     AnyTls(MihomoAnyTlsProxy),
     Mieru(MihomoMieruProxy),
     Sudoku(MihomoSudokuProxy),
+    Flux(MihomoFluxProxy),
     Naive(MihomoNaiveProxy),
     Tuic(MihomoTuicProxy),
     Unsupported(MihomoUnsupportedProxy),
@@ -183,6 +188,7 @@ impl<'de> Deserialize<'de> for MihomoProxy {
                 decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::AnyTls)
             }
             "sudoku" => decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::Sudoku),
+            "flux" => decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::Flux),
             "mieru" => decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::Mieru),
             "naive" | "naive+https" | "naive+quic" => {
                 decode_known_mihomo_proxy(&value, mapping, &kind, MihomoProxy::Naive)
@@ -548,6 +554,64 @@ pub struct MihomoHysteria2Proxy {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct MihomoFluxProxy {
+    pub name: String,
+    pub server: String,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default, alias = "password", alias = "uuid")]
+    pub key: String,
+    #[serde(default = "default_true")]
+    pub udp: bool,
+    #[serde(default)]
+    pub security: Option<FluxSecurityMode>,
+    #[serde(default, alias = "sni", alias = "server_name", alias = "server-name")]
+    pub servername: Option<String>,
+    #[serde(
+        default,
+        rename = "client-fingerprint",
+        alias = "client_fingerprint",
+        alias = "fingerprint",
+        deserialize_with = "deserialize_optional_fingerprint"
+    )]
+    pub client_fingerprint: Option<UtlsFingerprint>,
+    #[serde(
+        default,
+        rename = "skip-cert-verify",
+        alias = "skip_cert_verify",
+        alias = "insecure",
+        alias = "allow_insecure"
+    )]
+    pub skip_cert_verify: bool,
+    #[serde(default)]
+    pub alpn: Option<OneOrManyStrings>,
+    #[serde(default, rename = "reality-opts", alias = "reality_opts")]
+    pub reality_opts: Option<MihomoRealityOpts>,
+    #[serde(default, rename = "public-key", alias = "public_key")]
+    pub public_key: Option<String>,
+    #[serde(default, rename = "short-id", alias = "short_id")]
+    pub short_id: Option<String>,
+    #[serde(
+        default,
+        rename = "obfs-key",
+        alias = "obfs_key",
+        alias = "obfs-password",
+        alias = "obfs_password"
+    )]
+    pub obfs_key: Option<String>,
+    #[serde(default, rename = "resolved-v4", alias = "resolved_v4")]
+    pub resolved_v4: Vec<Ipv4Addr>,
+    #[serde(default, rename = "resolved-v6", alias = "resolved_v6")]
+    pub resolved_v6: Vec<Ipv6Addr>,
+    #[serde(default)]
+    pub channels: Vec<FluxChannelWireConfig>,
+    #[serde(flatten)]
+    pub options: FluxOptions,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct MihomoSudokuProxy {
     pub name: String,
     pub server: String,
@@ -838,6 +902,7 @@ pub enum MihomoClientConfig {
     AnyTls(ClientConfig),
     Mieru(MieruClientConfig),
     Sudoku(SudokuClientConfig),
+    Flux(FluxClientConfig),
     Naive(NaiveClientConfig),
     Tuic(TuicClientConfig),
 }

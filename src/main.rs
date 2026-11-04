@@ -586,6 +586,7 @@ enum RunnableClientConfig {
     Hysteria2(Hysteria2ClientConfig),
     Mieru(MieruClientConfig),
     Sudoku(aerion::SudokuClientConfig),
+    Flux(aerion::FluxClientConfig),
     Naive(NaiveClientConfig),
     Route(RouteClientConfig),
     Shadowsocks(ShadowsocksClientConfig),
@@ -604,6 +605,7 @@ impl From<MihomoClientConfig> for RunnableClientConfig {
             MihomoClientConfig::Hysteria2(config) => Self::Hysteria2(config),
             MihomoClientConfig::Mieru(config) => Self::Mieru(config),
             MihomoClientConfig::Sudoku(config) => Self::Sudoku(config),
+            MihomoClientConfig::Flux(config) => Self::Flux(config),
             MihomoClientConfig::Naive(config) => Self::Naive(config),
             MihomoClientConfig::Route(config) => Self::Route(config),
             MihomoClientConfig::Shadowsocks(config) => Self::Shadowsocks(config),
@@ -1458,6 +1460,7 @@ async fn run_client_config(config: RunnableClientConfig) -> Result<()> {
         RunnableClientConfig::Hysteria2(config) => run_hysteria2_client(config).await,
         RunnableClientConfig::Mieru(config) => run_mieru_client(config).await,
         RunnableClientConfig::Sudoku(config) => aerion::run_sudoku_client(config).await,
+        RunnableClientConfig::Flux(config) => aerion::run_flux_client(config).await,
         RunnableClientConfig::Naive(config) => run_naive_client(config).await,
         RunnableClientConfig::Route(config) => run_route_client(config).await,
         RunnableClientConfig::Shadowsocks(config) => run_shadowsocks_client(config).await,
@@ -1490,6 +1493,9 @@ async fn run_client_config_with_listener(
         RunnableClientConfig::Mieru(config) => run_mieru_client_listener(listener, config).await,
         RunnableClientConfig::Sudoku(config) => {
             aerion::run_sudoku_client_listener(listener, config).await
+        }
+        RunnableClientConfig::Flux(config) => {
+            aerion::run_flux_client_listener(listener, config).await
         }
         RunnableClientConfig::Naive(config) => run_naive_client_listener(listener, config).await,
         RunnableClientConfig::Route(config) => run_route_client_listener(listener, config).await,
