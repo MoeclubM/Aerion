@@ -55,11 +55,16 @@ pub struct RunningFluxServer {
     udp_addrs: Vec<SocketAddr>,
     stop: ListenerStopToken,
     tasks: JoinSet<Result<()>>,
+    registry: Arc<FluxServerRegistry>,
+    cancel_on_stop: bool,
 }
 
 impl Drop for RunningFluxServer {
     fn drop(&mut self) {
         self.stop.stop();
+        if self.cancel_on_stop {
+            self.registry.core.cancel_all_sessions();
+        }
         self.tasks.abort_all();
     }
 }
@@ -133,7 +138,9 @@ pub fn start_flux_server_with_core_and_stop(
     stop: ListenerStopToken,
 ) -> Result<RunningFluxServer> {
     let state = FluxServerState::new(core, config.udp);
-    start_flux_server_with_state(config, &state, stop)
+    let mut running = start_flux_server_with_state(config, &state, stop)?;
+    running.cancel_on_stop = true;
+    Ok(running)
 }
 
 pub fn start_flux_server_with_state(
@@ -242,6 +249,8 @@ pub fn start_flux_server_with_state(
         udp_addrs,
         stop,
         tasks,
+        registry,
+        cancel_on_stop: false,
     })
 }
 
@@ -723,13 +732,8 @@ async fn handle_server_channel(
         res
     });
 
-    let read_res = run_server_channel_reader(
-        &mut reader,
-        &ch_handle,
-        &session,
-        registry.udp_enabled.load(Ordering::Acquire),
-    )
-    .await;
+    let read_res =
+        run_server_channel_reader(&mut reader, &ch_handle, &session, &registry.udp_enabled).await;
     ch_handle.mark_dead();
     writer_task.abort();
     session
@@ -785,7 +789,7 @@ async fn run_server_channel_reader(
     reader: &mut FluxFrameReader,
     ch: &Arc<ServerChannelHandle>,
     session: &Arc<FluxServerSession>,
-    udp_enabled: bool,
+    udp_enabled: &AtomicBool,
 ) -> Result<()> {
     loop {
         let frame = tokio::select! {
@@ -932,7 +936,7 @@ async fn run_server_channel_reader(
                 target,
                 payload,
             } => {
-                if udp_enabled {
+                if udp_enabled.load(Ordering::Acquire) {
                     let _ = handle_server_udp_datagram(
                         session, ch, assoc_id, packet_id, frag_index, frag_total, target, payload,
                     )

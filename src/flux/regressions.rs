@@ -150,41 +150,47 @@ async fn download_only_blackhole_migrates_and_listener_abort_closes_channels() -
 
 #[tokio::test]
 async fn replacing_listeners_preserves_the_target_connection() -> Result<()> {
-    let core = ProxyCore::new(vec![CoreUser::password("u", "user-token")])?;
-    let state = FluxServerState::new(core, true);
-    let stop = ListenerStopToken::new();
-    let server = start_flux_server_with_state(server_config(), &state, stop.clone())?;
-    let port = server.tcp_addrs()[0].port();
-    let target = TcpListener::bind("127.0.0.1:0").await?;
-    let target_addr = target.local_addr()?;
-    let target_task = tokio::spawn(async move {
-        let (mut socket, _) = target.accept().await?;
-        let (mut r, mut w) = socket.split();
-        tokio::io::copy(&mut r, &mut w).await
-    });
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let client = tokio::spawn(run_flux_client_listener(
-        listener,
-        client_config(vec![port])?,
-    ));
-    let mut stream = crate::socks::connect_tcp(addr, &ProxyTarget::Ip(target_addr)).await?;
-    stream.write_all(b"before").await?;
-    let mut response = [0; 6];
-    stream.read_exact(&mut response).await?;
-    stop.stop();
-    server.wait().await?;
-    let mut config = server_config();
-    config.listeners[0].ports = vec![port];
-    let replacement = start_flux_server_with_state(config, &state, ListenerStopToken::new())?;
-    stream.write_all(b"after!").await?;
-    tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut response)).await??;
-    assert_eq!(&response, b"after!");
-    client.abort();
-    let _ = client.await;
-    target_task.abort();
-    replacement.stop();
-    replacement.wait().await?;
+    for transport in [FluxTransportKind::Tcp, FluxTransportKind::Udp] {
+        let core = ProxyCore::new(vec![CoreUser::password("u", "user-token")])?;
+        let state = FluxServerState::new(core, true);
+        let stop = ListenerStopToken::new();
+        let mut config = server_config();
+        config.listeners[0].transport = transport;
+        let server = start_flux_server_with_state(config.clone(), &state, stop.clone())?;
+        let port = if transport == FluxTransportKind::Udp {
+            server.udp_addrs()[0].port()
+        } else {
+            server.tcp_addrs()[0].port()
+        };
+        let target = TcpListener::bind("127.0.0.1:0").await?;
+        let target_addr = target.local_addr()?;
+        let target_task = tokio::spawn(async move {
+            let (mut socket, _) = target.accept().await?;
+            let (mut r, mut w) = socket.split();
+            tokio::io::copy(&mut r, &mut w).await
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let mut client_config = client_config(vec![port])?;
+        client_config.channels[0].transport = transport;
+        let client = tokio::spawn(run_flux_client_listener(listener, client_config));
+        let mut stream = crate::socks::connect_tcp(addr, &ProxyTarget::Ip(target_addr)).await?;
+        stream.write_all(b"before").await?;
+        let mut response = [0; 6];
+        stream.read_exact(&mut response).await?;
+        stop.stop();
+        server.wait().await?;
+        config.listeners[0].ports = vec![port];
+        let replacement = start_flux_server_with_state(config, &state, ListenerStopToken::new())?;
+        stream.write_all(b"after!").await?;
+        tokio::time::timeout(Duration::from_secs(8), stream.read_exact(&mut response)).await??;
+        assert_eq!(&response, b"after!");
+        client.abort();
+        let _ = client.await;
+        target_task.abort();
+        replacement.stop();
+        replacement.wait().await?;
+    }
     Ok(())
 }
 
