@@ -4,7 +4,9 @@ Flux aggregates TCP, QUIC and HTTP transport channels into one authenticated log
 
 ## Client compatibility
 
-`type: flux` is an Aerion extension using the Clash YAML envelope. Stock Mihomo and Clash do not implement this protocol. Panels must filter Flux before producing their proxy entries and group membership for ordinary clients. `types=all` and `format=clash` do not declare Flux support. An explicit `types=...,flux`, `X-XBClient-Protocols: ...,flux`, or an Aerion/XBClient identity declares support. An explicit supported-protocol list that excludes Flux takes precedence over the user agent.
+`type: flux` is an Aerion extension using a YAML envelope compatible with the existing proxy and routing configuration. Stock Mihomo and Clash do not implement this protocol. Panels use a separate Aerion subscription adapter: Xboard selects it with `flag=aerion` / `flag=xbclient`, and PxBoard with `format=aerion` / `format=xbclient` or the matching flag. Without an explicit adapter selection, an Aerion/XBClient identity selects the Aerion adapter. Explicit Mihomo/Clash selection always excludes Flux, even when `types=flux` or a Flux capability header is present. Filtering happens before proxy entries and group membership are produced.
+
+Within the Aerion adapter, an explicit supported-protocol list that excludes Flux takes precedence over the capability header and user agent. `types=all` uses the selected adapter's supported protocols; it never changes adapters. Standard protocol field serializers and YAML templates can be shared without sharing custom protocol admission or Mihomo version requirements.
 
 Public subscriptions contain only dialing parameters. Listener addresses, local ports, certificate paths, private keys and fallback destinations belong exclusively to the authenticated node configuration API. Both panels must resolve inherited public keys, Short IDs and security settings consistently with NodeRS. An empty per-channel Short ID inherits the node value even when the channel uses an independent private key.
 
