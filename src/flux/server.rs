@@ -39,7 +39,14 @@ pub struct RunningFluxServer {
     tcp_addrs: Vec<SocketAddr>,
     udp_addrs: Vec<SocketAddr>,
     stop: ListenerStopToken,
-    join: JoinHandle<Result<()>>,
+    tasks: JoinSet<Result<()>>,
+}
+
+impl Drop for RunningFluxServer {
+    fn drop(&mut self) {
+        self.stop.stop();
+        self.tasks.abort_all();
+    }
 }
 
 impl RunningFluxServer {
@@ -55,8 +62,29 @@ impl RunningFluxServer {
         self.stop.stop();
     }
 
-    pub async fn wait(self) -> Result<()> {
-        self.join.await.context("join Flux server task")?
+    pub async fn wait(mut self) -> Result<()> {
+        while let Some(res) = self.tasks.join_next().await {
+            match res {
+                Ok(Ok(())) => {
+                    if self.stop.is_stopped() {
+                        self.tasks.shutdown().await;
+                        return Ok(());
+                    }
+                }
+                Ok(Err(err)) => {
+                    self.stop.stop();
+                    self.tasks.shutdown().await;
+                    return Err(err);
+                }
+                Err(join_err) if join_err.is_cancelled() => {}
+                Err(join_err) => {
+                    self.stop.stop();
+                    self.tasks.shutdown().await;
+                    return Err(anyhow::anyhow!("Flux server listener panicked: {join_err}"));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -177,35 +205,11 @@ pub fn start_flux_server_with_core_and_stop(
         }
     });
 
-    let stop_for_join = stop.clone();
-    let join = tokio::spawn(async move {
-        while let Some(res) = tasks.join_next().await {
-            match res {
-                Ok(Ok(())) => {
-                    if stop_for_join.is_stopped() {
-                        tasks.abort_all();
-                        return Ok(());
-                    }
-                }
-                Ok(Err(err)) => {
-                    tasks.abort_all();
-                    return Err(err);
-                }
-                Err(join_err) if join_err.is_cancelled() => {}
-                Err(join_err) => {
-                    tasks.abort_all();
-                    return Err(anyhow::anyhow!("Flux server listener panicked: {join_err}"));
-                }
-            }
-        }
-        Ok(())
-    });
-
     Ok(RunningFluxServer {
         tcp_addrs,
         udp_addrs,
         stop,
-        join,
+        tasks,
     })
 }
 
@@ -220,6 +224,19 @@ async fn run_quic_listener_loop(
         let incoming = tokio::select! {
             _ = stop.stopped() => {
                 endpoint.close(quinn::VarInt::from_u32(0), b"flux server stopped");
+                let _ = tokio::time::timeout(Duration::from_millis(50), endpoint.wait_idle()).await;
+                let dummy_bind: SocketAddr = match endpoint.local_addr() {
+                    Ok(addr) if addr.is_ipv6() => "[::1]:0".parse().unwrap(),
+                    _ => "127.0.0.1:0".parse().unwrap(),
+                };
+                if let Ok(eph1) = socket_protect::bind_udp_std(dummy_bind) {
+                    let _ = endpoint.rebind(eph1);
+                }
+                if let Ok(eph2) = socket_protect::bind_udp_std(dummy_bind) {
+                    let _ = endpoint.rebind(eph2);
+                }
+                drop(endpoint);
+                tokio::task::yield_now().await;
                 return Ok(());
             }
             next = endpoint.accept() => match next {

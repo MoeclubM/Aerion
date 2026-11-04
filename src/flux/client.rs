@@ -260,6 +260,7 @@ pub struct FluxClientPool {
     udp_assocs: StdMutex<HashMap<u32, mpsc::Sender<(ProxyTarget, Vec<u8>)>>>,
     udp_fragments: Mutex<HashMap<(u32, u32), ClientUdpFragmentEntry>>,
     dial_mutex: Mutex<()>,
+    channel_ready: Notify,
     warmer_wake: Notify,
     next_channel_uid: AtomicU64,
     next_stream_id: AtomicU32,
@@ -285,6 +286,7 @@ impl FluxClientPool {
             udp_assocs: StdMutex::new(HashMap::new()),
             udp_fragments: Mutex::new(HashMap::new()),
             dial_mutex: Mutex::new(()),
+            channel_ready: Notify::new(),
             warmer_wake: Notify::new(),
             next_channel_uid: AtomicU64::new(1),
             next_stream_id: AtomicU32::new(1),
@@ -341,6 +343,61 @@ impl FluxClientPool {
             .collect()
     }
 
+    fn has_usable_channel_excluding(&self, excluded_uid: Option<u64>) -> bool {
+        self.channels
+            .lock()
+            .expect("Flux client channels poisoned")
+            .values()
+            .any(|ch| ch.is_usable_for_new() && Some(ch.uid) != excluded_uid)
+    }
+
+    async fn ensure_usable_channel(self: &Arc<Self>, excluded_uid: Option<u64>) -> Result<()> {
+        loop {
+            let notified = self.channel_ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.has_usable_channel_excluding(excluded_uid) {
+                return Ok(());
+            }
+            if let Ok(guard) = self.dial_mutex.try_lock() {
+                drop(guard);
+                let pool = self.clone();
+                let mut warm_fut = Box::pin(async move { pool.warm_channels_now().await });
+                tokio::select! {
+                    res = &mut warm_fut => {
+                        if self.has_usable_channel_excluding(excluded_uid) {
+                            return Ok(());
+                        }
+                        return res;
+                    }
+                    _ = &mut notified => {
+                        tokio::spawn(async move {
+                            let _ = warm_fut.await;
+                        });
+                        if self.has_usable_channel_excluding(excluded_uid) {
+                            return Ok(());
+                        }
+                    }
+                }
+            } else {
+                tokio::select! {
+                    _ = &mut notified => {
+                        if self.has_usable_channel_excluding(excluded_uid) {
+                            return Ok(());
+                        }
+                    }
+                    guard = self.dial_mutex.lock() => {
+                        drop(guard);
+                        if self.has_usable_channel_excluding(excluded_uid) {
+                            return Ok(());
+                        }
+                        return self.warm_channels_now().await;
+                    }
+                }
+            }
+        }
+    }
+
     fn score_channel_for_stream(&self, ch: &ClientChannelHandle) -> i64 {
         let rtt = ch.rtt_ms() as i64;
         let load = (ch.active_streams.load(Ordering::Relaxed) as i64) * 4;
@@ -366,7 +423,7 @@ impl FluxClientPool {
             self.warmer_wake.notify_one();
             return Ok(best);
         }
-        self.warm_channels_now().await?;
+        self.ensure_usable_channel(None).await?;
         self.usable_channels()
             .into_iter()
             .min_by_key(|ch| self.score_channel_for_stream(ch))
@@ -388,7 +445,7 @@ impl FluxClientPool {
         {
             return Ok(best);
         }
-        self.warm_channels_now().await?;
+        self.ensure_usable_channel(None).await?;
         let usable = self.usable_channels();
         usable
             .iter()
@@ -438,7 +495,7 @@ impl FluxClientPool {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(80 * attempt as u64)).await;
             }
-            let _ = self.warm_channels_now().await;
+            let _ = self.ensure_usable_channel(Some(failed.uid)).await;
         }
         bail!("all Flux channels unavailable for stream migration")
     }
@@ -674,6 +731,7 @@ impl FluxClientPool {
             .lock()
             .expect("Flux client channels poisoned")
             .insert(uid, handle.clone());
+        self.channel_ready.notify_waiters();
 
         let writer_handle = handle.clone();
         let writer_task = tokio::spawn(async move {

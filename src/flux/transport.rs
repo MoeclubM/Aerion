@@ -207,7 +207,10 @@ pub fn split_quic_channel(
     )
 }
 
-fn build_quic_transport_config(client_keepalive: bool) -> Result<quinn::TransportConfig> {
+fn build_quic_transport_config(
+    client_keepalive: bool,
+    obfs: bool,
+) -> Result<quinn::TransportConfig> {
     let mut cfg =
         quic::transport_config_with_idle_timeout(QUIC_IDLE_TIMEOUT, "build Flux QUIC timeout")?;
     cfg.stream_receive_window(VarInt::from_u32(QUIC_STREAM_WINDOW))
@@ -216,6 +219,11 @@ fn build_quic_transport_config(client_keepalive: bool) -> Result<quinn::Transpor
         .datagram_receive_buffer_size(Some(QUIC_DATAGRAM_BUF))
         .datagram_send_buffer_size(QUIC_DATAGRAM_BUF)
         .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    if obfs {
+        let mut mtu_cfg = quinn::MtuDiscoveryConfig::default();
+        mtu_cfg.upper_bound(1440);
+        cfg.mtu_discovery_config(Some(mtu_cfg));
+    }
     if client_keepalive {
         cfg.keep_alive_interval(Some(QUIC_KEEPALIVE_INTERVAL));
     }
@@ -254,7 +262,10 @@ async fn connect_client_quic_channel(
         "0.0.0.0:0".parse().unwrap()
     };
     let udp_std = socket_protect::bind_udp_std(bind_addr)?;
-    let transport_cfg = Arc::new(build_quic_transport_config(true)?);
+    let transport_cfg = Arc::new(build_quic_transport_config(
+        true,
+        channel.security == FluxSecurityMode::Obfs,
+    )?);
     let alpn = quic_alpn_list(&channel.alpn);
     let sni_clean = {
         let trimmed = channel.sni.trim().trim_matches(['[', ']']);
@@ -305,8 +316,10 @@ async fn connect_client_quic_channel(
             let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_tls));
             client_cfg.transport_config(transport_cfg);
             let obfs_socket = FluxObfsUdpSocket::new(udp_std, obfs_key)?;
+            let mut ep_cfg = quinn::EndpointConfig::default();
+            let _ = ep_cfg.max_udp_payload_size(1488);
             let mut ep = Endpoint::new_with_abstract_socket(
-                quinn::EndpointConfig::default(),
+                ep_cfg,
                 None,
                 Arc::new(obfs_socket),
                 Arc::new(quinn::TokioRuntime),
@@ -661,26 +674,26 @@ pub fn bind_server_tcp_listener(addr: SocketAddr, v6_only: bool) -> Result<TcpLi
 }
 
 pub fn bind_server_udp_socket(addr: SocketAddr, v6_only: bool) -> Result<std::net::UdpSocket> {
-    if addr.ip() == IpAddr::V6(Ipv6Addr::UNSPECIFIED) && !v6_only {
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV6,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )
-        .with_context(|| format!("create dual-stack Flux UDP socket on {addr}"))?;
-        let _ = socket.set_reuse_address(true);
-        let _ = socket.set_only_v6(false);
-        socket
-            .set_nonblocking(true)
-            .context("set dual-stack Flux UDP socket nonblocking")?;
-        socket
-            .bind(&addr.into())
-            .with_context(|| format!("bind dual-stack Flux UDP socket on {addr}"))?;
-        let std_sock: std::net::UdpSocket = socket.into();
-        socket_protect::disable_windows_udp_connreset(&std_sock)?;
-        return Ok(std_sock);
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+        .with_context(|| format!("create Flux UDP socket on {addr}"))?;
+    let _ = socket.set_reuse_address(true);
+    if addr.ip() == IpAddr::V6(Ipv6Addr::UNSPECIFIED) {
+        let _ = socket.set_only_v6(v6_only);
     }
-    socket_protect::bind_udp_std(addr)
+    socket
+        .set_nonblocking(true)
+        .context("set Flux UDP socket nonblocking")?;
+    socket
+        .bind(&addr.into())
+        .with_context(|| format!("bind Flux UDP socket on {addr}"))?;
+    let std_sock: std::net::UdpSocket = socket.into();
+    socket_protect::disable_windows_udp_connreset(&std_sock)?;
+    Ok(std_sock)
 }
 
 pub fn build_server_quic_endpoint(
@@ -688,7 +701,10 @@ pub fn build_server_quic_endpoint(
     udp_std: std::net::UdpSocket,
 ) -> Result<Endpoint> {
     tls::init_crypto();
-    let transport_cfg = Arc::new(build_quic_transport_config(false)?);
+    let transport_cfg = Arc::new(build_quic_transport_config(
+        false,
+        listener.security == FluxSecurityMode::Obfs,
+    )?);
     let default_alpn = vec![b"h3".to_vec()];
 
     match listener.security {
@@ -727,8 +743,10 @@ pub fn build_server_quic_endpoint(
             let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
             server_cfg.transport_config(transport_cfg);
             let obfs_sock = FluxObfsUdpSocket::new(udp_std, obfs_key)?;
+            let mut ep_cfg = quinn::EndpointConfig::default();
+            let _ = ep_cfg.max_udp_payload_size(1488);
             Endpoint::new_with_abstract_socket(
-                quinn::EndpointConfig::default(),
+                ep_cfg,
                 Some(server_cfg),
                 Arc::new(obfs_sock),
                 Arc::new(quinn::TokioRuntime),

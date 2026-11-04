@@ -9,20 +9,18 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use quinn::udp::{RecvMeta, Transmit};
-use quinn::{AsyncUdpSocket, UdpPoller};
+use quinn::{AsyncUdpSocket, Runtime, TokioRuntime, UdpPoller};
 use sha2::Sha256;
 use std::fmt;
-use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll, ready};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex,
 };
-use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -32,28 +30,15 @@ const OBFS_MAX_CHUNK: usize = 32 * 1024;
 const OBFS_TAG_LEN: usize = 16;
 
 type HmacSha256 = Hmac<Sha256>;
-type IoFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync>>;
 
 pub struct FluxObfsUdpSocket {
-    io: UdpSocket,
+    inner: Arc<dyn AsyncUdpSocket>,
     key: Vec<u8>,
-    recv_buffer: StdMutex<Vec<u8>>,
 }
 
 impl fmt::Debug for FluxObfsUdpSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FluxObfsUdpSocket").finish_non_exhaustive()
-    }
-}
-
-struct FluxObfsUdpPoller {
-    socket: Arc<FluxObfsUdpSocket>,
-    future: Option<IoFuture>,
-}
-
-impl fmt::Debug for FluxObfsUdpPoller {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FluxObfsUdpPoller").finish_non_exhaustive()
     }
 }
 
@@ -63,15 +48,17 @@ impl FluxObfsUdpSocket {
             obfs_key.len() >= 4,
             "Flux UDP obfs_key must be at least 4 bytes"
         );
+        let inner = TokioRuntime
+            .wrap_udp_socket(socket)
+            .context("wrap Flux obfs UDP socket")?;
         Ok(Self {
-            io: UdpSocket::from_std(socket).context("wrap Flux obfs UDP socket")?,
+            inner,
             key: obfs_key.as_bytes().to_vec(),
-            recv_buffer: StdMutex::new(Vec::new()),
         })
     }
 }
 
-fn obfs_udp_xor(key: &[u8], salt: &[u8; OBFS_UDP_SALT_LEN], input: &[u8], output: &mut [u8]) {
+fn obfs_udp_mask(key: &[u8], salt: &[u8; OBFS_UDP_SALT_LEN]) -> [u8; 64] {
     let mut hasher = Blake2bVar::new(64).expect("64-byte Blake2bVar valid");
     hasher.update(key);
     hasher.update(salt);
@@ -79,6 +66,11 @@ fn obfs_udp_xor(key: &[u8], salt: &[u8; OBFS_UDP_SALT_LEN], input: &[u8], output
     hasher
         .finalize_variable(&mut mask)
         .expect("64-byte Blake2bVar output valid");
+    mask
+}
+
+fn obfs_udp_xor(key: &[u8], salt: &[u8; OBFS_UDP_SALT_LEN], input: &[u8], output: &mut [u8]) {
+    let mask = obfs_udp_mask(key, salt);
     for (idx, (dst, src)) in output.iter_mut().zip(input.iter()).enumerate() {
         *dst = *src ^ mask[idx & 63];
     }
@@ -86,10 +78,7 @@ fn obfs_udp_xor(key: &[u8], salt: &[u8; OBFS_UDP_SALT_LEN], input: &[u8], output
 
 impl AsyncUdpSocket for FluxObfsUdpSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(FluxObfsUdpPoller {
-            socket: self,
-            future: None,
-        })
+        self.inner.clone().create_io_poller()
     }
 
     fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
@@ -104,15 +93,14 @@ impl AsyncUdpSocket for FluxObfsUdpSocket {
             transmit.contents,
             &mut packet[OBFS_UDP_SALT_LEN..],
         );
-        let written = self.io.try_send_to(&packet, transmit.destination)?;
-        if written == packet.len() {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "partial Flux obfs UDP send",
-            ))
-        }
+        let out = Transmit {
+            destination: transmit.destination,
+            ecn: transmit.ecn,
+            contents: &packet,
+            segment_size: None,
+            src_ip: transmit.src_ip,
+        };
+        self.inner.try_send(&out)
     }
 
     fn poll_recv(
@@ -122,70 +110,82 @@ impl AsyncUdpSocket for FluxObfsUdpSocket {
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
         loop {
-            ready!(self.io.poll_recv_ready(cx))?;
-            let mut buffer = self
-                .recv_buffer
-                .lock()
-                .expect("Flux obfs recv buffer poisoned");
-            buffer.resize(bufs[0].len() + OBFS_UDP_SALT_LEN, 0);
-            match self.io.try_recv_from(&mut buffer) {
-                Ok((read, addr)) => {
-                    if read <= OBFS_UDP_SALT_LEN {
-                        continue;
-                    }
-                    let mut salt = [0u8; OBFS_UDP_SALT_LEN];
-                    salt.copy_from_slice(&buffer[..OBFS_UDP_SALT_LEN]);
-                    let out_len = read - OBFS_UDP_SALT_LEN;
-                    obfs_udp_xor(
-                        &self.key,
-                        &salt,
-                        &buffer[OBFS_UDP_SALT_LEN..read],
-                        &mut bufs[0][..out_len],
-                    );
-                    meta[0] = RecvMeta {
-                        addr,
-                        len: out_len,
-                        stride: out_len,
-                        ecn: None,
-                        dst_ip: None,
-                    };
-                    return Poll::Ready(Ok(1));
-                }
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::ConnectionReset
-                    ) =>
-                {
+            let count = ready!(self.inner.poll_recv(cx, bufs, meta))?;
+            let mut write_idx = 0usize;
+            for idx in 0..count {
+                let m = meta[idx];
+                if m.len <= OBFS_UDP_SALT_LEN {
                     continue;
                 }
-                Err(err) => return Poll::Ready(Err(err)),
+                let seg_stride = if m.stride == 0 { m.len } else { m.stride };
+                if seg_stride <= OBFS_UDP_SALT_LEN {
+                    continue;
+                }
+                let mut src_off = 0usize;
+                let mut dst_off = 0usize;
+                let mut segs = 0usize;
+                let mut valid = true;
+                {
+                    let slot_buf = &mut bufs[idx][..m.len];
+                    while src_off < m.len {
+                        let seg_len = (m.len - src_off).min(seg_stride);
+                        if seg_len <= OBFS_UDP_SALT_LEN {
+                            valid = false;
+                            break;
+                        }
+                        let mut salt = [0u8; OBFS_UDP_SALT_LEN];
+                        salt.copy_from_slice(&slot_buf[src_off..src_off + OBFS_UDP_SALT_LEN]);
+                        let plain_len = seg_len - OBFS_UDP_SALT_LEN;
+                        let mask = obfs_udp_mask(&self.key, &salt);
+                        for j in 0..plain_len {
+                            slot_buf[dst_off + j] =
+                                slot_buf[src_off + OBFS_UDP_SALT_LEN + j] ^ mask[j & 63];
+                        }
+                        src_off += seg_len;
+                        dst_off += plain_len;
+                        segs += 1;
+                    }
+                }
+                if !valid || dst_off == 0 {
+                    continue;
+                }
+                if write_idx < idx {
+                    let (left, right) = bufs.split_at_mut(idx);
+                    left[write_idx][..dst_off].copy_from_slice(&right[0][..dst_off]);
+                }
+                meta[write_idx] = RecvMeta {
+                    addr: m.addr,
+                    len: dst_off,
+                    stride: if segs <= 1 {
+                        dst_off
+                    } else {
+                        seg_stride - OBFS_UDP_SALT_LEN
+                    },
+                    ecn: m.ecn,
+                    dst_ip: m.dst_ip,
+                };
+                write_idx += 1;
+            }
+            if write_idx > 0 {
+                return Poll::Ready(Ok(write_idx));
             }
         }
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.io.local_addr()
+        self.inner.local_addr()
     }
-}
 
-impl UdpPoller for FluxObfsUdpPoller {
-    fn poll_writable(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        if this.future.is_none() {
-            let socket = this.socket.clone();
-            this.future = Some(Box::pin(async move { socket.io.writable().await }));
-        }
-        let poll = this
-            .future
-            .as_mut()
-            .expect("Flux obfs writable future set")
-            .as_mut()
-            .poll(cx);
-        if poll.is_ready() {
-            this.future = None;
-        }
-        poll
+    fn max_transmit_segments(&self) -> usize {
+        1
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.inner.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
     }
 }
 

@@ -5,21 +5,21 @@ use crate::socket_protect;
 use anyhow::{Context, Result, ensure};
 use hmac::{Hmac, Mac};
 use quinn::udp::{RecvMeta, Transmit};
-use quinn::{AsyncUdpSocket, ConnectionId, ConnectionIdGenerator, UdpPoller};
+use quinn::{
+    AsyncUdpSocket, ConnectionId, ConnectionIdGenerator, Runtime, TokioRuntime, UdpPoller,
+};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
-use std::future::Future;
 use std::io::{self, IoSliceMut};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::task::{Context as TaskContext, Poll, ready};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -31,7 +31,6 @@ const MAX_AUTHORIZED_PEERS: usize = 4096;
 const MAX_FALLBACK_RELAYS: usize = 64;
 
 type HmacSha256 = Hmac<Sha256>;
-type IoFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync>>;
 
 pub fn reality_public_from_private(private_key: &[u8; 32]) -> [u8; 32] {
     PublicKey::from(&StaticSecret::from(*private_key)).to_bytes()
@@ -235,7 +234,7 @@ impl ServerCertVerifier for RealityQuicCertVerifier {
 }
 
 pub struct RealityUdpSocket {
-    io: Arc<UdpSocket>,
+    inner: Arc<dyn AsyncUdpSocket>,
     enable_fallback: bool,
     seed: [u8; 32],
     short_ids: Vec<[u8; 8]>,
@@ -254,25 +253,20 @@ impl fmt::Debug for RealityUdpSocket {
     }
 }
 
-struct RealityUdpPoller {
-    socket: Arc<RealityUdpSocket>,
-    future: Option<IoFuture>,
-}
-
-impl fmt::Debug for RealityUdpPoller {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RealityUdpPoller").finish_non_exhaustive()
-    }
-}
-
 impl RealityUdpSocket {
     pub fn new(
         socket: std::net::UdpSocket,
         config: &RealityServerConfig,
         enable_fallback_override: Option<bool>,
     ) -> Result<Self> {
-        let io = Arc::new(UdpSocket::from_std(socket).context("wrap REALITY tokio UDP socket")?);
-        let local_port = io.local_addr()?.port();
+        ensure!(
+            !config.private_key.iter().all(|b| *b == 0),
+            "REALITY UDP server private_key cannot be all zeros"
+        );
+        let inner = TokioRuntime
+            .wrap_udp_socket(socket)
+            .context("wrap REALITY UDP socket")?;
+        let local_port = inner.local_addr()?.port();
         let enable_fallback = enable_fallback_override.unwrap_or(local_port == 443);
         let public_key = reality_public_from_private(&config.private_key);
         let seed = derive_quic_reality_seed(&public_key);
@@ -290,12 +284,8 @@ impl RealityUdpSocket {
                     config.fallback_limit.clone(),
                 )
             });
-        ensure!(
-            !config.private_key.iter().all(|b| *b == 0),
-            "REALITY UDP server private_key cannot be all zeros"
-        );
         Ok(Self {
-            io,
+            inner,
             enable_fallback,
             seed,
             short_ids: config.short_ids.clone(),
@@ -335,7 +325,7 @@ impl RealityUdpSocket {
         }
     }
 
-    fn forward_probe(&self, peer: SocketAddr, mut datagram: Vec<u8>) {
+    fn forward_probe(&self, peer: SocketAddr, dst_ip: Option<IpAddr>, mut datagram: Vec<u8>) {
         if !self.enable_fallback {
             return;
         }
@@ -361,12 +351,19 @@ impl RealityUdpSocket {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(16);
         let _ = tx.try_send(datagram);
         relays.insert(peer, tx);
-        let server_io = self.io.clone();
+        let server_io = Arc::downgrade(&self.inner);
         let relays_map = self.fallback_relays.clone();
         tokio::spawn(async move {
-            let _ =
-                run_udp_fallback_relay(peer, target_host, target_port, limit, server_io, &mut rx)
-                    .await;
+            let _ = run_udp_fallback_relay(
+                peer,
+                dst_ip,
+                target_host,
+                target_port,
+                limit,
+                server_io,
+                &mut rx,
+            )
+            .await;
             relays_map
                 .lock()
                 .expect("REALITY UDP fallback_relays lock poisoned")
@@ -375,12 +372,41 @@ impl RealityUdpSocket {
     }
 }
 
+async fn send_fallback_reply(
+    server_io: &Arc<dyn AsyncUdpSocket>,
+    destination: SocketAddr,
+    src_ip: Option<IpAddr>,
+    contents: &[u8],
+) -> io::Result<()> {
+    let mut poller = server_io.clone().create_io_poller();
+    std::future::poll_fn(|cx| {
+        let transmit = Transmit {
+            destination,
+            ecn: None,
+            contents,
+            segment_size: None,
+            src_ip,
+        };
+        loop {
+            match server_io.try_send(&transmit) {
+                Ok(()) => return Poll::Ready(Ok(())),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    ready!(poller.as_mut().poll_writable(cx))?;
+                }
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+        }
+    })
+    .await
+}
+
 async fn run_udp_fallback_relay(
     probe_peer: SocketAddr,
+    dst_ip: Option<IpAddr>,
     target_host: String,
     target_port: u16,
     limit: RealityFallbackLimit,
-    server_io: Arc<UdpSocket>,
+    server_io: Weak<dyn AsyncUdpSocket>,
     rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
     let target_addr = tokio::net::lookup_host((target_host.as_str(), target_port))
@@ -415,13 +441,16 @@ async fn run_udp_fallback_relay(
             }
             inbound = upstream.recv(&mut buf) => {
                 let read = inbound?;
+                let Some(io) = server_io.upgrade() else {
+                    return Ok(());
+                };
                 let now = Instant::now();
                 let add = now.duration_since(last_refill).as_secs_f64() * rate;
                 budget = (budget + add).min(max_burst);
                 last_refill = now;
                 if budget >= read as f64 {
                     budget -= read as f64;
-                    let _ = server_io.send_to(&buf[..read], probe_peer).await;
+                    let _ = send_fallback_reply(&io, probe_peer, dst_ip, &buf[..read]).await;
                 }
             }
         }
@@ -430,24 +459,11 @@ async fn run_udp_fallback_relay(
 
 impl AsyncUdpSocket for RealityUdpSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(RealityUdpPoller {
-            socket: self,
-            future: None,
-        })
+        self.inner.clone().create_io_poller()
     }
 
     fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
-        let written = self
-            .io
-            .try_send_to(transmit.contents, transmit.destination)?;
-        if written == transmit.contents.len() {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "partial REALITY UDP send",
-            ))
-        }
+        self.inner.try_send(transmit)
     }
 
     fn poll_recv(
@@ -457,76 +473,65 @@ impl AsyncUdpSocket for RealityUdpSocket {
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
         loop {
-            ready!(self.io.poll_recv_ready(cx))?;
-            match self.io.try_recv_from(&mut bufs[0]) {
-                Ok((read, addr)) => {
-                    let now = Instant::now();
-                    if self.is_peer_authorized(addr, now) {
-                        meta[0] = RecvMeta {
-                            addr,
-                            len: read,
-                            stride: read,
-                            ecn: None,
-                            dst_ip: None,
-                        };
-                        return Poll::Ready(Ok(1));
-                    }
-                    let pkt = &bufs[0][..read];
-                    if let Some(scid) = extract_quic_long_header_scid(pkt)
-                        && let Some(cid) = verify_reality_scid(
-                            &self.seed,
-                            &self.short_ids,
-                            scid,
-                            self.max_skew_buckets,
-                        )
-                        && self.replay.check_and_store(cid).is_ok()
-                    {
-                        self.authorize_peer(addr, now);
-                        meta[0] = RecvMeta {
-                            addr,
-                            len: read,
-                            stride: read,
-                            ecn: None,
-                            dst_ip: None,
-                        };
-                        return Poll::Ready(Ok(1));
-                    }
-                    self.forward_probe(addr, pkt.to_vec());
-                }
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::ConnectionReset
-                    ) =>
-                {
+            let count = ready!(self.inner.poll_recv(cx, bufs, meta))?;
+            let now = Instant::now();
+            let mut write_idx = 0usize;
+            for idx in 0..count {
+                let m = meta[idx];
+                if m.len == 0 {
                     continue;
                 }
-                Err(err) => return Poll::Ready(Err(err)),
+                let mut keep = self.is_peer_authorized(m.addr, now);
+                let stride = if m.stride == 0 { m.len } else { m.stride };
+                if !keep {
+                    for seg in bufs[idx][..m.len].chunks(stride) {
+                        if let Some(scid) = extract_quic_long_header_scid(seg)
+                            && let Some(cid) = verify_reality_scid(
+                                &self.seed,
+                                &self.short_ids,
+                                scid,
+                                self.max_skew_buckets,
+                            )
+                            && self.replay.check_and_store(cid).is_ok()
+                        {
+                            self.authorize_peer(m.addr, now);
+                            keep = true;
+                            break;
+                        }
+                    }
+                }
+                if keep {
+                    if write_idx < idx {
+                        let (left, right) = bufs.split_at_mut(idx);
+                        left[write_idx][..m.len].copy_from_slice(&right[0][..m.len]);
+                        meta[write_idx] = m;
+                    }
+                    write_idx += 1;
+                } else {
+                    for seg in bufs[idx][..m.len].chunks(stride) {
+                        self.forward_probe(m.addr, m.dst_ip, seg.to_vec());
+                    }
+                }
+            }
+            if write_idx > 0 {
+                return Poll::Ready(Ok(write_idx));
             }
         }
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.io.local_addr()
+        self.inner.local_addr()
     }
-}
 
-impl UdpPoller for RealityUdpPoller {
-    fn poll_writable(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        if this.future.is_none() {
-            let io = this.socket.io.clone();
-            this.future = Some(Box::pin(async move { io.writable().await }));
-        }
-        let poll = this
-            .future
-            .as_mut()
-            .expect("REALITY UDP writable future set")
-            .as_mut()
-            .poll(cx);
-        if poll.is_ready() {
-            this.future = None;
-        }
-        poll
+    fn max_transmit_segments(&self) -> usize {
+        self.inner.max_transmit_segments()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.inner.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
     }
 }
