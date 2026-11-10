@@ -841,7 +841,7 @@ impl FluxClientPool {
         loop {
             tokio::select! {
                 _ = stop.stopped() => return,
-                _ = warming.join_next(), if !warming.is_empty() => {},
+                _ = warming.join_next(), if !warming.is_empty() => continue,
                 _ = self.warmer_wake.notified() => {},
                 _ = tick.tick() => {
                     self.expire_unanswered_probes();
@@ -948,6 +948,42 @@ impl FluxClientPool {
                 padding: Bytes::from(pad),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+    use std::future::{Future, poll_fn};
+
+    #[tokio::test]
+    async fn unavailable_entrances_do_not_spin_maintenance() -> Result<()> {
+        let reserved = TcpListener::bind("127.0.0.1:0").await?;
+        let port = reserved.local_addr()?.port();
+        drop(reserved);
+        let proxy: crate::config_compat::mihomo::MihomoFluxProxy =
+            serde_json::from_value(serde_json::json!({
+                "name": "Flux", "server": "127.0.0.1", "port": port,
+                "key": "test-user", "security": "obfs", "obfs-key": "test-channel",
+                "channels": [{"id": "tcp", "transport": "tcp"}],
+            }))?;
+        let pool = FluxClientPool::new(proxy.to_client_config("127.0.0.1:0".parse()?)?)?;
+        let stop = pool.stop.clone();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = polls.clone();
+        let mut maintenance = Box::pin(pool.run_maintenance_loop(stop.clone()));
+        let task = tokio::spawn(async move {
+            poll_fn(|cx| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                maintenance.as_mut().poll(cx)
+            })
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        stop.stop();
+        task.await?;
+        assert!(polls.load(Ordering::Relaxed) < 64);
+        Ok(())
     }
 }
 
