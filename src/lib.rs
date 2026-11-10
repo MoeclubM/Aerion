@@ -119,6 +119,10 @@ pub use shadowsocks::{
     run_shadowsocks_client_listener, run_shadowsocks_client_listener_with_core,
     run_shadowsocks_server, run_shadowsocks_server_with_core,
 };
+pub use socket_protect::{
+    OutboundInterface, clear_outbound_interface, detect_default_outbound_interface,
+    set_outbound_interface,
+};
 pub use socks::{SocksProxyClientConfig, run_socks_proxy_client, run_socks_proxy_client_listener};
 pub use sudoku::{
     SudokuClientConfig, SudokuOptions, SudokuServerConfig, run_sudoku_client,

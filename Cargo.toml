@@ -52,6 +52,7 @@ socket2 = "0.6.5"
 tun2proxy = { version = "0.7.21", default-features = false }
 tproxy-config = { version = "7.0.9", default-features = false }
 regex = "1.13.1"
+ring = "0.17.14"
 boring = { version = "5.3.0", optional = true }
 tokio-boring = { version = "5.3.0", optional = true }
 

@@ -476,12 +476,20 @@ impl AsyncUdpSocket for RealityUdpSocket {
             let count = ready!(self.inner.poll_recv(cx, bufs, meta))?;
             let now = Instant::now();
             let mut write_idx = 0usize;
+            let mut cached_peer: Option<(SocketAddr, bool)> = None;
             for idx in 0..count {
                 let m = meta[idx];
                 if m.len == 0 {
                     continue;
                 }
-                let mut keep = self.is_peer_authorized(m.addr, now);
+                let mut keep = match cached_peer {
+                    Some((addr, ok)) if addr == m.addr => ok,
+                    _ => {
+                        let ok = self.is_peer_authorized(m.addr, now);
+                        cached_peer = Some((m.addr, ok));
+                        ok
+                    }
+                };
                 let stride = if m.stride == 0 { m.len } else { m.stride };
                 if !keep {
                     for seg in bufs[idx][..m.len].chunks(stride) {
@@ -495,6 +503,7 @@ impl AsyncUdpSocket for RealityUdpSocket {
                             && self.replay.check_and_store(cid).is_ok()
                         {
                             self.authorize_peer(m.addr, now);
+                            cached_peer = Some((m.addr, true));
                             keep = true;
                             break;
                         }

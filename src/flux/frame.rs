@@ -6,8 +6,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const FLUX_WIRE_VERSION: u8 = 2;
 pub const MAX_FLUX_FRAME_LEN: usize = 128 * 1024;
-pub const MAX_FLUX_CHUNK_LEN: usize = 32 * 1024;
-pub const DEFAULT_STREAM_WINDOW_BYTES: usize = 256 * 1024;
+pub const MAX_FLUX_CHUNK_LEN: usize = 60 * 1024;
+pub const DEFAULT_STREAM_WINDOW_BYTES: usize = 1024 * 1024;
+const MAX_STREAM_WINDOW_BYTES: usize = 16 * 1024 * 1024;
 
 const FRAME_SESSION_HELLO: u8 = 0x01;
 const FRAME_SESSION_OK: u8 = 0x02;
@@ -87,8 +88,41 @@ pub enum FluxFrame {
     },
 }
 
+fn frame_encoded_hint(frame: &FluxFrame) -> usize {
+    match frame {
+        FluxFrame::StreamData { payload, .. } => 24 + payload.len(),
+        FluxFrame::StreamOpen {
+            initial_payload, ..
+        } => 64 + initial_payload.len(),
+        FluxFrame::UdpDatagram { payload, .. } => 64 + payload.len(),
+        FluxFrame::Ping { padding, .. } | FluxFrame::Pong { padding, .. } => 24 + padding.len(),
+        _ => 160,
+    }
+}
+
 pub fn encode_frame_body(frame: &FluxFrame) -> Result<Bytes> {
-    let mut buf = BytesMut::with_capacity(128);
+    let mut buf = BytesMut::with_capacity(frame_encoded_hint(frame));
+    encode_frame_body_into(frame, &mut buf)?;
+    Ok(buf.freeze())
+}
+
+pub fn encode_length_prefixed_frame_into(frame: &FluxFrame, out: &mut BytesMut) -> Result<()> {
+    let start = out.len();
+    out.reserve(4 + frame_encoded_hint(frame));
+    out.put_u32(0);
+    encode_frame_body_into(frame, out)?;
+    let body_len = out.len() - start - 4;
+    ensure!(
+        (1..=MAX_FLUX_FRAME_LEN).contains(&body_len),
+        "Flux frame exceeds limit"
+    );
+    let len_bytes = (body_len as u32).to_be_bytes();
+    out[start..start + 4].copy_from_slice(&len_bytes);
+    Ok(())
+}
+
+pub fn encode_frame_body_into(frame: &FluxFrame, buf: &mut BytesMut) -> Result<()> {
+    let start = buf.len();
     match frame {
         FluxFrame::SessionHello {
             session_id,
@@ -241,11 +275,18 @@ pub fn encode_frame_body(frame: &FluxFrame) -> Result<Bytes> {
             buf.put_slice(payload);
         }
     }
-    ensure!(buf.len() <= MAX_FLUX_FRAME_LEN, "Flux frame exceeds limit");
-    Ok(buf.freeze())
+    ensure!(
+        buf.len() - start <= MAX_FLUX_FRAME_LEN,
+        "Flux frame exceeds limit"
+    );
+    Ok(())
 }
 
 pub fn decode_frame_body(body: &[u8]) -> Result<FluxFrame> {
+    decode_frame_body_bytes(Bytes::copy_from_slice(body))
+}
+
+pub fn decode_frame_body_bytes(body: Bytes) -> Result<FluxFrame> {
     ensure!(!body.is_empty(), "empty Flux frame");
     let kind = body[0];
     let rest = &body[1..];
@@ -304,7 +345,7 @@ pub fn decode_frame_body(body: &[u8]) -> Result<FluxFrame> {
             let ts = u64::from_be_bytes(rest[8..16].try_into().unwrap());
             let pad_len = usize::from(u16::from_be_bytes([rest[16], rest[17]]));
             ensure!(rest.len() == 18 + pad_len, "invalid Flux Ping/Pong padding");
-            let padding = Bytes::copy_from_slice(&rest[18..]);
+            let padding = body.slice(body.len() - pad_len..);
             if kind == FRAME_PING {
                 Ok(FluxFrame::Ping {
                     seq,
@@ -334,7 +375,7 @@ pub fn decode_frame_body(body: &[u8]) -> Result<FluxFrame> {
                 stream_id,
                 epoch,
                 target,
-                initial_payload: Bytes::copy_from_slice(&tail[2..]),
+                initial_payload: body.slice(body.len() - init_len..),
             })
         }
         FRAME_STREAM_DATA => {
@@ -348,7 +389,7 @@ pub fn decode_frame_body(body: &[u8]) -> Result<FluxFrame> {
                 stream_id,
                 epoch,
                 offset,
-                payload: Bytes::copy_from_slice(&rest[18..]),
+                payload: body.slice(body.len() - len..),
             })
         }
         FRAME_STREAM_ACK => {
@@ -403,7 +444,7 @@ pub fn decode_frame_body(body: &[u8]) -> Result<FluxFrame> {
                 frag_index,
                 frag_total,
                 target,
-                payload: Bytes::copy_from_slice(&tail[2..]),
+                payload: body.slice(body.len() - len..),
             })
         }
         other => bail!("unknown Flux frame type {other:#x}"),
@@ -414,16 +455,12 @@ pub async fn write_length_prefixed_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     frame: &FluxFrame,
 ) -> Result<()> {
-    let body = encode_frame_body(frame)?;
-    let len = body.len() as u32;
+    let mut buf = BytesMut::with_capacity(4 + frame_encoded_hint(frame));
+    encode_length_prefixed_frame_into(frame, &mut buf)?;
     writer
-        .write_all(&len.to_be_bytes())
+        .write_all(&buf)
         .await
-        .context("write Flux frame length")?;
-    writer
-        .write_all(&body)
-        .await
-        .context("write Flux frame body")?;
+        .context("write Flux frame")?;
     Ok(())
 }
 
@@ -441,12 +478,12 @@ pub async fn read_length_prefixed_frame<R: AsyncRead + Unpin>(
         (1..=MAX_FLUX_FRAME_LEN).contains(&len),
         "invalid Flux frame length {len}"
     );
-    let mut body = vec![0u8; len];
+    let mut body = BytesMut::zeroed(len);
     reader
         .read_exact(&mut body)
         .await
         .context("read Flux frame body")?;
-    Ok(Some(decode_frame_body(&body)?))
+    Ok(Some(decode_frame_body_bytes(body.freeze())?))
 }
 
 #[derive(Debug)]
@@ -499,8 +536,8 @@ impl SendWindowBuffer {
         if ack_offset <= self.acked_offset {
             return 0;
         }
-        if self.buffered_bytes >= self.max_bytes / 2 {
-            self.max_bytes = self.max_bytes.saturating_mul(2).min(8 * 1024 * 1024);
+        if self.buffered_bytes >= self.max_bytes / 4 {
+            self.max_bytes = self.max_bytes.saturating_mul(2).min(MAX_STREAM_WINDOW_BYTES);
         }
         let target = ack_offset.min(self.next_offset);
         let mut freed = 0usize;
@@ -610,4 +647,25 @@ impl RecvOffsetAssembler {
         self.fin_offset
             .is_some_and(|fin_offset| self.next_offset >= fin_offset)
     }
+}
+
+pub fn push_coalesced_frame(batch: &mut Vec<FluxFrame>, frame: FluxFrame) {
+    if let FluxFrame::StreamAck {
+        stream_id,
+        ack_offset,
+    } = &frame
+    {
+        for item in batch.iter_mut() {
+            if let FluxFrame::StreamAck {
+                stream_id: prev_id,
+                ack_offset: prev_ack,
+            } = item
+                && *prev_id == *stream_id
+            {
+                *prev_ack = (*prev_ack).max(*ack_offset);
+                return;
+            }
+        }
+    }
+    batch.push(frame);
 }

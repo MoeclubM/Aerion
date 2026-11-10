@@ -4,12 +4,11 @@ use crate::vless_transport::BoxedTransportStream;
 use anyhow::{Context, Result, bail, ensure};
 use blake2::Blake2bVar;
 use blake2::digest::{Update, VariableOutput};
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, Runtime, TokioRuntime, UdpPoller};
+use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use sha2::Sha256;
 use std::fmt;
 use std::io::{self, IoSliceMut};
@@ -25,7 +24,7 @@ use tokio::task::JoinHandle;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const OBFS_UDP_SALT_LEN: usize = 8;
-const OBFS_PIPE_CAP: usize = 64 * 1024;
+const OBFS_PIPE_CAP: usize = 256 * 1024;
 const OBFS_MAX_CHUNK: usize = 32 * 1024;
 const OBFS_TAG_LEN: usize = 16;
 
@@ -454,9 +453,12 @@ fn spawn_obfs_stream(
     let (writer, mut app_source) = duplex(OBFS_PIPE_CAP);
 
     let read_task = tokio::spawn(async move {
-        let cipher = ChaCha20Poly1305::new((&read_key).into());
+        let cipher = LessSafeKey::new(
+            UnboundKey::new(&CHACHA20_POLY1305, &read_key).expect("32-byte ChaCha20 key"),
+        );
         let mut seq = 0u64;
         let mut len_buf = [0u8; 2];
+        let mut ct = Vec::with_capacity(OBFS_MAX_CHUNK + OBFS_TAG_LEN);
         loop {
             match wire_reader.read_exact(&mut len_buf).await {
                 Ok(_) => {}
@@ -473,28 +475,31 @@ fn spawn_obfs_stream(
                 (OBFS_TAG_LEN..=OBFS_MAX_CHUNK + OBFS_TAG_LEN).contains(&cipher_len),
                 "invalid Flux obfs record length {cipher_len}"
             );
-            let mut ct = vec![0u8; cipher_len];
+            ct.resize(cipher_len, 0);
             wire_reader
                 .read_exact(&mut ct)
                 .await
                 .context("read Flux obfs ciphertext")?;
             let plain = cipher
-                .decrypt(Nonce::from_slice(&nonce), ct.as_ref())
+                .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut ct)
                 .map_err(|_| anyhow::anyhow!("decrypt Flux obfs record"))?;
             if plain.is_empty() {
                 let _ = app_sink.shutdown().await;
                 return Ok(());
             }
-            if app_sink.write_all(&plain).await.is_err() {
+            if app_sink.write_all(plain).await.is_err() {
                 return Ok(());
             }
         }
     });
 
     let write_task = tokio::spawn(async move {
-        let cipher = ChaCha20Poly1305::new((&write_key).into());
+        let cipher = LessSafeKey::new(
+            UnboundKey::new(&CHACHA20_POLY1305, &write_key).expect("32-byte ChaCha20 key"),
+        );
         let mut seq = 0u64;
         let mut buf = vec![0u8; OBFS_MAX_CHUNK];
+        let mut write_buf = Vec::with_capacity(2 + OBFS_MAX_CHUNK + OBFS_TAG_LEN);
         loop {
             let read = app_source
                 .read(&mut buf)
@@ -502,18 +507,23 @@ fn spawn_obfs_stream(
                 .context("read local Flux obfs source")?;
             let (nonce, mask) = step_nonce(&write_iv, seq);
             seq = seq.checked_add(1).context("Flux obfs write seq overflow")?;
-            let ct = cipher
-                .encrypt(Nonce::from_slice(&nonce), &buf[..read])
+            let ct_len = read + OBFS_TAG_LEN;
+            let masked_len = ((ct_len as u16) ^ mask).to_be_bytes();
+            write_buf.clear();
+            write_buf.extend_from_slice(&masked_len);
+            write_buf.extend_from_slice(&buf[..read]);
+            let tag = cipher
+                .seal_in_place_separate_tag(
+                    Nonce::assume_unique_for_key(nonce),
+                    Aad::empty(),
+                    &mut write_buf[2..],
+                )
                 .map_err(|_| anyhow::anyhow!("encrypt Flux obfs record"))?;
-            let masked_len = ((ct.len() as u16) ^ mask).to_be_bytes();
+            write_buf.extend_from_slice(tag.as_ref());
             wire_writer
-                .write_all(&masked_len)
+                .write_all(&write_buf)
                 .await
-                .context("write Flux obfs length")?;
-            wire_writer
-                .write_all(&ct)
-                .await
-                .context("write Flux obfs ciphertext")?;
+                .context("write Flux obfs frame")?;
             wire_writer
                 .flush()
                 .await

@@ -1,12 +1,12 @@
 use crate::reality::{RealityClientConfig, build_reality_client_hello_with_alpn};
 use crate::utls::UtlsFingerprint;
 use crate::vless_vision::VisionControl;
-use aes_gcm::aead::{AeadInPlace, KeyInit};
-use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use anyhow::{Context, Result, bail, ensure};
-use chacha20poly1305::ChaCha20Poly1305;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
+use ring::aead::{
+    AES_128_GCM, AES_256_GCM, Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey,
+};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::pin::Pin;
 use std::sync::{
@@ -59,7 +59,7 @@ const TLS_GROUP_X25519: u16 = 29;
 const TLS_SIGNATURE_SCHEME_ED25519: u16 = 0x0807;
 const TLS13_LABEL_PREFIX: &[u8] = b"tls13 ";
 const TLS13_SERVER_CERT_VERIFY_CONTEXT: &[u8] = b"TLS 1.3, server CertificateVerify";
-const REALITY_PIPE_CAPACITY: usize = 64 * 1024;
+const REALITY_PIPE_CAPACITY: usize = 256 * 1024;
 
 type HmacSha512 = Hmac<Sha512>;
 
@@ -296,39 +296,42 @@ async fn pump_inbound(
     vision: Option<Arc<VisionControl>>,
     mut permit: UnboundedReceiver<()>,
 ) -> Result<()> {
+    let mut record_payload = Vec::with_capacity(TLS_MAX_PLAINTEXT_LEN + 256);
     loop {
         if vision.as_ref().is_some_and(|v| v.read_direct()) {
             tokio::io::copy(&mut stream, &mut sink).await?;
             sink.shutdown().await?;
             return Ok(());
         }
-        let Some(mut record) = read_tls_record(&mut stream).await? else {
+        let Some(record_content_type) =
+            read_tls_record_into(&mut stream, &mut record_payload).await?
+        else {
             let _ = control.send(OutboundControl::CloseNotify);
             sink.shutdown().await.ok();
             return Ok(());
         };
-        match record.content_type {
+        match record_content_type {
             TLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC => {
                 ensure!(
-                    record.payload == [1],
+                    record_payload == [1],
                     "invalid REALITY ChangeCipherSpec payload"
                 );
             }
             TLS_CONTENT_TYPE_ALERT => {
-                if record.payload.len() == 2 && record.payload[1] == TLS_ALERT_CLOSE_NOTIFY {
+                if record_payload.len() == 2 && record_payload[1] == TLS_ALERT_CLOSE_NOTIFY {
                     let _ = control.send(OutboundControl::CloseNotify);
                     sink.shutdown().await.ok();
                     return Ok(());
                 }
-                bail!("REALITY peer sent alert {:?}", record.payload);
+                bail!("REALITY peer sent alert {:?}", record_payload);
             }
             TLS_CONTENT_TYPE_APPLICATION_DATA => {
                 let content_type = cipher
-                    .decrypt_record_in_place(record.content_type, &mut record.payload)
+                    .decrypt_record_in_place(record_content_type, &mut record_payload)
                     .context("decrypt REALITY application record")?;
                 match content_type {
                     TLS_CONTENT_TYPE_APPLICATION_DATA => {
-                        sink.write_all(&record.payload)
+                        sink.write_all(&record_payload)
                             .await
                             .context("write REALITY plaintext into pipe")?;
                         if vision.is_some() && permit.recv().await.is_none() {
@@ -336,16 +339,16 @@ async fn pump_inbound(
                         }
                     }
                     TLS_CONTENT_TYPE_ALERT => {
-                        if record.payload.len() == 2 && record.payload[1] == TLS_ALERT_CLOSE_NOTIFY
+                        if record_payload.len() == 2 && record_payload[1] == TLS_ALERT_CLOSE_NOTIFY
                         {
                             let _ = control.send(OutboundControl::CloseNotify);
                             sink.shutdown().await.ok();
                             return Ok(());
                         }
-                        bail!("REALITY peer sent encrypted alert {:?}", record.payload);
+                        bail!("REALITY peer sent encrypted alert {:?}", record_payload);
                     }
                     TLS_CONTENT_TYPE_HANDSHAKE => {
-                        let mut messages = record.payload.as_slice();
+                        let mut messages = record_payload.as_slice();
                         while !messages.is_empty() {
                             let consumed =
                                 handle_post_handshake_message(&mut cipher, messages, &control)?;
@@ -369,6 +372,7 @@ async fn pump_outbound(
     progress: &WriteProgress,
 ) -> Result<()> {
     let mut buffer = vec![0u8; TLS_MAX_PLAINTEXT_LEN];
+    let mut write_buf = Vec::with_capacity(4 * (TLS_MAX_PLAINTEXT_LEN + 32));
     let mut control_closed = false;
     loop {
         tokio::select! {
@@ -398,21 +402,68 @@ async fn pump_outbound(
                     stream.shutdown().await.ok();
                     return Ok(());
                 }
-                let record = if vision.as_ref().is_some_and(|v| v.write_direct()) {
-                    buffer[..read].to_vec()
+                write_buf.clear();
+                let mut total_plain = read;
+                let mut eof_after_batch = false;
+                if vision.as_ref().is_some_and(|v| v.write_direct()) {
+                    write_buf.extend_from_slice(&buffer[..read]);
                 } else {
-                    cipher.encrypt_record(TLS_CONTENT_TYPE_APPLICATION_DATA, &buffer[..read])
-                        .context("encrypt REALITY application record")?
-                };
+                    cipher
+                        .encrypt_record_into(
+                            TLS_CONTENT_TYPE_APPLICATION_DATA,
+                            &buffer[..read],
+                            &mut write_buf,
+                        )
+                        .context("encrypt REALITY application record")?;
+                    for _ in 0..3 {
+                        match try_read_duplex(&mut source, &mut buffer)
+                            .context("drain REALITY plaintext pipe")?
+                        {
+                            Some(0) => {
+                                eof_after_batch = true;
+                                break;
+                            }
+                            Some(more) => {
+                                cipher
+                                    .encrypt_record_into(
+                                        TLS_CONTENT_TYPE_APPLICATION_DATA,
+                                        &buffer[..more],
+                                        &mut write_buf,
+                                    )
+                                    .context("encrypt REALITY application record")?;
+                                total_plain += more;
+                            }
+                            None => break,
+                        }
+                    }
+                }
                 stream
-                    .write_all(&record)
+                    .write_all(&write_buf)
                     .await
                     .context("write REALITY application record")?;
                 stream.flush().await?;
-                progress.pending.fetch_sub(read, Ordering::AcqRel);
+                progress.pending.fetch_sub(total_plain, Ordering::AcqRel);
                 progress.wake();
+                if eof_after_batch {
+                    if !vision.as_ref().is_some_and(|v| v.read_direct() || v.write_direct()) {
+                        send_close_notify(&mut stream, &mut cipher).await.ok();
+                    }
+                    stream.shutdown().await.ok();
+                    return Ok(());
+                }
             }
         }
+    }
+}
+
+fn try_read_duplex(source: &mut DuplexStream, buffer: &mut [u8]) -> std::io::Result<Option<usize>> {
+    let waker = std::task::Waker::noop();
+    let mut cx = TaskContext::from_waker(waker);
+    let mut read_buf = ReadBuf::new(buffer);
+    match Pin::new(source).poll_read(&mut cx, &mut read_buf) {
+        Poll::Ready(Ok(())) => Ok(Some(read_buf.filled().len())),
+        Poll::Ready(Err(err)) => Err(err),
+        Poll::Pending => Ok(None),
     }
 }
 
@@ -1011,20 +1062,31 @@ async fn read_tls_record<R>(reader: &mut R) -> Result<Option<TlsRecord>>
 where
     R: AsyncRead + Unpin,
 {
+    let mut payload = Vec::new();
+    let Some(content_type) = read_tls_record_into(reader, &mut payload).await? else {
+        return Ok(None);
+    };
+    Ok(Some(TlsRecord {
+        content_type,
+        payload,
+    }))
+}
+
+async fn read_tls_record_into<R>(reader: &mut R, payload: &mut Vec<u8>) -> Result<Option<u8>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut header = [0u8; TLS_RECORD_HEADER_LEN];
     let Some(()) = read_exact_or_eof(reader, &mut header).await? else {
         return Ok(None);
     };
     let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
-    let mut payload = vec![0u8; payload_len];
+    payload.resize(payload_len, 0);
     reader
-        .read_exact(&mut payload)
+        .read_exact(payload)
         .await
         .context("read REALITY TLS record payload")?;
-    Ok(Some(TlsRecord {
-        content_type: header[0],
-        payload,
-    }))
+    Ok(Some(header[0]))
 }
 
 async fn read_exact_or_eof<R>(reader: &mut R, buffer: &mut [u8]) -> Result<Option<()>>
@@ -1054,15 +1116,9 @@ struct TlsRecord {
 struct RecordCipher {
     suite: CipherSuite,
     traffic_secret: Vec<u8>,
-    cipher: AeadCipher,
+    cipher: LessSafeKey,
     iv: [u8; 12],
     sequence: u64,
-}
-
-enum AeadCipher {
-    Aes128(Aes128Gcm),
-    Aes256(Aes256Gcm),
-    Chacha(ChaCha20Poly1305),
 }
 
 enum OutboundControl {
@@ -1076,35 +1132,57 @@ impl RecordCipher {
         let iv = hkdf_expand_label(suite.hash_kind(), secret, b"iv", &[], 12)?;
         let mut nonce_iv = [0u8; 12];
         nonce_iv.copy_from_slice(&iv);
+        let algorithm = match suite.id {
+            0x1301 => &AES_128_GCM,
+            0x1302 => &AES_256_GCM,
+            0x1303 => &CHACHA20_POLY1305,
+            _ => unreachable!(),
+        };
+        let unbound = UnboundKey::new(algorithm, &key)
+            .map_err(|_| anyhow::anyhow!("create REALITY AEAD key"))?;
         Ok(Self {
             suite,
             traffic_secret: secret.to_vec(),
-            cipher: AeadCipher::new(suite, &key)?,
+            cipher: LessSafeKey::new(unbound),
             iv: nonce_iv,
             sequence: 0,
         })
     }
 
     fn encrypt_record(&mut self, inner_content_type: u8, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let mut record = Vec::with_capacity(
+            TLS_RECORD_HEADER_LEN + plaintext.len() + 1 + self.suite.tag_len(),
+        );
+        self.encrypt_record_into(inner_content_type, plaintext, &mut record)?;
+        Ok(record)
+    }
+
+    fn encrypt_record_into(
+        &mut self,
+        inner_content_type: u8,
+        plaintext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         ensure!(
             plaintext.len() <= TLS_MAX_PLAINTEXT_LEN,
             "REALITY plaintext chunk exceeds TLS record limit"
         );
-        let mut payload = plaintext.to_vec();
-        payload.push(inner_content_type);
-        let header = build_encrypted_record_header(payload.len() + self.suite.tag_len())?;
-        let nonce = build_nonce(self.iv, self.sequence);
+        let inner_len = plaintext.len() + 1;
+        let encrypted_len = inner_len + self.suite.tag_len();
+        let header = build_encrypted_record_header(encrypted_len)?;
+        let nonce = Nonce::assume_unique_for_key(build_nonce(self.iv, self.sequence));
+        out.reserve(TLS_RECORD_HEADER_LEN + encrypted_len);
+        out.extend_from_slice(&header);
+        let body_start = out.len();
+        out.extend_from_slice(plaintext);
+        out.push(inner_content_type);
         let tag = self
             .cipher
-            .encrypt_in_place_detached(&nonce, &header, &mut payload)
-            .context("seal REALITY TLS record")?;
+            .seal_in_place_separate_tag(nonce, Aad::from(&header), &mut out[body_start..])
+            .map_err(|_| anyhow::anyhow!("seal REALITY TLS record"))?;
+        out.extend_from_slice(tag.as_ref());
         self.sequence += 1;
-
-        let mut record = Vec::with_capacity(TLS_RECORD_HEADER_LEN + payload.len() + tag.len());
-        record.extend_from_slice(&header);
-        record.extend_from_slice(&payload);
-        record.extend_from_slice(&tag);
-        Ok(record)
+        Ok(())
     }
 
     fn decrypt_record_in_place(&mut self, record_type: u8, payload: &mut Vec<u8>) -> Result<u8> {
@@ -1117,14 +1195,14 @@ impl RecordCipher {
             "REALITY encrypted record is too short"
         );
         let header = build_encrypted_record_header(payload.len())?;
-        let nonce = build_nonce(self.iv, self.sequence);
-        let ciphertext_len = payload.len() - self.suite.tag_len();
-        let tag = payload[ciphertext_len..].to_vec();
-        payload.truncate(ciphertext_len);
-        self.cipher
-            .decrypt_in_place_detached(&nonce, &header, payload, &tag)
-            .context("open REALITY TLS record")?;
+        let nonce = Nonce::assume_unique_for_key(build_nonce(self.iv, self.sequence));
+        let plain_len = self
+            .cipher
+            .open_in_place(nonce, Aad::from(&header), payload)
+            .map_err(|_| anyhow::anyhow!("open REALITY TLS record"))?
+            .len();
         self.sequence += 1;
+        payload.truncate(plain_len);
 
         let content_type_offset = payload
             .iter()
@@ -1145,74 +1223,6 @@ impl RecordCipher {
         )?;
         *self = Self::new(self.suite, &next_secret)?;
         Ok(())
-    }
-}
-
-impl AeadCipher {
-    fn new(suite: CipherSuite, key: &[u8]) -> Result<Self> {
-        Ok(match suite.id {
-            0x1301 => Self::Aes128(
-                Aes128Gcm::new_from_slice(key).context("create REALITY AES-128-GCM cipher")?,
-            ),
-            0x1302 => Self::Aes256(
-                Aes256Gcm::new_from_slice(key).context("create REALITY AES-256-GCM cipher")?,
-            ),
-            0x1303 => Self::Chacha(
-                ChaCha20Poly1305::new_from_slice(key)
-                    .context("create REALITY ChaCha20-Poly1305 cipher")?,
-            ),
-            _ => unreachable!(),
-        })
-    }
-
-    fn encrypt_in_place_detached(
-        &self,
-        nonce: &[u8; 12],
-        aad: &[u8],
-        payload: &mut Vec<u8>,
-    ) -> Result<Vec<u8>> {
-        match self {
-            Self::Aes128(cipher) => cipher
-                .encrypt_in_place_detached(aes_gcm::Nonce::from_slice(nonce), aad, payload)
-                .map(|tag| tag.to_vec()),
-            Self::Aes256(cipher) => cipher
-                .encrypt_in_place_detached(aes_gcm::Nonce::from_slice(nonce), aad, payload)
-                .map(|tag| tag.to_vec()),
-            Self::Chacha(cipher) => cipher
-                .encrypt_in_place_detached(chacha20poly1305::Nonce::from_slice(nonce), aad, payload)
-                .map(|tag| tag.to_vec()),
-        }
-        .map_err(|_| anyhow::anyhow!("REALITY AEAD encrypt failed"))
-    }
-
-    fn decrypt_in_place_detached(
-        &self,
-        nonce: &[u8; 12],
-        aad: &[u8],
-        payload: &mut Vec<u8>,
-        tag: &[u8],
-    ) -> Result<()> {
-        match self {
-            Self::Aes128(cipher) => cipher.decrypt_in_place_detached(
-                aes_gcm::Nonce::from_slice(nonce),
-                aad,
-                payload,
-                aes_gcm::Tag::from_slice(tag),
-            ),
-            Self::Aes256(cipher) => cipher.decrypt_in_place_detached(
-                aes_gcm::Nonce::from_slice(nonce),
-                aad,
-                payload,
-                aes_gcm::Tag::from_slice(tag),
-            ),
-            Self::Chacha(cipher) => cipher.decrypt_in_place_detached(
-                chacha20poly1305::Nonce::from_slice(nonce),
-                aad,
-                payload,
-                chacha20poly1305::Tag::from_slice(tag),
-            ),
-        }
-        .map_err(|_| anyhow::anyhow!("REALITY AEAD decrypt failed"))
     }
 }
 

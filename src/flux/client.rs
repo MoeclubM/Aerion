@@ -5,7 +5,7 @@ use super::config::{
 };
 use super::frame::{
     DEFAULT_STREAM_WINDOW_BYTES, FluxFrame, MAX_FLUX_CHUNK_LEN, RecvOffsetAssembler,
-    SendWindowBuffer,
+    SendWindowBuffer, push_coalesced_frame,
 };
 use super::transport::{
     FluxChannelGuard, FluxFrameReader, FluxFrameWriter, connect_client_channel,
@@ -33,7 +33,9 @@ const MAX_UDP_SLICE_BYTES: usize = 1100;
 const CHANNEL_DIAL_TIMEOUT: Duration = Duration::from_secs(8);
 const PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const UDP_FRAG_TIMEOUT: Duration = Duration::from_secs(20);
-const MIN_RTO_MS: u64 = 600;
+const SILENT_PROBE_US: u64 = 600_000;
+const WRITER_BATCH_MAX: usize = 64;
+const STREAM_EVENT_BURST_MAX: usize = 32;
 
 pub async fn run_flux_client(config: FluxClientConfig) -> Result<()> {
     let listener = TcpListener::bind(config.listen)
@@ -176,15 +178,13 @@ impl ClientChannelHandle {
     }
 
     pub fn mark_draining(&self) {
-        if !self.draining.swap(true, Ordering::AcqRel) {
-            self.state_notify.notify_waiters();
-        }
+        self.draining.store(true, Ordering::Release);
     }
 
     pub async fn wait_needs_migration(&self) {
         loop {
             let notified = self.state_notify.notified();
-            if self.is_dead() || self.is_draining() {
+            if self.is_dead() {
                 return;
             }
             notified.await;
@@ -193,6 +193,10 @@ impl ClientChannelHandle {
 
     pub fn rtt_ms(&self) -> u64 {
         self.smoothed_rtt_ms.load(Ordering::Relaxed).max(1)
+    }
+
+    fn probe_timeout_us(&self) -> u64 {
+        (self.rtt_ms() * 8).clamp(1800, 4500) * 1000
     }
 
     fn record_rtt_sample(&self, rtt_ms: u64) -> bool {
@@ -236,29 +240,56 @@ impl ClientChannelHandle {
         !self.is_dead() && self.prio_tx.send(frame).is_ok()
     }
 
-    async fn send_stream(&self, frame: FluxFrame) -> bool {
-        let notified = self.wait_needs_migration();
-        let permit = tokio::select! {
-            _ = notified => return false,
-            _ = self.guard.closed() => return false,
-            _ = tokio::time::sleep(Duration::from_millis((self.rtt_ms() * 3).max(600))) => {
-                self.mark_draining();
-                return false;
-            }
-            permit = self.stream_tx.reserve() => match permit {
-                Ok(permit) => permit,
-                Err(_) => return false,
-            },
-        };
-        if self.is_dead() || self.is_draining() {
-            return false;
-        }
+    fn record_outbound_bytes(&self, frame: &FluxFrame) {
         if let FluxFrame::StreamData { payload, .. } | FluxFrame::UdpDatagram { payload, .. } =
-            &frame
+            frame
         {
             self.bytes_transferred
                 .fetch_add(payload.len() as u64, Ordering::Relaxed);
         }
+    }
+
+    fn try_send_stream(&self, frame: FluxFrame) -> std::result::Result<(), Option<FluxFrame>> {
+        if self.is_dead() {
+            return Err(None);
+        }
+        self.record_outbound_bytes(&frame);
+        match self.stream_tx.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                if let FluxFrame::StreamData { payload, .. }
+                | FluxFrame::UdpDatagram { payload, .. } = &returned
+                {
+                    self.bytes_transferred
+                        .fetch_sub(payload.len() as u64, Ordering::Relaxed);
+                }
+                Err(Some(returned))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(None),
+        }
+    }
+
+    async fn reserve_stream(&self) -> Option<mpsc::Permit<'_, FluxFrame>> {
+        if self.is_dead() {
+            return None;
+        }
+        let notified = self.wait_needs_migration();
+        let permit = tokio::select! {
+            _ = notified => return None,
+            _ = self.guard.closed() => return None,
+            permit = self.stream_tx.reserve() => permit.ok()?,
+        };
+        if self.is_dead() {
+            return None;
+        }
+        Some(permit)
+    }
+
+    async fn send_stream(&self, frame: FluxFrame) -> bool {
+        let Some(permit) = self.reserve_stream().await else {
+            return false;
+        };
+        self.record_outbound_bytes(&frame);
         permit.send(frame);
         true
     }
@@ -351,7 +382,23 @@ impl FluxClientPool {
     }
 
     fn target_warm_count(&self) -> usize {
-        1 + self.config.options.standby_channels
+        let base = 1 + self.config.options.standby_channels;
+        if self.config.options.standby_channels == 0 {
+            return 1;
+        }
+        let active_streams: usize = self
+            .channels
+            .lock()
+            .expect("Flux client channels poisoned")
+            .values()
+            .filter(|ch| ch.is_usable_for_new())
+            .map(|ch| ch.active_streams.load(Ordering::Relaxed))
+            .sum();
+        if active_streams >= 4 {
+            base.max(4)
+        } else {
+            base
+        }
     }
 
     async fn discover_candidates(&self) -> Result<Vec<CandidateEndpoint>> {
@@ -457,8 +504,13 @@ impl FluxClientPool {
 
     fn score_channel_for_stream(&self, ch: &ClientChannelHandle) -> i64 {
         let rtt = ch.rtt_ms() as i64;
-        let load = (ch.active_streams.load(Ordering::Relaxed) as i64) * 4;
+        let load = (ch.active_streams.load(Ordering::Relaxed) as i64) * 12;
         let weight_bonus = i64::from(ch.weight) / 10;
+        let transport_bonus = match ch.transport {
+            FluxTransportKind::Udp => 6,
+            FluxTransportKind::Tcp => 0,
+            FluxTransportKind::Http => -2,
+        };
         let ip_penalty = match (self.config.options.ip_strategy, ch.remote_addr.is_ipv6()) {
             (FluxIpStrategy::PreferV4, true) => 15,
             (FluxIpStrategy::PreferV6, false) => 15,
@@ -468,23 +520,28 @@ impl FluxClientPool {
             FluxChannelRole::Primary => 0,
             FluxChannelRole::Backup => 500,
         };
-        rtt + load - weight_bonus + ip_penalty + role_penalty
+        rtt + load - weight_bonus - transport_bonus + ip_penalty + role_penalty
     }
 
-    async fn pick_channel_for_new_stream(self: &Arc<Self>) -> Result<Arc<ClientChannelHandle>> {
+    async fn pick_channel_for_new_stream(self: &Arc<Self>) -> Result<StreamSlotGuard> {
         if let Some(best) = self
             .new_stream_candidates()
             .into_iter()
             .min_by_key(|ch| self.score_channel_for_stream(ch))
         {
+            let slot = StreamSlotGuard::acquire(best);
             self.warmer_wake.notify_one();
-            return Ok(best);
+            return Ok(slot);
         }
         self.ensure_usable_channel(None).await?;
-        self.new_stream_candidates()
+        let best = self
+            .new_stream_candidates()
             .into_iter()
             .min_by_key(|ch| self.score_channel_for_stream(ch))
-            .context("no healthy Flux channel available")
+            .context("no healthy Flux channel available")?;
+        let slot = StreamSlotGuard::acquire(best);
+        self.warmer_wake.notify_one();
+        Ok(slot)
     }
 
     async fn pick_channel_for_udp(self: &Arc<Self>) -> Result<Arc<ClientChannelHandle>> {
@@ -574,22 +631,27 @@ impl FluxClientPool {
         }
 
         let candidates = self.discover_candidates().await?;
-
-        let mut remaining = candidates
+        let now = Instant::now();
+        let healthy_candidates = candidates
             .into_iter()
+            .filter(|cand| {
+                self.failed_endpoints
+                    .lock()
+                    .expect("Flux failures poisoned")
+                    .get(&(cand.spec_idx, cand.addr))
+                    .is_none_or(|(until, _)| *until <= now)
+            })
+            .collect::<Vec<_>>();
+
+        let mut remaining = healthy_candidates
+            .iter()
             .filter(|cand| {
                 !active
                     .iter()
                     .any(|ch| ch.spec_idx == cand.spec_idx && ch.remote_addr == cand.addr)
             })
+            .cloned()
             .collect::<Vec<_>>();
-        remaining.retain(|cand| {
-            self.failed_endpoints
-                .lock()
-                .expect("Flux failures poisoned")
-                .get(&(cand.spec_idx, cand.addr))
-                .is_none_or(|(until, _)| *until <= Instant::now())
-        });
         let mut dial_set = JoinSet::new();
         let mut last_err = None;
         loop {
@@ -656,6 +718,77 @@ impl FluxClientPool {
                 Err(err) => last_err = Some(anyhow::anyhow!("Flux dial task failed: {err}")),
             }
         }
+
+        if !active.is_empty() && active.len() < target {
+            let primary_pool = healthy_candidates
+                .into_iter()
+                .filter(|cand| {
+                    self.config.channels[cand.spec_idx].role == FluxChannelRole::Primary
+                        && !self
+                            .failed_endpoints
+                            .lock()
+                            .expect("Flux failures poisoned")
+                            .contains_key(&(cand.spec_idx, cand.addr))
+                })
+                .collect::<Vec<_>>();
+            if !primary_pool.is_empty() {
+                let mut in_flight: HashMap<(usize, SocketAddr), usize> = HashMap::new();
+                while active.len() + dial_set.len() < target {
+                    let cand = primary_pool
+                        .iter()
+                        .min_by_key(|cand| {
+                            let spec = &self.config.channels[cand.spec_idx];
+                            let existing = active
+                                .iter()
+                                .filter(|ch| {
+                                    ch.spec_idx == cand.spec_idx && ch.remote_addr == cand.addr
+                                })
+                                .count()
+                                + in_flight
+                                    .get(&(cand.spec_idx, cand.addr))
+                                    .copied()
+                                    .unwrap_or(0);
+                            let tp_bias = if spec.transport == FluxTransportKind::Udp {
+                                -1i64
+                            } else {
+                                0i64
+                            };
+                            (existing as i64) * 10 - i64::from(spec.weight) / 20 + tp_bias
+                        })
+                        .cloned()
+                        .unwrap();
+                    *in_flight.entry((cand.spec_idx, cand.addr)).or_insert(0) += 1;
+                    let pool = self.clone();
+                    dial_set.spawn(async move {
+                        let result = pool.dial_and_register_channel(cand.clone()).await;
+                        (cand, result)
+                    });
+                }
+                while let Some(next) = tokio::select! {
+                    _ = self.stop.stopped() => bail!("Flux client stopped"),
+                    next = dial_set.join_next() => next,
+                } {
+                    if let Ok((cand, res)) = next {
+                        match res {
+                            Ok(ch) => active.push(ch),
+                            Err(err) => {
+                                let mut failed = self
+                                    .failed_endpoints
+                                    .lock()
+                                    .expect("Flux failures poisoned");
+                                let entry = failed
+                                    .entry((cand.spec_idx, cand.addr))
+                                    .or_insert((Instant::now(), 0));
+                                entry.1 = entry.1.saturating_add(1);
+                                let delay = Duration::from_secs(1u64 << entry.1.min(5));
+                                entry.0 = Instant::now() + delay;
+                                last_err = Some(err);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if active.is_empty() {
             return Err(last_err.unwrap_or_else(|| {
                 anyhow::anyhow!("no Flux channel available; failed entrances are awaiting retry")
@@ -669,7 +802,6 @@ impl FluxClientPool {
         cand: CandidateEndpoint,
     ) -> Result<Arc<ClientChannelHandle>> {
         let spec = &self.config.channels[cand.spec_idx];
-        let t0 = Instant::now();
         let (mut reader, mut writer, guard) = tokio::time::timeout(
             CHANNEL_DIAL_TIMEOUT,
             connect_client_channel(spec, cand.addr),
@@ -724,12 +856,14 @@ impl FluxClientPool {
         if let FluxFrame::SessionHello { client_proof, .. } = &mut hello {
             *client_proof = proof;
         }
+        let t_hello = Instant::now();
         writer.write_frame(&hello, true).await?;
 
         let ok_frame = tokio::time::timeout(CHANNEL_DIAL_TIMEOUT, reader.read_frame())
             .await
             .context("Flux SessionOk timed out")??
             .context("Flux channel closed before SessionOk")?;
+        let init_rtt_ms = (t_hello.elapsed().as_millis() as u64).max(1);
         let FluxFrame::SessionOk {
             status,
             server_proof,
@@ -750,10 +884,9 @@ impl FluxClientPool {
             "Flux server proof verification failed"
         );
 
-        let init_rtt_ms = (t0.elapsed().as_millis() as u64).max(1);
         let uid = self.next_channel_uid.fetch_add(1, Ordering::Relaxed);
         let (prio_tx, mut prio_rx) = mpsc::unbounded_channel::<FluxFrame>();
-        let (stream_tx, mut stream_rx) = mpsc::channel::<FluxFrame>(256);
+        let (stream_tx, mut stream_rx) = mpsc::channel::<FluxFrame>(512);
 
         let rotate_after = jitter_duration_secs(self.config.options.rotation_interval_sec, 300);
         let rotate_bytes_limit = jitter_bytes_mb(self.config.options.rotation_bytes_mb, 250);
@@ -845,6 +978,7 @@ impl FluxClientPool {
                 _ = self.warmer_wake.notified() => {},
                 _ = tick.tick() => {
                     self.expire_unanswered_probes();
+                    self.probe_silent_active_channels();
                     if last_probe.elapsed() >= PROBE_INTERVAL {
                         self.probe_and_rotate_channels().await;
                         last_probe = Instant::now();
@@ -868,12 +1002,49 @@ impl FluxClientPool {
         {
             let pending = *ch.pending_ping.lock().expect("Flux ping poisoned");
             if let Some((_, sent)) = pending {
-                let timeout_us = (ch.rtt_ms() * 3).max(600) * 1000;
+                let timeout_us = ch.probe_timeout_us();
                 if now.saturating_sub(sent) > timeout_us
                     && now.saturating_sub(ch.last_rx_micros.load(Ordering::Relaxed)) > timeout_us
                 {
                     ch.mark_dead();
                 }
+            }
+        }
+    }
+
+    fn send_ping_on_channel(&self, ch: &ClientChannelHandle, now: u64) {
+        let seq = self.next_ping_seq.fetch_add(1, Ordering::Relaxed);
+        let mut pad_byte = [0u8; 1];
+        let _ = getrandom::fill(&mut pad_byte);
+        let pad_len = usize::from(pad_byte[0] % 48);
+        let mut pad = vec![0u8; pad_len];
+        let _ = getrandom::fill(&mut pad);
+        let _ = ch.send_prio(FluxFrame::Ping {
+            seq,
+            sent_micros: now,
+            padding: Bytes::from(pad),
+        });
+        *ch.pending_ping.lock().expect("Flux ping poisoned") = Some((seq, now));
+    }
+
+    fn probe_silent_active_channels(&self) {
+        let now = self.now_micros();
+        let snapshot = self
+            .channels
+            .lock()
+            .expect("Flux client channels poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for ch in &snapshot {
+            if ch.is_dead() || ch.active_streams.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            if now.saturating_sub(ch.last_rx_micros.load(Ordering::Relaxed)) < SILENT_PROBE_US {
+                continue;
+            }
+            if ch.pending_ping.lock().expect("Flux ping poisoned").is_none() {
+                self.send_ping_on_channel(ch, now);
             }
         }
     }
@@ -924,9 +1095,9 @@ impl FluxClientPool {
             }
 
             let now = self.now_micros();
-            let mut pending = ch.pending_ping.lock().expect("Flux ping poisoned");
-            if let Some((_, sent)) = *pending {
-                let timeout_us = (ch.rtt_ms() * 3).max(600) * 1000;
+            let pending = *ch.pending_ping.lock().expect("Flux ping poisoned");
+            if let Some((_, sent)) = pending {
+                let timeout_us = ch.probe_timeout_us();
                 if now.saturating_sub(sent) > timeout_us
                     && now.saturating_sub(ch.last_rx_micros.load(Ordering::Relaxed)) > timeout_us
                 {
@@ -934,19 +1105,7 @@ impl FluxClientPool {
                 }
                 continue;
             }
-            let seq = self.next_ping_seq.fetch_add(1, Ordering::Relaxed);
-            *pending = Some((seq, now));
-            drop(pending);
-            let mut pad_byte = [0u8; 1];
-            let _ = getrandom::fill(&mut pad_byte);
-            let pad_len = usize::from(pad_byte[0] % 48);
-            let mut pad = vec![0u8; pad_len];
-            let _ = getrandom::fill(&mut pad);
-            let _ = ch.send_prio(FluxFrame::Ping {
-                seq,
-                sent_micros: now,
-                padding: Bytes::from(pad),
-            });
+            self.send_ping_on_channel(ch, now);
         }
     }
 }
@@ -1068,7 +1227,9 @@ async fn run_client_writer_loop(
     prio_rx: &mut mpsc::UnboundedReceiver<FluxFrame>,
     stream_rx: &mut mpsc::Receiver<FluxFrame>,
 ) -> Result<()> {
+    let mut batch = Vec::with_capacity(WRITER_BATCH_MAX);
     loop {
+        batch.clear();
         let first = tokio::select! {
             frame = prio_rx.recv() => match frame {
                 Some(f) => f,
@@ -1079,24 +1240,19 @@ async fn run_client_writer_loop(
                 None => return Ok(()),
             },
         };
-        let mut batch_has_more = !prio_rx.is_empty() || !stream_rx.is_empty();
-        writer.write_frame(&first, !batch_has_more).await?;
-        let mut drained = 0usize;
-        while batch_has_more && drained < 32 {
-            let next = if let Ok(p) = prio_rx.try_recv() {
-                Some(p)
+        push_coalesced_frame(&mut batch, first);
+        while batch.len() < WRITER_BATCH_MAX {
+            if let Ok(p) = prio_rx.try_recv() {
+                push_coalesced_frame(&mut batch, p);
+            } else if let Ok(s) = stream_rx.try_recv() {
+                push_coalesced_frame(&mut batch, s);
             } else {
-                stream_rx.try_recv().ok()
-            };
-            let Some(frame) = next else {
-                writer.flush().await?;
                 break;
-            };
-            drained += 1;
-            batch_has_more = !prio_rx.is_empty() || !stream_rx.is_empty();
-            writer
-                .write_frame(&frame, !batch_has_more || drained == 32)
-                .await?;
+            }
+        }
+        let last_idx = batch.len() - 1;
+        for (idx, frame) in batch.iter().enumerate() {
+            writer.write_frame(frame, idx == last_idx).await?;
         }
     }
 }
@@ -1312,8 +1468,8 @@ async fn handle_flux_socks_client(
 
     match socks::read_request(&mut local).await? {
         SocksRequest::Connect(target) => {
-            let mut active_ch = match pool.pick_channel_for_new_stream().await {
-                Ok(ch) => ch,
+            let mut slot = match pool.pick_channel_for_new_stream().await {
+                Ok(slot) => slot,
                 Err(err) => {
                     let _ = socks::write_reply(&mut local, 0x05).await;
                     return Err(err);
@@ -1321,13 +1477,14 @@ async fn handle_flux_socks_client(
             };
 
             let stream_id = pool.next_stream_id.fetch_add(1, Ordering::Relaxed);
-            let (ev_tx, ev_rx) = mpsc::channel::<ClientStreamEvent>(128);
+            let (ev_tx, ev_rx) = mpsc::channel::<ClientStreamEvent>(512);
             pool.streams
                 .lock()
                 .expect("Flux client streams poisoned")
                 .insert(stream_id, ev_tx);
 
-            let mut opened = active_ch
+            let mut opened = slot
+                .ch
                 .send_stream(FluxFrame::StreamOpen {
                     stream_id,
                     epoch: 1,
@@ -1336,10 +1493,11 @@ async fn handle_flux_socks_client(
                 })
                 .await;
             if !opened {
-                active_ch.mark_dead();
-                if let Ok(fallback_ch) = pool.pick_migration_channel(&active_ch).await {
-                    active_ch = fallback_ch;
-                    opened = active_ch
+                slot.ch.mark_dead();
+                if let Ok(fallback_ch) = pool.pick_migration_channel(&slot.ch).await {
+                    slot.switch_to(fallback_ch);
+                    opened = slot
+                        .ch
                         .send_stream(FluxFrame::StreamOpen {
                             stream_id,
                             epoch: 1,
@@ -1363,17 +1521,17 @@ async fn handle_flux_socks_client(
                     .lock()
                     .expect("Flux client streams poisoned")
                     .remove(&stream_id);
-                let _ = active_ch
+                let _ = slot
+                    .ch
                     .send_stream(FluxFrame::StreamRst { stream_id, code: 0 })
                     .await;
                 return Err(err);
             }
 
-            active_ch.active_streams.fetch_add(1, Ordering::Relaxed);
             let res = run_client_stream(
                 local,
                 pool.clone(),
-                active_ch,
+                slot,
                 stream_id,
                 target,
                 ev_rx,
@@ -1401,7 +1559,8 @@ struct StreamSlotGuard {
 }
 
 impl StreamSlotGuard {
-    fn new(ch: Arc<ClientChannelHandle>) -> Self {
+    fn acquire(ch: Arc<ClientChannelHandle>) -> Self {
+        ch.active_streams.fetch_add(1, Ordering::Relaxed);
         Self { ch }
     }
 
@@ -1421,46 +1580,34 @@ impl Drop for StreamSlotGuard {
 async fn run_client_stream(
     mut local: TcpStream,
     pool: Arc<FluxClientPool>,
-    initial_ch: Arc<ClientChannelHandle>,
+    mut slot: StreamSlotGuard,
     stream_id: u32,
     target: ProxyTarget,
     mut ev_rx: mpsc::Receiver<ClientStreamEvent>,
     core_session: Option<CoreSession>,
 ) -> Result<()> {
-    let mut slot = StreamSlotGuard::new(initial_ch);
     let mut epoch = 1u32;
     let mut uplink_win = SendWindowBuffer::new(DEFAULT_STREAM_WINDOW_BYTES);
     let mut downlink_recv = RecvOffsetAssembler::default();
     let _ = downlink_recv.accept_migrate(1);
     let mut uplink_done = false;
     let mut downlink_done = false;
-    let mut last_ack_or_rx = Instant::now();
+    let mut pending_uplink: Option<FluxFrame> = None;
     let mut half_close_deadline: Option<Instant> = None;
     let mut read_buf = vec![0u8; MAX_FLUX_CHUNK_LEN];
 
     loop {
-        if uplink_done && downlink_done && !uplink_win.has_unacked() {
+        if uplink_done && downlink_done && pending_uplink.is_none() && !uplink_win.has_unacked() {
             let _ = local.shutdown().await;
             return Ok(());
         }
 
         let local_read_cap = uplink_win.available_window().min(MAX_FLUX_CHUNK_LEN);
-        let can_read_local = !uplink_done && local_read_cap > 0;
-        let rto_ms = ((slot.ch.rtt_ms() * 3) / 2).max(MIN_RTO_MS);
-        let stall_deadline = uplink_win
-            .has_unacked()
-            .then(|| last_ack_or_rx + Duration::from_millis(rto_ms));
+        let can_read_local = !uplink_done && pending_uplink.is_none() && local_read_cap > 0;
 
         let cancel_fut = async {
             if let Some(session) = &core_session {
                 session.cancelled().await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
-        let stall_fut = async {
-            if let Some(deadline) = stall_deadline {
-                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
             } else {
                 std::future::pending::<()>().await;
             }
@@ -1473,6 +1620,7 @@ async fn run_client_stream(
             }
         };
         let ch_watch = slot.ch.clone();
+        let ch_pending = slot.ch.clone();
 
         tokio::select! {
             _ = cancel_fut => {
@@ -1485,6 +1633,7 @@ async fn run_client_stream(
                 return Ok(());
             }
             _ = ch_watch.wait_needs_migration() => {
+                pending_uplink = None;
                 migrate_client_stream(
                     &pool,
                     &mut slot,
@@ -1496,81 +1645,106 @@ async fn run_client_stream(
                     uplink_done,
                 )
                 .await?;
-                last_ack_or_rx = Instant::now();
             }
-            _ = stall_fut => {
-                slot.ch.mark_draining();
-                migrate_client_stream(
-                    &pool,
-                    &mut slot,
-                    stream_id,
-                    &mut epoch,
-                    &target,
-                    &uplink_win,
-                    &downlink_recv,
-                    uplink_done,
-                )
-                .await?;
-                last_ack_or_rx = Instant::now();
+            permit_res = ch_pending.reserve_stream(), if pending_uplink.is_some() => {
+                match permit_res {
+                    Some(permit) => {
+                        if let Some(frame) = pending_uplink.take() {
+                            ch_pending.record_outbound_bytes(&frame);
+                            permit.send(frame);
+                        }
+                    }
+                    None => {
+                        pending_uplink = None;
+                        migrate_client_stream(
+                            &pool,
+                            &mut slot,
+                            stream_id,
+                            &mut epoch,
+                            &target,
+                            &uplink_win,
+                            &downlink_recv,
+                            uplink_done,
+                        )
+                        .await?;
+                    }
+                }
             }
             ev = ev_rx.recv() => {
                 let Some(ev) = ev else {
                     let _ = local.shutdown().await;
                     return Ok(());
                 };
-                match ev {
-                    ClientStreamEvent::Data { epoch: pkt_epoch, offset, payload } => {
-                        last_ack_or_rx = Instant::now();
-                        let accepted = downlink_recv.accept_data(pkt_epoch, offset, payload)?;
-                        if let Some(fresh) = accepted {
-                            if let Some(session) = &core_session {
-                                session.record_download(fresh.len()).await?;
+                let mut cur_ev = Some(ev);
+                let mut drained = 0usize;
+                let mut ack_dirty = false;
+                while let Some(event) = cur_ev.take() {
+                    match event {
+                        ClientStreamEvent::Data {
+                            epoch: pkt_epoch,
+                            offset,
+                            payload,
+                        } => {
+                            let accepted = downlink_recv.accept_data(pkt_epoch, offset, payload)?;
+                            if let Some(fresh) = accepted {
+                                if let Some(session) = &core_session {
+                                    session.record_download(fresh.len()).await?;
+                                }
+                                if let Err(err) = local.write_all(&fresh).await {
+                                    let rst = FluxFrame::StreamRst {
+                                        stream_id,
+                                        code: 0,
+                                    };
+                                    let _ = slot.ch.send_stream(rst).await;
+                                    return Err(err).context("write Flux local SOCKS stream");
+                                }
                             }
-                            if let Err(err) = local.write_all(&fresh).await {
-                                let rst = FluxFrame::StreamRst {
-                                    stream_id,
-                                    code: 0,
-                                };
-                                let _ = slot.ch.send_stream(rst).await;
-                                return Err(err).context("write Flux local SOCKS stream");
+                            ack_dirty = true;
+                            if !downlink_done && downlink_recv.is_complete() {
+                                downlink_done = true;
+                                let _ = local.shutdown().await;
+                                if uplink_done && half_close_deadline.is_none() {
+                                    half_close_deadline =
+                                        Some(Instant::now() + Duration::from_secs(5));
+                                }
                             }
                         }
-                        let _ = slot.ch.send_prio(FluxFrame::StreamAck {
-                            stream_id,
-                            ack_offset: downlink_recv.next_offset(),
-                        });
-                        if !downlink_done && downlink_recv.is_complete() {
-                            downlink_done = true;
+                        ClientStreamEvent::Ack { ack_offset } => {
+                            uplink_win.ack(ack_offset);
+                        }
+                        ClientStreamEvent::Fin {
+                            epoch: pkt_epoch,
+                            final_offset,
+                        } => {
+                            if downlink_recv.accept_fin(pkt_epoch, final_offset) && !downlink_done {
+                                downlink_done = true;
+                                let _ = local.shutdown().await;
+                                if uplink_done && half_close_deadline.is_none() {
+                                    half_close_deadline =
+                                        Some(Instant::now() + Duration::from_secs(5));
+                                }
+                            }
+                        }
+                        ClientStreamEvent::Rst { code } => {
                             let _ = local.shutdown().await;
-                            if uplink_done && half_close_deadline.is_none() {
-                                half_close_deadline = Some(Instant::now() + Duration::from_secs(5));
+                            let untouched =
+                                downlink_recv.next_offset() == 0 && uplink_win.next_offset() == 0;
+                            if code != 0 && untouched {
+                                bail!("Flux remote stream reset with code {code}");
                             }
+                            return Ok(());
                         }
                     }
-                    ClientStreamEvent::Ack { ack_offset } => {
-                        if uplink_win.ack(ack_offset) > 0 {
-                            last_ack_or_rx = Instant::now();
-                        }
+                    drained += 1;
+                    if drained < STREAM_EVENT_BURST_MAX {
+                        cur_ev = ev_rx.try_recv().ok();
                     }
-                    ClientStreamEvent::Fin { epoch: pkt_epoch, final_offset } => {
-                        last_ack_or_rx = Instant::now();
-                        if downlink_recv.accept_fin(pkt_epoch, final_offset) && !downlink_done {
-                            downlink_done = true;
-                            let _ = local.shutdown().await;
-                            if uplink_done && half_close_deadline.is_none() {
-                                half_close_deadline = Some(Instant::now() + Duration::from_secs(5));
-                            }
-                        }
-                    }
-                    ClientStreamEvent::Rst { code } => {
-                        let _ = local.shutdown().await;
-                        let untouched =
-                            downlink_recv.next_offset() == 0 && uplink_win.next_offset() == 0;
-                        if code != 0 && untouched {
-                            bail!("Flux remote stream reset with code {code}");
-                        }
-                        return Ok(());
-                    }
+                }
+                if ack_dirty {
+                    let _ = slot.ch.send_prio(FluxFrame::StreamAck {
+                        stream_id,
+                        ack_offset: downlink_recv.next_offset(),
+                    });
                 }
             }
             read_res = local.read(&mut read_buf[..local_read_cap]), if can_read_local => {
@@ -1578,22 +1752,27 @@ async fn run_client_stream(
                     Ok(0) => {
                         uplink_done = true;
                         let final_offset = uplink_win.next_offset();
-                        if !slot.ch.send_stream(FluxFrame::StreamFin {
+                        let fin_frame = FluxFrame::StreamFin {
                             stream_id,
                             epoch,
                             final_offset,
-                        }).await {
-                            migrate_client_stream(
-                                &pool,
-                                &mut slot,
-                                stream_id,
-                                &mut epoch,
-                                &target,
-                                &uplink_win,
-                                &downlink_recv,
-                                uplink_done,
-                            )
-                            .await?;
+                        };
+                        match slot.ch.try_send_stream(fin_frame) {
+                            Ok(()) => {}
+                            Err(Some(returned)) => pending_uplink = Some(returned),
+                            Err(None) => {
+                                migrate_client_stream(
+                                    &pool,
+                                    &mut slot,
+                                    stream_id,
+                                    &mut epoch,
+                                    &target,
+                                    &uplink_win,
+                                    &downlink_recv,
+                                    uplink_done,
+                                )
+                                .await?;
+                            }
                         }
                         if downlink_done && half_close_deadline.is_none() {
                             half_close_deadline = Some(Instant::now() + Duration::from_secs(5));
@@ -1604,29 +1783,29 @@ async fn run_client_stream(
                             session.record_upload(n).await?;
                         }
                         let chunk = Bytes::copy_from_slice(&read_buf[..n]);
-                        let was_empty = !uplink_win.has_unacked();
                         let offset = uplink_win.push(chunk.clone());
-                        if was_empty {
-                            last_ack_or_rx = Instant::now();
-                        }
-                        if !slot.ch.send_stream(FluxFrame::StreamData {
+                        let data_frame = FluxFrame::StreamData {
                             stream_id,
                             epoch,
                             offset,
                             payload: chunk,
-                        }).await {
-                            migrate_client_stream(
-                                &pool,
-                                &mut slot,
-                                stream_id,
-                                &mut epoch,
-                                &target,
-                                &uplink_win,
-                                &downlink_recv,
-                                uplink_done,
-                            )
-                            .await?;
-                            last_ack_or_rx = Instant::now();
+                        };
+                        match slot.ch.try_send_stream(data_frame) {
+                            Ok(()) => {}
+                            Err(Some(returned)) => pending_uplink = Some(returned),
+                            Err(None) => {
+                                migrate_client_stream(
+                                    &pool,
+                                    &mut slot,
+                                    stream_id,
+                                    &mut epoch,
+                                    &target,
+                                    &uplink_win,
+                                    &downlink_recv,
+                                    uplink_done,
+                                )
+                                .await?;
+                            }
                         }
                     }
                     Err(err) => {

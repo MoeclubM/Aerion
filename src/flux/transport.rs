@@ -3,8 +3,8 @@ use super::config::{
     FluxTransportKind,
 };
 use super::frame::{
-    FluxFrame, MAX_FLUX_FRAME_LEN, decode_frame_body, encode_frame_body,
-    write_length_prefixed_frame,
+    FluxFrame, MAX_FLUX_FRAME_LEN, decode_frame_body_bytes, encode_frame_body,
+    encode_length_prefixed_frame_into,
 };
 use super::obfs::{FluxObfsUdpSocket, client_obfs_handshake, server_obfs_handshake};
 use super::reality_udp::{
@@ -34,9 +34,10 @@ use tokio::net::{TcpListener, TcpStream};
 
 const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const QUIC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(12);
-const QUIC_STREAM_WINDOW: u32 = 8 * 1024 * 1024;
-const QUIC_CONN_WINDOW: u32 = 20 * 1024 * 1024;
-const QUIC_DATAGRAM_BUF: usize = 4 * 1024 * 1024;
+const QUIC_STREAM_WINDOW: u32 = 32 * 1024 * 1024;
+const QUIC_CONN_WINDOW: u32 = 48 * 1024 * 1024;
+const QUIC_DATAGRAM_BUF: usize = 8 * 1024 * 1024;
+const FRAME_IO_BUF_CAP: usize = 64 * 1024;
 
 pub struct FluxChannelGuard {
     stop: ListenerStopToken,
@@ -82,6 +83,7 @@ pub struct FluxFrameReader {
 pub struct FluxFrameWriter {
     writer: Box<dyn AsyncWrite + Unpin + Send>,
     quic_conn: Option<quinn::Connection>,
+    write_buf: BytesMut,
     _guard: Arc<FluxChannelGuard>,
 }
 
@@ -105,9 +107,12 @@ impl FluxFrameReader {
                 );
                 if self.buf.len() >= 4 + len {
                     let _ = self.buf.split_to(4);
-                    let body = self.buf.split_to(len);
-                    return Ok(Some(decode_frame_body(&body)?));
+                    let body = self.buf.split_to(len).freeze();
+                    return Ok(Some(decode_frame_body_bytes(body)?));
                 }
+                self.buf.reserve((4 + len).saturating_sub(self.buf.len()));
+            } else if self.buf.capacity() - self.buf.len() < FRAME_IO_BUF_CAP {
+                self.buf.reserve(FRAME_IO_BUF_CAP);
             }
             if let Some(conn) = &self.quic_conn {
                 tokio::select! {
@@ -119,7 +124,7 @@ impl FluxFrameReader {
                     }
                     dgram = conn.read_datagram() => {
                         match dgram {
-                            Ok(bytes) => return Ok(Some(decode_frame_body(&bytes)?)),
+                            Ok(bytes) => return Ok(Some(decode_frame_body_bytes(bytes)?)),
                             Err(_) => {
                                 if self.buf.is_empty() {
                                     return Ok(None);
@@ -166,7 +171,14 @@ impl FluxFrameWriter {
                 return Ok(());
             }
         }
-        write_length_prefixed_frame(&mut self.writer, frame).await?;
+        encode_length_prefixed_frame_into(frame, &mut self.write_buf)?;
+        if flush || self.write_buf.len() >= FRAME_IO_BUF_CAP {
+            self.writer
+                .write_all(&self.write_buf)
+                .await
+                .context("write Flux channel stream")?;
+            self.write_buf.clear();
+        }
         if flush {
             self.writer
                 .flush()
@@ -177,9 +189,22 @@ impl FluxFrameWriter {
     }
 
     pub async fn flush(&mut self) -> Result<()> {
+        let guard = self._guard.clone();
         tokio::select! {
-            _ = self._guard.closed() => bail!("Flux channel closed"),
-            result = self.writer.flush() => result.context("flush Flux channel stream"),
+            _ = guard.closed() => bail!("Flux channel closed"),
+            result = async {
+                if !self.write_buf.is_empty() {
+                    self.writer
+                        .write_all(&self.write_buf)
+                        .await
+                        .context("write Flux channel stream")?;
+                    self.write_buf.clear();
+                }
+                self.writer
+                    .flush()
+                    .await
+                    .context("flush Flux channel stream")
+            } => result,
         }
     }
 
@@ -202,12 +227,13 @@ pub fn split_boxed_stream(
         FluxFrameReader {
             reader: Box::new(reader),
             quic_conn: None,
-            buf: BytesMut::with_capacity(16 * 1024),
+            buf: BytesMut::with_capacity(FRAME_IO_BUF_CAP),
             _guard: guard.clone(),
         },
         FluxFrameWriter {
             writer: Box::new(writer),
             quic_conn: None,
+            write_buf: BytesMut::with_capacity(FRAME_IO_BUF_CAP),
             _guard: guard.clone(),
         },
         guard,
@@ -229,12 +255,13 @@ pub fn split_quic_channel(
         FluxFrameReader {
             reader: Box::new(recv),
             quic_conn: Some(connection.clone()),
-            buf: BytesMut::with_capacity(16 * 1024),
+            buf: BytesMut::with_capacity(FRAME_IO_BUF_CAP),
             _guard: guard.clone(),
         },
         FluxFrameWriter {
             writer: Box::new(send),
             quic_conn: Some(connection),
+            write_buf: BytesMut::with_capacity(FRAME_IO_BUF_CAP),
             _guard: guard.clone(),
         },
         guard,
@@ -722,6 +749,7 @@ pub fn bind_server_udp_socket(addr: SocketAddr, v6_only: bool) -> Result<std::ne
     socket
         .set_nonblocking(true)
         .context("set Flux UDP socket nonblocking")?;
+    socket_protect::configure_udp_socket_buffers(&socket);
     socket
         .bind(&addr.into())
         .with_context(|| format!("bind Flux UDP socket on {addr}"))?;

@@ -2,7 +2,7 @@ use super::auth::{self, derive_blind_key, handshake_key, xor_32};
 use super::config::{FluxSecurityMode, FluxServerConfig, FluxTransportKind};
 use super::frame::{
     DEFAULT_STREAM_WINDOW_BYTES, FluxFrame, MAX_FLUX_CHUNK_LEN, RecvOffsetAssembler,
-    SendWindowBuffer,
+    SendWindowBuffer, push_coalesced_frame,
 };
 use super::transport::{
     FluxChannelGuard, FluxFrameReader, FluxFrameWriter, PreparedStreamListener,
@@ -35,6 +35,15 @@ const SESSION_ORPHAN_GRACE: Duration = super::config::SESSION_RESUME_TIMEOUT;
 const UDP_ASSOC_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const UDP_FRAG_TIMEOUT: Duration = Duration::from_secs(20);
 const CLOSED_STREAM_RING_CAP: usize = 512;
+const WRITER_BATCH_MAX: usize = 64;
+const STREAM_EVENT_BURST_MAX: usize = 32;
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 /// Session state is owned by the node controller and survives listener replacement.
 #[derive(Clone)]
@@ -398,16 +407,37 @@ impl ServerChannelHandle {
         !self.is_dead() && self.prio_tx.send(frame).is_ok()
     }
 
+    fn try_send_stream(&self, frame: FluxFrame) -> std::result::Result<(), Option<FluxFrame>> {
+        if self.is_dead() {
+            return Err(None);
+        }
+        match self.stream_tx.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(returned)) => Err(Some(returned)),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(None),
+        }
+    }
+
+    async fn reserve_stream(&self) -> Option<mpsc::Permit<'_, FluxFrame>> {
+        if self.is_dead() {
+            return None;
+        }
+        let permit = tokio::select! {
+            _ = self.guard.closed() => return None,
+            permit = self.stream_tx.reserve() => permit.ok()?,
+        };
+        if self.is_dead() {
+            return None;
+        }
+        Some(permit)
+    }
+
     async fn send_stream(&self, frame: FluxFrame) -> bool {
         if self.is_dead() {
             return false;
         }
         tokio::select! {
             _ = self.guard.closed() => false,
-            _ = tokio::time::sleep(Duration::from_millis(600)) => {
-                self.mark_dead();
-                false
-            }
             result = self.stream_tx.send(frame) => result.is_ok(),
         }
     }
@@ -470,15 +500,13 @@ struct FluxServerSession {
     udp_assocs: Mutex<HashMap<u32, Arc<ServerUdpAssoc>>>,
     udp_fragments: Mutex<HashMap<(u32, u32), ServerUdpFragmentEntry>>,
     next_udp_packet_id: AtomicU32,
-    last_active: StdMutex<Instant>,
+    last_active_secs: AtomicU64,
 }
 
 impl FluxServerSession {
     fn touch(&self) {
-        *self
-            .last_active
-            .lock()
-            .expect("Flux session last_active poisoned") = Instant::now();
+        self.last_active_secs
+            .store(now_unix_secs(), Ordering::Relaxed);
     }
 
     fn mark_stream_closed(&self, stream_id: u32) {
@@ -575,14 +603,14 @@ impl FluxServerRegistry {
             udp_assocs: Mutex::new(HashMap::new()),
             udp_fragments: Mutex::new(HashMap::new()),
             next_udp_packet_id: AtomicU32::new(1),
-            last_active: StdMutex::new(Instant::now()),
+            last_active_secs: AtomicU64::new(now_unix_secs()),
         });
         guard.insert(session_id, session.clone());
         Ok(session)
     }
 
     async fn reap_idle_sessions(&self) {
-        let now = Instant::now();
+        let now_secs = now_unix_secs();
         let mut sessions = self.sessions.lock().await;
         let mut expired_ids = Vec::new();
         for (id, session) in sessions.iter() {
@@ -595,11 +623,9 @@ impl FluxServerRegistry {
                 .lock()
                 .expect("Flux server channels poisoned")
                 .is_empty();
-            let last_active = *session
-                .last_active
-                .lock()
-                .expect("Flux session last_active poisoned");
-            if ch_empty && now.duration_since(last_active) >= SESSION_ORPHAN_GRACE {
+            let idle_secs =
+                now_secs.saturating_sub(session.last_active_secs.load(Ordering::Relaxed));
+            if ch_empty && idle_secs >= SESSION_ORPHAN_GRACE.as_secs() {
                 expired_ids.push(*id);
             }
         }
@@ -705,7 +731,7 @@ async fn handle_server_channel(
 
     let uid = registry.next_channel_uid.fetch_add(1, Ordering::Relaxed);
     let (prio_tx, mut prio_rx) = mpsc::unbounded_channel::<FluxFrame>();
-    let (stream_tx, mut stream_rx) = mpsc::channel::<FluxFrame>(256);
+    let (stream_tx, mut stream_rx) = mpsc::channel::<FluxFrame>(512);
     let ch_handle = Arc::new(ServerChannelHandle {
         uid,
         transport,
@@ -751,7 +777,9 @@ async fn run_channel_writer_loop(
     stream_rx: &mut mpsc::Receiver<FluxFrame>,
     core_session: &CoreSession,
 ) -> Result<()> {
+    let mut batch = Vec::with_capacity(WRITER_BATCH_MAX);
     loop {
+        batch.clear();
         let first = tokio::select! {
             _ = core_session.cancelled() => return Ok(()),
             frame = prio_rx.recv() => match frame {
@@ -763,24 +791,19 @@ async fn run_channel_writer_loop(
                 None => return Ok(()),
             },
         };
-        let mut batch_has_more = !prio_rx.is_empty() || !stream_rx.is_empty();
-        writer.write_frame(&first, !batch_has_more).await?;
-        let mut drained = 0usize;
-        while batch_has_more && drained < 32 {
-            let next = if let Ok(p) = prio_rx.try_recv() {
-                Some(p)
+        push_coalesced_frame(&mut batch, first);
+        while batch.len() < WRITER_BATCH_MAX {
+            if let Ok(p) = prio_rx.try_recv() {
+                push_coalesced_frame(&mut batch, p);
+            } else if let Ok(s) = stream_rx.try_recv() {
+                push_coalesced_frame(&mut batch, s);
             } else {
-                stream_rx.try_recv().ok()
-            };
-            let Some(frame) = next else {
-                writer.flush().await?;
                 break;
-            };
-            drained += 1;
-            batch_has_more = !prio_rx.is_empty() || !stream_rx.is_empty();
-            writer
-                .write_frame(&frame, !batch_has_more || drained == 32)
-                .await?;
+            }
+        }
+        let last_idx = batch.len() - 1;
+        for (idx, frame) in batch.iter().enumerate() {
+            writer.write_frame(frame, idx == last_idx).await?;
         }
     }
 }
@@ -958,7 +981,7 @@ async fn spawn_or_get_server_stream(
     target: ProxyTarget,
     initial_payload: Bytes,
 ) {
-    let (tx, rx) = mpsc::channel::<ServerStreamEvent>(128);
+    let (tx, rx) = mpsc::channel::<ServerStreamEvent>(512);
     let existing = {
         let mut streams = session
             .streams
@@ -1046,16 +1069,21 @@ async fn run_server_stream(
     }
 
     let mut read_buf = vec![0u8; MAX_FLUX_CHUNK_LEN];
+    let mut pending_downlink: Option<FluxFrame> = None;
     let mut half_close_deadline: Option<Instant> = None;
 
     loop {
-        if uplink_done && downlink_done && !downlink_win.has_unacked() {
+        if uplink_done
+            && downlink_done
+            && pending_downlink.is_none()
+            && !downlink_win.has_unacked()
+        {
             let _ = remote.shutdown().await;
             return Ok(());
         }
 
         let remote_read_cap = downlink_win.available_window().min(MAX_FLUX_CHUNK_LEN);
-        let can_read_remote = !downlink_done && remote_read_cap > 0;
+        let can_read_remote = !downlink_done && pending_downlink.is_none() && remote_read_cap > 0;
         let drain_sleep = async {
             if let Some(deadline) = half_close_deadline {
                 tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
@@ -1063,6 +1091,7 @@ async fn run_server_stream(
                 std::future::pending::<()>().await;
             }
         };
+        let pending_ch = active_ch.clone();
 
         tokio::select! {
             _ = session.core_session.cancelled() => {
@@ -1073,82 +1102,126 @@ async fn run_server_stream(
                 let _ = remote.shutdown().await;
                 return Ok(());
             }
+            permit_res = pending_ch.reserve_stream(), if pending_downlink.is_some() => {
+                match permit_res {
+                    Some(permit) => {
+                        if let Some(frame) = pending_downlink.take() {
+                            permit.send(frame);
+                        }
+                    }
+                    None => {
+                        pending_downlink = None;
+                    }
+                }
+            }
             ev = ev_rx.recv() => {
                 let Some(ev) = ev else {
                     let _ = remote.shutdown().await;
                     return Ok(());
                 };
-                match ev {
-                    ServerStreamEvent::Data { epoch, offset, payload, reply_ch } => {
-                        if epoch > downlink_epoch {
-                            downlink_epoch = epoch;
-                            active_ch = reply_ch;
-                        }
-                        if let Some(fresh) = uplink_recv.accept_data(epoch, offset, payload)? {
-                            session.core_session.record_upload(fresh.len()).await?;
-                            if let Err(err) = remote.write_all(&fresh).await {
-                                let rst = FluxFrame::StreamRst {
-                                    stream_id,
-                                    code: 3,
-                                };
-                                let _ = active_ch.send_stream(rst).await;
-                                return Err(err).context("write Flux target TCP");
+                let mut cur_ev = Some(ev);
+                let mut drained = 0usize;
+                let mut ack_dirty = false;
+                while let Some(event) = cur_ev.take() {
+                    match event {
+                        ServerStreamEvent::Data {
+                            epoch,
+                            offset,
+                            payload,
+                            reply_ch,
+                        } => {
+                            if epoch > downlink_epoch {
+                                downlink_epoch = epoch;
+                                active_ch = reply_ch;
+                            }
+                            if let Some(fresh) = uplink_recv.accept_data(epoch, offset, payload)? {
+                                session.core_session.record_upload(fresh.len()).await?;
+                                if let Err(err) = remote.write_all(&fresh).await {
+                                    let rst = FluxFrame::StreamRst {
+                                        stream_id,
+                                        code: 3,
+                                    };
+                                    let _ = active_ch.send_stream(rst).await;
+                                    return Err(err).context("write Flux target TCP");
+                                }
+                            }
+                            ack_dirty = true;
+                            if !uplink_done && uplink_recv.is_complete() {
+                                uplink_done = true;
+                                let _ = remote.shutdown().await;
+                                if downlink_done && half_close_deadline.is_none() {
+                                    half_close_deadline =
+                                        Some(Instant::now() + Duration::from_secs(5));
+                                }
                             }
                         }
-                        let _ = active_ch.send_prio(FluxFrame::StreamAck {
-                            stream_id,
-                            ack_offset: uplink_recv.next_offset(),
-                        });
-                        if !uplink_done && uplink_recv.is_complete() {
-                            uplink_done = true;
+                        ServerStreamEvent::Ack { ack_offset } => {
+                            downlink_win.ack(ack_offset);
+                        }
+                        ServerStreamEvent::Migrate {
+                            epoch,
+                            client_rx_offset,
+                            new_ch,
+                        } => {
+                            if uplink_recv.accept_migrate(epoch) {
+                                pending_downlink = None;
+                                downlink_epoch = epoch;
+                                active_ch = new_ch;
+                                downlink_win.ack(client_rx_offset);
+                                ack_dirty = false;
+                                let _ = active_ch.send_prio(FluxFrame::StreamAck {
+                                    stream_id,
+                                    ack_offset: uplink_recv.next_offset(),
+                                });
+                                for (offset, chunk) in downlink_win.unacked_from(client_rx_offset) {
+                                    let _ = active_ch
+                                        .send_stream(FluxFrame::StreamData {
+                                            stream_id,
+                                            epoch: downlink_epoch,
+                                            offset,
+                                            payload: chunk,
+                                        })
+                                        .await;
+                                }
+                                if downlink_done {
+                                    let _ = active_ch
+                                        .send_stream(FluxFrame::StreamFin {
+                                            stream_id,
+                                            epoch: downlink_epoch,
+                                            final_offset: downlink_win.next_offset(),
+                                        })
+                                        .await;
+                                }
+                            }
+                        }
+                        ServerStreamEvent::Fin {
+                            epoch,
+                            final_offset,
+                        } => {
+                            if uplink_recv.accept_fin(epoch, final_offset) && !uplink_done {
+                                uplink_done = true;
+                                let _ = remote.shutdown().await;
+                                if downlink_done && half_close_deadline.is_none() {
+                                    half_close_deadline =
+                                        Some(Instant::now() + Duration::from_secs(5));
+                                }
+                            }
+                        }
+                        ServerStreamEvent::Rst => {
                             let _ = remote.shutdown().await;
-                            if downlink_done && half_close_deadline.is_none() {
-                                half_close_deadline = Some(Instant::now() + Duration::from_secs(5));
-                            }
+                            return Ok(());
                         }
                     }
-                    ServerStreamEvent::Ack { ack_offset } => {
-                        downlink_win.ack(ack_offset);
+                    drained += 1;
+                    if drained < STREAM_EVENT_BURST_MAX {
+                        cur_ev = ev_rx.try_recv().ok();
                     }
-                    ServerStreamEvent::Migrate { epoch, client_rx_offset, new_ch } => {
-                        if uplink_recv.accept_migrate(epoch) {
-                            downlink_epoch = epoch;
-                            active_ch = new_ch;
-                            downlink_win.ack(client_rx_offset);
-                            let _ = active_ch.send_prio(FluxFrame::StreamAck {
-                                stream_id,
-                                ack_offset: uplink_recv.next_offset(),
-                            });
-                            for (offset, chunk) in downlink_win.unacked_from(client_rx_offset) {
-                                let _ = active_ch.send_stream(FluxFrame::StreamData {
-                                    stream_id,
-                                    epoch: downlink_epoch,
-                                    offset,
-                                    payload: chunk,
-                                }).await;
-                            }
-                            if downlink_done {
-                                let _ = active_ch.send_stream(FluxFrame::StreamFin {
-                                    stream_id,
-                                    epoch: downlink_epoch,
-                                    final_offset: downlink_win.next_offset(),
-                                }).await;
-                            }
-                        }
-                    }
-                    ServerStreamEvent::Fin { epoch, final_offset } => {
-                        if uplink_recv.accept_fin(epoch, final_offset) && !uplink_done {
-                            uplink_done = true;
-                            let _ = remote.shutdown().await;
-                            if downlink_done && half_close_deadline.is_none() {
-                                half_close_deadline = Some(Instant::now() + Duration::from_secs(5));
-                            }
-                        }
-                    }
-                    ServerStreamEvent::Rst => {
-                        let _ = remote.shutdown().await;
-                        return Ok(());
-                    }
+                }
+                if ack_dirty {
+                    let _ = active_ch.send_prio(FluxFrame::StreamAck {
+                        stream_id,
+                        ack_offset: uplink_recv.next_offset(),
+                    });
                 }
             }
             read_res = remote.read(&mut read_buf[..remote_read_cap]), if can_read_remote => {
@@ -1156,11 +1229,14 @@ async fn run_server_stream(
                     Ok(0) => {
                         downlink_done = true;
                         let final_offset = downlink_win.next_offset();
-                        let _ = active_ch.send_stream(FluxFrame::StreamFin {
+                        let fin_frame = FluxFrame::StreamFin {
                             stream_id,
                             epoch: downlink_epoch,
                             final_offset,
-                        }).await;
+                        };
+                        if let Err(Some(returned)) = active_ch.try_send_stream(fin_frame) {
+                            pending_downlink = Some(returned);
+                        }
                         if uplink_done && half_close_deadline.is_none() {
                             half_close_deadline = Some(Instant::now() + Duration::from_secs(5));
                         }
@@ -1169,12 +1245,15 @@ async fn run_server_stream(
                         session.core_session.record_download(n).await?;
                         let chunk = Bytes::copy_from_slice(&read_buf[..n]);
                         let offset = downlink_win.push(chunk.clone());
-                        let _ = active_ch.send_stream(FluxFrame::StreamData {
+                        let data_frame = FluxFrame::StreamData {
                             stream_id,
                             epoch: downlink_epoch,
                             offset,
                             payload: chunk,
-                        }).await;
+                        };
+                        if let Err(Some(returned)) = active_ch.try_send_stream(data_frame) {
+                            pending_downlink = Some(returned);
+                        }
                     }
                     Err(err) => {
                         let _ = active_ch.send_stream(FluxFrame::StreamRst {
