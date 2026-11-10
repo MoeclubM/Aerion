@@ -377,11 +377,11 @@ mod windows_udp {
             sin_zero: [0; 8],
         };
         let mut idx_v4 = 0u32;
-        let ipv4_index = (unsafe {
-            GetBestInterfaceEx((&probe_v4 as *const SockAddrIn).cast(), &mut idx_v4)
-        } == 0
-            && idx_v4 != 0)
-            .then_some(idx_v4);
+        let ipv4_index =
+            (unsafe { GetBestInterfaceEx((&probe_v4 as *const SockAddrIn).cast(), &mut idx_v4) }
+                == 0
+                && idx_v4 != 0)
+                .then_some(idx_v4);
 
         let probe_v6 = SockAddrIn6 {
             sin6_family: AF_INET6,
@@ -393,11 +393,11 @@ mod windows_udp {
             sin6_scope_id: 0,
         };
         let mut idx_v6 = 0u32;
-        let ipv6_index = (unsafe {
-            GetBestInterfaceEx((&probe_v6 as *const SockAddrIn6).cast(), &mut idx_v6)
-        } == 0
-            && idx_v6 != 0)
-            .then_some(idx_v6);
+        let ipv6_index =
+            (unsafe { GetBestInterfaceEx((&probe_v6 as *const SockAddrIn6).cast(), &mut idx_v6) }
+                == 0
+                && idx_v6 != 0)
+                .then_some(idx_v6);
 
         if ipv4_index.is_none() && ipv6_index.is_none() {
             return None;

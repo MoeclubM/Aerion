@@ -1073,10 +1073,7 @@ async fn run_server_stream(
     let mut half_close_deadline: Option<Instant> = None;
 
     loop {
-        if uplink_done
-            && downlink_done
-            && pending_downlink.is_none()
-            && !downlink_win.has_unacked()
+        if uplink_done && downlink_done && pending_downlink.is_none() && !downlink_win.has_unacked()
         {
             let _ = remote.shutdown().await;
             return Ok(());

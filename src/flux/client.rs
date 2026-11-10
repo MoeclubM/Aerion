@@ -1043,7 +1043,12 @@ impl FluxClientPool {
             if now.saturating_sub(ch.last_rx_micros.load(Ordering::Relaxed)) < SILENT_PROBE_US {
                 continue;
             }
-            if ch.pending_ping.lock().expect("Flux ping poisoned").is_none() {
+            if ch
+                .pending_ping
+                .lock()
+                .expect("Flux ping poisoned")
+                .is_none()
+            {
                 self.send_ping_on_channel(ch, now);
             }
         }

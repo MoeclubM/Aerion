@@ -1150,9 +1150,8 @@ impl RecordCipher {
     }
 
     fn encrypt_record(&mut self, inner_content_type: u8, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let mut record = Vec::with_capacity(
-            TLS_RECORD_HEADER_LEN + plaintext.len() + 1 + self.suite.tag_len(),
-        );
+        let mut record =
+            Vec::with_capacity(TLS_RECORD_HEADER_LEN + plaintext.len() + 1 + self.suite.tag_len());
         self.encrypt_record_into(inner_content_type, plaintext, &mut record)?;
         Ok(record)
     }

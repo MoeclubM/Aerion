@@ -457,10 +457,7 @@ pub async fn write_length_prefixed_frame<W: AsyncWrite + Unpin>(
 ) -> Result<()> {
     let mut buf = BytesMut::with_capacity(4 + frame_encoded_hint(frame));
     encode_length_prefixed_frame_into(frame, &mut buf)?;
-    writer
-        .write_all(&buf)
-        .await
-        .context("write Flux frame")?;
+    writer.write_all(&buf).await.context("write Flux frame")?;
     Ok(())
 }
 
@@ -537,7 +534,10 @@ impl SendWindowBuffer {
             return 0;
         }
         if self.buffered_bytes >= self.max_bytes / 4 {
-            self.max_bytes = self.max_bytes.saturating_mul(2).min(MAX_STREAM_WINDOW_BYTES);
+            self.max_bytes = self
+                .max_bytes
+                .saturating_mul(2)
+                .min(MAX_STREAM_WINDOW_BYTES);
         }
         let target = ack_offset.min(self.next_offset);
         let mut freed = 0usize;
