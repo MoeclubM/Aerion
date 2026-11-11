@@ -10,6 +10,11 @@ pub const MAX_FLUX_CHUNK_LEN: usize = 60 * 1024;
 pub const DEFAULT_STREAM_WINDOW_BYTES: usize = 1024 * 1024;
 const MAX_STREAM_WINDOW_BYTES: usize = 16 * 1024 * 1024;
 
+pub const RST_CLIENT_ABORT: u8 = 0x00;
+pub const RST_REMOTE_RESET: u8 = 0x10;
+pub const RST_STREAM_CLOSED: u8 = 0x11;
+pub const RST_MIGRATE_UNKNOWN: u8 = 0x12;
+
 const FRAME_SESSION_HELLO: u8 = 0x01;
 const FRAME_SESSION_OK: u8 = 0x02;
 const FRAME_PING: u8 = 0x03;

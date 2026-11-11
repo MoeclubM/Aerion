@@ -748,18 +748,23 @@ async fn handle_hy2_socks_client(
             let session = match shared.get_or_connect().await {
                 Ok(session) => session,
                 Err(error) => {
-                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    let _ = socks::write_reply(
+                        &mut local,
+                        socks::reply_code_for_proxy_error(&error),
+                    )
+                    .await;
                     return Err(error);
                 }
             };
             let stream = match session.open_tcp(target.clone()).await {
                 Ok(stream) => stream,
                 Err(error) => {
-                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    let _ =
+                        socks::write_reply(&mut local, socks::reply_code_for_error(&error)).await;
                     return Err(error);
                 }
             };
-            socks::write_reply(&mut local, 0x00).await?;
+            socks::write_reply(&mut local, socks::REPLY_SUCCEEDED).await?;
             tracing::info!("Hysteria2 proxying {}", target_name(&target));
             relay_hy2_tcp(local, stream, session).await
         }
@@ -767,7 +772,11 @@ async fn handle_hy2_socks_client(
             let session = match shared.get_or_connect().await {
                 Ok(session) => session,
                 Err(error) => {
-                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    let _ = socks::write_reply(
+                        &mut local,
+                        socks::reply_code_for_proxy_error(&error),
+                    )
+                    .await;
                     return Err(error);
                 }
             };
@@ -1077,7 +1086,8 @@ async fn handle_hy2_tcp_stream(
     let mut remote = match socket_protect::connect_proxy_target(&target).await {
         Ok(remote) => remote,
         Err(error) => {
-            write_tcp_response(&mut send, 1, &error.to_string()).await?;
+            let detail = format!("{error:#}");
+            write_tcp_response(&mut send, 1, &detail).await?;
             let _ = send.finish();
             return Err(error).with_context(|| {
                 format!("connect Hysteria2 destination {}", target_name(&target))

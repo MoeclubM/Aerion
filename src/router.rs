@@ -198,50 +198,71 @@ async fn handle_route_client(mut local: TcpStream, state: RouteProxyState) -> Re
                     let mut remote = match connect_direct(&target).await {
                         Ok(remote) => remote,
                         Err(error) => {
-                            let _ = socks::write_reply(&mut local, 0x01).await;
+                            let _ =
+                                socks::write_reply(&mut local, socks::reply_code_for_error(&error))
+                                    .await;
                             return Err(error);
                         }
                     };
-                    socks::write_reply(&mut local, 0x00).await?;
+                    socks::write_reply(&mut local, socks::REPLY_SUCCEEDED).await?;
                     tracing::info!("routing {} direct", target_name(&target));
-                    if let Some(session) = session {
+                    let relay_res = if let Some(session) = session {
                         relay_bidirectional_counted(&mut local, &mut remote, session, "route")
                             .await
-                            .context("relay direct recorded route")?;
+                            .context("relay direct recorded route")
                     } else {
                         copy_bidirectional(&mut local, &mut remote)
                             .await
-                            .context("relay direct route")?;
+                            .map(|_| ())
+                            .context("relay direct route")
+                    };
+                    if let Err(error) = &relay_res
+                        && socket_protect::is_connection_reset_error(error)
+                    {
+                        socket_protect::reset_tcp_stream(&local);
+                        socket_protect::reset_tcp_stream(&remote);
                     }
-                    Ok(())
+                    relay_res
                 }
                 RouteDecision::Block => {
-                    socks::write_reply(&mut local, 0x02).await?;
+                    socks::write_reply(&mut local, socks::REPLY_NOT_ALLOWED).await?;
                     bail!("route blocked {}", target_name(&target))
                 }
                 RouteDecision::Proxy(tag) => {
-                    let upstream = state
-                        .upstream(&tag)
-                        .with_context(|| format!("route outbound {tag} was not started"))?;
+                    let Some(upstream) = state.upstream(&tag) else {
+                        let _ = socks::write_reply(&mut local, socks::REPLY_GENERAL_FAILURE).await;
+                        bail!("route outbound {tag} was not started");
+                    };
                     let mut remote = match socks::connect_tcp(upstream, &target).await {
                         Ok(remote) => remote,
                         Err(error) => {
-                            let _ = socks::write_reply(&mut local, 0x05).await;
+                            let _ = socks::write_reply(
+                                &mut local,
+                                socks::reply_code_for_proxy_error(&error),
+                            )
+                            .await;
                             return Err(error);
                         }
                     };
-                    socks::write_reply(&mut local, 0x00).await?;
+                    socks::write_reply(&mut local, socks::REPLY_SUCCEEDED).await?;
                     tracing::info!("routing {} via {tag}", target_name(&target));
-                    if let Some(session) = session {
+                    let relay_res = if let Some(session) = session {
                         relay_bidirectional_counted(&mut local, &mut remote, session, "route")
                             .await
-                            .with_context(|| format!("relay recorded route via {tag}"))?;
+                            .with_context(|| format!("relay recorded route via {tag}"))
                     } else {
                         copy_bidirectional(&mut local, &mut remote)
                             .await
-                            .with_context(|| format!("relay route via {tag}"))?;
+                            .map(|_| ())
+                            .with_context(|| format!("relay route via {tag}"))
+                    };
+                    if let Err(error) = &relay_res
+                        && socket_protect::is_connection_reset_error(error)
+                    {
+                        socket_protect::reset_tcp_stream(&local);
+                        socket_protect::reset_tcp_stream(&remote);
                     }
-                    Ok(())
+                    relay_res
                 }
             }
         }
@@ -250,10 +271,7 @@ async fn handle_route_client(mut local: TcpStream, state: RouteProxyState) -> Re
 }
 
 async fn connect_direct(target: &ProxyTarget) -> Result<TcpStream> {
-    match target {
-        ProxyTarget::Ip(addr) => socket_protect::connect_tcp_addr(*addr).await,
-        ProxyTarget::Domain(host, port) => socket_protect::connect_tcp_host_port(host, *port).await,
-    }
+    socket_protect::connect_proxy_target(target).await
 }
 
 async fn handle_udp_associate(mut control: TcpStream, state: RouteProxyState) -> Result<()> {

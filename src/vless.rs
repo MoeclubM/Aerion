@@ -219,25 +219,44 @@ async fn handle_vless_socks_with_core(
     };
     match request {
         socks::SocksRequest::Connect(target) => {
-            validate_vision_transport(
-                &config.flow,
-                &config.transport,
-                config.tls || config.reality.is_some(),
-            )?;
-            let vision = is_vision_flow(&config.flow).then(|| Arc::new(VisionControl::default()));
-            let mut server = connect_vless_server(&config, vision.clone()).await?;
-            let user = parse_uuid(&config.user_id)?;
-            if config.mux {
-                write_vless_request(&mut server, &user, CMD_MUX, &vless_xudp::mux_target(), "")
-                    .await?;
+            let (mut server, user, vision) = match async {
+                validate_vision_transport(
+                    &config.flow,
+                    &config.transport,
+                    config.tls || config.reality.is_some(),
+                )?;
+                let vision =
+                    is_vision_flow(&config.flow).then(|| Arc::new(VisionControl::default()));
+                let mut server = connect_vless_server(&config, vision.clone()).await?;
+                let user = parse_uuid(&config.user_id)?;
+                if config.mux {
+                    write_vless_request(&mut server, &user, CMD_MUX, &vless_xudp::mux_target(), "")
+                        .await?;
+                } else {
+                    write_vless_request(&mut server, &user, CMD_TCP, &target, &config.flow)
+                        .await?;
+                }
                 read_vless_response_header(&mut server).await?;
-                socks::write_reply(&mut stream, 0x00).await?;
+                Ok::<_, anyhow::Error>((server, user, vision))
+            }
+            .await
+            {
+                Ok(opened) => opened,
+                Err(error) => {
+                    let _ = socks::write_reply(
+                        &mut stream,
+                        socks::reply_code_for_proxy_error(&error),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            if config.mux {
+                socks::write_reply(&mut stream, socks::REPLY_SUCCEEDED).await?;
                 return vless_mux::relay_single_tcp_client_counted(server, stream, target, session)
                     .await;
             }
-            write_vless_request(&mut server, &user, CMD_TCP, &target, &config.flow).await?;
-            read_vless_response_header(&mut server).await?;
-            socks::write_reply(&mut stream, 0x00).await?;
+            socks::write_reply(&mut stream, socks::REPLY_SUCCEEDED).await?;
             tracing::info!("VLESS proxying {}", target_name(&target));
             if is_vision_flow(&config.flow) {
                 relay_vision_client_counted(
@@ -253,7 +272,10 @@ async fn handle_vless_socks_with_core(
             }
         }
         socks::SocksRequest::UdpAssociate => {
-            ensure!(config.udp, "VLESS UDP is disabled by client config");
+            if !config.udp {
+                let _ = socks::write_reply(&mut stream, socks::REPLY_COMMAND_NOT_SUPPORTED).await;
+                bail!("VLESS UDP is disabled by client config");
+            }
             handle_vless_udp_associate_counted(stream, config, session).await
         }
     }

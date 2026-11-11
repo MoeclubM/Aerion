@@ -480,33 +480,51 @@ async fn handle_shadowsocks_socks(
     };
     match socks::read_request(&mut local).await? {
         socks::SocksRequest::Connect(target) => {
-            let tcp = socket_protect::connect_tcp_host_port(
-                runtime.server_host.as_str(),
-                runtime.server_port,
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "connect Shadowsocks server {}:{}",
-                    runtime.server_host, runtime.server_port
+            let mut remote = match async {
+                let tcp = socket_protect::connect_tcp_host_port(
+                    runtime.server_host.as_str(),
+                    runtime.server_port,
                 )
-            })?;
-            let mut remote = ProxyClientStream::from_stream(
-                runtime.context.clone(),
-                tcp,
-                &runtime.server,
-                shadowsocks_address(&target),
-            );
-            poll_fn(|cx| Pin::new(&mut remote).poll_write(cx, &[]))
                 .await
-                .context("write Shadowsocks TCP request header")?;
-            socks::write_reply(&mut local, 0x00).await?;
+                .with_context(|| {
+                    format!(
+                        "connect Shadowsocks server {}:{}",
+                        runtime.server_host, runtime.server_port
+                    )
+                })?;
+                let mut remote = ProxyClientStream::from_stream(
+                    runtime.context.clone(),
+                    tcp,
+                    &runtime.server,
+                    shadowsocks_address(&target),
+                );
+                poll_fn(|cx| Pin::new(&mut remote).poll_write(cx, &[]))
+                    .await
+                    .context("write Shadowsocks TCP request header")?;
+                Ok::<_, anyhow::Error>(remote)
+            }
+            .await
+            {
+                Ok(remote) => remote,
+                Err(error) => {
+                    let _ = socks::write_reply(
+                        &mut local,
+                        socks::reply_code_for_proxy_error(&error),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            socks::write_reply(&mut local, socks::REPLY_SUCCEEDED).await?;
             tracing::info!("Shadowsocks proxying {}", target_name(&target));
             relay_bidirectional_counted(&mut local, &mut remote, session, "Shadowsocks client")
                 .await
         }
         socks::SocksRequest::UdpAssociate => {
-            ensure!(runtime.udp, "Shadowsocks UDP is disabled by client config");
+            if !runtime.udp {
+                let _ = socks::write_reply(&mut local, socks::REPLY_COMMAND_NOT_SUPPORTED).await;
+                bail!("Shadowsocks UDP is disabled by client config");
+            }
             if runtime.udp_over_tcp {
                 return handle_shadowsocks_uot_associate(local, runtime).await;
             }

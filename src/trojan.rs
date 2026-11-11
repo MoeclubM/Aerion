@@ -166,9 +166,24 @@ async fn handle_trojan_socks_with_core(
     };
     match target {
         socks::SocksRequest::Connect(target) => {
-            let mut server = connect_trojan_server(&config).await?;
-            write_trojan_request(&mut server, &config.password, CMD_CONNECT, &target).await?;
-            socks::write_reply(&mut stream, 0x00).await?;
+            let mut server = match async {
+                let mut server = connect_trojan_server(&config).await?;
+                write_trojan_request(&mut server, &config.password, CMD_CONNECT, &target).await?;
+                Ok::<_, anyhow::Error>(server)
+            }
+            .await
+            {
+                Ok(server) => server,
+                Err(error) => {
+                    let _ = socks::write_reply(
+                        &mut stream,
+                        socks::reply_code_for_proxy_error(&error),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            socks::write_reply(&mut stream, socks::REPLY_SUCCEEDED).await?;
             tracing::info!("Trojan proxying {}", target_name(&target));
             relay_bidirectional_counted(&mut stream, &mut server, session, "Trojan").await
         }
@@ -177,7 +192,10 @@ async fn handle_trojan_socks_with_core(
                 IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
                 ip => ip,
             };
-            ensure!(config.udp, "Trojan UDP is disabled by client config");
+            if !config.udp {
+                let _ = socks::write_reply(&mut stream, socks::REPLY_COMMAND_NOT_SUPPORTED).await;
+                bail!("Trojan UDP is disabled by client config");
+            }
             handle_trojan_udp_associate_counted(stream, config, session).await
         }
     }

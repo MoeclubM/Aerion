@@ -33,3 +33,82 @@ fn udp_associate_uses_upstream_ip_for_unspecified_bind() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn maps_io_and_proxy_errors_to_rfc1928_reply_codes() {
+    let refused = anyhow::Error::new(std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        "refused",
+    ));
+    assert_eq!(reply_code_for_error(&refused), REPLY_CONNECTION_REFUSED);
+    assert_eq!(reply_code_for_proxy_error(&refused), REPLY_GENERAL_FAILURE);
+
+    let unreachable_host = anyhow::Error::new(std::io::Error::new(
+        std::io::ErrorKind::HostUnreachable,
+        "nxdomain",
+    ));
+    assert_eq!(
+        reply_code_for_error(&unreachable_host),
+        REPLY_HOST_UNREACHABLE
+    );
+
+    let timeout = anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
+    assert_eq!(reply_code_for_error(&timeout), REPLY_TTL_EXPIRED);
+    assert_eq!(reply_code_for_proxy_error(&timeout), REPLY_TTL_EXPIRED);
+
+    let socks_err = anyhow::Error::new(SocksConnectError {
+        code: REPLY_HOST_UNREACHABLE,
+        upstream: "127.0.0.1:1080".parse().expect("valid addr"),
+    });
+    assert_eq!(
+        reply_code_for_proxy_error(&socks_err),
+        REPLY_HOST_UNREACHABLE
+    );
+
+    assert_eq!(
+        reply_code_for_http_connect_failure(403, None),
+        REPLY_NOT_ALLOWED
+    );
+    assert_eq!(
+        reply_code_for_http_connect_failure(504, None),
+        REPLY_TTL_EXPIRED
+    );
+    assert_eq!(
+        reply_code_for_http_connect_failure(502, Some("aerion; error=dns_error")),
+        REPLY_HOST_UNREACHABLE
+    );
+    assert_eq!(
+        reply_code_for_http_connect_failure(502, Some("aerion; error=connection_refused")),
+        REPLY_CONNECTION_REFUSED
+    );
+}
+
+#[tokio::test]
+async fn connect_tcp_preserves_upstream_socks_reply_code() -> Result<()> {
+    for code in [
+        REPLY_NOT_ALLOWED,
+        REPLY_NETWORK_UNREACHABLE,
+        REPLY_HOST_UNREACHABLE,
+        REPLY_CONNECTION_REFUSED,
+        REPLY_TTL_EXPIRED,
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let upstream = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let _ = read_request(&mut stream).await?;
+            write_reply(&mut stream, code).await?;
+            anyhow::Ok(())
+        });
+        let err = connect_tcp(upstream, &ProxyTarget::Domain("example.com".into(), 443))
+            .await
+            .expect_err("SOCKS error reply must fail connect_tcp");
+        let typed = err
+            .downcast_ref::<SocksConnectError>()
+            .expect("error must preserve SocksConnectError");
+        assert_eq!(typed.code, code);
+        assert_eq!(typed.upstream, upstream);
+        server.await??;
+    }
+    Ok(())
+}

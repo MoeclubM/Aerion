@@ -155,10 +155,15 @@ where
         _ = session.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
         result = forwarding => result,
     };
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let _ = tokio::join!(right_writer.shutdown(), left_writer.shutdown());
-    })
-    .await;
+    let reset = result
+        .as_ref()
+        .is_err_and(crate::socket_protect::is_connection_reset_error);
+    if !reset {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let _ = tokio::join!(right_writer.shutdown(), left_writer.shutdown());
+        })
+        .await;
+    }
     result
 }
 

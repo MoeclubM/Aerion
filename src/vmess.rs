@@ -272,25 +272,43 @@ async fn handle_vmess_socks(
     };
     match socks::read_request(&mut local).await? {
         socks::SocksRequest::Connect(target) => {
-            let mut server = connect_vmess_transport(&config).await?;
-            let security = SecurityType::from_name(&config.security)?;
-            let options = vmess_request_options(CMD_TCP, security);
-            let keys = write_vmess_request(
-                &mut server,
-                &parse_uuid(&config.user_id)?,
-                CMD_TCP,
-                &target,
-                security,
-                options,
-            )
-            .await?;
-            read_vmess_response_header(&mut server, &keys).await?;
-            socks::write_reply(&mut local, 0x00).await?;
+            let (server, keys) = match async {
+                let mut server = connect_vmess_transport(&config).await?;
+                let security = SecurityType::from_name(&config.security)?;
+                let options = vmess_request_options(CMD_TCP, security);
+                let keys = write_vmess_request(
+                    &mut server,
+                    &parse_uuid(&config.user_id)?,
+                    CMD_TCP,
+                    &target,
+                    security,
+                    options,
+                )
+                .await?;
+                read_vmess_response_header(&mut server, &keys).await?;
+                Ok::<_, anyhow::Error>((server, keys))
+            }
+            .await
+            {
+                Ok(opened) => opened,
+                Err(error) => {
+                    let _ = socks::write_reply(
+                        &mut local,
+                        socks::reply_code_for_proxy_error(&error),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            socks::write_reply(&mut local, socks::REPLY_SUCCEEDED).await?;
             tracing::info!("VMess proxying {}", target_name(&target));
             relay_vmess_client_tcp(local, server, keys, session).await
         }
         socks::SocksRequest::UdpAssociate => {
-            ensure!(config.udp, "VMess UDP is disabled by client config");
+            if !config.udp {
+                let _ = socks::write_reply(&mut local, socks::REPLY_COMMAND_NOT_SUPPORTED).await;
+                bail!("VMess UDP is disabled by client config");
+            }
             handle_vmess_udp_associate(local, config).await
         }
     }

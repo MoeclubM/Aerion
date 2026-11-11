@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, WriteHalf, split};
 use tokio::net::{TcpListener, TcpStream};
@@ -440,7 +441,16 @@ async fn run_tcp_stream(
             let _permit = dial_budget.acquire_owned().await.context("AnyTLS dial budget closed")?;
             ensure!(!abort.is_triggered(), "AnyTLS stream cancelled");
             socket_protect::connect_proxy_target(&target).await
-        }) => remote.context("AnyTLS dial timed out").and_then(|r| r),
+        }) => match remote {
+            Ok(res) => res,
+            Err(_) => {
+                let err = std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("AnyTLS dial {} timed out", target_name(&target)),
+                );
+                Err(err).context("AnyTLS dial timed out")
+            }
+        },
     } {
         Ok(remote) => remote,
         Err(error) => {
@@ -449,11 +459,13 @@ async fn run_tcp_stream(
                 _ = abort.cancelled() => return Ok(()),
                 writer = writer.lock() => writer,
             };
+            let detail = format!("{error:#}");
+            let detail_bytes = &detail.as_bytes()[..detail.len().min(4096)];
             write_frame(
                 &mut *writer,
                 CMD_SYNACK,
                 stream_id,
-                error.to_string().as_bytes(),
+                detail_bytes,
             )
             .await?;
             return Err(error);
@@ -471,7 +483,9 @@ async fn run_tcp_stream(
     let (mut remote_reader, mut remote_writer) = remote.into_split();
     tracing::info!("opened stream {stream_id} to {}", target_name(&target));
 
+    let sent_fin = Arc::new(AtomicBool::new(false));
     let downlink_writer = writer.clone();
+    let downlink_sent_fin = sent_fin.clone();
     let downlink_session = session.clone();
     let downlink_abort = abort.clone();
     let downlink_connection_abort = connection_abort.clone();
@@ -483,13 +497,22 @@ async fn run_tcp_stream(
             loop {
                 let read = tokio::select! {
                     _ = downlink_abort.cancelled() => return Ok::<(), anyhow::Error>(()),
-                    read = remote_reader.read(&mut buffer) => {
-                        read.context("read target payload")?
+                    read = remote_reader.read(&mut buffer) => match read {
+                        Ok(read) => read,
+                        Err(error) => {
+                            if !downlink_sent_fin.swap(true, Ordering::AcqRel) {
+                                let mut writer = downlink_writer.lock().await;
+                                let _ = write_frame(&mut *writer, CMD_FIN, stream_id, &[]).await;
+                            }
+                            return Err(error).context("read target payload");
+                        }
                     }
                 };
                 if read == 0 {
-                    let mut writer = downlink_writer.lock().await;
-                    write_frame(&mut *writer, CMD_FIN, stream_id, &[]).await?;
+                    if !downlink_sent_fin.swap(true, Ordering::AcqRel) {
+                        let mut writer = downlink_writer.lock().await;
+                        write_frame(&mut *writer, CMD_FIN, stream_id, &[]).await?;
+                    }
                     return Ok(());
                 }
                 tokio::select! {
@@ -533,6 +556,10 @@ async fn run_tcp_stream(
     let _ = tokio::time::timeout(Duration::from_secs(5), remote_writer.shutdown()).await;
     uplink_abort.trigger();
     if let Err(error) = result {
+        if !connection_abort.is_triggered() && !sent_fin.swap(true, Ordering::AcqRel) {
+            let mut writer = writer.lock().await;
+            let _ = write_frame(&mut *writer, CMD_FIN, stream_id, &[]).await;
+        }
         tracing::warn!("stream {stream_id} uplink failed: {error:?}");
     }
     Ok(())

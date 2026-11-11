@@ -232,3 +232,116 @@ fn handshake_proofs_require_secret_and_channel_binding() -> Result<()> {
     assert_ne!(proof, auth::client_proof(&key, &hello)?);
     Ok(())
 }
+
+#[tokio::test]
+async fn target_connect_failures_return_real_socks_reply_codes() -> Result<()> {
+    let config = server_config();
+    let core = ProxyCore::new(vec![CoreUser::password("u", "user-token")])?;
+    let server = start_flux_server_with_core(config, core)?;
+    let server_port = server.tcp_addrs()[0].port();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let socks_addr = listener.local_addr()?;
+    let client_task = tokio::spawn(run_flux_client_listener(
+        listener,
+        client_config(vec![server_port])?,
+    ));
+
+    let closed_probe = TcpListener::bind("127.0.0.1:0").await?;
+    let closed_addr = closed_probe.local_addr()?;
+    drop(closed_probe);
+
+    let refused_err = crate::socks::connect_tcp(socks_addr, &ProxyTarget::Ip(closed_addr))
+        .await
+        .expect_err("closed target port must fail SOCKS connect");
+    assert_eq!(
+        refused_err
+            .downcast_ref::<crate::socks::SocksConnectError>()
+            .map(|err| err.code),
+        Some(crate::socks::REPLY_CONNECTION_REFUSED)
+    );
+
+    let nx_err = crate::socks::connect_tcp(
+        socks_addr,
+        &ProxyTarget::Domain("nonexistent.invalid.".to_string(), 443),
+    )
+    .await
+    .expect_err("unresolvable domain must fail SOCKS connect");
+    assert_eq!(
+        nx_err
+            .downcast_ref::<crate::socks::SocksConnectError>()
+            .map(|err| err.code),
+        Some(crate::socks::REPLY_HOST_UNREACHABLE)
+    );
+
+    client_task.abort();
+    let _ = client_task.await;
+    server.stop();
+    server.wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn midstream_target_reset_propagates_rst_while_fin_stays_clean() -> Result<()> {
+    let config = server_config();
+    let core = ProxyCore::new(vec![CoreUser::password("u", "user-token")])?;
+    let server = start_flux_server_with_core(config, core)?;
+    let server_port = server.tcp_addrs()[0].port();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let socks_addr = listener.local_addr()?;
+    let client_task = tokio::spawn(run_flux_client_listener(
+        listener,
+        client_config(vec![server_port])?,
+    ));
+
+    let fin_target = TcpListener::bind("127.0.0.1:0").await?;
+    let fin_addr = fin_target.local_addr()?;
+    let fin_task = tokio::spawn(async move {
+        let (mut socket, _) = fin_target.accept().await?;
+        socket.write_all(b"clean").await?;
+        socket.shutdown().await?;
+        anyhow::Ok(())
+    });
+    let mut fin_stream = crate::socks::connect_tcp(socks_addr, &ProxyTarget::Ip(fin_addr)).await?;
+    let mut fin_buf = [0u8; 5];
+    fin_stream.read_exact(&mut fin_buf).await?;
+    assert_eq!(&fin_buf, b"clean");
+    let mut eof_probe = [0u8; 1];
+    assert_eq!(fin_stream.read(&mut eof_probe).await?, 0);
+    fin_task.await??;
+
+    let rst_target = TcpListener::bind("127.0.0.1:0").await?;
+    let rst_addr = rst_target.local_addr()?;
+    let rst_gate = Arc::new(Notify::new());
+    let rst_trigger = rst_gate.clone();
+    let rst_task = tokio::spawn(async move {
+        let (mut socket, _) = rst_target.accept().await?;
+        socket.write_all(b"abort").await?;
+        rst_trigger.notified().await;
+        crate::socket_protect::reset_tcp_stream(&socket);
+        drop(socket);
+        anyhow::Ok(())
+    });
+    let mut rst_stream = crate::socks::connect_tcp(socks_addr, &ProxyTarget::Ip(rst_addr)).await?;
+    let mut rst_buf = [0u8; 5];
+    rst_stream.read_exact(&mut rst_buf).await?;
+    assert_eq!(&rst_buf, b"abort");
+    rst_gate.notify_one();
+    let read_res = rst_stream.read(&mut eof_probe).await;
+    let err = read_res.expect_err("mid-stream target RST must not become clean EOF");
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+        ),
+        "unexpected error kind for mid-stream reset: {err:?}"
+    );
+    rst_task.await??;
+
+    client_task.abort();
+    let _ = client_task.await;
+    server.stop();
+    server.wait().await?;
+    Ok(())
+}

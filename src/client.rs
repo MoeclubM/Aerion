@@ -500,14 +500,19 @@ async fn handle_socks_client(
             let session = match shared.acquire().await {
                 Ok(session) => session,
                 Err(error) => {
-                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    let _ = socks::write_reply(
+                        &mut local,
+                        socks::reply_code_for_proxy_error(&error),
+                    )
+                    .await;
                     return Err(error);
                 }
             };
             let stream = match session.open_stream(target.clone(), Vec::new()).await {
                 Ok(stream) => stream,
                 Err(error) => {
-                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    let _ =
+                        socks::write_reply(&mut local, socks::reply_code_for_error(&error)).await;
                     shared.release(session).await;
                     return Err(error);
                 }
@@ -517,7 +522,7 @@ async fn handle_socks_client(
             } else {
                 CoreSession::disabled()
             };
-            socks::write_reply(&mut local, 0x00).await?;
+            socks::write_reply(&mut local, socks::REPLY_SUCCEEDED).await?;
             tracing::info!("proxying {}", target_name(&target));
             let result = relay_tcp_counted(local, stream, core_session).await;
             shared.release(session).await;
@@ -527,7 +532,11 @@ async fn handle_socks_client(
             let session = match shared.acquire().await {
                 Ok(session) => session,
                 Err(error) => {
-                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    let _ = socks::write_reply(
+                        &mut local,
+                        socks::reply_code_for_proxy_error(&error),
+                    )
+                    .await;
                     return Err(error);
                 }
             };

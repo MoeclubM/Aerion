@@ -4,8 +4,8 @@ use super::config::{
     FluxTransportKind,
 };
 use super::frame::{
-    DEFAULT_STREAM_WINDOW_BYTES, FluxFrame, MAX_FLUX_CHUNK_LEN, RecvOffsetAssembler,
-    SendWindowBuffer, push_coalesced_frame,
+    DEFAULT_STREAM_WINDOW_BYTES, FluxFrame, MAX_FLUX_CHUNK_LEN, RST_CLIENT_ABORT,
+    RST_REMOTE_RESET, RecvOffsetAssembler, SendWindowBuffer, push_coalesced_frame,
 };
 use super::transport::{
     FluxChannelGuard, FluxFrameReader, FluxFrameWriter, connect_client_channel,
@@ -13,6 +13,7 @@ use super::transport::{
 use crate::core::{CoreSession, ProxyCore};
 use crate::listener::{self, ListenerStopToken};
 use crate::protocol::{ProxyTarget, constant_time_eq, password_hash};
+use crate::socket_protect;
 use crate::socks::{self, SocksRequest};
 use crate::udp_fragments::{FragmentPayload, MAX_PENDING_PACKETS};
 use crate::uot;
@@ -34,6 +35,7 @@ const CHANNEL_DIAL_TIMEOUT: Duration = Duration::from_secs(8);
 const PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const UDP_FRAG_TIMEOUT: Duration = Duration::from_secs(20);
 const SILENT_PROBE_US: u64 = 600_000;
+const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(18);
 const WRITER_BATCH_MAX: usize = 64;
 const STREAM_EVENT_BURST_MAX: usize = 32;
 
@@ -1476,40 +1478,32 @@ async fn handle_flux_socks_client(
             let mut slot = match pool.pick_channel_for_new_stream().await {
                 Ok(slot) => slot,
                 Err(err) => {
-                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    let _ =
+                        socks::write_reply(&mut local, socks::reply_code_for_proxy_error(&err))
+                            .await;
                     return Err(err);
                 }
             };
 
             let stream_id = pool.next_stream_id.fetch_add(1, Ordering::Relaxed);
-            let (ev_tx, ev_rx) = mpsc::channel::<ClientStreamEvent>(512);
+            let (ev_tx, mut ev_rx) = mpsc::channel::<ClientStreamEvent>(512);
             pool.streams
                 .lock()
                 .expect("Flux client streams poisoned")
                 .insert(stream_id, ev_tx);
 
-            let mut opened = slot
-                .ch
-                .send_stream(FluxFrame::StreamOpen {
-                    stream_id,
-                    epoch: 1,
-                    target: target.clone(),
-                    initial_payload: Bytes::new(),
-                })
-                .await;
+            let open_frame = FluxFrame::StreamOpen {
+                stream_id,
+                epoch: 1,
+                target: target.clone(),
+                initial_payload: Bytes::new(),
+            };
+            let mut opened = slot.ch.send_prio(open_frame.clone());
             if !opened {
                 slot.ch.mark_dead();
                 if let Ok(fallback_ch) = pool.pick_migration_channel(&slot.ch).await {
                     slot.switch_to(fallback_ch);
-                    opened = slot
-                        .ch
-                        .send_stream(FluxFrame::StreamOpen {
-                            stream_id,
-                            epoch: 1,
-                            target: target.clone(),
-                            initial_payload: Bytes::new(),
-                        })
-                        .await;
+                    opened = slot.ch.send_prio(open_frame);
                 }
             }
             if !opened {
@@ -1517,18 +1511,52 @@ async fn handle_flux_socks_client(
                     .lock()
                     .expect("Flux client streams poisoned")
                     .remove(&stream_id);
-                let _ = socks::write_reply(&mut local, 0x05).await;
+                let _ = socks::write_reply(&mut local, socks::REPLY_GENERAL_FAILURE).await;
                 bail!("failed to open Flux stream on any channel");
             }
 
-            if let Err(err) = socks::write_reply(&mut local, 0x00).await {
+            let mut initial_epoch = 1u32;
+            let initial_event = match wait_flux_stream_open(
+                &local,
+                &pool,
+                &mut slot,
+                stream_id,
+                &mut initial_epoch,
+                &target,
+                &mut ev_rx,
+                core_session.as_ref(),
+            )
+            .await
+            {
+                Ok(event) => event,
+                Err((Some(reply_code), err)) => {
+                    pool.streams
+                        .lock()
+                        .expect("Flux client streams poisoned")
+                        .remove(&stream_id);
+                    let _ = socks::write_reply(&mut local, reply_code).await;
+                    return Err(err);
+                }
+                Err((None, err)) => {
+                    pool.streams
+                        .lock()
+                        .expect("Flux client streams poisoned")
+                        .remove(&stream_id);
+                    return Err(err);
+                }
+            };
+
+            if let Err(err) = socks::write_reply(&mut local, socks::REPLY_SUCCEEDED).await {
                 pool.streams
                     .lock()
                     .expect("Flux client streams poisoned")
                     .remove(&stream_id);
                 let _ = slot
                     .ch
-                    .send_stream(FluxFrame::StreamRst { stream_id, code: 0 })
+                    .send_stream(FluxFrame::StreamRst {
+                        stream_id,
+                        code: RST_CLIENT_ABORT,
+                    })
                     .await;
                 return Err(err);
             }
@@ -1538,6 +1566,8 @@ async fn handle_flux_socks_client(
                 pool.clone(),
                 slot,
                 stream_id,
+                initial_epoch,
+                initial_event,
                 target,
                 ev_rx,
                 core_session,
@@ -1551,10 +1581,132 @@ async fn handle_flux_socks_client(
         }
         SocksRequest::UdpAssociate => {
             if !pool.config.udp {
-                let _ = socks::write_reply(&mut local, 0x07).await;
+                let _ = socks::write_reply(&mut local, socks::REPLY_COMMAND_NOT_SUPPORTED).await;
                 bail!("Flux client UDP is disabled");
             }
             handle_flux_udp_associate(local, pool, core_session).await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_flux_stream_open(
+    local: &TcpStream,
+    pool: &Arc<FluxClientPool>,
+    slot: &mut StreamSlotGuard,
+    stream_id: u32,
+    epoch: &mut u32,
+    target: &ProxyTarget,
+    ev_rx: &mut mpsc::Receiver<ClientStreamEvent>,
+    core_session: Option<&CoreSession>,
+) -> std::result::Result<Option<ClientStreamEvent>, (Option<u8>, anyhow::Error)> {
+    let empty_win = SendWindowBuffer::new(DEFAULT_STREAM_WINDOW_BYTES);
+    let empty_recv = RecvOffsetAssembler::default();
+    let deadline = tokio::time::Instant::now() + STREAM_OPEN_TIMEOUT;
+    let mut watch_local = true;
+    let mut peek_buf = [0u8; 1];
+    loop {
+        let cancel_fut = async {
+            if let Some(session) = core_session {
+                session.cancelled().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        let ch_watch = slot.ch.clone();
+        tokio::select! {
+            _ = cancel_fut => {
+                let _ = slot.ch.send_prio(FluxFrame::StreamRst {
+                    stream_id,
+                    code: RST_CLIENT_ABORT,
+                });
+                return Err((
+                    Some(socks::REPLY_GENERAL_FAILURE),
+                    anyhow::anyhow!("core session cancelled"),
+                ));
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                let _ = slot.ch.send_prio(FluxFrame::StreamRst {
+                    stream_id,
+                    code: RST_CLIENT_ABORT,
+                });
+                return Err((
+                    Some(socks::REPLY_TTL_EXPIRED),
+                    anyhow::anyhow!("Flux stream {stream_id} connect timed out"),
+                ));
+            }
+            peek_res = local.peek(&mut peek_buf), if watch_local => match peek_res {
+                Ok(0) => {
+                    let _ = slot.ch.send_prio(FluxFrame::StreamRst {
+                        stream_id,
+                        code: RST_CLIENT_ABORT,
+                    });
+                    return Err((
+                        None,
+                        anyhow::anyhow!("Flux local SOCKS client closed before connect reply"),
+                    ));
+                }
+                Err(err) => {
+                    let _ = slot.ch.send_prio(FluxFrame::StreamRst {
+                        stream_id,
+                        code: RST_CLIENT_ABORT,
+                    });
+                    return Err((
+                        None,
+                        anyhow::Error::new(err)
+                            .context("Flux local SOCKS client aborted before connect reply"),
+                    ));
+                }
+                Ok(_) => {
+                    watch_local = false;
+                }
+            },
+            _ = ch_watch.wait_needs_migration() => {
+                if let Err(err) = migrate_client_stream(
+                    pool,
+                    slot,
+                    stream_id,
+                    epoch,
+                    target,
+                    &empty_win,
+                    &empty_recv,
+                    false,
+                )
+                .await
+                {
+                    return Err((Some(socks::REPLY_GENERAL_FAILURE), err));
+                }
+            }
+            ev = ev_rx.recv() => match ev {
+                Some(ClientStreamEvent::Ack { ack_offset }) => {
+                    let initial = (ack_offset > 0).then_some(ClientStreamEvent::Ack { ack_offset });
+                    return Ok(initial);
+                }
+                Some(ev @ ClientStreamEvent::Data { .. })
+                | Some(ev @ ClientStreamEvent::Fin { .. }) => {
+                    return Ok(Some(ev));
+                }
+                Some(ClientStreamEvent::Rst { code }) => {
+                    let reply = if (0x01..=0x08).contains(&code) {
+                        code
+                    } else {
+                        socks::REPLY_GENERAL_FAILURE
+                    };
+                    return Err((
+                        Some(reply),
+                        anyhow::anyhow!(
+                            "Flux target connect failed with code {reply:#04x} ({})",
+                            socks::reply_code_description(reply)
+                        ),
+                    ));
+                }
+                None => {
+                    return Err((
+                        Some(socks::REPLY_GENERAL_FAILURE),
+                        anyhow::anyhow!("Flux stream {stream_id} closed before connect reply"),
+                    ));
+                }
+            }
         }
     }
 }
@@ -1582,19 +1734,22 @@ impl Drop for StreamSlotGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_client_stream(
     mut local: TcpStream,
     pool: Arc<FluxClientPool>,
     mut slot: StreamSlotGuard,
     stream_id: u32,
+    initial_epoch: u32,
+    mut pending_initial_event: Option<ClientStreamEvent>,
     target: ProxyTarget,
     mut ev_rx: mpsc::Receiver<ClientStreamEvent>,
     core_session: Option<CoreSession>,
 ) -> Result<()> {
-    let mut epoch = 1u32;
+    let mut epoch = initial_epoch;
     let mut uplink_win = SendWindowBuffer::new(DEFAULT_STREAM_WINDOW_BYTES);
     let mut downlink_recv = RecvOffsetAssembler::default();
-    let _ = downlink_recv.accept_migrate(1);
+    let _ = downlink_recv.accept_migrate(initial_epoch);
     let mut uplink_done = false;
     let mut downlink_done = false;
     let mut pending_uplink: Option<FluxFrame> = None;
@@ -1602,6 +1757,52 @@ async fn run_client_stream(
     let mut read_buf = vec![0u8; MAX_FLUX_CHUNK_LEN];
 
     loop {
+        if let Some(first_ev) = pending_initial_event.take() {
+            match first_ev {
+                ClientStreamEvent::Data {
+                    epoch: pkt_epoch,
+                    offset,
+                    payload,
+                } => {
+                    if let Some(fresh) = downlink_recv.accept_data(pkt_epoch, offset, payload)? {
+                        if let Some(session) = &core_session {
+                            session.record_download(fresh.len()).await?;
+                        }
+                        if let Err(err) = local.write_all(&fresh).await {
+                            let _ = slot
+                                .ch
+                                .send_stream(FluxFrame::StreamRst {
+                                    stream_id,
+                                    code: RST_CLIENT_ABORT,
+                                })
+                                .await;
+                            return Err(err).context("write Flux local SOCKS stream");
+                        }
+                    }
+                    let _ = slot.ch.send_prio(FluxFrame::StreamAck {
+                        stream_id,
+                        ack_offset: downlink_recv.next_offset(),
+                    });
+                }
+                ClientStreamEvent::Ack { ack_offset } => {
+                    uplink_win.ack(ack_offset);
+                }
+                ClientStreamEvent::Fin {
+                    epoch: pkt_epoch,
+                    final_offset,
+                } => {
+                    if downlink_recv.accept_fin(pkt_epoch, final_offset) {
+                        downlink_done = true;
+                        let _ = local.shutdown().await;
+                    }
+                }
+                ClientStreamEvent::Rst { .. } => {
+                    socket_protect::reset_tcp_stream(&local);
+                    return Ok(());
+                }
+            }
+        }
+
         if uplink_done && downlink_done && pending_uplink.is_none() && !uplink_win.has_unacked() {
             let _ = local.shutdown().await;
             return Ok(());
@@ -1629,7 +1830,13 @@ async fn run_client_stream(
 
         tokio::select! {
             _ = cancel_fut => {
-                let _ = slot.ch.send_stream(FluxFrame::StreamRst { stream_id, code: 0 }).await;
+                let _ = slot
+                    .ch
+                    .send_stream(FluxFrame::StreamRst {
+                        stream_id,
+                        code: RST_CLIENT_ABORT,
+                    })
+                    .await;
                 let _ = local.shutdown().await;
                 return Err(anyhow::anyhow!("core session cancelled"));
             }
@@ -1698,7 +1905,7 @@ async fn run_client_stream(
                                 if let Err(err) = local.write_all(&fresh).await {
                                     let rst = FluxFrame::StreamRst {
                                         stream_id,
-                                        code: 0,
+                                        code: RST_CLIENT_ABORT,
                                     };
                                     let _ = slot.ch.send_stream(rst).await;
                                     return Err(err).context("write Flux local SOCKS stream");
@@ -1731,7 +1938,7 @@ async fn run_client_stream(
                             }
                         }
                         ClientStreamEvent::Rst { code } => {
-                            let _ = local.shutdown().await;
+                            socket_protect::reset_tcp_stream(&local);
                             let untouched =
                                 downlink_recv.next_offset() == 0 && uplink_win.next_offset() == 0;
                             if code != 0 && untouched {
@@ -1814,9 +2021,18 @@ async fn run_client_stream(
                         }
                     }
                     Err(err) => {
+                        let code = if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) {
+                            RST_REMOTE_RESET
+                        } else {
+                            RST_CLIENT_ABORT
+                        };
                         let rst = FluxFrame::StreamRst {
                             stream_id,
-                            code: 0,
+                            code,
                         };
                         let _ = slot.ch.send_stream(rst).await;
                         return Err(err).context("read Flux local SOCKS stream");

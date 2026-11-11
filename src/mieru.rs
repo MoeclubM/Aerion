@@ -943,10 +943,26 @@ async fn handle_mieru_socks_client(
 
     let request = read_socks_request_raw(&mut local).await?;
     let command = request[1];
-    let underlay = shared.get_or_connect().await?;
-    let mut session = underlay.open_session(shared.config.mtu()).await?;
-    session.write_all(&request).await?;
-    let response = read_socks_response_raw(&mut session).await?;
+    let (mut session, response) = match async {
+        let underlay = shared.get_or_connect().await?;
+        let mut session = underlay.open_session(shared.config.mtu()).await?;
+        session.write_all(&request).await?;
+        let response = read_socks_response_raw(&mut session).await?;
+        Ok::<_, anyhow::Error>((session, response))
+    }
+    .await
+    {
+        Ok(pair) => pair,
+        Err(error) => {
+            let _ = write_socks_reply_with_bind(
+                &mut local,
+                crate::socks::reply_code_for_proxy_error(&error),
+                unspecified_v4(),
+            )
+            .await;
+            return Err(error);
+        }
+    };
     match command {
         SOCKS_CMD_CONNECT => {
             local.write_all(&response).await?;
@@ -2277,7 +2293,19 @@ async fn handle_mieru_server_socks_session(
     };
     match request {
         SocksRequest::Connect(target) => {
-            let mut remote = socket_protect::connect_proxy_target(&target).await?;
+            let mut remote = match socket_protect::connect_proxy_target(&target).await {
+                Ok(remote) => remote,
+                Err(error) => {
+                    let _ = write_socks_reply_with_bind(
+                        &mut session,
+                        crate::socks::reply_code_for_error(&error),
+                        unspecified_v4(),
+                    )
+                    .await;
+                    let _ = session.shutdown().await;
+                    return Err(error);
+                }
+            };
             let _ = remote.set_nodelay(true);
             let bind = remote.local_addr().unwrap_or_else(|_| unspecified_v4());
             write_socks_reply_with_bind(&mut session, 0, bind).await?;

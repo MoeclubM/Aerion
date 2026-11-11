@@ -657,36 +657,99 @@ pub async fn run_sudoku_client_listener_with_core(
     config.options.tables(&sudoku_key_seed(&config.key)?)?;
     tracing::info!("Sudoku client listening on {}", listener.local_addr()?);
     loop {
-        let (mut local, peer) = crate::listener::accept_tcp(&listener).await?;
+        let (local, peer) = crate::listener::accept_tcp(&listener).await?;
         let config = config.clone();
         let core = core.clone();
         tokio::spawn(async move {
-            let result=async {
-                let request=socks::read_request(&mut local).await?;
-                let mut upstream=tokio::time::timeout(Duration::from_secs(5),transport::client(&config)).await??;
-                let (receiver,mut sender)=tokio::time::timeout(Duration::from_secs(5),client_handshake(&mut upstream,&config.key,&config.options)).await??;
-                let session=if let Some(core)=core {core.authenticate(&config.key).await?} else {CoreSession::disabled()};
-                match request {
-                    socks::SocksRequest::Connect(target)=>{
-                        let mut address=Vec::new();uot::write_socks_address(&mut address,&target)?;
-                        let multiplex=config.options.multiplex=="on";
-                        if multiplex { sender.kip(&mut upstream,0x11,&[]).await?; } else { sender.kip(&mut upstream,0x10,&address).await?; }
-                        socks::write_reply(&mut local,0).await?;
-                        let mut upstream=tunnel(upstream,receiver,sender);
-                        let mut upstream=if multiplex { mux_frame(&mut upstream,1,1,&address).await?; mux_client(upstream) } else { upstream };
-                        tokio::select!{_=session.cancelled()=>Ok(()),result=relay_bidirectional_half_closed_counted(&mut local,&mut upstream,session.clone(),"Sudoku client")=>result}
-                    },
-                    socks::SocksRequest::UdpAssociate=>{
-                        sender.kip(&mut upstream,0x12,&[]).await?;
-                        let mut upstream=tunnel(upstream,receiver,sender);
-                        udp_client(&mut local,&mut upstream,session).await
-                    },
-                }
-            }.await;
-            if let Err(error) = result {
+            if let Err(error) = handle_sudoku_socks_client(local, &config, core).await {
                 tracing::warn!("Sudoku client {peer}: {error:#}");
             }
         });
+    }
+}
+
+async fn handle_sudoku_socks_client(
+    mut local: TcpStream,
+    config: &SudokuClientConfig,
+    core: Option<ProxyCore>,
+) -> Result<()> {
+    let request = socks::read_request(&mut local).await?;
+    let (mut upstream, receiver, mut sender, session) = match async {
+        let mut upstream =
+            match tokio::time::timeout(Duration::from_secs(5), transport::client(config)).await {
+                Ok(res) => res?,
+                Err(_) => {
+                    let err = std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Sudoku client connect timed out",
+                    );
+                    return Err(err.into());
+                }
+            };
+        let (receiver, sender) = match tokio::time::timeout(
+            Duration::from_secs(5),
+            client_handshake(&mut upstream, &config.key, &config.options),
+        )
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => {
+                let err = std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Sudoku client handshake timed out",
+                );
+                return Err(err.into());
+            }
+        };
+        let session = if let Some(core) = core {
+            core.authenticate(&config.key).await?
+        } else {
+            CoreSession::disabled()
+        };
+        Ok::<_, anyhow::Error>((upstream, receiver, sender, session))
+    }
+    .await
+    {
+        Ok(opened) => opened,
+        Err(error) => {
+            let _ =
+                socks::write_reply(&mut local, socks::reply_code_for_proxy_error(&error)).await;
+            return Err(error);
+        }
+    };
+    match request {
+        socks::SocksRequest::Connect(target) => {
+            let mut address = Vec::new();
+            uot::write_socks_address(&mut address, &target)?;
+            let multiplex = config.options.multiplex == "on";
+            if multiplex {
+                sender.kip(&mut upstream, 0x11, &[]).await?;
+            } else {
+                sender.kip(&mut upstream, 0x10, &address).await?;
+            }
+            socks::write_reply(&mut local, socks::REPLY_SUCCEEDED).await?;
+            let mut upstream = tunnel(upstream, receiver, sender);
+            let mut upstream = if multiplex {
+                mux_frame(&mut upstream, 1, 1, &address).await?;
+                mux_client(upstream)
+            } else {
+                upstream
+            };
+            tokio::select! {
+                _ = session.cancelled() => Ok(()),
+                result = relay_bidirectional_half_closed_counted(
+                    &mut local,
+                    &mut upstream,
+                    session.clone(),
+                    "Sudoku client",
+                ) => result,
+            }
+        }
+        socks::SocksRequest::UdpAssociate => {
+            sender.kip(&mut upstream, 0x12, &[]).await?;
+            let mut upstream = tunnel(upstream, receiver, sender);
+            udp_client(&mut local, &mut upstream, session).await
+        }
     }
 }
 

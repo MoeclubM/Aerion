@@ -464,27 +464,42 @@ async fn handle_tuic_socks_client(
             let client = match shared.get_or_connect().await {
                 Ok(client) => client,
                 Err(error) => {
-                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    let _ = socks::write_reply(
+                        &mut local,
+                        socks::reply_code_for_proxy_error(&error),
+                    )
+                    .await;
                     return Err(error);
                 }
             };
             let stream = match client.open_tcp(&target).await {
                 Ok(stream) => stream,
                 Err(error) => {
-                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    let _ = socks::write_reply(
+                        &mut local,
+                        socks::reply_code_for_proxy_error(&error),
+                    )
+                    .await;
                     return Err(error);
                 }
             };
-            socks::write_reply(&mut local, 0x00).await?;
+            socks::write_reply(&mut local, socks::REPLY_SUCCEEDED).await?;
             tracing::info!("TUIC proxying {}", target_name(&target));
             relay_tuic_tcp(local, stream).await
         }
         socks::SocksRequest::UdpAssociate => {
-            ensure!(udp_enabled, "TUIC UDP is disabled by config");
+            if !udp_enabled {
+                let _ = socks::write_reply(&mut local, socks::REPLY_COMMAND_NOT_SUPPORTED).await;
+                bail!("TUIC UDP is disabled by config");
+            }
             let client = match shared.get_or_connect().await {
                 Ok(client) => client,
                 Err(error) => {
-                    let _ = socks::write_reply(&mut local, 0x05).await;
+                    let _ = socks::write_reply(
+                        &mut local,
+                        socks::reply_code_for_proxy_error(&error),
+                    )
+                    .await;
                     return Err(error);
                 }
             };

@@ -252,10 +252,12 @@ async fn handle_naive_http1_connection(
     }
     response.push_str("\r\n");
     if uot::is_magic_target(&target) {
-        ensure!(
-            runtime.udp_over_tcp,
-            "Naive HTTP/1.1 UDP-over-TCP is disabled by server config"
-        );
+        if !runtime.udp_over_tcp {
+            let msg =
+                b"HTTP/1.1 403 Forbidden\r\nProxy-Status: aerion; error=connection_refused\r\n\r\n";
+            let _ = tls.write_all(msg).await;
+            bail!("Naive HTTP/1.1 UDP-over-TCP is disabled by server config");
+        }
         tls.write_all(response.as_bytes())
             .await
             .context("write Naive HTTP/1.1 UOT response")?;
@@ -265,7 +267,18 @@ async fn handle_naive_http1_connection(
             result = relay_naive_http1_uot(tls, pending, target, session, padding_enabled) => result,
         };
     }
-    let remote = connect_proxy_target(&target).await?;
+    let remote = match connect_proxy_target(&target).await {
+        Ok(remote) => remote,
+        Err(error) => {
+            let code = socks::reply_code_for_error(&error);
+            let (http_code, reason, proxy_err) = socks::http_status_for_reply_code(code);
+            let reply = format!(
+                "HTTP/1.1 {http_code} {reason}\r\nProxy-Status: aerion; error={proxy_err}\r\n\r\n"
+            );
+            let _ = tls.write_all(reply.as_bytes()).await;
+            return Err(error);
+        }
+    };
     tls.write_all(response.as_bytes())
         .await
         .context("write Naive HTTP/1.1 CONNECT response")?;
@@ -311,7 +324,7 @@ async fn handle_naive_h2_request(
                 .and_then(|value| value.to_str().ok()),
             &runtime.credentials,
         ) else {
-            send_h2_status(&mut respond, 407)?;
+            send_h2_status(&mut respond, 407, None)?;
             return Ok(());
         };
         Some(credential)
@@ -320,12 +333,14 @@ async fn handle_naive_h2_request(
     let remote = match connect_naive_target(&target, runtime.udp_over_tcp).await {
         Ok(remote) => remote,
         Err(error) => {
-            let status = if uot::is_magic_target(&target) {
-                403
+            let (status, proxy_err) = if uot::is_magic_target(&target) {
+                (403, Some("connection_refused"))
             } else {
-                502
+                let code = socks::reply_code_for_error(&error);
+                let (st, _, pe) = socks::http_status_for_reply_code(code);
+                (st, Some(pe))
             };
-            send_h2_status(&mut respond, status)?;
+            send_h2_status(&mut respond, status, proxy_err)?;
             return Err(error);
         }
     };
@@ -421,7 +436,7 @@ where
                 .and_then(|value| value.to_str().ok()),
             &runtime.credentials,
         ) else {
-            send_h3_status(&mut stream, 407).await?;
+            send_h3_status(&mut stream, 407, None).await?;
             return Ok(());
         };
         Some(credential)
@@ -430,12 +445,14 @@ where
     let remote = match connect_naive_target(&target, runtime.udp_over_tcp).await {
         Ok(remote) => remote,
         Err(error) => {
-            let status = if uot::is_magic_target(&target) {
-                403
+            let (status, proxy_err) = if uot::is_magic_target(&target) {
+                (403, Some("connection_refused"))
             } else {
-                502
+                let code = socks::reply_code_for_error(&error);
+                let (st, _, pe) = socks::http_status_for_reply_code(code);
+                (st, Some(pe))
             };
-            send_h3_status(&mut stream, status).await?;
+            send_h3_status(&mut stream, status, proxy_err).await?;
             return Err(error);
         }
     };
@@ -616,9 +633,16 @@ async fn record_naive_download(session: &Option<CoreSession>, bytes: usize) -> R
     Ok(())
 }
 
-fn send_h2_status(respond: &mut h2::server::SendResponse<Bytes>, status: u16) -> Result<()> {
-    let response = http::Response::builder()
-        .status(status)
+fn send_h2_status(
+    respond: &mut h2::server::SendResponse<Bytes>,
+    status: u16,
+    proxy_error: Option<&str>,
+) -> Result<()> {
+    let mut builder = http::Response::builder().status(status);
+    if let Some(err) = proxy_error {
+        builder = builder.header("proxy-status", format!("aerion; error={err}"));
+    }
+    let response = builder
         .body(())
         .with_context(|| format!("build Naive HTTP/2 {status} response"))?;
     let mut send = respond
@@ -632,12 +656,16 @@ fn send_h2_status(respond: &mut h2::server::SendResponse<Bytes>, status: u16) ->
 async fn send_h3_status<S>(
     stream: &mut h3::server::RequestStream<S, Bytes>,
     status: u16,
+    proxy_error: Option<&str>,
 ) -> Result<()>
 where
     S: h3::quic::SendStream<Bytes>,
 {
-    let response = http::Response::builder()
-        .status(status)
+    let mut builder = http::Response::builder().status(status);
+    if let Some(err) = proxy_error {
+        builder = builder.header("proxy-status", format!("aerion; error={err}"));
+    }
+    let response = builder
         .body(())
         .with_context(|| format!("build Naive HTTP/3 {status} response"))?;
     stream
@@ -668,19 +696,23 @@ async fn handle_naive_socks_client(
             let tunnel = match open_naive_tunnel(&config, &target).await {
                 Ok(tunnel) => tunnel,
                 Err(error) => {
-                    let _ = socks::write_reply(&mut local, 0x01).await;
+                    let _ = socks::write_reply(
+                        &mut local,
+                        socks::reply_code_for_proxy_error(&error),
+                    )
+                    .await;
                     return Err(error);
                 }
             };
-            socks::write_reply(&mut local, 0x00).await?;
+            socks::write_reply(&mut local, socks::REPLY_SUCCEEDED).await?;
             tracing::info!("Naive proxying {}", target_name(&target));
             relay_naive_tcp(local, tunnel, session).await
         }
         socks::SocksRequest::UdpAssociate => {
-            ensure!(
-                config.udp_over_tcp,
-                "Naive UDP requires udp_over_tcp/uot to be enabled"
-            );
+            if !config.udp_over_tcp {
+                let _ = socks::write_reply(&mut local, socks::REPLY_COMMAND_NOT_SUPPORTED).await;
+                bail!("Naive UDP requires udp_over_tcp/uot to be enabled");
+            }
             tokio::select! {
                 _ = session.cancelled() => Err(anyhow::anyhow!("core session cancelled")),
                 result = handle_naive_udp_associate(local, config, session.clone()) => result,
@@ -777,11 +809,29 @@ async fn open_naive_http1_tunnel(
                 .next()
                 .and_then(|line| line.split_whitespace().nth(1))
                 .unwrap_or_default();
-            ensure!(
-                status == "200",
-                "Naive CONNECT failed: {}",
-                header.lines().next().unwrap_or("")
-            );
+            if status != "200" {
+                let code_num = status.parse::<u16>().unwrap_or(502);
+                let proxy_status = header.lines().skip(1).find_map(|line| {
+                    let (k, v) = line.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("proxy-status")
+                        .then(|| v.trim().to_string())
+                });
+                let socks_code = socks::reply_code_for_http_connect_failure(
+                    code_num,
+                    proxy_status.as_deref(),
+                );
+                let upstream =
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.server_port);
+                let status_line = header.lines().next().unwrap_or("");
+                let err = socks::SocksConnectError {
+                    code: socks_code,
+                    upstream,
+                };
+                return Err(
+                    anyhow::Error::new(err).context(format!("Naive CONNECT failed: {status_line}"))
+                );
+            }
             let pending = response[end + 4..].to_vec();
             return Ok(NaiveTunnel::Http1 {
                 stream: tls,
@@ -815,11 +865,22 @@ async fn open_naive_http2_tunnel(
     let response = response
         .await
         .context("read Naive HTTP/2 CONNECT response")?;
-    ensure!(
-        response.status().as_u16() == 200,
-        "Naive HTTP/2 CONNECT failed with HTTP {}",
-        response.status()
-    );
+    if response.status().as_u16() != 200 {
+        let proxy_status = response
+            .headers()
+            .get("proxy-status")
+            .and_then(|value| value.to_str().ok());
+        let socks_code =
+            socks::reply_code_for_http_connect_failure(response.status().as_u16(), proxy_status);
+        let upstream = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.server_port);
+        let status = response.status();
+        let err = socks::SocksConnectError {
+            code: socks_code,
+            upstream,
+        };
+        return Err(anyhow::Error::new(err)
+            .context(format!("Naive HTTP/2 CONNECT failed with HTTP {status}")));
+    }
     Ok(NaiveTunnel::Http2 {
         send,
         recv: response.into_body(),
@@ -858,11 +919,22 @@ async fn open_naive_http3_tunnel(
         .recv_response()
         .await
         .context("read Naive HTTP/3 CONNECT response")?;
-    ensure!(
-        response.status().as_u16() == 200,
-        "Naive HTTP/3 CONNECT failed with HTTP {}",
-        response.status()
-    );
+    if response.status().as_u16() != 200 {
+        let proxy_status = response
+            .headers()
+            .get("proxy-status")
+            .and_then(|value| value.to_str().ok());
+        let socks_code =
+            socks::reply_code_for_http_connect_failure(response.status().as_u16(), proxy_status);
+        let upstream = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.server_port);
+        let status = response.status();
+        let err = socks::SocksConnectError {
+            code: socks_code,
+            upstream,
+        };
+        return Err(anyhow::Error::new(err)
+            .context(format!("Naive HTTP/3 CONNECT failed with HTTP {status}")));
+    }
     let (send, recv) = stream.split();
     Ok(NaiveTunnel::Http3 {
         send,
@@ -1558,10 +1630,7 @@ async fn relay_naive_uot_packet(
 }
 
 async fn connect_proxy_target(target: &ProxyTarget) -> Result<TcpStream> {
-    match target {
-        ProxyTarget::Ip(addr) => socket_protect::connect_tcp_addr(*addr).await,
-        ProxyTarget::Domain(host, port) => socket_protect::connect_tcp_host_port(host, *port).await,
-    }
+    socket_protect::connect_proxy_target(target).await
 }
 
 async fn resolve_proxy_target_addr(target: &ProxyTarget) -> Result<SocketAddr> {

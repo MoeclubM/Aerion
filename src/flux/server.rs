@@ -1,8 +1,9 @@
 use super::auth::{self, derive_blind_key, handshake_key, xor_32};
 use super::config::{FluxSecurityMode, FluxServerConfig, FluxTransportKind};
 use super::frame::{
-    DEFAULT_STREAM_WINDOW_BYTES, FluxFrame, MAX_FLUX_CHUNK_LEN, RecvOffsetAssembler,
-    SendWindowBuffer, push_coalesced_frame,
+    DEFAULT_STREAM_WINDOW_BYTES, FluxFrame, MAX_FLUX_CHUNK_LEN, RST_MIGRATE_UNKNOWN,
+    RST_REMOTE_RESET, RST_STREAM_CLOSED, RecvOffsetAssembler, SendWindowBuffer,
+    push_coalesced_frame,
 };
 use super::transport::{
     FluxChannelGuard, FluxFrameReader, FluxFrameWriter, PreparedStreamListener,
@@ -16,6 +17,7 @@ use crate::protocol::{
 };
 use crate::replay_cache::{ReplayCache, ReplayError};
 use crate::socket_protect;
+use crate::socks;
 use crate::udp_fragments::{FragmentPayload, MAX_PENDING_PACKETS};
 use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
@@ -893,7 +895,10 @@ async fn run_server_channel_reader(
             } => {
                 if session.is_stream_closed(stream_id) {
                     let _ = ch
-                        .send_stream(FluxFrame::StreamRst { stream_id, code: 1 })
+                        .send_stream(FluxFrame::StreamRst {
+                            stream_id,
+                            code: RST_STREAM_CLOSED,
+                        })
                         .await;
                     continue;
                 }
@@ -916,7 +921,10 @@ async fn run_server_channel_reader(
                         .await;
                 } else {
                     let _ = ch
-                        .send_stream(FluxFrame::StreamRst { stream_id, code: 2 })
+                        .send_stream(FluxFrame::StreamRst {
+                            stream_id,
+                            code: RST_MIGRATE_UNKNOWN,
+                        })
                         .await;
                 }
             }
@@ -1037,20 +1045,44 @@ async fn run_server_stream(
     initial_payload: Bytes,
     mut ev_rx: mpsc::Receiver<ServerStreamEvent>,
 ) -> Result<()> {
-    let mut remote = match socket_protect::connect_proxy_target(&target).await {
+    let mut downlink_epoch = initial_epoch;
+    let mut buffered_events = Vec::new();
+    let dial_res = {
+        let dial_fut = socket_protect::connect_proxy_target(&target);
+        tokio::pin!(dial_fut);
+        loop {
+            tokio::select! {
+                _ = session.core_session.cancelled() => return Ok(()),
+                res = &mut dial_fut => break res,
+                ev = ev_rx.recv() => match ev {
+                    Some(ServerStreamEvent::Migrate { epoch, new_ch, .. }) => {
+                        if epoch > downlink_epoch {
+                            downlink_epoch = epoch;
+                            active_ch = new_ch;
+                        }
+                    }
+                    Some(ServerStreamEvent::Rst) | None => return Ok(()),
+                    Some(other) => buffered_events.push(other),
+                }
+            }
+        }
+    };
+    let mut remote = match dial_res {
         Ok(stream) => stream,
         Err(err) => {
-            let _ = active_ch
-                .send_stream(FluxFrame::StreamRst { stream_id, code: 1 })
-                .await;
+            let code = socks::reply_code_for_error(&err);
+            send_server_prio(
+                &session,
+                &mut active_ch,
+                FluxFrame::StreamRst { stream_id, code },
+            );
             return Err(err);
         }
     };
 
     let mut uplink_recv = RecvOffsetAssembler::default();
-    let _ = uplink_recv.accept_migrate(initial_epoch);
+    let _ = uplink_recv.accept_migrate(downlink_epoch);
     let mut downlink_win = SendWindowBuffer::new(DEFAULT_STREAM_WINDOW_BYTES);
-    let mut downlink_epoch = initial_epoch;
     let mut uplink_done = false;
     let mut downlink_done = false;
 
@@ -1058,14 +1090,62 @@ async fn run_server_stream(
         && let Some(fresh) = uplink_recv.accept_data(initial_epoch, 0, initial_payload)?
     {
         session.core_session.record_upload(fresh.len()).await?;
-        remote
-            .write_all(&fresh)
-            .await
-            .context("write initial Flux target payload")?;
-        let _ = active_ch.send_prio(FluxFrame::StreamAck {
+        if let Err(err) = remote.write_all(&fresh).await {
+            send_server_prio(
+                &session,
+                &mut active_ch,
+                FluxFrame::StreamRst {
+                    stream_id,
+                    code: RST_REMOTE_RESET,
+                },
+            );
+            return Err(err).context("write initial Flux target payload");
+        }
+    }
+    send_server_prio(
+        &session,
+        &mut active_ch,
+        FluxFrame::StreamAck {
             stream_id,
             ack_offset: uplink_recv.next_offset(),
-        });
+        },
+    );
+    for event in buffered_events {
+        if let ServerStreamEvent::Data {
+            epoch,
+            offset,
+            payload,
+            reply_ch,
+        } = event
+        {
+            if epoch > downlink_epoch {
+                downlink_epoch = epoch;
+                active_ch = reply_ch;
+            }
+            if let Some(fresh) = uplink_recv.accept_data(epoch, offset, payload)? {
+                session.core_session.record_upload(fresh.len()).await?;
+                remote
+                    .write_all(&fresh)
+                    .await
+                    .context("write buffered Flux target payload")?;
+            }
+            send_server_prio(
+                &session,
+                &mut active_ch,
+                FluxFrame::StreamAck {
+                    stream_id,
+                    ack_offset: uplink_recv.next_offset(),
+                },
+            );
+        } else if let ServerStreamEvent::Fin {
+            epoch,
+            final_offset,
+        } = event
+            && uplink_recv.accept_fin(epoch, final_offset)
+        {
+            uplink_done = true;
+            let _ = remote.shutdown().await;
+        }
     }
 
     let mut read_buf = vec![0u8; MAX_FLUX_CHUNK_LEN];
@@ -1134,11 +1214,15 @@ async fn run_server_stream(
                             if let Some(fresh) = uplink_recv.accept_data(epoch, offset, payload)? {
                                 session.core_session.record_upload(fresh.len()).await?;
                                 if let Err(err) = remote.write_all(&fresh).await {
-                                    let rst = FluxFrame::StreamRst {
-                                        stream_id,
-                                        code: 3,
-                                    };
-                                    let _ = active_ch.send_stream(rst).await;
+                                    send_server_stream(
+                                        &session,
+                                        &mut active_ch,
+                                        FluxFrame::StreamRst {
+                                            stream_id,
+                                            code: RST_REMOTE_RESET,
+                                        },
+                                    )
+                                    .await;
                                     return Err(err).context("write Flux target TCP");
                                 }
                             }
@@ -1205,7 +1289,7 @@ async fn run_server_stream(
                             }
                         }
                         ServerStreamEvent::Rst => {
-                            let _ = remote.shutdown().await;
+                            socket_protect::reset_tcp_stream(&remote);
                             return Ok(());
                         }
                     }
@@ -1253,15 +1337,48 @@ async fn run_server_stream(
                         }
                     }
                     Err(err) => {
-                        let _ = active_ch.send_stream(FluxFrame::StreamRst {
-                            stream_id,
-                            code: 4,
-                        }).await;
+                        send_server_stream(
+                            &session,
+                            &mut active_ch,
+                            FluxFrame::StreamRst {
+                                stream_id,
+                                code: RST_REMOTE_RESET,
+                            },
+                        )
+                        .await;
                         return Err(err).context("read Flux target TCP");
                     }
                 }
             }
         }
+    }
+}
+
+fn send_server_prio(
+    session: &FluxServerSession,
+    active_ch: &mut Arc<ServerChannelHandle>,
+    frame: FluxFrame,
+) {
+    if active_ch.send_prio(frame.clone()) {
+        return;
+    }
+    if let Some(next) = session.pick_downlink_channel(active_ch) {
+        *active_ch = next;
+        let _ = active_ch.send_prio(frame);
+    }
+}
+
+async fn send_server_stream(
+    session: &FluxServerSession,
+    active_ch: &mut Arc<ServerChannelHandle>,
+    frame: FluxFrame,
+) {
+    if active_ch.send_stream(frame.clone()).await {
+        return;
+    }
+    if let Some(next) = session.pick_downlink_channel(active_ch) {
+        *active_ch = next;
+        let _ = active_ch.send_stream(frame).await;
     }
 }
 

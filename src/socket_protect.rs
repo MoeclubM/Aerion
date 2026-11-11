@@ -1,4 +1,4 @@
-use crate::protocol::ProxyTarget;
+use crate::protocol::{ProxyTarget, target_name};
 use anyhow::{Context, Result, bail};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -113,7 +113,7 @@ pub fn protect_socket_fd(fd: i32) -> Result<()> {
 }
 
 pub async fn connect_proxy_target(target: &ProxyTarget) -> Result<TcpStream> {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    match tokio::time::timeout(Duration::from_secs(15), async {
         match target {
             ProxyTarget::Ip(addr) => connect_tcp_addr(*addr)
                 .await
@@ -124,16 +124,35 @@ pub async fn connect_proxy_target(target: &ProxyTarget) -> Result<TcpStream> {
         }
     })
     .await
-    .context("connect target timed out")?
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let err = std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("connect target {} timed out", target_name(target)),
+            );
+            Err(err).context("connect target timed out")
+        }
+    }
 }
 
 pub async fn connect_tcp_host_port(host: &str, port: u16) -> Result<TcpStream> {
     let addrs = tokio::net::lookup_host((host, port))
         .await
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::HostUnreachable,
+                format!("{host}:{port}: {error}"),
+            )
+        })
         .with_context(|| format!("resolve TCP peer {host}:{port}"))?
         .collect::<Vec<_>>();
     if addrs.is_empty() {
-        bail!("TCP peer resolved to no addresses: {host}:{port}");
+        let err = std::io::Error::new(
+            std::io::ErrorKind::HostUnreachable,
+            format!("TCP peer resolved to no addresses: {host}:{port}"),
+        );
+        return Err(err.into());
     }
     if addrs.len() == 1 {
         return connect_tcp_addr(addrs[0])
@@ -144,7 +163,7 @@ pub async fn connect_tcp_host_port(host: &str, port: u16) -> Result<TcpStream> {
     for addr in addrs {
         racers.spawn(async move { connect_tcp_addr(addr).await.map_err(|error| (addr, error)) });
     }
-    let mut last_error = None;
+    let mut best_error: Option<anyhow::Error> = None;
     while let Some(result) = racers.join_next().await {
         match result {
             Ok(Ok(stream)) => {
@@ -152,15 +171,53 @@ pub async fn connect_tcp_host_port(host: &str, port: u16) -> Result<TcpStream> {
                 return Ok(stream);
             }
             Ok(Err((addr, error))) => {
-                last_error = Some(anyhow::anyhow!("connect TCP peer {addr}: {error:#}"));
+                let candidate = error.context(format!("connect target {addr}"));
+                best_error = Some(match best_error {
+                    Some(prev) => prefer_dial_error(prev, candidate),
+                    None => candidate,
+                });
             }
             Err(join_error) => {
-                last_error = Some(anyhow::anyhow!("TCP dial task failed: {join_error}"));
+                if best_error.is_none() {
+                    best_error = Some(anyhow::anyhow!("TCP dial task failed: {join_error}"));
+                }
             }
         }
     }
-    Err(last_error
-        .unwrap_or_else(|| anyhow::anyhow!("TCP peer resolved to no addresses: {host}:{port}")))
+    if let Some(error) = best_error {
+        return Err(error);
+    }
+    let err = std::io::Error::new(
+        std::io::ErrorKind::HostUnreachable,
+        format!("TCP peer resolved to no addresses: {host}:{port}"),
+    );
+    Err(err.into())
+}
+
+fn dial_error_rank(error: &anyhow::Error) -> u8 {
+    for cause in error.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            return match io_err.kind() {
+                std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::PermissionDenied => 3,
+                std::io::ErrorKind::HostUnreachable => 2,
+                std::io::ErrorKind::NetworkUnreachable
+                | std::io::ErrorKind::NetworkDown
+                | std::io::ErrorKind::AddrNotAvailable => 1,
+                _ => 2,
+            };
+        }
+    }
+    0
+}
+
+fn prefer_dial_error(prev: anyhow::Error, next: anyhow::Error) -> anyhow::Error {
+    if dial_error_rank(&next) >= dial_error_rank(&prev) {
+        next
+    } else {
+        prev
+    }
 }
 
 pub async fn connect_tcp_addr(addr: SocketAddr) -> Result<TcpStream> {
@@ -172,6 +229,23 @@ pub async fn connect_tcp_addr(addr: SocketAddr) -> Result<TcpStream> {
 pub fn configure_tcp_socket(stream: &TcpStream) {
     let _ = stream.set_nodelay(true);
     enable_tcp_keepalive(stream);
+}
+
+pub fn reset_tcp_stream(stream: &TcpStream) {
+    let _ = socket2::SockRef::from(stream).set_linger(Some(Duration::ZERO));
+}
+
+pub fn is_connection_reset_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| {
+                matches!(
+                    io_err.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                )
+            })
+    })
 }
 
 pub fn enable_tcp_keepalive(stream: &TcpStream) {

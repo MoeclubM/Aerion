@@ -108,11 +108,15 @@ async fn handle_http_proxy_socks(
             let mut tunnel = match open_http_proxy_tunnel(&config, &target).await {
                 Ok(tunnel) => tunnel,
                 Err(error) => {
-                    let _ = socks::write_reply(&mut local, 0x01).await;
+                    let _ = socks::write_reply(
+                        &mut local,
+                        socks::reply_code_for_proxy_error(&error),
+                    )
+                    .await;
                     return Err(error);
                 }
             };
-            socks::write_reply(&mut local, 0x00).await?;
+            socks::write_reply(&mut local, socks::REPLY_SUCCEEDED).await?;
             if !tunnel.pending.is_empty() {
                 local
                     .write_all(&tunnel.pending)
@@ -120,12 +124,19 @@ async fn handle_http_proxy_socks(
                     .context("write pending HTTP proxy tunnel bytes to SOCKS client")?;
             }
             tracing::info!("HTTP proxying {}", target_name(&target));
-            copy_bidirectional(&mut local, &mut tunnel.stream)
+            if let Err(error) = copy_bidirectional(&mut local, &mut tunnel.stream)
                 .await
-                .context("relay HTTP proxy tunnel")?;
+                .context("relay HTTP proxy tunnel")
+            {
+                if socket_protect::is_connection_reset_error(&error) {
+                    socket_protect::reset_tcp_stream(&local);
+                }
+                return Err(error);
+            }
             Ok(())
         }
         socks::SocksRequest::UdpAssociate => {
+            let _ = socks::write_reply(&mut local, socks::REPLY_COMMAND_NOT_SUPPORTED).await;
             bail!("HTTP proxy outbound does not support SOCKS UDP ASSOCIATE")
         }
     }
@@ -214,11 +225,22 @@ async fn http_proxy_connect(
                 .next()
                 .and_then(|line| line.split_whitespace().nth(1))
                 .unwrap_or_default();
-            ensure!(
-                status == "200",
-                "HTTP proxy CONNECT failed: {}",
-                header.lines().next().unwrap_or("")
-            );
+            if status != "200" {
+                let code_num = status.parse::<u16>().unwrap_or(502);
+                let proxy_status = extract_proxy_status_header(&header);
+                let socks_code = socks::reply_code_for_http_connect_failure(
+                    code_num,
+                    proxy_status.as_deref(),
+                );
+                let upstream = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), config.server_port);
+                let status_line = header.lines().next().unwrap_or("");
+                let err = socks::SocksConnectError {
+                    code: socks_code,
+                    upstream,
+                };
+                return Err(anyhow::Error::new(err)
+                    .context(format!("HTTP proxy CONNECT failed: {status_line}")));
+            }
             return Ok(HttpProxyTunnel {
                 stream,
                 pending: response[end + 4..].to_vec(),
@@ -231,26 +253,35 @@ pub async fn handle_http_connect(mut local: TcpStream, upstream_socks: SocketAdd
     let target = match read_connect_target(&mut local).await {
         Ok(target) => target,
         Err(error) => {
-            let _ = write_http_response(&mut local, 400, "Bad Request").await;
+            let _ = write_http_response(&mut local, 400, "Bad Request", None).await;
             return Err(error);
         }
     };
     let mut upstream = match socks::connect_tcp(upstream_socks, &target).await {
         Ok(upstream) => upstream,
         Err(error) => {
-            let _ = write_http_response(&mut local, 502, "Bad Gateway").await;
+            let reply_code = socks::reply_code_for_error(&error);
+            let (http_code, reason, proxy_err) = socks::http_status_for_reply_code(reply_code);
+            let _ = write_http_response(&mut local, http_code, reason, Some(proxy_err)).await;
             return Err(error);
         }
     };
-    write_http_response(&mut local, 200, "Connection Established").await?;
+    write_http_response(&mut local, 200, "Connection Established", None).await?;
     tracing::info!(
         "HTTP CONNECT {} via SOCKS {}",
         target_name(&target),
         upstream_socks
     );
-    copy_bidirectional(&mut local, &mut upstream)
+    if let Err(error) = copy_bidirectional(&mut local, &mut upstream)
         .await
-        .context("relay HTTP CONNECT tunnel")?;
+        .context("relay HTTP CONNECT tunnel")
+    {
+        if socket_protect::is_connection_reset_error(&error) {
+            socket_protect::reset_tcp_stream(&local);
+            socket_protect::reset_tcp_stream(&upstream);
+        }
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -321,9 +352,31 @@ fn parse_connect_authority(authority: &str) -> Result<ProxyTarget> {
     Ok(ProxyTarget::Domain(host.to_string(), port))
 }
 
-async fn write_http_response(stream: &mut TcpStream, code: u16, reason: &str) -> Result<()> {
+fn extract_proxy_status_header(header_block: &str) -> Option<String> {
+    for line in header_block.lines().skip(1) {
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("proxy-status")
+        {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
+}
+
+async fn write_http_response(
+    stream: &mut TcpStream,
+    code: u16,
+    reason: &str,
+    proxy_error: Option<&str>,
+) -> Result<()> {
+    let payload = match proxy_error {
+        Some(err) => {
+            format!("HTTP/1.1 {code} {reason}\r\nProxy-Status: aerion; error={err}\r\n\r\n")
+        }
+        None => format!("HTTP/1.1 {code} {reason}\r\n\r\n"),
+    };
     stream
-        .write_all(format!("HTTP/1.1 {code} {reason}\r\n\r\n").as_bytes())
+        .write_all(payload.as_bytes())
         .await
         .context("write HTTP CONNECT response")
 }
