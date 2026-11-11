@@ -108,11 +108,9 @@ async fn handle_http_proxy_socks(
             let mut tunnel = match open_http_proxy_tunnel(&config, &target).await {
                 Ok(tunnel) => tunnel,
                 Err(error) => {
-                    let _ = socks::write_reply(
-                        &mut local,
-                        socks::reply_code_for_proxy_error(&error),
-                    )
-                    .await;
+                    let _ =
+                        socks::write_reply(&mut local, socks::reply_code_for_proxy_error(&error))
+                            .await;
                     return Err(error);
                 }
             };
@@ -228,10 +226,8 @@ async fn http_proxy_connect(
             if status != "200" {
                 let code_num = status.parse::<u16>().unwrap_or(502);
                 let proxy_status = extract_proxy_status_header(&header);
-                let socks_code = socks::reply_code_for_http_connect_failure(
-                    code_num,
-                    proxy_status.as_deref(),
-                );
+                let socks_code =
+                    socks::reply_code_for_http_connect_failure(code_num, proxy_status.as_deref());
                 let upstream = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), config.server_port);
                 let status_line = header.lines().next().unwrap_or("");
                 let err = socks::SocksConnectError {

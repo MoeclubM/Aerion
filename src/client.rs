@@ -500,11 +500,9 @@ async fn handle_socks_client(
             let session = match shared.acquire().await {
                 Ok(session) => session,
                 Err(error) => {
-                    let _ = socks::write_reply(
-                        &mut local,
-                        socks::reply_code_for_proxy_error(&error),
-                    )
-                    .await;
+                    let _ =
+                        socks::write_reply(&mut local, socks::reply_code_for_proxy_error(&error))
+                            .await;
                     return Err(error);
                 }
             };
@@ -532,11 +530,9 @@ async fn handle_socks_client(
             let session = match shared.acquire().await {
                 Ok(session) => session,
                 Err(error) => {
-                    let _ = socks::write_reply(
-                        &mut local,
-                        socks::reply_code_for_proxy_error(&error),
-                    )
-                    .await;
+                    let _ =
+                        socks::write_reply(&mut local, socks::reply_code_for_proxy_error(&error))
+                            .await;
                     return Err(error);
                 }
             };

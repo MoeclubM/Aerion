@@ -1,5 +1,5 @@
 use crate::protocol::{ProxyTarget, target_name};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
@@ -534,7 +534,7 @@ mod windows_udp {
             )
         };
         if result != 0 {
-            bail!(
+            anyhow::bail!(
                 "disable Windows UDP connreset failed: {}",
                 std::io::Error::last_os_error()
             );

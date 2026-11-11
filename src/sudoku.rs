@@ -712,8 +712,7 @@ async fn handle_sudoku_socks_client(
     {
         Ok(opened) => opened,
         Err(error) => {
-            let _ =
-                socks::write_reply(&mut local, socks::reply_code_for_proxy_error(&error)).await;
+            let _ = socks::write_reply(&mut local, socks::reply_code_for_proxy_error(&error)).await;
             return Err(error);
         }
     };

@@ -4,8 +4,8 @@ use super::config::{
     FluxTransportKind,
 };
 use super::frame::{
-    DEFAULT_STREAM_WINDOW_BYTES, FluxFrame, MAX_FLUX_CHUNK_LEN, RST_CLIENT_ABORT,
-    RST_REMOTE_RESET, RecvOffsetAssembler, SendWindowBuffer, push_coalesced_frame,
+    DEFAULT_STREAM_WINDOW_BYTES, FluxFrame, MAX_FLUX_CHUNK_LEN, RST_CLIENT_ABORT, RST_REMOTE_RESET,
+    RecvOffsetAssembler, SendWindowBuffer, push_coalesced_frame,
 };
 use super::transport::{
     FluxChannelGuard, FluxFrameReader, FluxFrameWriter, connect_client_channel,
@@ -1478,9 +1478,8 @@ async fn handle_flux_socks_client(
             let mut slot = match pool.pick_channel_for_new_stream().await {
                 Ok(slot) => slot,
                 Err(err) => {
-                    let _ =
-                        socks::write_reply(&mut local, socks::reply_code_for_proxy_error(&err))
-                            .await;
+                    let _ = socks::write_reply(&mut local, socks::reply_code_for_proxy_error(&err))
+                        .await;
                     return Err(err);
                 }
             };

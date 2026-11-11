@@ -696,11 +696,9 @@ async fn handle_naive_socks_client(
             let tunnel = match open_naive_tunnel(&config, &target).await {
                 Ok(tunnel) => tunnel,
                 Err(error) => {
-                    let _ = socks::write_reply(
-                        &mut local,
-                        socks::reply_code_for_proxy_error(&error),
-                    )
-                    .await;
+                    let _ =
+                        socks::write_reply(&mut local, socks::reply_code_for_proxy_error(&error))
+                            .await;
                     return Err(error);
                 }
             };
@@ -817,10 +815,8 @@ async fn open_naive_http1_tunnel(
                         .eq_ignore_ascii_case("proxy-status")
                         .then(|| v.trim().to_string())
                 });
-                let socks_code = socks::reply_code_for_http_connect_failure(
-                    code_num,
-                    proxy_status.as_deref(),
-                );
+                let socks_code =
+                    socks::reply_code_for_http_connect_failure(code_num, proxy_status.as_deref());
                 let upstream =
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.server_port);
                 let status_line = header.lines().next().unwrap_or("");

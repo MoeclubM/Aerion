@@ -464,22 +464,18 @@ async fn handle_tuic_socks_client(
             let client = match shared.get_or_connect().await {
                 Ok(client) => client,
                 Err(error) => {
-                    let _ = socks::write_reply(
-                        &mut local,
-                        socks::reply_code_for_proxy_error(&error),
-                    )
-                    .await;
+                    let _ =
+                        socks::write_reply(&mut local, socks::reply_code_for_proxy_error(&error))
+                            .await;
                     return Err(error);
                 }
             };
             let stream = match client.open_tcp(&target).await {
                 Ok(stream) => stream,
                 Err(error) => {
-                    let _ = socks::write_reply(
-                        &mut local,
-                        socks::reply_code_for_proxy_error(&error),
-                    )
-                    .await;
+                    let _ =
+                        socks::write_reply(&mut local, socks::reply_code_for_proxy_error(&error))
+                            .await;
                     return Err(error);
                 }
             };
@@ -495,11 +491,9 @@ async fn handle_tuic_socks_client(
             let client = match shared.get_or_connect().await {
                 Ok(client) => client,
                 Err(error) => {
-                    let _ = socks::write_reply(
-                        &mut local,
-                        socks::reply_code_for_proxy_error(&error),
-                    )
-                    .await;
+                    let _ =
+                        socks::write_reply(&mut local, socks::reply_code_for_proxy_error(&error))
+                            .await;
                     return Err(error);
                 }
             };

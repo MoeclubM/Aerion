@@ -102,7 +102,10 @@ pub fn reply_code_for_error(error: &anyhow::Error) -> u8 {
         }
     }
     for cause in error.chain() {
-        if cause.downcast_ref::<tokio::time::error::Elapsed>().is_some() {
+        if cause
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+        {
             return REPLY_TTL_EXPIRED;
         }
     }
@@ -129,7 +132,10 @@ pub fn reply_code_for_proxy_error(error: &anyhow::Error) -> u8 {
         }
     }
     for cause in error.chain() {
-        if cause.downcast_ref::<tokio::time::error::Elapsed>().is_some() {
+        if cause
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+        {
             return REPLY_TTL_EXPIRED;
         }
         if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {

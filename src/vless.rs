@@ -233,8 +233,7 @@ async fn handle_vless_socks_with_core(
                     write_vless_request(&mut server, &user, CMD_MUX, &vless_xudp::mux_target(), "")
                         .await?;
                 } else {
-                    write_vless_request(&mut server, &user, CMD_TCP, &target, &config.flow)
-                        .await?;
+                    write_vless_request(&mut server, &user, CMD_TCP, &target, &config.flow).await?;
                 }
                 read_vless_response_header(&mut server).await?;
                 Ok::<_, anyhow::Error>((server, user, vision))
@@ -243,11 +242,9 @@ async fn handle_vless_socks_with_core(
             {
                 Ok(opened) => opened,
                 Err(error) => {
-                    let _ = socks::write_reply(
-                        &mut stream,
-                        socks::reply_code_for_proxy_error(&error),
-                    )
-                    .await;
+                    let _ =
+                        socks::write_reply(&mut stream, socks::reply_code_for_proxy_error(&error))
+                            .await;
                     return Err(error);
                 }
             };

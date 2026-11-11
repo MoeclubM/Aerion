@@ -73,7 +73,7 @@ async fn http_connect_maps_socks_errors_to_status_and_proxy_status() -> Result<(
         let http_listener = TcpListener::bind("127.0.0.1:0").await?;
         let http_addr = http_listener.local_addr()?;
         let http_task = tokio::spawn(async move {
-            let (stream, _) = http_listener.accept().await?;
+            let (stream, _) = http_listener.accept().await.expect("accept HTTP client");
             let _ = handle_http_connect(stream, socks_addr).await;
         });
 

@@ -175,11 +175,9 @@ async fn handle_trojan_socks_with_core(
             {
                 Ok(server) => server,
                 Err(error) => {
-                    let _ = socks::write_reply(
-                        &mut stream,
-                        socks::reply_code_for_proxy_error(&error),
-                    )
-                    .await;
+                    let _ =
+                        socks::write_reply(&mut stream, socks::reply_code_for_proxy_error(&error))
+                            .await;
                     return Err(error);
                 }
             };

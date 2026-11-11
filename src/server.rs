@@ -461,13 +461,7 @@ async fn run_tcp_stream(
             };
             let detail = format!("{error:#}");
             let detail_bytes = &detail.as_bytes()[..detail.len().min(4096)];
-            write_frame(
-                &mut *writer,
-                CMD_SYNACK,
-                stream_id,
-                detail_bytes,
-            )
-            .await?;
+            write_frame(&mut *writer, CMD_SYNACK, stream_id, detail_bytes).await?;
             return Err(error);
         }
     };
