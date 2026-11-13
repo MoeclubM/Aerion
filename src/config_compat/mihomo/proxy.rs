@@ -401,7 +401,7 @@ impl MihomoUnsupportedProxy {
         for (key, value) in &self.fields {
             mapping.insert(Value::String(key.clone()), value.clone());
         }
-        Value::Mapping(mapping)
+        normalize_mihomo_proxy_value(&Value::Mapping(mapping))
     }
 }
 
@@ -656,6 +656,11 @@ impl MihomoHysteria2Proxy {
             &self.fields,
         )?;
         ensure!(
+            self.tls,
+            "mihomo Hysteria2 proxy {} disables TLS; Hysteria2 requires TLS in Aerion",
+            self.name
+        );
+        ensure!(
             self.ports.is_none(),
             "mihomo Hysteria2 proxy {} uses port hopping; Aerion Hysteria2 client expects one fixed port",
             self.name
@@ -754,6 +759,11 @@ impl MihomoHysteria2Proxy {
 impl MihomoAnyTlsProxy {
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<ClientConfig> {
         ensure_no_proxy_extra_fields(&format!("mihomo AnyTLS proxy {}", self.name), &self.fields)?;
+        ensure!(
+            self.tls,
+            "mihomo AnyTLS proxy {} disables TLS; AnyTLS requires TLS in Aerion",
+            self.name
+        );
         Ok(ClientConfig {
             listen,
             server_host: self.server.clone(),
@@ -948,6 +958,18 @@ impl MihomoMieruProxy {
 impl MihomoNaiveProxy {
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<NaiveClientConfig> {
         ensure_no_proxy_extra_fields(&format!("mihomo Naive proxy {}", self.name), &self.fields)?;
+        ensure!(
+            self.tls,
+            "mihomo Naive proxy {} disables TLS; Naive requires TLS in Aerion",
+            self.name
+        );
+        let quic_cc = self
+            .quic_congestion_control
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(default_naive_quic_congestion_control);
         Ok(NaiveClientConfig {
             listen,
             server_host: self.server.clone(),
@@ -968,7 +990,7 @@ impl MihomoNaiveProxy {
                 .transpose()?
                 .unwrap_or(false),
             quic: self.quic,
-            quic_congestion_control: default_naive_quic_congestion_control(),
+            quic_congestion_control: quic_cc,
         })
     }
 }
@@ -976,6 +998,11 @@ impl MihomoNaiveProxy {
 impl MihomoTuicProxy {
     pub fn to_client_config(&self, listen: SocketAddr) -> Result<TuicClientConfig> {
         ensure_no_proxy_extra_fields(&format!("mihomo TUIC proxy {}", self.name), &self.fields)?;
+        ensure!(
+            self.tls,
+            "mihomo TUIC proxy {} disables TLS; TUIC requires TLS in Aerion",
+            self.name
+        );
         ensure!(
             self.token.as_deref().unwrap_or_default().trim().is_empty(),
             "mihomo TUIC proxy {} uses TUIC v4 token; Aerion implements TUIC v5 UUID/password auth",

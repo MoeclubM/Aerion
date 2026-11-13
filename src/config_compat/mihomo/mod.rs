@@ -272,7 +272,8 @@ where
     E: de::Error,
     F: FnOnce(T) -> MihomoProxy,
 {
-    match serde_yaml::from_value(value.clone()) {
+    let normalized = normalize_mihomo_proxy_value(value);
+    match serde_yaml::from_value(normalized) {
         Ok(proxy) => Ok(wrap(proxy)),
         Err(_) => mihomo_raw_proxy(mapping, kind),
     }
@@ -343,7 +344,7 @@ pub struct MihomoHttpProxy {
     pub password: Option<String>,
     #[serde(default)]
     pub tls: bool,
-    #[serde(default, alias = "servername", alias = "server-name", alias = "sni")]
+    #[serde(default, alias = "server-name", alias = "server_name", alias = "sni")]
     pub servername: Option<String>,
     #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
     pub skip_cert_verify: bool,
@@ -380,7 +381,7 @@ pub struct MihomoVlessProxy {
     pub encryption: Option<String>,
     #[serde(default, rename = "packet-encoding", alias = "packet_encoding")]
     pub packet_encoding: String,
-    #[serde(default, alias = "server-name", alias = "sni")]
+    #[serde(default, alias = "server-name", alias = "server_name", alias = "sni")]
     pub servername: Option<String>,
     #[serde(
         default,
@@ -433,7 +434,7 @@ pub struct MihomoVmessProxy {
     pub network: String,
     #[serde(default, rename = "packet-encoding", alias = "packet_encoding")]
     pub packet_encoding: String,
-    #[serde(default, alias = "server-name", alias = "sni")]
+    #[serde(default, alias = "server-name", alias = "server_name", alias = "sni")]
     pub servername: Option<String>,
     #[serde(
         default,
@@ -466,7 +467,7 @@ pub struct MihomoTrojanProxy {
     pub tls: bool,
     #[serde(default = "default_tcp")]
     pub network: String,
-    #[serde(default, alias = "servername", alias = "server-name")]
+    #[serde(default, alias = "servername", alias = "server-name", alias = "server_name")]
     pub sni: Option<String>,
     #[serde(
         default,
@@ -498,10 +499,19 @@ pub struct MihomoHysteria2Proxy {
     #[serde(default, rename = "hop-interval", alias = "hop_interval")]
     pub hop_interval: Option<Value>,
     pub password: String,
-    #[serde(default, alias = "servername", alias = "server-name")]
+    #[serde(default = "default_true")]
+    pub tls: bool,
+    #[serde(default, alias = "servername", alias = "server-name", alias = "server_name")]
     pub sni: Option<String>,
     #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
     pub skip_cert_verify: bool,
+    #[serde(
+        default,
+        rename = "client-fingerprint",
+        alias = "client_fingerprint",
+        deserialize_with = "deserialize_optional_fingerprint"
+    )]
+    pub client_fingerprint: Option<UtlsFingerprint>,
     #[serde(default)]
     pub fingerprint: Option<String>,
     #[serde(default)]
@@ -542,7 +552,9 @@ pub struct MihomoHysteria2Proxy {
     pub max_connection_receive_window: Option<Value>,
     #[serde(
         default = "default_hy2_congestion_control",
-        rename = "congestion-control"
+        rename = "congestion-control",
+        alias = "congestion_control",
+        alias = "congestion-controller"
     )]
     pub congestion_control: String,
     #[serde(default = "default_true")]
@@ -633,8 +645,14 @@ pub struct MihomoMieruProxy {
     #[serde(default)]
     pub username: Option<String>,
     pub password: String,
+    #[serde(default = "default_true")]
+    pub udp: bool,
     #[serde(default = "default_tcp")]
     pub transport: String,
+    #[serde(default)]
+    pub multiplexing: Option<String>,
+    #[serde(default, rename = "handshake-mode", alias = "handshake_mode")]
+    pub handshake_mode: Option<String>,
     #[serde(default, rename = "traffic-pattern", alias = "traffic_pattern")]
     pub traffic_pattern: Option<String>,
     #[serde(default, rename = "nonce-pattern", alias = "nonce_pattern")]
@@ -649,7 +667,11 @@ pub struct MihomoAnyTlsProxy {
     pub server: String,
     pub port: u16,
     pub password: String,
-    #[serde(default, alias = "servername", alias = "server-name", alias = "sni")]
+    #[serde(default = "default_true")]
+    pub udp: bool,
+    #[serde(default = "default_true")]
+    pub tls: bool,
+    #[serde(default, alias = "server-name", alias = "server_name", alias = "sni")]
     pub servername: Option<String>,
     #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
     pub skip_cert_verify: bool,
@@ -660,6 +682,8 @@ pub struct MihomoAnyTlsProxy {
         deserialize_with = "deserialize_optional_fingerprint"
     )]
     pub client_fingerprint: Option<UtlsFingerprint>,
+    #[serde(default)]
+    pub alpn: Option<OneOrManyStrings>,
     #[serde(default, rename = "padding-scheme", alias = "padding_scheme")]
     pub padding_scheme: Vec<String>,
     #[serde(flatten)]
@@ -676,12 +700,27 @@ pub struct MihomoNaiveProxy {
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
-    #[serde(default, alias = "servername", alias = "server-name", alias = "sni")]
+    #[serde(default = "default_true")]
+    pub udp: bool,
+    #[serde(default = "default_true")]
+    pub tls: bool,
+    #[serde(default, alias = "server-name", alias = "server_name", alias = "sni")]
     pub servername: Option<String>,
     #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
     pub skip_cert_verify: bool,
+    #[serde(
+        default,
+        rename = "client-fingerprint",
+        alias = "client_fingerprint",
+        deserialize_with = "deserialize_optional_fingerprint"
+    )]
+    pub client_fingerprint: Option<UtlsFingerprint>,
+    #[serde(default)]
+    pub alpn: Option<OneOrManyStrings>,
     #[serde(default)]
     pub quic: bool,
+    #[serde(default, rename = "quic-congestion-control", alias = "quic_congestion_control")]
+    pub quic_congestion_control: Option<String>,
     #[serde(default, rename = "udp-over-tcp", alias = "udp_over_tcp")]
     pub udp_over_tcp: Option<MihomoUdpOverTcpOptions>,
     #[serde(default, rename = "extra-headers", alias = "extra_headers")]
@@ -705,10 +744,19 @@ pub struct MihomoTuicProxy {
     pub token: Option<String>,
     #[serde(default = "default_true")]
     pub udp: bool,
-    #[serde(default, alias = "servername", alias = "server-name", alias = "sni")]
+    #[serde(default = "default_true")]
+    pub tls: bool,
+    #[serde(default, alias = "server-name", alias = "server_name", alias = "sni")]
     pub servername: Option<String>,
     #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
     pub skip_cert_verify: bool,
+    #[serde(
+        default,
+        rename = "client-fingerprint",
+        alias = "client_fingerprint",
+        deserialize_with = "deserialize_optional_fingerprint"
+    )]
+    pub client_fingerprint: Option<UtlsFingerprint>,
     #[serde(default, rename = "disable-sni", alias = "disable_sni")]
     pub disable_sni: bool,
     #[serde(default, rename = "reduce-rtt", alias = "reduce_rtt")]
@@ -1258,6 +1306,216 @@ fn mihomo_string_fields(mapping: &Mapping) -> BTreeMap<String, Value> {
             Some((key.clone(), value.clone()))
         })
         .collect()
+}
+
+pub(super) fn normalize_mihomo_proxy_value(value: &Value) -> Value {
+    let Value::Mapping(mapping) = value else {
+        return value.clone();
+    };
+    let mut out = mapping.clone();
+    let kind = mihomo_mapping_str(&out, "type")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    coalesce_sni_keys(
+        &mut out,
+        "servername",
+        &["servername", "sni", "server-name", "server_name"],
+    );
+    if out.contains_key(Value::String("server".into())) {
+        out.remove(Value::String("host".into()));
+    }
+    if kind == "flux" {
+        coalesce_alias_keys(&mut out, "key", &["key", "password", "uuid"]);
+        coalesce_alias_keys(
+            &mut out,
+            "skip-cert-verify",
+            &[
+                "skip-cert-verify",
+                "skip_cert_verify",
+                "insecure",
+                "allow_insecure",
+            ],
+        );
+        coalesce_alias_keys(
+            &mut out,
+            "client-fingerprint",
+            &["client-fingerprint", "client_fingerprint", "fingerprint"],
+        );
+        coalesce_alias_keys(
+            &mut out,
+            "obfs-key",
+            &["obfs-key", "obfs_key", "obfs-password", "obfs_password"],
+        );
+    } else {
+        coalesce_alias_keys(
+            &mut out,
+            "skip-cert-verify",
+            &["skip-cert-verify", "skip_cert_verify"],
+        );
+        if out.contains_key(Value::String("skip-cert-verify".into())) {
+            out.remove(Value::String("insecure".into()));
+            out.remove(Value::String("allow_insecure".into()));
+        }
+        coalesce_alias_keys(
+            &mut out,
+            "client-fingerprint",
+            &["client-fingerprint", "client_fingerprint"],
+        );
+        coalesce_alias_keys(&mut out, "obfs-password", &["obfs-password", "obfs_password"]);
+    }
+    for (canonical, group) in [
+        ("plugin-opts", &["plugin-opts", "plugin_opts"][..]),
+        ("udp-over-tcp", &["udp-over-tcp", "udp_over_tcp"][..]),
+        ("packet-encoding", &["packet-encoding", "packet_encoding"][..]),
+        ("reality-opts", &["reality-opts", "reality_opts"][..]),
+        ("ws-opts", &["ws-opts", "ws_opts"][..]),
+        ("grpc-opts", &["grpc-opts", "grpc_opts"][..]),
+        (
+            "xhttp-opts",
+            &[
+                "xhttp-opts",
+                "xhttp_opts",
+                "splithttp-opts",
+                "splithttp_opts",
+            ][..],
+        ),
+        ("alterId", &["alterId", "alter_id"][..]),
+        ("hop-interval", &["hop-interval", "hop_interval"][..]),
+        ("bbr-profile", &["bbr-profile", "bbr_profile"][..]),
+        ("realm-opts", &["realm-opts", "realm_opts"][..]),
+        (
+            "congestion-control",
+            &[
+                "congestion-control",
+                "congestion_control",
+                "congestion-controller",
+            ][..],
+        ),
+        ("public-key", &["public-key", "public_key"][..]),
+        ("short-id", &["short-id", "short_id"][..]),
+        ("resolved-v4", &["resolved-v4", "resolved_v4"][..]),
+        ("resolved-v6", &["resolved-v6", "resolved_v6"][..]),
+        ("handshake-mode", &["handshake-mode", "handshake_mode"][..]),
+        ("traffic-pattern", &["traffic-pattern", "traffic_pattern"][..]),
+        ("nonce-pattern", &["nonce-pattern", "nonce_pattern"][..]),
+        ("padding-scheme", &["padding-scheme", "padding_scheme"][..]),
+        ("extra-headers", &["extra-headers", "extra_headers"][..]),
+        (
+            "quic-congestion-control",
+            &["quic-congestion-control", "quic_congestion_control"][..],
+        ),
+        ("disable-sni", &["disable-sni", "disable_sni"][..]),
+        ("reduce-rtt", &["reduce-rtt", "reduce_rtt"][..]),
+        ("fast-open", &["fast-open", "fast_open"][..]),
+        (
+            "heartbeat-interval",
+            &["heartbeat-interval", "heartbeat_interval"][..],
+        ),
+        ("udp-relay-mode", &["udp-relay-mode", "udp_relay_mode"][..]),
+    ] {
+        coalesce_alias_keys(&mut out, canonical, group);
+    }
+    if let Some(Value::Sequence(channels)) = out.get_mut(Value::String("channels".into())) {
+        for ch in channels.iter_mut() {
+            if let Value::Mapping(ch_map) = ch {
+                coalesce_sni_keys(
+                    ch_map,
+                    "sni",
+                    &["sni", "servername", "server_name", "server-name"],
+                );
+                coalesce_alias_keys(
+                    ch_map,
+                    "server",
+                    &["server", "connect_host", "connect-host", "host"],
+                );
+                coalesce_alias_keys(
+                    ch_map,
+                    "ports",
+                    &["ports", "connect_ports", "connect-ports", "port"],
+                );
+                coalesce_alias_keys(
+                    ch_map,
+                    "fingerprint",
+                    &["fingerprint", "client-fingerprint", "client_fingerprint"],
+                );
+                coalesce_alias_keys(
+                    ch_map,
+                    "insecure",
+                    &[
+                        "insecure",
+                        "skip-cert-verify",
+                        "skip_cert_verify",
+                        "allow_insecure",
+                    ],
+                );
+                coalesce_alias_keys(
+                    ch_map,
+                    "obfs_key",
+                    &["obfs_key", "obfs-key", "obfs_password", "obfs-password"],
+                );
+            }
+        }
+    }
+    Value::Mapping(out)
+}
+
+fn is_yaml_ip_literal(raw: &str) -> bool {
+    let trimmed = raw.trim().trim_start_matches('[').trim_end_matches(']');
+    trimmed.parse::<IpAddr>().is_ok()
+}
+
+fn coalesce_sni_keys(mapping: &mut Mapping, canonical: &str, keys: &[&str]) {
+    let mut values = Vec::new();
+    for key in keys {
+        if let Some(v) = mapping.remove(Value::String((*key).to_string())) {
+            values.push(v);
+        }
+    }
+    if values.is_empty() {
+        return;
+    }
+    let best = values
+        .iter()
+        .find(|v| {
+            v.as_str()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty() && !is_yaml_ip_literal(s))
+        })
+        .or_else(|| {
+            values
+                .iter()
+                .find(|v| v.as_str().map(str::trim).is_some_and(|s| !s.is_empty()))
+        })
+        .or_else(|| values.iter().find(|v| !v.is_null()))
+        .cloned();
+    if let Some(chosen) = best {
+        mapping.insert(Value::String(canonical.to_string()), chosen);
+    }
+}
+
+fn coalesce_alias_keys(mapping: &mut Mapping, canonical: &str, keys: &[&str]) {
+    let present = keys
+        .iter()
+        .filter(|k| mapping.contains_key(Value::String((**k).to_string())))
+        .count();
+    if present < 2 {
+        return;
+    }
+    let mut chosen = None;
+    for key in keys {
+        if let Some(v) = mapping.remove(Value::String((*key).to_string()))
+            && chosen.is_none()
+            && !v.is_null()
+        {
+            chosen = Some(v);
+        }
+    }
+    mapping.insert(
+        Value::String(canonical.to_string()),
+        chosen.unwrap_or(Value::Null),
+    );
 }
 
 fn mihomo_transport_config(

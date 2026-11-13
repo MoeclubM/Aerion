@@ -782,6 +782,114 @@ proxies:
 }
 
 #[test]
+fn parses_proxies_with_duplicate_sni_and_servername_fields() -> Result<()> {
+    let yaml = r#"
+proxies:
+  - name: VN Hanoi VNPT
+    type: anytls
+    server: vn.example.com
+    port: 443
+    password: secret
+    udp: true
+    tls: true
+    sni: sni.example.com
+    servername: sni.example.com
+    skip-cert-verify: false
+    alpn:
+      - h2
+  - name: vless-dup
+    type: vless
+    server: vless.example.com
+    port: 443
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    udp: true
+    tls: true
+    sni: vless-sni.example.com
+    servername: vless-sni.example.com
+  - name: trojan-dup
+    type: trojan
+    server: trojan.example.com
+    port: 443
+    password: secret
+    udp: true
+    tls: true
+    sni: trojan-sni.example.com
+    servername: trojan-sni.example.com
+  - name: hy2-dup
+    type: hysteria2
+    server: hy2.example.com
+    port: 443
+    password: secret
+    udp: true
+    tls: true
+    sni: hy2-sni.example.com
+    servername: hy2-sni.example.com
+  - name: tuic-dup
+    type: tuic
+    server: tuic.example.com
+    port: 443
+    uuid: a3482e88-686a-4a58-8126-99c9df64b7bf
+    password: secret
+    udp: true
+    tls: true
+    sni: tuic-sni.example.com
+    servername: tuic-sni.example.com
+  - name: naive-dup
+    type: naive
+    server: naive.example.com
+    port: 443
+    password: secret
+    udp: true
+    tls: true
+    quic: true
+    quic_congestion_control: bbr
+    sni: naive-sni.example.com
+    servername: naive-sni.example.com
+  - name: mieru-udp
+    type: mieru
+    server: mieru.example.com
+    port: 8443
+    username: u1
+    password: u1
+    transport: TCP
+    udp: true
+"#;
+    let config: MihomoConfig = serde_yaml::from_str(yaml)?;
+    let addr: SocketAddr = "127.0.0.1:1080".parse()?;
+    let MihomoClientConfig::AnyTls(anytls) = config.resolved_proxy_config("VN Hanoi VNPT", addr)?
+    else {
+        bail!("expected AnyTLS")
+    };
+    assert_eq!(anytls.sni, "sni.example.com");
+    assert!(matches!(
+        config.resolved_proxy_config("vless-dup", addr)?,
+        MihomoClientConfig::Vless(_)
+    ));
+    assert!(matches!(
+        config.resolved_proxy_config("trojan-dup", addr)?,
+        MihomoClientConfig::Trojan(_)
+    ));
+    assert!(matches!(
+        config.resolved_proxy_config("hy2-dup", addr)?,
+        MihomoClientConfig::Hysteria2(_)
+    ));
+    assert!(matches!(
+        config.resolved_proxy_config("tuic-dup", addr)?,
+        MihomoClientConfig::Tuic(_)
+    ));
+    let MihomoClientConfig::Naive(naive) = config.resolved_proxy_config("naive-dup", addr)? else {
+        bail!("expected Naive")
+    };
+    assert_eq!(naive.sni, "naive-sni.example.com");
+    assert_eq!(naive.quic_congestion_control, "bbr");
+    assert!(matches!(
+        config.resolved_proxy_config("mieru-udp", addr)?,
+        MihomoClientConfig::Mieru(_)
+    ));
+    Ok(())
+}
+
+#[test]
 fn rejects_unsupported_udp_over_tcp_version() -> Result<()> {
     let yaml = r#"
 proxies:
