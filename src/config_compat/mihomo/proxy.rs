@@ -833,18 +833,23 @@ impl MihomoFluxProxy {
                 "mihomo Flux proxy {} is missing port",
                 self.name
             );
-            for (id, transport) in [
-                ("ch-tcp", FluxTransportKind::Tcp),
-                ("ch-udp", FluxTransportKind::Udp),
-            ] {
+            for (id, ip_version) in [("tcp-v4", "ipv4"), ("tcp-v6", "ipv6")] {
                 built_channels.push(FluxChannelClientConfig {
                     id: id.to_string(),
                     server_host: self.server.clone(),
                     ports: vec![self.port],
-                    ip_version: "auto".to_string(),
-                    resolved_v4: self.resolved_v4.clone(),
-                    resolved_v6: self.resolved_v6.clone(),
-                    transport,
+                    ip_version: ip_version.to_string(),
+                    resolved_v4: if ip_version == "ipv4" {
+                        self.resolved_v4.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    resolved_v6: if ip_version == "ipv6" {
+                        self.resolved_v6.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    transport: FluxTransportKind::Tcp,
                     http_mode: FluxHttpMode::Ws,
                     http_host: None,
                     http_path: "/".to_string(),
@@ -895,8 +900,12 @@ impl MihomoFluxProxy {
                         && ch.resolved_v4.is_empty()
                         && ch.resolved_v6.is_empty()
                     {
-                        ch.resolved_v4 = self.resolved_v4.clone();
-                        ch.resolved_v6 = self.resolved_v6.clone();
+                        if ch.ip_version != "ipv6" {
+                            ch.resolved_v4 = self.resolved_v4.clone();
+                        }
+                        if ch.ip_version != "ipv4" {
+                            ch.resolved_v6 = self.resolved_v6.clone();
+                        }
                     }
                     built_channels.push(ch);
                 }

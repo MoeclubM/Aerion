@@ -20,6 +20,14 @@ pub enum FluxIpStrategy {
     #[default]
     #[serde(alias = "auto", alias = "both", alias = "dual-stack")]
     Dual,
+    #[serde(
+        alias = "latency-first",
+        alias = "latency_first",
+        alias = "lowest_latency",
+        alias = "lowest-latency",
+        alias = "rtt"
+    )]
+    Latency,
     #[serde(alias = "prefer-v4", alias = "ipv4_first")]
     PreferV4,
     #[serde(alias = "prefer-v6", alias = "ipv6_first")]
@@ -76,12 +84,36 @@ pub enum FluxCertMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum FluxChannelRole {
     #[default]
+    #[serde(alias = "equal", alias = "normal")]
     Primary,
+    #[serde(alias = "high", alias = "preferred")]
+    Prefer,
+    #[serde(
+        alias = "udp_only",
+        alias = "udp-only",
+        alias = "udp-relay",
+        alias = "udp"
+    )]
+    UdpRelay,
     #[serde(alias = "standby", alias = "failover")]
     Backup,
+}
+
+impl FluxChannelRole {
+    pub fn normalized_for_transport(self, transport: FluxTransportKind) -> Self {
+        if self == Self::UdpRelay && transport != FluxTransportKind::Udp {
+            Self::Primary
+        } else {
+            self
+        }
+    }
+
+    pub fn is_primary_tier(self) -> bool {
+        matches!(self, Self::Primary | Self::Prefer)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -324,7 +356,28 @@ impl FluxChannelWireConfig {
         };
         let (transport, inferred_http_mode) = parse_transport_and_mode(self.transport.as_deref())?;
         let http_mode = self.http_mode.or(inferred_http_mode).unwrap_or_default();
-        let security = self.security.unwrap_or(default_security);
+        let security = self.security.unwrap_or_else(|| {
+            if self
+                .reality_opts
+                .as_ref()
+                .is_some_and(|o| !o.public_key.trim().is_empty())
+                || self
+                    .public_key
+                    .as_deref()
+                    .is_some_and(|v| !v.trim().is_empty())
+            {
+                FluxSecurityMode::Reality
+            } else if self
+                .obfs_key
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty())
+            {
+                FluxSecurityMode::Obfs
+            } else {
+                default_security
+            }
+        });
+        let role = self.role.normalized_for_transport(transport);
         let ip_version = normalize_ip_version(&self.ip_version)?;
         let sni = self
             .sni
@@ -417,7 +470,7 @@ impl FluxChannelWireConfig {
             pinned_cert_sha256: Vec::new(),
             reality,
             obfs_key,
-            role: self.role,
+            role,
             weight: self.weight,
         }))
     }

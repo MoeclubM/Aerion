@@ -92,11 +92,19 @@ proxies:
         panic!("expected Flux client config for FluxAuto");
     };
     assert_eq!(auto_cfg.channels.len(), 2);
+    assert_eq!(auto_cfg.channels[0].id, "tcp-v4");
     assert_eq!(auto_cfg.channels[0].transport, FluxTransportKind::Tcp);
-    assert_eq!(auto_cfg.channels[1].transport, FluxTransportKind::Udp);
+    assert_eq!(auto_cfg.channels[0].ip_version, "ipv4");
+    assert_eq!(auto_cfg.channels[1].id, "tcp-v6");
+    assert_eq!(auto_cfg.channels[1].transport, FluxTransportKind::Tcp);
+    assert_eq!(auto_cfg.channels[1].ip_version, "ipv6");
     assert_eq!(
         auto_cfg.channels[0].resolved_v4,
         vec![Ipv4Addr::new(203, 0, 113, 10)]
+    );
+    assert_eq!(
+        auto_cfg.channels[1].resolved_v6,
+        vec!["2001:db8::10".parse::<Ipv6Addr>()?]
     );
     assert_eq!(auto_cfg.all_static_ips().len(), 2);
 
@@ -713,6 +721,149 @@ async fn flux_reality_tcp_and_udp_fallback_forwards_unauthenticated_probes() -> 
         tokio::time::timeout(Duration::from_secs(5), probe_udp.recv_from(&mut udp_resp)).await??;
     assert_eq!(&udp_resp[..n], b"BORROWED-H3-UDP");
 
+    running.stop();
+    let _ = running.wait().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn flux_latency_strategy_and_udp_relay_role_route_cleanly() -> Result<()> {
+    let (_, _, pub_b64) = make_reality_keypair();
+    let yaml = format!(
+        r#"
+proxies:
+  - name: FluxPerChannel
+    type: flux
+    server: edge.example.com
+    port: 443
+    key: user-secret-token
+    ip-strategy: latency
+    standby-channels: 0
+    channels:
+      - id: tcp-v4
+        transport: tcp
+        ip-version: ipv4
+        obfs-key: chan-v4-secret
+        role: primary
+      - id: tcp-v6
+        transport: tcp
+        ip-version: ipv6
+        reality-opts:
+          public-key: {pub_b64}
+          short-id: 01020304
+        sni: www.microsoft.com
+        role: primary
+      - id: udp-dedicated
+        transport: udp
+        ports: 21000
+        obfs-key: chan-udp-secret
+        role: udp_relay
+      - id: udp-equal
+        transport: udp
+        ports: 21001
+        obfs-key: chan-udp-equal
+        role: equal
+"#
+    );
+    let cfg: MihomoConfig = serde_yaml::from_str(&yaml)?;
+    let listen: SocketAddr = "127.0.0.1:1080".parse()?;
+    let MihomoClientConfig::Flux(parsed) = cfg.resolved_proxy_config("FluxPerChannel", listen)?
+    else {
+        panic!("expected Flux client config");
+    };
+    assert_eq!(parsed.options.ip_strategy, FluxIpStrategy::Latency);
+    assert_eq!(parsed.channels[0].security, FluxSecurityMode::Obfs);
+    assert_eq!(parsed.channels[1].security, FluxSecurityMode::Reality);
+    assert_eq!(parsed.channels[2].security, FluxSecurityMode::Obfs);
+    assert_eq!(parsed.channels[2].role, FluxChannelRole::UdpRelay);
+    assert_eq!(parsed.channels[3].role, FluxChannelRole::Primary);
+
+    // Live runtime check: primary TCP + dedicated udp_relay UDP channel
+    let core = ProxyCore::new(vec![CoreUser::password("u1", "user-secret-token")])?;
+    let running = start_flux_server_with_core(
+        FluxServerConfig {
+            key: String::new(),
+            users: Vec::new(),
+            udp: true,
+            listeners: vec![
+                FluxChannelServerConfig {
+                    id: "tcp-main".to_string(),
+                    listen_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    ports: vec![0],
+                    transport: FluxTransportKind::Tcp,
+                    http_mode: FluxHttpMode::Ws,
+                    http_host: None,
+                    http_path: "/".to_string(),
+                    http_headers: BTreeMap::new(),
+                    security: FluxSecurityMode::Obfs,
+                    cert_mode: FluxCertMode::Inherit,
+                    tls_material: None,
+                    reality: None,
+                    reality_fallback: None,
+                    obfs_key: Some("tcp-chan-key".to_string()),
+                },
+                FluxChannelServerConfig {
+                    id: "udp-relay".to_string(),
+                    listen_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    ports: vec![0],
+                    transport: FluxTransportKind::Udp,
+                    http_mode: FluxHttpMode::Ws,
+                    http_host: None,
+                    http_path: "/".to_string(),
+                    http_headers: BTreeMap::new(),
+                    security: FluxSecurityMode::Obfs,
+                    cert_mode: FluxCertMode::Inherit,
+                    tls_material: None,
+                    reality: None,
+                    reality_fallback: None,
+                    obfs_key: Some("udp-chan-key".to_string()),
+                },
+            ],
+        },
+        core,
+    )?;
+    let tcp_port = running.tcp_addrs()[0].port();
+    let udp_port = running.udp_addrs()[0].port();
+
+    let client_proxy: crate::config_compat::mihomo::MihomoFluxProxy =
+        serde_json::from_value(serde_json::json!({
+            "name": "FluxLive",
+            "server": "127.0.0.1",
+            "port": tcp_port,
+            "key": "user-secret-token",
+            "ip-strategy": "latency",
+            "standby-channels": 0,
+            "channels": [
+                {
+                    "id": "tcp-main",
+                    "transport": "tcp",
+                    "ports": tcp_port,
+                    "obfs-key": "tcp-chan-key",
+                    "role": "primary"
+                },
+                {
+                    "id": "udp-relay",
+                    "transport": "udp",
+                    "ports": udp_port,
+                    "obfs-key": "udp-chan-key",
+                    "role": "udp_relay"
+                }
+            ]
+        }))?;
+    let pool = FluxClientPool::new(client_proxy.to_client_config("127.0.0.1:0".parse()?)?)?;
+
+    // UDP picker dials udp_relay on demand and selects it
+    let udp_ch = pool.pick_channel_for_udp().await?;
+    assert_eq!(udp_ch.role, FluxChannelRole::UdpRelay);
+    assert_eq!(udp_ch.transport, FluxTransportKind::Udp);
+
+    // Even though udp_relay is already warm, TCP stream picker warms and picks primary TCP
+    let tcp_slot = pool.pick_channel_for_new_stream().await?;
+    assert_eq!(tcp_slot.ch.role, FluxChannelRole::Primary);
+    assert_eq!(tcp_slot.ch.transport, FluxTransportKind::Tcp);
+    drop(tcp_slot);
+
+    pool.shutdown_all();
     running.stop();
     let _ = running.wait().await;
     Ok(())

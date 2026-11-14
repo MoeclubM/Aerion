@@ -335,6 +335,8 @@ pub struct FluxClientPool {
     dial_mutex: Mutex<()>,
     channel_ready: Notify,
     warmer_wake: Notify,
+    dual_stack_healthy: AtomicBool,
+    last_udp_relay_dial_micros: AtomicU64,
     next_channel_uid: AtomicU64,
     next_stream_id: AtomicU32,
     next_udp_assoc_id: AtomicU32,
@@ -349,6 +351,7 @@ impl FluxClientPool {
         getrandom::fill(&mut session_id)
             .map_err(|e| anyhow::anyhow!("generate Flux session_id: {e}"))?;
         let cred_hash = password_hash(config.key.trim());
+        let dual_stack_capable = config_allows_dual_stack(&config);
         Ok(Arc::new(Self {
             config,
             stop: ListenerStopToken::new(),
@@ -363,6 +366,8 @@ impl FluxClientPool {
             dial_mutex: Mutex::new(()),
             channel_ready: Notify::new(),
             warmer_wake: Notify::new(),
+            dual_stack_healthy: AtomicBool::new(dual_stack_capable),
+            last_udp_relay_dial_micros: AtomicU64::new(0),
             next_channel_uid: AtomicU64::new(1),
             next_stream_id: AtomicU32::new(1),
             next_udp_assoc_id: AtomicU32::new(1),
@@ -393,7 +398,7 @@ impl FluxClientPool {
             .lock()
             .expect("Flux client channels poisoned")
             .values()
-            .filter(|ch| ch.is_usable_for_new())
+            .filter(|ch| ch.is_usable_for_new() && ch.role != FluxChannelRole::UdpRelay)
             .map(|ch| ch.active_streams.load(Ordering::Relaxed))
             .sum();
         if active_streams >= 4 {
@@ -401,6 +406,43 @@ impl FluxClientPool {
         } else {
             base
         }
+    }
+
+    fn has_non_udp_relay_specs(&self) -> bool {
+        self.config
+            .channels
+            .iter()
+            .any(|ch| ch.role != FluxChannelRole::UdpRelay)
+    }
+
+    fn has_udp_relay_specs(&self) -> bool {
+        self.config
+            .channels
+            .iter()
+            .any(|ch| ch.role == FluxChannelRole::UdpRelay)
+    }
+
+    fn usable_stream_channels(&self) -> Vec<Arc<ClientChannelHandle>> {
+        let usable = self.usable_channels();
+        if self.has_non_udp_relay_specs() {
+            usable
+                .into_iter()
+                .filter(|ch| ch.role != FluxChannelRole::UdpRelay)
+                .collect()
+        } else {
+            usable
+        }
+    }
+
+    fn needs_latency_stack_probe(&self, stream_usable: &[Arc<ClientChannelHandle>]) -> bool {
+        if self.config.options.ip_strategy != FluxIpStrategy::Latency
+            || !self.dual_stack_healthy.load(Ordering::Relaxed)
+        {
+            return false;
+        }
+        let has_v4 = stream_usable.iter().any(|ch| ch.remote_addr.is_ipv4());
+        let has_v6 = stream_usable.iter().any(|ch| ch.remote_addr.is_ipv6());
+        !(has_v4 && has_v6)
     }
 
     async fn discover_candidates(&self) -> Result<Vec<CandidateEndpoint>> {
@@ -436,29 +478,55 @@ impl FluxClientPool {
 
     fn new_stream_candidates(&self) -> Vec<Arc<ClientChannelHandle>> {
         let mut channels = self.usable_channels();
-        if channels
+        if channels.iter().any(|ch| ch.role.is_primary_tier()) {
+            channels.retain(|ch| ch.role.is_primary_tier());
+        } else if channels
             .iter()
-            .any(|ch| ch.role == FluxChannelRole::Primary)
+            .any(|ch| ch.role != FluxChannelRole::UdpRelay)
         {
-            channels.retain(|ch| ch.role == FluxChannelRole::Primary);
+            channels.retain(|ch| ch.role != FluxChannelRole::UdpRelay);
         }
         channels
     }
 
-    fn has_usable_channel_excluding(&self, excluded_uid: Option<u64>) -> bool {
+    fn has_usable_channel_excluding(
+        &self,
+        excluded_uid: Option<u64>,
+        prefer_stream_tier: bool,
+    ) -> bool {
+        let require_non_udp_relay = prefer_stream_tier && self.has_non_udp_relay_specs();
         self.channels
             .lock()
             .expect("Flux client channels poisoned")
             .values()
-            .any(|ch| ch.is_usable_for_new() && Some(ch.uid) != excluded_uid)
+            .any(|ch| {
+                ch.is_usable_for_new()
+                    && Some(ch.uid) != excluded_uid
+                    && (!require_non_udp_relay || ch.role != FluxChannelRole::UdpRelay)
+            })
     }
 
     async fn ensure_usable_channel(self: &Arc<Self>, excluded_uid: Option<u64>) -> Result<()> {
+        self.ensure_usable_channel_inner(excluded_uid, false).await
+    }
+
+    async fn ensure_usable_stream_channel(
+        self: &Arc<Self>,
+        excluded_uid: Option<u64>,
+    ) -> Result<()> {
+        self.ensure_usable_channel_inner(excluded_uid, true).await
+    }
+
+    async fn ensure_usable_channel_inner(
+        self: &Arc<Self>,
+        excluded_uid: Option<u64>,
+        prefer_stream_tier: bool,
+    ) -> Result<()> {
         loop {
             let notified = self.channel_ready.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.has_usable_channel_excluding(excluded_uid) {
+            if self.has_usable_channel_excluding(excluded_uid, prefer_stream_tier) {
                 return Ok(());
             }
             if let Ok(guard) = self.dial_mutex.try_lock() {
@@ -467,7 +535,7 @@ impl FluxClientPool {
                 let mut warm_fut = Box::pin(async move { pool.warm_channels_now().await });
                 tokio::select! {
                     res = &mut warm_fut => {
-                        if self.has_usable_channel_excluding(excluded_uid) {
+                        if self.has_usable_channel_excluding(excluded_uid, prefer_stream_tier) {
                             return Ok(());
                         }
                         return res;
@@ -480,7 +548,7 @@ impl FluxClientPool {
                                 _ = warm_fut => {},
                             }
                         });
-                        if self.has_usable_channel_excluding(excluded_uid) {
+                        if self.has_usable_channel_excluding(excluded_uid, prefer_stream_tier) {
                             return Ok(());
                         }
                     }
@@ -488,13 +556,13 @@ impl FluxClientPool {
             } else {
                 tokio::select! {
                     _ = &mut notified => {
-                        if self.has_usable_channel_excluding(excluded_uid) {
+                        if self.has_usable_channel_excluding(excluded_uid, prefer_stream_tier) {
                             return Ok(());
                         }
                     }
                     guard = self.dial_mutex.lock() => {
                         drop(guard);
-                        if self.has_usable_channel_excluding(excluded_uid) {
+                        if self.has_usable_channel_excluding(excluded_uid, prefer_stream_tier) {
                             return Ok(());
                         }
                         return self.warm_channels_now().await;
@@ -506,11 +574,14 @@ impl FluxClientPool {
 
     fn score_channel_for_stream(&self, ch: &ClientChannelHandle) -> i64 {
         let rtt = ch.rtt_ms() as i64;
-        let load = (ch.active_streams.load(Ordering::Relaxed) as i64) * 12;
+        let load_step = match self.config.options.ip_strategy {
+            FluxIpStrategy::Latency => 2,
+            _ => 12,
+        };
+        let load = (ch.active_streams.load(Ordering::Relaxed) as i64) * load_step;
         let weight_bonus = i64::from(ch.weight) / 10;
         let transport_bonus = match ch.transport {
-            FluxTransportKind::Udp => 6,
-            FluxTransportKind::Tcp => 0,
+            FluxTransportKind::Tcp | FluxTransportKind::Udp => 0,
             FluxTransportKind::Http => -2,
         };
         let ip_penalty = match (self.config.options.ip_strategy, ch.remote_addr.is_ipv6()) {
@@ -519,13 +590,46 @@ impl FluxClientPool {
             _ => 0,
         };
         let role_penalty = match ch.role {
+            FluxChannelRole::Prefer => -25,
             FluxChannelRole::Primary => 0,
             FluxChannelRole::Backup => 500,
+            FluxChannelRole::UdpRelay => 1000,
         };
-        rtt + load - weight_bonus - transport_bonus + ip_penalty + role_penalty
+        let congestion_penalty = (ch.degraded_strikes.load(Ordering::Relaxed) as i64) * 60
+            + if ch.throughput_degraded.load(Ordering::Relaxed) {
+                40
+            } else {
+                0
+            };
+        rtt + load - weight_bonus - transport_bonus + ip_penalty + role_penalty + congestion_penalty
     }
 
-    async fn pick_channel_for_new_stream(self: &Arc<Self>) -> Result<StreamSlotGuard> {
+    fn score_channel_for_udp(&self, ch: &ClientChannelHandle) -> i64 {
+        let base = self.score_channel_for_stream(ch);
+        if ch.role == FluxChannelRole::UdpRelay {
+            base - 1200
+        } else {
+            base
+        }
+    }
+
+    pub(crate) async fn pick_channel_for_new_stream(self: &Arc<Self>) -> Result<StreamSlotGuard> {
+        let candidates = self.new_stream_candidates();
+        let needs_stream_warm = candidates.is_empty()
+            || (self.has_non_udp_relay_specs()
+                && candidates
+                    .iter()
+                    .all(|ch| ch.role == FluxChannelRole::UdpRelay));
+        if !needs_stream_warm
+            && let Some(best) = candidates
+                .into_iter()
+                .min_by_key(|ch| self.score_channel_for_stream(ch))
+        {
+            let slot = StreamSlotGuard::acquire(best);
+            self.warmer_wake.notify_one();
+            return Ok(slot);
+        }
+        let warm_res = self.ensure_usable_stream_channel(None).await;
         if let Some(best) = self
             .new_stream_candidates()
             .into_iter()
@@ -535,44 +639,113 @@ impl FluxClientPool {
             self.warmer_wake.notify_one();
             return Ok(slot);
         }
-        self.ensure_usable_channel(None).await?;
-        let best = self
-            .new_stream_candidates()
-            .into_iter()
-            .min_by_key(|ch| self.score_channel_for_stream(ch))
-            .context("no healthy Flux channel available")?;
-        let slot = StreamSlotGuard::acquire(best);
-        self.warmer_wake.notify_one();
-        Ok(slot)
+        warm_res?;
+        bail!("no healthy Flux channel available")
     }
 
-    async fn pick_channel_for_udp(self: &Arc<Self>) -> Result<Arc<ClientChannelHandle>> {
-        let usable = self.new_stream_candidates();
-        if let Some(best) = usable
+    async fn maybe_warm_udp_relay_channel(self: &Arc<Self>, has_fallback_usable: bool) {
+        if !self.has_udp_relay_specs() {
+            return;
+        }
+        if self
+            .usable_channels()
             .iter()
-            .filter(|ch| ch.transport == FluxTransportKind::Udp)
-            .min_by_key(|ch| self.score_channel_for_stream(ch))
-            .cloned()
-            .or_else(|| {
-                usable
-                    .into_iter()
-                    .min_by_key(|ch| self.score_channel_for_stream(ch))
+            .any(|ch| ch.role == FluxChannelRole::UdpRelay)
+        {
+            return;
+        }
+        let now_us = self.now_micros();
+        if has_fallback_usable {
+            let prev = self.last_udp_relay_dial_micros.load(Ordering::Relaxed);
+            if prev > 0 && now_us.saturating_sub(prev) < 2_000_000 {
+                return;
+            }
+        }
+        self.last_udp_relay_dial_micros
+            .store(now_us.max(1), Ordering::Relaxed);
+
+        let _guard = self.dial_mutex.lock().await;
+        if self.stop.is_stopped()
+            || self
+                .usable_channels()
+                .iter()
+                .any(|ch| ch.role == FluxChannelRole::UdpRelay)
+        {
+            return;
+        }
+        let Ok(candidates) = self.discover_candidates().await else {
+            return;
+        };
+        let now = Instant::now();
+        let best = candidates
+            .into_iter()
+            .filter(|cand| {
+                self.config.channels[cand.spec_idx].role == FluxChannelRole::UdpRelay
+                    && self
+                        .failed_endpoints
+                        .lock()
+                        .expect("Flux failures poisoned")
+                        .get(&(cand.spec_idx, cand.addr))
+                        .is_none_or(|(until, _)| *until <= now)
             })
+            .min_by_key(|cand| {
+                let spec = &self.config.channels[cand.spec_idx];
+                let ip_pen = match (self.config.options.ip_strategy, cand.addr.is_ipv6()) {
+                    (FluxIpStrategy::PreferV4, true) => 15i64,
+                    (FluxIpStrategy::PreferV6, false) => 15i64,
+                    _ => 0i64,
+                };
+                ip_pen - i64::from(spec.weight) / 10
+            });
+        if let Some(cand) = best {
+            match self.dial_and_register_channel(cand.clone()).await {
+                Ok(_) => {
+                    self.failed_endpoints
+                        .lock()
+                        .expect("Flux failures poisoned")
+                        .remove(&(cand.spec_idx, cand.addr));
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        channel = %self.config.channels[cand.spec_idx].id,
+                        "Flux UDP relay channel dial failed: {err:#}"
+                    );
+                    let mut failed = self
+                        .failed_endpoints
+                        .lock()
+                        .expect("Flux failures poisoned");
+                    let entry = failed
+                        .entry((cand.spec_idx, cand.addr))
+                        .or_insert((Instant::now(), 0));
+                    entry.1 = entry.1.saturating_add(1);
+                    entry.0 = Instant::now() + Duration::from_secs(1u64 << entry.1.min(5));
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn pick_channel_for_udp(self: &Arc<Self>) -> Result<Arc<ClientChannelHandle>> {
+        let usable = self.usable_channels();
+        if let Some(best_relay) = usable
+            .iter()
+            .filter(|ch| ch.role == FluxChannelRole::UdpRelay)
+            .min_by_key(|ch| self.score_channel_for_udp(ch))
+            .cloned()
+        {
+            return Ok(best_relay);
+        }
+        self.maybe_warm_udp_relay_channel(!usable.is_empty()).await;
+        let usable = self.usable_channels();
+        if let Some(best) = usable
+            .into_iter()
+            .min_by_key(|ch| self.score_channel_for_udp(ch))
         {
             return Ok(best);
         }
         self.ensure_usable_channel(None).await?;
-        let usable = self.new_stream_candidates();
-        usable
-            .iter()
-            .filter(|ch| ch.transport == FluxTransportKind::Udp)
-            .min_by_key(|ch| self.score_channel_for_stream(ch))
-            .cloned()
-            .or_else(|| {
-                usable
-                    .into_iter()
-                    .min_by_key(|ch| self.score_channel_for_stream(ch))
-            })
+        self.usable_channels()
+            .into_iter()
+            .min_by_key(|ch| self.score_channel_for_udp(ch))
             .context("no healthy Flux channel available for UDP")
     }
 
@@ -627,8 +800,9 @@ impl FluxClientPool {
         let _guard = self.dial_mutex.lock().await;
         ensure!(!self.stop.is_stopped(), "Flux client stopped");
         let target = self.target_warm_count();
-        let mut active = self.usable_channels();
-        if active.len() >= target {
+        let has_stream_specs = self.has_non_udp_relay_specs();
+        let mut active = self.usable_stream_channels();
+        if active.len() >= target && !self.needs_latency_stack_probe(&active) {
             return Ok(());
         }
 
@@ -637,13 +811,29 @@ impl FluxClientPool {
         let healthy_candidates = candidates
             .into_iter()
             .filter(|cand| {
-                self.failed_endpoints
-                    .lock()
-                    .expect("Flux failures poisoned")
-                    .get(&(cand.spec_idx, cand.addr))
-                    .is_none_or(|(until, _)| *until <= now)
+                (!has_stream_specs
+                    || self.config.channels[cand.spec_idx].role != FluxChannelRole::UdpRelay)
+                    && self
+                        .failed_endpoints
+                        .lock()
+                        .expect("Flux failures poisoned")
+                        .get(&(cand.spec_idx, cand.addr))
+                        .is_none_or(|(until, _)| *until <= now)
             })
             .collect::<Vec<_>>();
+        let has_v4 = healthy_candidates.iter().any(|c| c.addr.is_ipv4());
+        let has_v6 = healthy_candidates.iter().any(|c| c.addr.is_ipv6());
+        self.dual_stack_healthy
+            .store(has_v4 && has_v6, Ordering::Relaxed);
+        let pass1_target =
+            if self.config.options.ip_strategy == FluxIpStrategy::Latency && has_v4 && has_v6 {
+                target.max(2)
+            } else {
+                target
+            };
+        if active.len() >= pass1_target {
+            return Ok(());
+        }
 
         let mut remaining = healthy_candidates
             .iter()
@@ -654,27 +844,39 @@ impl FluxClientPool {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let mut planned: Vec<(usize, SocketAddr, FluxTransportKind)> = active
+            .iter()
+            .map(|ch| (ch.spec_idx, ch.remote_addr, ch.transport))
+            .collect();
         let mut dial_set = JoinSet::new();
         let mut last_err = None;
         loop {
-            while active.len() + dial_set.len() < target && !remaining.is_empty() {
+            while active.len() + dial_set.len() < pass1_target && !remaining.is_empty() {
                 let best = remaining
                     .iter()
                     .enumerate()
                     .max_by_key(|(_, cand)| {
                         let spec = &self.config.channels[cand.spec_idx];
                         let mut score = i64::from(spec.weight) / 10;
-                        if spec.role == FluxChannelRole::Primary {
-                            score += 25;
+                        score += match spec.role {
+                            FluxChannelRole::Prefer => 35,
+                            FluxChannelRole::Primary => 25,
+                            FluxChannelRole::Backup => 0,
+                            FluxChannelRole::UdpRelay => -40,
+                        };
+                        match (self.config.options.ip_strategy, cand.addr.is_ipv6()) {
+                            (FluxIpStrategy::PreferV4, false) => score += 15,
+                            (FluxIpStrategy::PreferV6, true) => score += 15,
+                            _ => {}
                         }
-                        for ch in &active {
-                            if ch.remote_addr.is_ipv6() != cand.addr.is_ipv6() {
+                        for &(p_spec_idx, p_addr, p_transport) in &planned {
+                            if p_addr.is_ipv6() != cand.addr.is_ipv6() {
                                 score += 100;
                             }
-                            if ch.transport != spec.transport {
+                            if p_transport != spec.transport {
                                 score += 80;
                             }
-                            if ch.spec_idx != cand.spec_idx {
+                            if p_spec_idx != cand.spec_idx {
                                 score += 30;
                             }
                         }
@@ -683,6 +885,11 @@ impl FluxClientPool {
                     .map(|(idx, _)| idx)
                     .unwrap();
                 let cand = remaining.swap_remove(best);
+                planned.push((
+                    cand.spec_idx,
+                    cand.addr,
+                    self.config.channels[cand.spec_idx].transport,
+                ));
                 let pool = self.clone();
                 dial_set.spawn(async move {
                     let result = pool.dial_and_register_channel(cand.clone()).await;
@@ -706,6 +913,7 @@ impl FluxClientPool {
                 }
                 Ok((cand, Err(err))) => {
                     tracing::debug!(channel = %self.config.channels[cand.spec_idx].id, "Flux channel dial failed: {err:#}");
+                    planned.retain(|&(idx, addr, _)| !(idx == cand.spec_idx && addr == cand.addr));
                     let mut failed = self
                         .failed_endpoints
                         .lock()
@@ -725,7 +933,7 @@ impl FluxClientPool {
             let primary_pool = healthy_candidates
                 .into_iter()
                 .filter(|cand| {
-                    self.config.channels[cand.spec_idx].role == FluxChannelRole::Primary
+                    self.config.channels[cand.spec_idx].role.is_primary_tier()
                         && !self
                             .failed_endpoints
                             .lock()
@@ -750,12 +958,29 @@ impl FluxClientPool {
                                     .get(&(cand.spec_idx, cand.addr))
                                     .copied()
                                     .unwrap_or(0);
-                            let tp_bias = if spec.transport == FluxTransportKind::Udp {
-                                -1i64
+                            let role_bias = if spec.role == FluxChannelRole::Prefer {
+                                -4i64
                             } else {
                                 0i64
                             };
-                            (existing as i64) * 10 - i64::from(spec.weight) / 20 + tp_bias
+                            let rtt_term = if self.config.options.ip_strategy
+                                == FluxIpStrategy::Latency
+                            {
+                                active
+                                    .iter()
+                                    .filter(|ch| {
+                                        ch.spec_idx == cand.spec_idx && ch.remote_addr == cand.addr
+                                    })
+                                    .map(|ch| ch.rtt_ms() as i64)
+                                    .min()
+                                    .unwrap_or(50)
+                                    / 5
+                            } else {
+                                0i64
+                            };
+                            (existing as i64) * 10 - i64::from(spec.weight) / 20
+                                + role_bias
+                                + rtt_term
                         })
                         .cloned()
                         .unwrap();
@@ -987,9 +1212,14 @@ impl FluxClientPool {
                     }
                 }
             }
-            if warming.is_empty() && self.usable_channels().len() < self.target_warm_count() {
-                let pool = self.clone();
-                warming.spawn(async move { pool.warm_channels_now().await });
+            if warming.is_empty() {
+                let stream_usable = self.usable_stream_channels();
+                if stream_usable.len() < self.target_warm_count()
+                    || self.needs_latency_stack_probe(&stream_usable)
+                {
+                    let pool = self.clone();
+                    warming.spawn(async move { pool.warm_channels_now().await });
+                }
             }
         }
     }
@@ -1057,6 +1287,21 @@ impl FluxClientPool {
     }
 
     async fn probe_and_rotate_channels(self: &Arc<Self>) {
+        if self.config.options.ip_strategy == FluxIpStrategy::Latency
+            && config_allows_dual_stack(&self.config)
+            && !self.dual_stack_healthy.load(Ordering::Relaxed)
+        {
+            let now = Instant::now();
+            let mut failed = self
+                .failed_endpoints
+                .lock()
+                .expect("Flux failures poisoned");
+            let before = failed.len();
+            failed.retain(|_, (until, _)| *until > now);
+            if failed.len() < before {
+                self.dual_stack_healthy.store(true, Ordering::Relaxed);
+            }
+        }
         let snapshot = self
             .channels
             .lock()
@@ -1093,7 +1338,12 @@ impl FluxClientPool {
             if ch.should_proactively_rotate() {
                 let others_usable = snapshot
                     .iter()
-                    .filter(|other| other.uid != ch.uid && other.is_usable_for_new())
+                    .filter(|other| {
+                        other.uid != ch.uid
+                            && other.is_usable_for_new()
+                            && (ch.role == FluxChannelRole::UdpRelay
+                                || other.role != FluxChannelRole::UdpRelay)
+                    })
                     .count();
                 if others_usable > 0 {
                     ch.mark_draining();
@@ -1175,6 +1425,26 @@ fn jitter_bytes_mb(base_mb: u64, jitter_permille: u64) -> Option<u64> {
     let offset = u64::from(u16::from_be_bytes(rand_buf)) % span;
     let permille = 1000u64.saturating_sub(jitter_permille) + offset;
     Some((base_mb.saturating_mul(1024 * 1024).saturating_mul(permille)) / 1000)
+}
+
+fn config_allows_dual_stack(config: &FluxClientConfig) -> bool {
+    if matches!(
+        config.options.ip_strategy,
+        FluxIpStrategy::V4Only | FluxIpStrategy::V6Only
+    ) {
+        return false;
+    }
+    let has_stream_specs = config
+        .channels
+        .iter()
+        .any(|ch| ch.role != FluxChannelRole::UdpRelay);
+    let allows_v4 = config.channels.iter().any(|ch| {
+        (!has_stream_specs || ch.role != FluxChannelRole::UdpRelay) && ch.ip_version != "ipv6"
+    });
+    let allows_v6 = config.channels.iter().any(|ch| {
+        (!has_stream_specs || ch.role != FluxChannelRole::UdpRelay) && ch.ip_version != "ipv4"
+    });
+    allows_v4 && allows_v6
 }
 
 async fn resolve_channel_ips(
@@ -1710,8 +1980,8 @@ async fn wait_flux_stream_open(
     }
 }
 
-struct StreamSlotGuard {
-    ch: Arc<ClientChannelHandle>,
+pub(crate) struct StreamSlotGuard {
+    pub(crate) ch: Arc<ClientChannelHandle>,
 }
 
 impl StreamSlotGuard {
