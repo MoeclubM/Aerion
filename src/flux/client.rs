@@ -28,7 +28,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinSet;
-use x25519_dalek::{PublicKey, StaticSecret};
 
 const MAX_UDP_SLICE_BYTES: usize = 1100;
 const CHANNEL_DIAL_TIMEOUT: Duration = Duration::from_secs(8);
@@ -1040,29 +1039,13 @@ impl FluxClientPool {
         getrandom::fill(&mut eph_bytes).map_err(|e| anyhow::anyhow!("Flux hello random: {e}"))?;
 
         let client_binding = guard.channel_binding()?;
-        let (client_ephemeral_pub, blind_key) = if spec.security == FluxSecurityMode::Reality {
-            let reality = spec
-                .reality
-                .as_ref()
-                .context("missing Flux client REALITY config")?;
-            let secret = StaticSecret::from(eph_bytes);
-            let pub_bytes = PublicKey::from(&secret).to_bytes();
-            let shared = secret.diffie_hellman(&PublicKey::from(reality.public_key));
-            ensure!(
-                shared.was_contributory(),
-                "non-contributory Flux REALITY public key"
-            );
-            let bkey = derive_blind_key(shared.as_bytes(), &self.session_id, &client_binding)?;
-            (pub_bytes, bkey)
-        } else {
-            let secret = spec
-                .obfs_key
-                .as_deref()
-                .map(str::as_bytes)
-                .unwrap_or(&client_binding);
-            let bkey = derive_blind_key(secret, &self.session_id, &eph_bytes)?;
-            (eph_bytes, bkey)
-        };
+        let secret = spec
+            .obfs_key
+            .as_deref()
+            .map(str::as_bytes)
+            .unwrap_or(&client_binding);
+        let blind_key = derive_blind_key(secret, &self.session_id, &eph_bytes)?;
+        let client_ephemeral_pub = eph_bytes;
 
         let blinded_credential = xor_32(&self.cred_hash, &blind_key);
         let auth_key = handshake_key(&blind_key, &self.cred_hash, &client_binding)?;
@@ -1377,12 +1360,13 @@ mod maintenance_tests {
         let reserved = TcpListener::bind("127.0.0.1:0").await?;
         let port = reserved.local_addr()?.port();
         drop(reserved);
-        let proxy: crate::config_compat::mihomo::MihomoFluxProxy =
-            serde_json::from_value(serde_json::json!({
+        let proxy: crate::config_compat::mihomo::MihomoFluxProxy = serde_json::from_value(
+            serde_json::json!({
                 "name": "Flux", "server": "127.0.0.1", "port": port,
-                "key": "test-user", "security": "obfs", "obfs-key": "test-channel",
-                "channels": [{"id": "tcp", "transport": "tcp"}],
-            }))?;
+                "key": "test-user",
+                "channels": [{"id": "tcp", "transport": "tcp", "security": "obfs", "obfs-key": "test-channel"}],
+            }),
+        )?;
         let pool = FluxClientPool::new(proxy.to_client_config("127.0.0.1:0".parse()?)?)?;
         let stop = pool.stop.clone();
         let polls = Arc::new(AtomicUsize::new(0));

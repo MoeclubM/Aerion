@@ -467,7 +467,12 @@ pub struct MihomoTrojanProxy {
     pub tls: bool,
     #[serde(default = "default_tcp")]
     pub network: String,
-    #[serde(default, alias = "servername", alias = "server-name", alias = "server_name")]
+    #[serde(
+        default,
+        alias = "servername",
+        alias = "server-name",
+        alias = "server_name"
+    )]
     pub sni: Option<String>,
     #[serde(
         default,
@@ -501,7 +506,12 @@ pub struct MihomoHysteria2Proxy {
     pub password: String,
     #[serde(default = "default_true")]
     pub tls: bool,
-    #[serde(default, alias = "servername", alias = "server-name", alias = "server_name")]
+    #[serde(
+        default,
+        alias = "servername",
+        alias = "server-name",
+        alias = "server_name"
+    )]
     pub sni: Option<String>,
     #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
     pub skip_cert_verify: bool,
@@ -575,8 +585,6 @@ pub struct MihomoFluxProxy {
     pub key: String,
     #[serde(default = "default_true")]
     pub udp: bool,
-    #[serde(default)]
-    pub security: Option<FluxSecurityMode>,
     #[serde(default, alias = "sni", alias = "server_name", alias = "server-name")]
     pub servername: Option<String>,
     #[serde(
@@ -597,20 +605,6 @@ pub struct MihomoFluxProxy {
     pub skip_cert_verify: bool,
     #[serde(default)]
     pub alpn: Option<OneOrManyStrings>,
-    #[serde(default, rename = "reality-opts", alias = "reality_opts")]
-    pub reality_opts: Option<MihomoRealityOpts>,
-    #[serde(default, rename = "public-key", alias = "public_key")]
-    pub public_key: Option<String>,
-    #[serde(default, rename = "short-id", alias = "short_id")]
-    pub short_id: Option<String>,
-    #[serde(
-        default,
-        rename = "obfs-key",
-        alias = "obfs_key",
-        alias = "obfs-password",
-        alias = "obfs_password"
-    )]
-    pub obfs_key: Option<String>,
     #[serde(default, rename = "resolved-v4", alias = "resolved_v4")]
     pub resolved_v4: Vec<Ipv4Addr>,
     #[serde(default, rename = "resolved-v6", alias = "resolved_v6")]
@@ -719,7 +713,11 @@ pub struct MihomoNaiveProxy {
     pub alpn: Option<OneOrManyStrings>,
     #[serde(default)]
     pub quic: bool,
-    #[serde(default, rename = "quic-congestion-control", alias = "quic_congestion_control")]
+    #[serde(
+        default,
+        rename = "quic-congestion-control",
+        alias = "quic_congestion_control"
+    )]
     pub quic_congestion_control: Option<String>,
     #[serde(default, rename = "udp-over-tcp", alias = "udp_over_tcp")]
     pub udp_over_tcp: Option<MihomoUdpOverTcpOptions>,
@@ -1363,12 +1361,19 @@ pub(super) fn normalize_mihomo_proxy_value(value: &Value) -> Value {
             "client-fingerprint",
             &["client-fingerprint", "client_fingerprint"],
         );
-        coalesce_alias_keys(&mut out, "obfs-password", &["obfs-password", "obfs_password"]);
+        coalesce_alias_keys(
+            &mut out,
+            "obfs-password",
+            &["obfs-password", "obfs_password"],
+        );
     }
     for (canonical, group) in [
         ("plugin-opts", &["plugin-opts", "plugin_opts"][..]),
         ("udp-over-tcp", &["udp-over-tcp", "udp_over_tcp"][..]),
-        ("packet-encoding", &["packet-encoding", "packet_encoding"][..]),
+        (
+            "packet-encoding",
+            &["packet-encoding", "packet_encoding"][..],
+        ),
         ("reality-opts", &["reality-opts", "reality_opts"][..]),
         ("ws-opts", &["ws-opts", "ws_opts"][..]),
         ("grpc-opts", &["grpc-opts", "grpc_opts"][..]),
@@ -1398,7 +1403,10 @@ pub(super) fn normalize_mihomo_proxy_value(value: &Value) -> Value {
         ("resolved-v4", &["resolved-v4", "resolved_v4"][..]),
         ("resolved-v6", &["resolved-v6", "resolved_v6"][..]),
         ("handshake-mode", &["handshake-mode", "handshake_mode"][..]),
-        ("traffic-pattern", &["traffic-pattern", "traffic_pattern"][..]),
+        (
+            "traffic-pattern",
+            &["traffic-pattern", "traffic_pattern"][..],
+        ),
         ("nonce-pattern", &["nonce-pattern", "nonce_pattern"][..]),
         ("padding-scheme", &["padding-scheme", "padding_scheme"][..]),
         ("extra-headers", &["extra-headers", "extra_headers"][..]),

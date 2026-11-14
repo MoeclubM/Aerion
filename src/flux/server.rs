@@ -1,5 +1,5 @@
 use super::auth::{self, derive_blind_key, handshake_key, xor_32};
-use super::config::{FluxSecurityMode, FluxServerConfig, FluxTransportKind};
+use super::config::{FluxServerConfig, FluxTransportKind};
 use super::frame::{
     DEFAULT_STREAM_WINDOW_BYTES, FluxFrame, MAX_FLUX_CHUNK_LEN, RST_MIGRATE_UNKNOWN,
     RST_REMOTE_RESET, RST_STREAM_CLOSED, RecvOffsetAssembler, SendWindowBuffer,
@@ -30,7 +30,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
-use x25519_dalek::{PublicKey, StaticSecret};
 
 const MAX_UDP_SLICE_BYTES: usize = 1100;
 const SESSION_ORPHAN_GRACE: Duration = super::config::SESSION_RESUME_TIMEOUT;
@@ -194,19 +193,9 @@ pub fn start_flux_server_with_state(
                     );
                     let reg = registry.clone();
                     let stop_token = stop.clone();
-                    let security = listener_cfg.security;
-                    let reality_priv = listener_cfg.reality.as_ref().map(|r| r.private_key);
                     let obfs_key = listener_cfg.obfs_key.clone();
                     tasks.spawn(async move {
-                        run_quic_listener_loop(
-                            endpoint,
-                            security,
-                            reality_priv,
-                            obfs_key,
-                            reg,
-                            stop_token,
-                        )
-                        .await
+                        run_quic_listener_loop(endpoint, obfs_key, reg, stop_token).await
                     });
                 }
             }
@@ -228,14 +217,8 @@ pub fn start_flux_server_with_state(
                     let stop_token = stop.clone();
                     let prepared_clone = prepared.clone();
                     tasks.spawn(async move {
-                        run_stream_listener_loop(
-                            tcp_listener,
-                            local_addr.port(),
-                            prepared_clone,
-                            reg,
-                            stop_token,
-                        )
-                        .await
+                        run_stream_listener_loop(tcp_listener, prepared_clone, reg, stop_token)
+                            .await
                     });
                 }
             }
@@ -267,8 +250,6 @@ pub fn start_flux_server_with_state(
 
 async fn run_quic_listener_loop(
     endpoint: quinn::Endpoint,
-    security: FluxSecurityMode,
-    reality_private_key: Option<[u8; 32]>,
     obfs_key: Option<String>,
     registry: Arc<FluxServerRegistry>,
     stop: ListenerStopToken,
@@ -320,8 +301,6 @@ async fn run_quic_listener_loop(
                 guard,
                 peer_addr,
                 FluxTransportKind::Udp,
-                security,
-                reality_private_key,
                 obfs_key,
                 reg,
             )
@@ -335,7 +314,6 @@ async fn run_quic_listener_loop(
 
 async fn run_stream_listener_loop(
     listener: tokio::net::TcpListener,
-    local_port: u16,
     prepared: PreparedStreamListener,
     registry: Arc<FluxServerRegistry>,
     stop: ListenerStopToken,
@@ -355,11 +333,9 @@ async fn run_stream_listener_loop(
         let reg = registry.clone();
         tokio::spawn(async move {
             let transport_kind = prepared.config.transport;
-            let security = prepared.config.security;
-            let reality_priv = prepared.config.reality.as_ref().map(|r| r.private_key);
             let obfs_key = prepared.config.obfs_key.clone();
             let res = prepared
-                .accept_and_serve(stream, local_port, move |boxed_stream| {
+                .accept_and_serve(stream, move |boxed_stream| {
                     let reg = reg.clone();
                     let obfs_key = obfs_key.clone();
                     async move {
@@ -370,8 +346,6 @@ async fn run_stream_listener_loop(
                             guard,
                             peer_addr,
                             transport_kind,
-                            security,
-                            reality_priv,
                             obfs_key,
                             reg,
                         )
@@ -654,8 +628,6 @@ async fn handle_server_channel(
     guard: Arc<FluxChannelGuard>,
     peer_addr: SocketAddr,
     transport: FluxTransportKind,
-    security: FluxSecurityMode,
-    reality_private_key: Option<[u8; 32]>,
     obfs_key: Option<String>,
     registry: Arc<FluxServerRegistry>,
 ) -> Result<()> {
@@ -685,19 +657,11 @@ async fn handle_server_channel(
     );
 
     let binding = guard.channel_binding()?;
-    let blind_key = if security == FluxSecurityMode::Reality {
-        let priv_key = reality_private_key.context("missing Flux REALITY private key")?;
-        let shared =
-            StaticSecret::from(priv_key).diffie_hellman(&PublicKey::from(client_ephemeral_pub));
-        ensure!(shared.was_contributory(), "invalid Flux REALITY ECDH key");
-        derive_blind_key(shared.as_bytes(), &session_id, &binding)?
-    } else {
-        derive_blind_key(
-            obfs_key.as_deref().map(str::as_bytes).unwrap_or(&binding),
-            &session_id,
-            &client_ephemeral_pub,
-        )?
-    };
+    let blind_key = derive_blind_key(
+        obfs_key.as_deref().map(str::as_bytes).unwrap_or(&binding),
+        &session_id,
+        &client_ephemeral_pub,
+    )?;
     let cred_hash = xor_32(&blinded_credential, &blind_key);
     let auth_key = handshake_key(&blind_key, &cred_hash, &binding)?;
     ensure!(
@@ -1572,8 +1536,6 @@ mod authentication_tests {
                     guard,
                     "127.0.0.1:1234".parse().unwrap(),
                     FluxTransportKind::Tcp,
-                    FluxSecurityMode::Tls,
-                    None,
                     None,
                     registry,
                 )

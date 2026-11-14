@@ -30,8 +30,6 @@ fn server_config() -> FluxServerConfig {
             security: FluxSecurityMode::Obfs,
             cert_mode: FluxCertMode::Inherit,
             tls_material: None,
-            reality: None,
-            reality_fallback: None,
             obfs_key: Some("channel-shared-key".into()),
         }],
     }
@@ -41,10 +39,11 @@ fn client_config(ports: Vec<u16>) -> Result<FluxClientConfig> {
     let proxy: crate::config_compat::mihomo::MihomoFluxProxy = serde_json::from_value(
         serde_json::json!({
             "name": "Flux", "server": "127.0.0.1", "port": ports[0],
-            "key": "user-token", "security": "obfs", "obfs-key": "channel-shared-key",
+            "key": "user-token",
             "standby-channels": ports.len() - 1, "rotation-interval-sec": 0, "rotation-bytes-mb": 0,
             "channels": ports.into_iter().enumerate().map(|(i, port)| serde_json::json!({
                 "id": format!("channel-{i}"), "ports": port, "transport": "tcp",
+                "security": "obfs", "obfs-key": "channel-shared-key",
                 "weight": if i == 0 { 100 } else { 1 }, "role": if i == 0 { "primary" } else { "backup" },
             })).collect::<Vec<_>>()
         }),

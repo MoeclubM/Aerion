@@ -1,5 +1,4 @@
 pub(crate) const SESSION_RESUME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-use crate::reality::{RealityClientConfig, RealityServerConfig};
 use crate::tls::ServerTlsMaterial;
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless_transport::VlessTransportConfig;
@@ -17,9 +16,9 @@ pub const DEFAULT_ROTATION_BYTES_MB: u64 = 96;
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FluxIpStrategy {
-    #[default]
     #[serde(alias = "auto", alias = "both", alias = "dual-stack")]
     Dual,
+    #[default]
     #[serde(
         alias = "latency-first",
         alias = "latency_first",
@@ -66,10 +65,9 @@ pub enum FluxHttpMode {
 #[serde(rename_all = "lowercase")]
 pub enum FluxSecurityMode {
     #[default]
-    Reality,
-    Tls,
     #[serde(alias = "salamander")]
     Obfs,
+    Tls,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -132,7 +130,7 @@ pub struct FluxOptions {
 impl Default for FluxOptions {
     fn default() -> Self {
         Self {
-            ip_strategy: FluxIpStrategy::Dual,
+            ip_strategy: FluxIpStrategy::Latency,
             standby_channels: DEFAULT_STANDBY_CHANNELS,
             rotation_interval_sec: DEFAULT_ROTATION_INTERVAL_SEC,
             rotation_bytes_mb: DEFAULT_ROTATION_BYTES_MB,
@@ -148,15 +146,6 @@ impl FluxOptions {
         );
         Ok(())
     }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct FluxRealityWireOpts {
-    #[serde(alias = "public-key", alias = "publicKey")]
-    pub public_key: String,
-    #[serde(alias = "short-id", alias = "shortId")]
-    pub short_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -283,12 +272,6 @@ pub struct FluxChannelWireConfig {
         alias = "allow_insecure"
     )]
     pub insecure: Option<bool>,
-    #[serde(alias = "reality-opts")]
-    pub reality_opts: Option<FluxRealityWireOpts>,
-    #[serde(alias = "public-key", alias = "public_key")]
-    pub public_key: Option<String>,
-    #[serde(alias = "short-id", alias = "short_id")]
-    pub short_id: Option<String>,
     #[serde(alias = "obfs-key", alias = "obfs_password", alias = "obfs-password")]
     pub obfs_key: Option<String>,
     pub role: FluxChannelRole,
@@ -318,12 +301,9 @@ impl FluxChannelWireConfig {
         index: usize,
         default_host: &str,
         default_port: u16,
-        default_security: FluxSecurityMode,
         default_sni: Option<&str>,
         default_fingerprint: Option<UtlsFingerprint>,
         default_insecure: bool,
-        default_reality: Option<&RealityClientConfig>,
-        default_obfs_key: Option<&str>,
         remaining_port_budget: usize,
     ) -> Result<Option<FluxChannelClientConfig>> {
         if !self.enabled {
@@ -358,23 +338,13 @@ impl FluxChannelWireConfig {
         let http_mode = self.http_mode.or(inferred_http_mode).unwrap_or_default();
         let security = self.security.unwrap_or_else(|| {
             if self
-                .reality_opts
-                .as_ref()
-                .is_some_and(|o| !o.public_key.trim().is_empty())
-                || self
-                    .public_key
-                    .as_deref()
-                    .is_some_and(|v| !v.trim().is_empty())
-            {
-                FluxSecurityMode::Reality
-            } else if self
                 .obfs_key
                 .as_deref()
                 .is_some_and(|v| !v.trim().is_empty())
             {
                 FluxSecurityMode::Obfs
             } else {
-                default_security
+                FluxSecurityMode::Tls
             }
         });
         let role = self.role.normalized_for_transport(transport);
@@ -387,40 +357,6 @@ impl FluxChannelWireConfig {
             .or_else(|| default_sni.map(str::trim).filter(|v| !v.is_empty()))
             .unwrap_or(&server_host)
             .to_string();
-        let inherited_sid = default_reality
-            .map(|r| hex::encode(r.short_id))
-            .unwrap_or_default();
-        let reality = match security {
-            FluxSecurityMode::Reality => {
-                if let Some(opts) = self
-                    .reality_opts
-                    .as_ref()
-                    .filter(|o| !o.public_key.trim().is_empty())
-                {
-                    Some(RealityClientConfig::from_strings(
-                        &opts.public_key,
-                        if opts.short_id.is_empty() {
-                            &inherited_sid
-                        } else {
-                            &opts.short_id
-                        },
-                    )?)
-                } else if let Some(pk) = self.public_key.as_deref().filter(|v| !v.trim().is_empty())
-                {
-                    let sid = self
-                        .short_id
-                        .as_deref()
-                        .filter(|v| !v.is_empty())
-                        .unwrap_or(&inherited_sid);
-                    Some(RealityClientConfig::from_strings(pk, sid)?)
-                } else {
-                    Some(default_reality.cloned().with_context(|| {
-                        format!("Flux channel {id} requires REALITY public_key")
-                    })?)
-                }
-            }
-            _ => None,
-        };
         let obfs_key = match security {
             FluxSecurityMode::Obfs => {
                 let key = self
@@ -428,7 +364,6 @@ impl FluxChannelWireConfig {
                     .as_deref()
                     .map(str::trim)
                     .filter(|v| !v.is_empty())
-                    .or_else(|| default_obfs_key.map(str::trim).filter(|v| !v.is_empty()))
                     .with_context(|| format!("Flux channel {id} requires obfs_key"))?;
                 ensure!(
                     key.len() >= 4,
@@ -436,7 +371,7 @@ impl FluxChannelWireConfig {
                 );
                 Some(key.to_string())
             }
-            _ => None,
+            FluxSecurityMode::Tls => None,
         };
         ensure!(
             (1..=100).contains(&self.weight),
@@ -468,7 +403,6 @@ impl FluxChannelWireConfig {
             ca_cert_paths: Vec::new(),
             ca_certificates: Vec::new(),
             pinned_cert_sha256: Vec::new(),
-            reality,
             obfs_key,
             role,
             weight: self.weight,
@@ -525,7 +459,6 @@ pub struct FluxChannelClientConfig {
     pub ca_cert_paths: Vec<PathBuf>,
     pub ca_certificates: Vec<String>,
     pub pinned_cert_sha256: Vec<String>,
-    pub reality: Option<RealityClientConfig>,
     pub obfs_key: Option<String>,
     pub role: FluxChannelRole,
     pub weight: u8,
@@ -598,18 +531,6 @@ impl FluxClientConfig {
                 "Flux expanded ports exceed limit of {MAX_FLUX_EXPANDED_PORTS}"
             );
             match channel.security {
-                FluxSecurityMode::Reality => {
-                    ensure!(
-                        channel.reality.is_some(),
-                        "Flux channel {} missing REALITY config",
-                        channel.id
-                    );
-                    ensure!(
-                        !channel.sni.trim().is_empty(),
-                        "Flux channel {} REALITY requires server_name",
-                        channel.id
-                    );
-                }
                 FluxSecurityMode::Tls => {
                     ensure!(
                         !channel.sni.trim().is_empty(),
@@ -679,8 +600,6 @@ pub struct FluxChannelServerConfig {
     pub security: FluxSecurityMode,
     pub cert_mode: FluxCertMode,
     pub tls_material: Option<ServerTlsMaterial>,
-    pub reality: Option<RealityServerConfig>,
-    pub reality_fallback: Option<bool>,
     pub obfs_key: Option<String>,
 }
 
@@ -752,13 +671,6 @@ impl FluxServerConfig {
                 );
             }
             match listener.security {
-                FluxSecurityMode::Reality => {
-                    ensure!(
-                        listener.reality.is_some(),
-                        "Flux listener {} missing REALITY server config",
-                        listener.id
-                    );
-                }
                 FluxSecurityMode::Tls => match listener.cert_mode {
                     FluxCertMode::OriginPlain => {
                         ensure!(

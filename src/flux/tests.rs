@@ -2,45 +2,43 @@ use super::*;
 use crate::core::{CoreUser, ProxyCore};
 use crate::listener::ListenerStopToken;
 use crate::protocol::ProxyTarget;
-use crate::reality::{RealityClientConfig, RealityServerConfig};
+use crate::tls::ServerTlsMaterial;
 use crate::{MihomoClientConfig, MihomoConfig, socks, uot};
 use anyhow::Result;
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use x25519_dalek::{PublicKey, StaticSecret};
 
-fn make_reality_keypair() -> ([u8; 32], String, String) {
-    let priv_bytes = [0x42u8; 32];
-    let secret = StaticSecret::from(priv_bytes);
-    let pub_bytes = PublicKey::from(&secret).to_bytes();
-    (
-        priv_bytes,
-        URL_SAFE_NO_PAD.encode(priv_bytes),
-        URL_SAFE_NO_PAD.encode(pub_bytes),
-    )
+fn make_test_tls_material() -> Result<(ServerTlsMaterial, String)> {
+    crate::tls::init_crypto();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+    let cert_pem = cert.cert.pem();
+    let material = ServerTlsMaterial {
+        cert_path: None,
+        key_path: None,
+        certificates: vec![cert_pem.clone()],
+        key: Some(cert.signing_key.serialize_pem()),
+        label: "flux test".into(),
+        alpn_protocols: Vec::new(),
+        early_data: false,
+        ech: None,
+    };
+    Ok((material, cert_pem))
 }
 
 #[test]
 fn flux_mihomo_yaml_parses_default_and_manual_channels() -> Result<()> {
-    let (_, _, pub_b64) = make_reality_keypair();
-    let yaml = format!(
-        r#"
+    let yaml = r#"
 proxies:
   - name: FluxAuto
     type: flux
     server: edge.example.com
     port: 443
     key: user-secret-token
-    servername: www.microsoft.com
-    reality-opts:
-      public-key: {pub_b64}
-      short-id: 01020304
+    servername: edge.example.com
     resolved-v4:
       - 203.0.113.10
     resolved-v6:
@@ -54,15 +52,13 @@ proxies:
     standby-channels: 3
     rotation-interval-sec: 120
     rotation-bytes-mb: 64
-    reality-opts:
-      public-key: {pub_b64}
-      short-id: aabbccdd
     channels:
-      - id: reality-v4
+      - id: tcp-v4
         transport: tcp
         ports: "443"
         ip-version: ipv4
-        sni: www.microsoft.com
+        security: obfs
+        obfs-key: tcp-v4-channel-secret
         role: primary
         weight: 100
       - id: ws-cdn
@@ -82,8 +78,7 @@ proxies:
         obfs-key: obfs-channel-secret
         role: backup
         weight: 60
-"#
-    );
+"#;
 
     let cfg: MihomoConfig = serde_yaml::from_str(&yaml)?;
     let listen: SocketAddr = "127.0.0.1:1080".parse()?;
@@ -91,13 +86,16 @@ proxies:
     let MihomoClientConfig::Flux(auto_cfg) = cfg.resolved_proxy_config("FluxAuto", listen)? else {
         panic!("expected Flux client config for FluxAuto");
     };
+    assert_eq!(auto_cfg.options.ip_strategy, FluxIpStrategy::Latency);
     assert_eq!(auto_cfg.channels.len(), 2);
     assert_eq!(auto_cfg.channels[0].id, "tcp-v4");
     assert_eq!(auto_cfg.channels[0].transport, FluxTransportKind::Tcp);
     assert_eq!(auto_cfg.channels[0].ip_version, "ipv4");
+    assert_eq!(auto_cfg.channels[0].security, FluxSecurityMode::Tls);
     assert_eq!(auto_cfg.channels[1].id, "tcp-v6");
     assert_eq!(auto_cfg.channels[1].transport, FluxTransportKind::Tcp);
     assert_eq!(auto_cfg.channels[1].ip_version, "ipv6");
+    assert_eq!(auto_cfg.channels[1].security, FluxSecurityMode::Tls);
     assert_eq!(
         auto_cfg.channels[0].resolved_v4,
         vec![Ipv4Addr::new(203, 0, 113, 10)]
@@ -114,12 +112,31 @@ proxies:
     };
     assert_eq!(manual_cfg.options.standby_channels, 3);
     assert_eq!(manual_cfg.channels.len(), 3);
+    assert_eq!(manual_cfg.channels[0].security, FluxSecurityMode::Obfs);
     assert_eq!(manual_cfg.channels[1].transport, FluxTransportKind::Http);
     assert_eq!(manual_cfg.channels[1].http_mode, FluxHttpMode::Ws);
     assert_eq!(manual_cfg.channels[1].http_path, "/flux-ws");
     assert_eq!(manual_cfg.channels[2].ports, vec![21000, 21001, 21002]);
     assert_eq!(manual_cfg.channels[2].security, FluxSecurityMode::Obfs);
     assert_eq!(manual_cfg.channels[2].role, FluxChannelRole::Backup);
+
+    let rejected_reality = serde_yaml::from_str::<MihomoConfig>(
+        r#"
+proxies:
+  - name: FluxRealityRejected
+    type: flux
+    server: edge.example.com
+    port: 443
+    key: user-secret-token
+    channels:
+      - id: ch-1
+        transport: tcp
+        security: reality
+"#,
+    )
+    .expect("mihomo top-level parses")
+    .resolved_proxy_config("FluxRealityRejected", listen);
+    assert!(rejected_reality.is_err());
 
     let oversized = parse_port_spec("10000-10100", MAX_FLUX_EXPANDED_PORTS);
     assert!(oversized.is_err());
@@ -128,8 +145,7 @@ proxies:
 
 #[tokio::test]
 async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> Result<()> {
-    let (_, priv_b64, pub_b64) = make_reality_keypair();
-    let short_id = "0102030405060708";
+    let (tls_material, cert_pem) = make_test_tls_material()?;
 
     // Target TCP echo server
     let tcp_echo = TcpListener::bind("127.0.0.1:0").await?;
@@ -171,15 +187,6 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
         IpAddr::V4(Ipv4Addr::LOCALHOST)
     };
 
-    let reality_srv = RealityServerConfig::from_strings(
-        "www.example.com",
-        443,
-        vec!["www.example.com".to_string()],
-        &priv_b64,
-        &[short_id.to_string()],
-        Vec::new(),
-    )?;
-
     let mut user = CoreUser::password("u-flux", "flux-user-credential");
     user.max_online_sessions = Some(1);
     user.max_online_ips = Some(2);
@@ -191,7 +198,7 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
         udp: true,
         listeners: vec![
             FluxChannelServerConfig {
-                id: "srv-tcp-reality".to_string(),
+                id: "srv-tcp-tls".to_string(),
                 listen_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 ports: vec![0],
                 transport: FluxTransportKind::Tcp,
@@ -199,11 +206,9 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
                 http_host: None,
                 http_path: "/".to_string(),
                 http_headers: BTreeMap::new(),
-                security: FluxSecurityMode::Reality,
+                security: FluxSecurityMode::Tls,
                 cert_mode: FluxCertMode::Inherit,
-                tls_material: None,
-                reality: Some(reality_srv.clone()),
-                reality_fallback: Some(false),
+                tls_material: Some(tls_material),
                 obfs_key: None,
             },
             FluxChannelServerConfig {
@@ -218,12 +223,10 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
                 security: FluxSecurityMode::Obfs,
                 cert_mode: FluxCertMode::OriginPlain,
                 tls_material: None,
-                reality: None,
-                reality_fallback: None,
                 obfs_key: Some("flux-obfs-shared-secret".to_string()),
             },
             FluxChannelServerConfig {
-                id: "srv-quic-reality".to_string(),
+                id: "srv-quic-obfs".to_string(),
                 listen_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 ports: vec![0],
                 transport: FluxTransportKind::Udp,
@@ -231,12 +234,10 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
                 http_host: None,
                 http_path: "/".to_string(),
                 http_headers: BTreeMap::new(),
-                security: FluxSecurityMode::Reality,
+                security: FluxSecurityMode::Obfs,
                 cert_mode: FluxCertMode::Inherit,
                 tls_material: None,
-                reality: Some(reality_srv),
-                reality_fallback: Some(false),
-                obfs_key: None,
+                obfs_key: Some("flux-quic-shared-secret".to_string()),
             },
         ],
     };
@@ -246,7 +247,6 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
     let ws_port = running_srv.tcp_addrs()[1].port();
     let quic_port = running_srv.udp_addrs()[0].port();
 
-    let reality_cli = RealityClientConfig::from_strings(&pub_b64, short_id)?;
     let ws_host = if has_v6 { "::1" } else { "127.0.0.1" };
 
     let socks_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -265,7 +265,7 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
         },
         channels: vec![
             FluxChannelClientConfig {
-                id: "c-tcp-reality".to_string(),
+                id: "c-tcp-tls".to_string(),
                 server_host: "127.0.0.1".to_string(),
                 ports: vec![tcp_port],
                 ip_version: "ipv4".to_string(),
@@ -276,15 +276,14 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
                 http_host: None,
                 http_path: "/".to_string(),
                 http_headers: BTreeMap::new(),
-                security: FluxSecurityMode::Reality,
-                sni: "www.example.com".to_string(),
+                security: FluxSecurityMode::Tls,
+                sni: "localhost".to_string(),
                 alpn: Vec::new(),
                 fingerprint: None,
                 insecure: false,
                 ca_cert_paths: Vec::new(),
-                ca_certificates: Vec::new(),
+                ca_certificates: vec![cert_pem],
                 pinned_cert_sha256: Vec::new(),
-                reality: Some(reality_cli.clone()),
                 obfs_key: None,
                 role: FluxChannelRole::Primary,
                 weight: 100,
@@ -309,13 +308,12 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
                 ca_cert_paths: Vec::new(),
                 ca_certificates: Vec::new(),
                 pinned_cert_sha256: Vec::new(),
-                reality: None,
                 obfs_key: Some("flux-obfs-shared-secret".to_string()),
                 role: FluxChannelRole::Primary,
                 weight: 90,
             },
             FluxChannelClientConfig {
-                id: "c-quic-reality".to_string(),
+                id: "c-quic-obfs".to_string(),
                 server_host: "127.0.0.1".to_string(),
                 ports: vec![quic_port],
                 ip_version: "ipv4".to_string(),
@@ -326,16 +324,15 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
                 http_host: None,
                 http_path: "/".to_string(),
                 http_headers: BTreeMap::new(),
-                security: FluxSecurityMode::Reality,
-                sni: "www.example.com".to_string(),
+                security: FluxSecurityMode::Obfs,
+                sni: "localhost".to_string(),
                 alpn: Vec::new(),
                 fingerprint: None,
                 insecure: false,
                 ca_cert_paths: Vec::new(),
                 ca_certificates: Vec::new(),
                 pinned_cert_sha256: Vec::new(),
-                reality: Some(reality_cli),
-                obfs_key: None,
+                obfs_key: Some("flux-quic-shared-secret".to_string()),
                 role: FluxChannelRole::Primary,
                 weight: 95,
             },
@@ -389,9 +386,6 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
 
 #[tokio::test]
 async fn flux_hot_stream_migration_survives_mid_transfer_channel_cut() -> Result<()> {
-    let (_, priv_b64, pub_b64) = make_reality_keypair();
-    let short_id = "a1b2c3d4";
-
     // Target TCP echo server that keeps connection open across multiple bursts
     let target_listener = TcpListener::bind("127.0.0.1:0").await?;
     let target_addr = target_listener.local_addr()?;
@@ -418,14 +412,6 @@ async fn flux_hot_stream_migration_survives_mid_transfer_channel_cut() -> Result
         }
     });
 
-    let reality_srv = RealityServerConfig::from_strings(
-        "www.example.com",
-        443,
-        vec!["www.example.com".to_string()],
-        &priv_b64,
-        &[short_id.to_string()],
-        Vec::new(),
-    )?;
     let core = ProxyCore::new(vec![CoreUser::password("u1", "secret-migrate")])?;
 
     let server_cfg = FluxServerConfig {
@@ -442,12 +428,10 @@ async fn flux_hot_stream_migration_survives_mid_transfer_channel_cut() -> Result
                 http_host: None,
                 http_path: "/".to_string(),
                 http_headers: BTreeMap::new(),
-                security: FluxSecurityMode::Reality,
+                security: FluxSecurityMode::Obfs,
                 cert_mode: FluxCertMode::Inherit,
                 tls_material: None,
-                reality: Some(reality_srv),
-                reality_fallback: Some(false),
-                obfs_key: None,
+                obfs_key: Some("primary-tcp-obfs-key".to_string()),
             },
             FluxChannelServerConfig {
                 id: "backup-quic".to_string(),
@@ -461,8 +445,6 @@ async fn flux_hot_stream_migration_survives_mid_transfer_channel_cut() -> Result
                 security: FluxSecurityMode::Obfs,
                 cert_mode: FluxCertMode::Inherit,
                 tls_material: None,
-                reality: None,
-                reality_fallback: None,
                 obfs_key: Some("backup-quic-obfs-key".to_string()),
             },
         ],
@@ -489,7 +471,6 @@ async fn flux_hot_stream_migration_survives_mid_transfer_channel_cut() -> Result
         }
     });
 
-    let reality_cli = RealityClientConfig::from_strings(&pub_b64, short_id)?;
     let socks_listener = TcpListener::bind("127.0.0.1:0").await?;
     let socks_addr = socks_listener.local_addr()?;
 
@@ -518,16 +499,15 @@ async fn flux_hot_stream_migration_survives_mid_transfer_channel_cut() -> Result
                 http_host: None,
                 http_path: "/".to_string(),
                 http_headers: BTreeMap::new(),
-                security: FluxSecurityMode::Reality,
-                sni: "www.example.com".to_string(),
+                security: FluxSecurityMode::Obfs,
+                sni: "localhost".to_string(),
                 alpn: Vec::new(),
                 fingerprint: None,
                 insecure: false,
                 ca_cert_paths: Vec::new(),
                 ca_certificates: Vec::new(),
                 pinned_cert_sha256: Vec::new(),
-                reality: Some(reality_cli),
-                obfs_key: None,
+                obfs_key: Some("primary-tcp-obfs-key".to_string()),
                 role: FluxChannelRole::Primary,
                 weight: 100,
             },
@@ -551,7 +531,6 @@ async fn flux_hot_stream_migration_survives_mid_transfer_channel_cut() -> Result
                 ca_cert_paths: Vec::new(),
                 ca_certificates: Vec::new(),
                 pinned_cert_sha256: Vec::new(),
-                reality: None,
                 obfs_key: Some("backup-quic-obfs-key".to_string()),
                 role: FluxChannelRole::Backup,
                 weight: 80,
@@ -610,127 +589,8 @@ async fn flux_hot_stream_migration_survives_mid_transfer_channel_cut() -> Result
 }
 
 #[tokio::test]
-async fn flux_reality_tcp_and_udp_fallback_forwards_unauthenticated_probes() -> Result<()> {
-    let (_, priv_b64, _) = make_reality_keypair();
-
-    // Mock borrowed TCP origin server
-    let origin_tcp = TcpListener::bind("127.0.0.1:0").await?;
-    let origin_tcp_port = origin_tcp.local_addr()?.port();
-    tokio::spawn(async move {
-        if let Ok((mut s, _)) = origin_tcp.accept().await {
-            let mut req = [0u8; 64];
-            let _ = s.read(&mut req).await;
-            let _ = s
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\nBORROWED-ORIGIN")
-                .await;
-            let _ = s.shutdown().await;
-        }
-    });
-
-    // Mock borrowed UDP/H3 origin server
-    let origin_udp = UdpSocket::bind("127.0.0.1:0").await?;
-    let origin_udp_port = origin_udp.local_addr()?.port();
-    tokio::spawn(async move {
-        let mut buf = [0u8; 1024];
-        if let Ok((_, peer)) = origin_udp.recv_from(&mut buf).await {
-            let _ = origin_udp.send_to(b"BORROWED-H3-UDP", peer).await;
-        }
-    });
-
-    let tcp_reality = RealityServerConfig::from_strings(
-        "127.0.0.1",
-        origin_tcp_port,
-        vec!["127.0.0.1".to_string()],
-        &priv_b64,
-        &["01020304".to_string()],
-        Vec::new(),
-    )?;
-    let udp_reality = RealityServerConfig::from_strings(
-        "127.0.0.1",
-        origin_udp_port,
-        vec!["127.0.0.1".to_string()],
-        &priv_b64,
-        &["01020304".to_string()],
-        Vec::new(),
-    )?;
-
-    let core = ProxyCore::new(vec![CoreUser::password("u1", "secret")])?;
-    let running = start_flux_server_with_core(
-        FluxServerConfig {
-            key: String::new(),
-            users: Vec::new(),
-            udp: true,
-            listeners: vec![
-                FluxChannelServerConfig {
-                    id: "tcp-fb".to_string(),
-                    listen_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                    ports: vec![0],
-                    transport: FluxTransportKind::Tcp,
-                    http_mode: FluxHttpMode::Ws,
-                    http_host: None,
-                    http_path: "/".to_string(),
-                    http_headers: BTreeMap::new(),
-                    security: FluxSecurityMode::Reality,
-                    cert_mode: FluxCertMode::Inherit,
-                    tls_material: None,
-                    reality: Some(tcp_reality),
-                    reality_fallback: Some(true),
-                    obfs_key: None,
-                },
-                FluxChannelServerConfig {
-                    id: "udp-fb".to_string(),
-                    listen_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                    ports: vec![0],
-                    transport: FluxTransportKind::Udp,
-                    http_mode: FluxHttpMode::Ws,
-                    http_host: None,
-                    http_path: "/".to_string(),
-                    http_headers: BTreeMap::new(),
-                    security: FluxSecurityMode::Reality,
-                    cert_mode: FluxCertMode::Inherit,
-                    tls_material: None,
-                    reality: Some(udp_reality),
-                    reality_fallback: Some(true),
-                    obfs_key: None,
-                },
-            ],
-        },
-        core,
-    )?;
-
-    // 1. Unauthenticated TCP HTTP probe -> forwarded to origin_tcp
-    let mut probe_tcp = TcpStream::connect(running.tcp_addrs()[0]).await?;
-    probe_tcp
-        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-        .await?;
-    let mut resp = Vec::new();
-    probe_tcp.read_to_end(&mut resp).await?;
-    assert!(
-        String::from_utf8_lossy(&resp).contains("BORROWED-ORIGIN"),
-        "unexpected TCP fallback response: {:?}",
-        String::from_utf8_lossy(&resp)
-    );
-
-    // 2. Unauthenticated UDP probe -> forwarded to origin_udp
-    let probe_udp = UdpSocket::bind("127.0.0.1:0").await?;
-    probe_udp
-        .send_to(b"unauthenticated-quic-probe-bytes", running.udp_addrs()[0])
-        .await?;
-    let mut udp_resp = [0u8; 256];
-    let (n, _) =
-        tokio::time::timeout(Duration::from_secs(5), probe_udp.recv_from(&mut udp_resp)).await??;
-    assert_eq!(&udp_resp[..n], b"BORROWED-H3-UDP");
-
-    running.stop();
-    let _ = running.wait().await;
-    Ok(())
-}
-
-#[tokio::test]
 async fn flux_latency_strategy_and_udp_relay_role_route_cleanly() -> Result<()> {
-    let (_, _, pub_b64) = make_reality_keypair();
-    let yaml = format!(
-        r#"
+    let yaml = r#"
 proxies:
   - name: FluxPerChannel
     type: flux
@@ -748,10 +608,8 @@ proxies:
       - id: tcp-v6
         transport: tcp
         ip-version: ipv6
-        reality-opts:
-          public-key: {pub_b64}
-          short-id: 01020304
-        sni: www.microsoft.com
+        security: tls
+        sni: edge.example.com
         role: primary
       - id: udp-dedicated
         transport: udp
@@ -763,8 +621,7 @@ proxies:
         ports: 21001
         obfs-key: chan-udp-equal
         role: equal
-"#
-    );
+"#;
     let cfg: MihomoConfig = serde_yaml::from_str(&yaml)?;
     let listen: SocketAddr = "127.0.0.1:1080".parse()?;
     let MihomoClientConfig::Flux(parsed) = cfg.resolved_proxy_config("FluxPerChannel", listen)?
@@ -773,7 +630,7 @@ proxies:
     };
     assert_eq!(parsed.options.ip_strategy, FluxIpStrategy::Latency);
     assert_eq!(parsed.channels[0].security, FluxSecurityMode::Obfs);
-    assert_eq!(parsed.channels[1].security, FluxSecurityMode::Reality);
+    assert_eq!(parsed.channels[1].security, FluxSecurityMode::Tls);
     assert_eq!(parsed.channels[2].security, FluxSecurityMode::Obfs);
     assert_eq!(parsed.channels[2].role, FluxChannelRole::UdpRelay);
     assert_eq!(parsed.channels[3].role, FluxChannelRole::Primary);
@@ -798,8 +655,6 @@ proxies:
                     security: FluxSecurityMode::Obfs,
                     cert_mode: FluxCertMode::Inherit,
                     tls_material: None,
-                    reality: None,
-                    reality_fallback: None,
                     obfs_key: Some("tcp-chan-key".to_string()),
                 },
                 FluxChannelServerConfig {
@@ -814,8 +669,6 @@ proxies:
                     security: FluxSecurityMode::Obfs,
                     cert_mode: FluxCertMode::Inherit,
                     tls_material: None,
-                    reality: None,
-                    reality_fallback: None,
                     obfs_key: Some("udp-chan-key".to_string()),
                 },
             ],

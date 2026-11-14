@@ -1,24 +1,20 @@
 use super::config::{
-    FluxCertMode, FluxChannelClientConfig, FluxChannelServerConfig, FluxHttpMode, FluxSecurityMode,
+    FluxCertMode, FluxChannelClientConfig, FluxChannelServerConfig, FluxSecurityMode,
     FluxTransportKind,
 };
 use super::frame::{
     FluxFrame, MAX_FLUX_FRAME_LEN, decode_frame_body_bytes, encode_frame_body,
     encode_length_prefixed_frame_into,
 };
-use super::obfs::{FluxObfsUdpSocket, client_obfs_handshake, server_obfs_handshake};
-use super::reality_udp::{
-    RealityCidGenerator, RealityQuicCertVerifier, RealityUdpSocket,
-    generate_ephemeral_quic_server_tls,
+use super::obfs::{
+    FluxObfsUdpSocket, ObfsQuicCertVerifier, client_obfs_handshake,
+    generate_ephemeral_quic_server_tls, server_obfs_handshake,
 };
 use crate::listener::ListenerStopToken;
 use crate::quic;
-use crate::reality::{self, RealityCertificateState, RealityServerConfig};
-use crate::reality_tls_client;
-use crate::replay_cache::{ReplayCache, ReplayError};
+use crate::replay_cache::ReplayCache;
 use crate::socket_protect;
 use crate::tls::{self, ServerTlsAcceptor};
-use crate::utls::UtlsFingerprint;
 use crate::vless_transport::{self, BoxedTransportStream, VlessTransportConfig};
 use anyhow::{Context, Result, bail, ensure};
 use bytes::BytesMut;
@@ -338,29 +334,6 @@ async fn connect_client_quic_channel(
     };
 
     let endpoint = match channel.security {
-        FluxSecurityMode::Reality => {
-            let reality = channel
-                .reality
-                .as_ref()
-                .context("missing Flux UDP REALITY client config")?;
-            let mut tls_cfg =
-                rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(RealityQuicCertVerifier::default()))
-                    .with_no_client_auth();
-            tls_cfg.alpn_protocols = alpn;
-            let quic_tls = QuicClientConfig::try_from(Arc::new(tls_cfg))
-                .context("build Flux REALITY QUIC client TLS")?;
-            let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_tls));
-            client_cfg.transport_config(transport_cfg);
-            let mut ep_cfg = quinn::EndpointConfig::default();
-            let cid_maker = RealityCidGenerator::new(reality);
-            ep_cfg.cid_generator(move || Box::new(cid_maker.clone()));
-            let mut ep = Endpoint::new(ep_cfg, None, udp_std, Arc::new(quinn::TokioRuntime))
-                .context("bind Flux REALITY QUIC client endpoint")?;
-            ep.set_default_client_config(client_cfg);
-            ep
-        }
         FluxSecurityMode::Obfs => {
             let obfs_key = channel
                 .obfs_key
@@ -369,7 +342,7 @@ async fn connect_client_quic_channel(
             let mut tls_cfg =
                 rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
                     .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(RealityQuicCertVerifier::default()))
+                    .with_custom_certificate_verifier(Arc::new(ObfsQuicCertVerifier::default()))
                     .with_no_client_auth();
             tls_cfg.alpn_protocols = alpn;
             let quic_tls = QuicClientConfig::try_from(Arc::new(tls_cfg))
@@ -438,35 +411,6 @@ async fn connect_client_stream_channel(
         .with_context(|| format!("connect Flux TCP channel {} ({remote_addr})", channel.id))?;
     let vless_tp = channel.to_vless_transport();
     match channel.security {
-        FluxSecurityMode::Reality => {
-            let reality = channel
-                .reality
-                .as_ref()
-                .context("missing Flux REALITY client config")?;
-            let fingerprint = channel.fingerprint.unwrap_or(UtlsFingerprint::Chrome);
-            let alpn = if !channel.alpn.is_empty() {
-                Some(
-                    channel
-                        .alpn
-                        .iter()
-                        .map(|item| item.as_bytes().to_vec())
-                        .collect(),
-                )
-            } else {
-                let tp_alpn = vless_tp.alpn_protocols();
-                if tp_alpn.is_empty() {
-                    None
-                } else {
-                    Some(tp_alpn)
-                }
-            };
-            let tls_stream =
-                reality_tls_client::connect(tcp, reality, &channel.sni, fingerprint, alpn, None)
-                    .await
-                    .with_context(|| format!("Flux REALITY handshake on channel {}", channel.id))?;
-            vless_transport::apply_client_transport(tls_stream, &vless_tp, &channel.server_host)
-                .await
-        }
         FluxSecurityMode::Tls => {
             let mut tls_cfg = Arc::unwrap_or_clone(
                 tls::client_config_with_fingerprint_and_custom_root_material_options(
@@ -514,19 +458,11 @@ async fn connect_client_stream_channel(
     }
 }
 
-pub struct PreparedRealityStreamState {
-    pub config: RealityServerConfig,
-    pub cert_state: RealityCertificateState,
-    pub replay: ReplayCache<[u8; 32]>,
-    pub fallback_override: Option<bool>,
-}
-
 #[derive(Clone)]
 pub struct PreparedStreamListener {
     pub config: FluxChannelServerConfig,
     pub vless_transport: VlessTransportConfig,
     pub tls_acceptor: Option<ServerTlsAcceptor>,
-    pub reality: Option<Arc<PreparedRealityStreamState>>,
     pub obfs_replay: Option<Arc<ReplayCache<[u8; 32]>>>,
 }
 
@@ -534,22 +470,9 @@ impl PreparedStreamListener {
     pub fn prepare(config: FluxChannelServerConfig) -> Result<Self> {
         let vless_transport = config.to_vless_transport();
         let mut tls_acceptor = None;
-        let mut reality = None;
         let mut obfs_replay = None;
 
         match config.security {
-            FluxSecurityMode::Reality => {
-                let reality_cfg = config
-                    .reality
-                    .clone()
-                    .context("missing Flux server REALITY config")?;
-                reality = Some(Arc::new(PreparedRealityStreamState {
-                    config: reality_cfg,
-                    cert_state: RealityCertificateState::build()?,
-                    replay: ReplayCache::new(Duration::from_secs(180), 8192),
-                    fallback_override: config.reality_fallback,
-                }));
-            }
             FluxSecurityMode::Tls => {
                 if config.cert_mode != FluxCertMode::OriginPlain {
                     let mut material = config
@@ -571,76 +494,16 @@ impl PreparedStreamListener {
             config,
             vless_transport,
             tls_acceptor,
-            reality,
             obfs_replay,
         })
     }
 
-    pub async fn accept_and_serve<F, Fut>(
-        &self,
-        stream: TcpStream,
-        local_port: u16,
-        handler: F,
-    ) -> Result<()>
+    pub async fn accept_and_serve<F, Fut>(&self, stream: TcpStream, handler: F) -> Result<()>
     where
         F: FnMut(BoxedTransportStream) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
         match self.config.security {
-            FluxSecurityMode::Reality => {
-                let state = self.reality.as_ref().expect("REALITY state prepared");
-                let auth_res = tokio::time::timeout(Duration::from_secs(10), async {
-                    let raw = reality::peek_client_hello(&stream).await?;
-                    let auth = reality::authenticate_client_hello(&raw, &state.config)?;
-                    match state.replay.check_and_store(auth.auth_key) {
-                        Ok(()) => Ok(auth),
-                        Err(ReplayError::Replayed) => bail!("replayed Flux REALITY ClientHello"),
-                        Err(ReplayError::Full) => bail!("Flux REALITY replay cache full"),
-                    }
-                })
-                .await;
-
-                let authenticated = match auth_res {
-                    Ok(Ok(auth)) => auth,
-                    Ok(Err(err)) => {
-                        tracing::debug!(
-                            "Flux REALITY probe/unauthenticated on :{local_port}: {err:#}"
-                        );
-                        handle_unauthenticated_reality_probe(
-                            stream,
-                            &state.config,
-                            local_port,
-                            state.fallback_override,
-                        )
-                        .await;
-                        return Ok(());
-                    }
-                    Err(_) => {
-                        return Ok(());
-                    }
-                };
-
-                let default_h2 = [b"h2".to_vec()];
-                let alpn: &[Vec<u8>] = if !state.config.alpn_protocols.is_empty() {
-                    &state.config.alpn_protocols
-                } else if self.config.transport == FluxTransportKind::Http
-                    && self.config.http_mode == FluxHttpMode::H2
-                {
-                    &default_h2
-                } else {
-                    &[]
-                };
-                let server_cfg = state
-                    .cert_state
-                    .server_config(&authenticated.auth_key, alpn)?;
-                let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
-                let tls_stream = acceptor
-                    .accept(stream)
-                    .await
-                    .context("accept Flux REALITY TLS")?;
-                vless_transport::serve_server_transport(tls_stream, &self.vless_transport, handler)
-                    .await
-            }
             FluxSecurityMode::Tls => {
                 if self.config.cert_mode == FluxCertMode::OriginPlain {
                     vless_transport::serve_server_transport(stream, &self.vless_transport, handler)
@@ -687,26 +550,6 @@ impl PreparedStreamListener {
                 .await
             }
         }
-    }
-}
-
-async fn handle_unauthenticated_reality_probe(
-    stream: TcpStream,
-    config: &RealityServerConfig,
-    local_port: u16,
-    fallback_override: Option<bool>,
-) {
-    let use_fallback = fallback_override.unwrap_or(local_port == 443)
-        && !config.server_name.trim().is_empty()
-        && config.server_port > 0;
-    if use_fallback {
-        let _ = reality::proxy_fallback(stream, config).await;
-    } else {
-        let mut jitter = [0u8; 2];
-        let _ = getrandom::fill(&mut jitter);
-        let delay_ms = 250 + (u64::from(u16::from_be_bytes(jitter)) % 651);
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        drop(stream);
     }
 }
 
@@ -770,30 +613,6 @@ pub fn build_server_quic_endpoint(
     let default_alpn = vec![b"h3".to_vec()];
 
     match listener.security {
-        FluxSecurityMode::Reality => {
-            let reality = listener
-                .reality
-                .as_ref()
-                .context("missing Flux UDP REALITY server config")?;
-            let alpn = if reality.alpn_protocols.is_empty() {
-                default_alpn
-            } else {
-                reality.alpn_protocols.clone()
-            };
-            let tls_cfg = generate_ephemeral_quic_server_tls(&reality.server_name, alpn)?;
-            let crypto = QuicServerConfig::try_from(tls_cfg)
-                .context("build Flux REALITY QUIC server TLS")?;
-            let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-            server_cfg.transport_config(transport_cfg);
-            let reality_sock = RealityUdpSocket::new(udp_std, reality, listener.reality_fallback)?;
-            Endpoint::new_with_abstract_socket(
-                quinn::EndpointConfig::default(),
-                Some(server_cfg),
-                Arc::new(reality_sock),
-                Arc::new(quinn::TokioRuntime),
-            )
-            .context("bind Flux REALITY QUIC server endpoint")
-        }
         FluxSecurityMode::Obfs => {
             let obfs_key = listener
                 .obfs_key

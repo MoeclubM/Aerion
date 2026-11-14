@@ -9,6 +9,9 @@ use hmac::{Hmac, Mac};
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, Runtime, TokioRuntime, UdpPoller};
 use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use sha2::Sha256;
 use std::fmt;
 use std::io::{self, IoSliceMut};
@@ -540,5 +543,88 @@ fn spawn_obfs_stream(
         writer,
         read_task,
         write_task,
+    }
+}
+
+pub fn generate_ephemeral_quic_server_tls(
+    server_name: &str,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> Result<rustls::ServerConfig> {
+    crate::tls::init_crypto();
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+        .context("generate Flux obfs QUIC Ed25519 key")?;
+    let mut params = rcgen::CertificateParams::new(vec![server_name.to_string()])
+        .context("build Flux obfs QUIC cert params")?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    let cert = params
+        .self_signed(&key)
+        .context("self-sign Flux obfs QUIC cert")?;
+    let cert_der = CertificateDer::from(cert.der().as_ref().to_vec());
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
+    let mut tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .context("build Flux obfs QUIC rustls server config")?;
+    tls_config.alpn_protocols = alpn_protocols;
+    Ok(tls_config)
+}
+
+#[derive(Debug)]
+pub struct ObfsQuicCertVerifier {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl Default for ObfsQuicCertVerifier {
+    fn default() -> Self {
+        Self {
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+        }
+    }
+}
+
+impl ServerCertVerifier for ObfsQuicCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
