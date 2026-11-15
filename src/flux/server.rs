@@ -1,5 +1,7 @@
 use super::auth::{self, derive_blind_key, handshake_key, xor_32};
-use super::config::{FluxServerConfig, FluxTransportKind};
+use super::config::{
+    FluxCertMode, FluxSecurityMode, FluxServerConfig, FluxTransportKind, parse_flux_x25519_key,
+};
 use super::frame::{
     DEFAULT_STREAM_WINDOW_BYTES, FluxFrame, MAX_FLUX_CHUNK_LEN, RST_MIGRATE_UNKNOWN,
     RST_REMOTE_RESET, RST_STREAM_CLOSED, RecvOffsetAssembler, SendWindowBuffer,
@@ -8,7 +10,7 @@ use super::frame::{
 use super::transport::{
     FluxChannelGuard, FluxFrameReader, FluxFrameWriter, PreparedStreamListener,
     bind_server_tcp_listener, bind_server_udp_socket, build_server_quic_endpoint,
-    split_boxed_stream, split_quic_channel,
+    split_boxed_stream_with_binding, split_quic_channel,
 };
 use crate::core::{CoreSession, ProxyCore};
 use crate::listener::{self, ListenerStopToken};
@@ -30,6 +32,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 const MAX_UDP_SLICE_BYTES: usize = 1100;
 const SESSION_ORPHAN_GRACE: Duration = super::config::SESSION_RESUME_TIMEOUT;
@@ -38,6 +41,11 @@ const UDP_FRAG_TIMEOUT: Duration = Duration::from_secs(20);
 const CLOSED_STREAM_RING_CAP: usize = 512;
 const WRITER_BATCH_MAX: usize = 64;
 const STREAM_EVENT_BURST_MAX: usize = 32;
+const MAX_STREAMS_PER_SESSION: usize = 1024;
+const MAX_UDP_ASSOCS_PER_SESSION: usize = 256;
+const MAX_CHANNELS_PER_SESSION: usize = 32;
+const HELLO_RATE_WINDOW_SECS: u64 = 60;
+const HELLO_RATE_MAX_PER_USER: usize = 256;
 
 fn now_unix_secs() -> u64 {
     SystemTime::now()
@@ -179,6 +187,16 @@ pub fn start_flux_server_with_state(
     for listener_cfg in config.listeners {
         match listener_cfg.transport {
             FluxTransportKind::Udp => {
+                let private_key = match listener_cfg.security {
+                    FluxSecurityMode::Obfs => Some(parse_flux_x25519_key(
+                        listener_cfg
+                            .private_key
+                            .as_deref()
+                            .context("missing Flux UDP server private_key")?,
+                    )?),
+                    FluxSecurityMode::Tls => None,
+                };
+                let require_tls_binding = listener_cfg.security == FluxSecurityMode::Tls;
                 for port in &listener_cfg.ports {
                     let bind_addr = SocketAddr::new(listener_cfg.listen_ip, *port);
                     let v6_only = explicit_v4_ports.contains(&(*port, true));
@@ -193,13 +211,30 @@ pub fn start_flux_server_with_state(
                     );
                     let reg = registry.clone();
                     let stop_token = stop.clone();
-                    let obfs_key = listener_cfg.obfs_key.clone();
                     tasks.spawn(async move {
-                        run_quic_listener_loop(endpoint, obfs_key, reg, stop_token).await
+                        run_quic_listener_loop(
+                            endpoint,
+                            private_key,
+                            require_tls_binding,
+                            reg,
+                            stop_token,
+                        )
+                        .await
                     });
                 }
             }
             FluxTransportKind::Tcp | FluxTransportKind::Http => {
+                let private_key = match listener_cfg.security {
+                    FluxSecurityMode::Obfs => Some(parse_flux_x25519_key(
+                        listener_cfg
+                            .private_key
+                            .as_deref()
+                            .context("missing Flux server private_key")?,
+                    )?),
+                    FluxSecurityMode::Tls => None,
+                };
+                let require_tls_binding = listener_cfg.security == FluxSecurityMode::Tls
+                    && listener_cfg.cert_mode != FluxCertMode::OriginPlain;
                 let prepared = PreparedStreamListener::prepare(listener_cfg.clone())?;
                 for port in &listener_cfg.ports {
                     let bind_addr = SocketAddr::new(listener_cfg.listen_ip, *port);
@@ -217,8 +252,15 @@ pub fn start_flux_server_with_state(
                     let stop_token = stop.clone();
                     let prepared_clone = prepared.clone();
                     tasks.spawn(async move {
-                        run_stream_listener_loop(tcp_listener, prepared_clone, reg, stop_token)
-                            .await
+                        run_stream_listener_loop(
+                            tcp_listener,
+                            prepared_clone,
+                            private_key,
+                            require_tls_binding,
+                            reg,
+                            stop_token,
+                        )
+                        .await
                     });
                 }
             }
@@ -250,7 +292,8 @@ pub fn start_flux_server_with_state(
 
 async fn run_quic_listener_loop(
     endpoint: quinn::Endpoint,
-    obfs_key: Option<String>,
+    private_key: Option<[u8; 32]>,
+    require_tls_binding: bool,
     registry: Arc<FluxServerRegistry>,
     stop: ListenerStopToken,
 ) -> Result<()> {
@@ -279,7 +322,6 @@ async fn run_quic_listener_loop(
             }
         };
         let reg = registry.clone();
-        let obfs_key = obfs_key.clone();
         tokio::spawn(async move {
             let connection = match incoming.await {
                 Ok(conn) => conn,
@@ -301,7 +343,8 @@ async fn run_quic_listener_loop(
                 guard,
                 peer_addr,
                 FluxTransportKind::Udp,
-                obfs_key,
+                private_key,
+                require_tls_binding,
                 reg,
             )
             .await
@@ -315,6 +358,8 @@ async fn run_quic_listener_loop(
 async fn run_stream_listener_loop(
     listener: tokio::net::TcpListener,
     prepared: PreparedStreamListener,
+    private_key: Option<[u8; 32]>,
+    require_tls_binding: bool,
     registry: Arc<FluxServerRegistry>,
     stop: ListenerStopToken,
 ) -> Result<()> {
@@ -333,20 +378,20 @@ async fn run_stream_listener_loop(
         let reg = registry.clone();
         tokio::spawn(async move {
             let transport_kind = prepared.config.transport;
-            let obfs_key = prepared.config.obfs_key.clone();
             let res = prepared
-                .accept_and_serve(stream, move |boxed_stream| {
+                .accept_and_serve(stream, move |boxed_stream, static_binding| {
                     let reg = reg.clone();
-                    let obfs_key = obfs_key.clone();
                     async move {
-                        let (reader, writer, guard) = split_boxed_stream(boxed_stream);
+                        let (reader, writer, guard) =
+                            split_boxed_stream_with_binding(boxed_stream, static_binding);
                         handle_server_channel(
                             reader,
                             writer,
                             guard,
                             peer_addr,
                             transport_kind,
-                            obfs_key,
+                            private_key,
+                            require_tls_binding,
                             reg,
                         )
                         .await
@@ -361,6 +406,7 @@ async fn run_stream_listener_loop(
 }
 
 struct ServerChannelHandle {
+    #[allow(dead_code)]
     uid: u64,
     transport: FluxTransportKind,
     prio_tx: mpsc::UnboundedSender<FluxFrame>,
@@ -532,6 +578,7 @@ struct FluxServerRegistry {
     core: ProxyCore,
     udp_enabled: AtomicBool,
     hello_replay: ReplayCache<[u8; 48]>,
+    hello_rate: StdMutex<HashMap<[u8; 32], (Instant, usize)>>,
     sessions: Mutex<HashMap<[u8; 16], Arc<FluxServerSession>>>,
     next_channel_uid: AtomicU64,
 }
@@ -541,10 +588,32 @@ impl FluxServerRegistry {
         Self {
             core,
             udp_enabled: AtomicBool::new(udp_enabled),
-            hello_replay: ReplayCache::new(Duration::from_secs(auth::HELLO_REPLAY_TTL_SECS), 16384),
+            hello_replay: ReplayCache::new(Duration::from_secs(auth::HELLO_REPLAY_TTL_SECS), 65_536),
+            hello_rate: StdMutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             next_channel_uid: AtomicU64::new(1),
         }
+    }
+
+    fn check_hello_rate(&self, cred_hash: &[u8; 32]) -> Result<()> {
+        let now = Instant::now();
+        let mut guard = self.hello_rate.lock().expect("Flux hello_rate poisoned");
+        if guard.len() > 4096 {
+            guard.retain(|_, (start, _)| {
+                now.duration_since(*start) < Duration::from_secs(HELLO_RATE_WINDOW_SECS)
+            });
+        }
+        let entry = guard.entry(*cred_hash).or_insert((now, 0));
+        if now.duration_since(entry.0) >= Duration::from_secs(HELLO_RATE_WINDOW_SECS) {
+            *entry = (now, 1);
+            return Ok(());
+        }
+        ensure!(
+            entry.1 < HELLO_RATE_MAX_PER_USER,
+            "Flux SessionHello per-user rate limit exceeded"
+        );
+        entry.1 += 1;
+        Ok(())
     }
 
     async fn get_or_open_session(
@@ -628,7 +697,8 @@ async fn handle_server_channel(
     guard: Arc<FluxChannelGuard>,
     peer_addr: SocketAddr,
     transport: FluxTransportKind,
-    obfs_key: Option<String>,
+    private_key: Option<[u8; 32]>,
+    require_tls_binding: bool,
     registry: Arc<FluxServerRegistry>,
 ) -> Result<()> {
     let first_frame = tokio::time::timeout(Duration::from_secs(10), reader.read_frame())
@@ -657,11 +727,17 @@ async fn handle_server_channel(
     );
 
     let binding = guard.channel_binding()?;
-    let blind_key = derive_blind_key(
-        obfs_key.as_deref().map(str::as_bytes).unwrap_or(&binding),
-        &session_id,
-        &client_ephemeral_pub,
-    )?;
+    if require_tls_binding {
+        ensure!(binding != [0; 32], "missing Flux TLS channel binding");
+    }
+    let secret = if let Some(priv_bytes) = private_key {
+        let ss = StaticSecret::from(priv_bytes).diffie_hellman(&PublicKey::from(client_ephemeral_pub));
+        ensure!(ss.was_contributory(), "invalid Flux SessionHello X25519 key");
+        *ss.as_bytes()
+    } else {
+        binding
+    };
+    let blind_key = derive_blind_key(&secret, &session_id, &client_ephemeral_pub)?;
     let cred_hash = xor_32(&blinded_credential, &blind_key);
     let auth_key = handshake_key(&blind_key, &cred_hash, &binding)?;
     ensure!(
@@ -669,6 +745,7 @@ async fn handle_server_channel(
         "Flux client proof verification failed"
     );
     registry.core.validate_password_hash(&cred_hash)?;
+    registry.check_hello_rate(&cred_hash)?;
     let mut replay_key = [0u8; 48];
     replay_key[..16].copy_from_slice(&session_id);
     replay_key[16..].copy_from_slice(&client_ephemeral_pub);
@@ -681,6 +758,13 @@ async fn handle_server_channel(
     let session = registry
         .get_or_open_session(session_id, cred_hash, peer_addr)
         .await?;
+    {
+        let channels = session.channels.lock().expect("Flux server channels poisoned");
+        ensure!(
+            channels.len() < MAX_CHANNELS_PER_SESSION,
+            "Flux session active channel limit reached"
+        );
+    }
 
     let udp_enabled = registry.udp_enabled.load(Ordering::Acquire);
     let server_proof = auth::server_proof(&auth_key, &first_frame, udp_enabled)?;
@@ -962,6 +1046,14 @@ async fn spawn_or_get_server_stream(
         if let Some(existing) = streams.get(&stream_id).cloned() {
             Some(existing)
         } else {
+            if streams.len() >= MAX_STREAMS_PER_SESSION {
+                drop(streams);
+                let _ = ch.send_prio(FluxFrame::StreamRst {
+                    stream_id,
+                    code: RST_REMOTE_RESET,
+                });
+                return;
+            }
             streams.insert(stream_id, tx);
             None
         }
@@ -1426,6 +1518,10 @@ async fn get_or_create_server_udp_assoc(
     if let Some(existing) = assocs.get(&assoc_id) {
         return Ok(existing.clone());
     }
+    ensure!(
+        assocs.len() < MAX_UDP_ASSOCS_PER_SESSION,
+        "Flux session UDP association limit reached"
+    );
 
     let socket = match socket_protect::bind_dual_stack_udp().await {
         Ok(sock) => Arc::new(sock),
@@ -1519,6 +1615,7 @@ mod authentication_tests {
             core,
             udp_enabled: AtomicBool::new(true),
             hello_replay: ReplayCache::new(Duration::from_secs(auth::HELLO_REPLAY_TTL_SECS), 1),
+            hello_rate: StdMutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             next_channel_uid: AtomicU64::new(1),
         });
@@ -1526,8 +1623,8 @@ mod authentication_tests {
             [(1, "wrong", false), (2, "wrong", false), (3, "valid", true)]
         {
             let (client, server) = tokio::io::duplex(4096);
-            let (mut reader, mut writer, _) = split_boxed_stream(Box::new(client));
-            let (server_reader, server_writer, guard) = split_boxed_stream(Box::new(server));
+            let (mut reader, mut writer, _) = split_boxed_stream_with_binding(Box::new(client), None);
+            let (server_reader, server_writer, guard) = split_boxed_stream_with_binding(Box::new(server), None);
             let registry = registry.clone();
             let server_task = tokio::spawn(async move {
                 handle_server_channel(
@@ -1537,6 +1634,7 @@ mod authentication_tests {
                     "127.0.0.1:1234".parse().unwrap(),
                     FluxTransportKind::Tcp,
                     None,
+                    false,
                     registry,
                 )
                 .await

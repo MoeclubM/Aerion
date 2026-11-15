@@ -1,6 +1,6 @@
 use super::config::{
     FluxCertMode, FluxChannelClientConfig, FluxChannelServerConfig, FluxSecurityMode,
-    FluxTransportKind,
+    FluxTransportKind, parse_flux_x25519_key,
 };
 use super::frame::{
     FluxFrame, MAX_FLUX_FRAME_LEN, decode_frame_body_bytes, encode_frame_body,
@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const QUIC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(12);
@@ -38,6 +39,7 @@ const FRAME_IO_BUF_CAP: usize = 64 * 1024;
 pub struct FluxChannelGuard {
     stop: ListenerStopToken,
     quic_conn: Option<quinn::Connection>,
+    static_binding: Option<[u8; 32]>,
     _quic_endpoint: Option<Endpoint>,
 }
 
@@ -58,6 +60,8 @@ impl FluxChannelGuard {
         if let Some(conn) = &self.quic_conn {
             conn.export_keying_material(&mut binding, b"EXPORTER-Flux-v2", b"")
                 .map_err(|_| anyhow::anyhow!("export Flux QUIC channel binding"))?;
+        } else if let Some(static_binding) = self.static_binding {
+            binding = static_binding;
         }
         Ok(binding)
     }
@@ -213,10 +217,18 @@ impl FluxFrameWriter {
 pub fn split_boxed_stream(
     stream: BoxedTransportStream,
 ) -> (FluxFrameReader, FluxFrameWriter, Arc<FluxChannelGuard>) {
+    split_boxed_stream_with_binding(stream, None)
+}
+
+pub fn split_boxed_stream_with_binding(
+    stream: BoxedTransportStream,
+    static_binding: Option<[u8; 32]>,
+) -> (FluxFrameReader, FluxFrameWriter, Arc<FluxChannelGuard>) {
     let (reader, writer) = tokio::io::split(stream);
     let guard = Arc::new(FluxChannelGuard {
         stop: ListenerStopToken::new(),
         quic_conn: None,
+        static_binding,
         _quic_endpoint: None,
     });
     (
@@ -245,6 +257,7 @@ pub fn split_quic_channel(
     let guard = Arc::new(FluxChannelGuard {
         stop: ListenerStopToken::new(),
         quic_conn: Some(connection.clone()),
+        static_binding: None,
         _quic_endpoint: endpoint,
     });
     (
@@ -278,7 +291,7 @@ fn build_quic_transport_config(
         .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     if obfs {
         let mut mtu_cfg = quinn::MtuDiscoveryConfig::default();
-        mtu_cfg.upper_bound(1440);
+        mtu_cfg.upper_bound(1400);
         cfg.mtu_discovery_config(Some(mtu_cfg));
     }
     if client_keepalive {
@@ -302,8 +315,8 @@ pub async fn connect_client_channel(
     match channel.transport {
         FluxTransportKind::Udp => connect_client_quic_channel(channel, remote_addr).await,
         FluxTransportKind::Tcp | FluxTransportKind::Http => {
-            let stream = connect_client_stream_channel(channel, remote_addr).await?;
-            Ok(split_boxed_stream(stream))
+            let (stream, binding) = connect_client_stream_channel(channel, remote_addr).await?;
+            Ok(split_boxed_stream_with_binding(stream, binding))
         }
     }
 }
@@ -335,10 +348,11 @@ async fn connect_client_quic_channel(
 
     let endpoint = match channel.security {
         FluxSecurityMode::Obfs => {
-            let obfs_key = channel
-                .obfs_key
+            let public_key = channel
+                .public_key
                 .as_deref()
-                .context("missing Flux UDP obfs_key")?;
+                .context("missing Flux UDP public_key")?;
+            let public_key_bytes = parse_flux_x25519_key(public_key)?;
             let mut tls_cfg =
                 rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
                     .dangerous()
@@ -349,9 +363,9 @@ async fn connect_client_quic_channel(
                 .context("build Flux obfs QUIC client TLS")?;
             let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_tls));
             client_cfg.transport_config(transport_cfg);
-            let obfs_socket = FluxObfsUdpSocket::new(udp_std, obfs_key)?;
+            let obfs_socket = FluxObfsUdpSocket::new(udp_std, &public_key_bytes)?;
             let mut ep_cfg = quinn::EndpointConfig::default();
-            let _ = ep_cfg.max_udp_payload_size(1488);
+            let _ = ep_cfg.max_udp_payload_size(1440);
             let mut ep = Endpoint::new_with_abstract_socket(
                 ep_cfg,
                 None,
@@ -405,7 +419,7 @@ async fn connect_client_quic_channel(
 async fn connect_client_stream_channel(
     channel: &FluxChannelClientConfig,
     remote_addr: SocketAddr,
-) -> Result<BoxedTransportStream> {
+) -> Result<(BoxedTransportStream, Option<[u8; 32]>)> {
     let tcp = socket_protect::connect_tcp_addr(remote_addr)
         .await
         .with_context(|| format!("connect Flux TCP channel {} ({remote_addr})", channel.id))?;
@@ -442,18 +456,36 @@ async fn connect_client_stream_channel(
                 .connect(server_name, tcp)
                 .await
                 .with_context(|| format!("Flux TLS handshake on channel {}", channel.id))?;
-            vless_transport::apply_client_transport(tls_stream, &vless_tp, &channel.server_host)
-                .await
+            let binding = if channel.tls_binding {
+                let mut exporter = [0u8; 32];
+                tls_stream
+                    .get_ref()
+                    .1
+                    .export_keying_material(&mut exporter, b"EXPORTER-Flux-v2", Some(b""))
+                    .context("export Flux TLS channel binding")?;
+                Some(exporter)
+            } else {
+                None
+            };
+            let boxed = vless_transport::apply_client_transport(
+                tls_stream,
+                &vless_tp,
+                &channel.server_host,
+            )
+            .await?;
+            Ok((boxed, binding))
         }
         FluxSecurityMode::Obfs => {
-            let obfs_key = channel
-                .obfs_key
+            let public_key = channel
+                .public_key
                 .as_deref()
-                .context("missing Flux obfs_key")?;
+                .context("missing Flux public_key")?;
+            let public_key_bytes = parse_flux_x25519_key(public_key)?;
             let outer =
                 vless_transport::apply_client_transport(tcp, &vless_tp, &channel.server_host)
                     .await?;
-            client_obfs_handshake(outer, obfs_key).await
+            let (stream, binding) = client_obfs_handshake(outer, public_key_bytes).await?;
+            Ok((stream, Some(binding)))
         }
     }
 }
@@ -463,7 +495,7 @@ pub struct PreparedStreamListener {
     pub config: FluxChannelServerConfig,
     pub vless_transport: VlessTransportConfig,
     pub tls_acceptor: Option<ServerTlsAcceptor>,
-    pub obfs_replay: Option<Arc<ReplayCache<[u8; 32]>>>,
+    pub(crate) obfs_replay: Option<Arc<ReplayCache<[u8; 32]>>>,
 }
 
 impl PreparedStreamListener {
@@ -486,7 +518,7 @@ impl PreparedStreamListener {
                 }
             }
             FluxSecurityMode::Obfs => {
-                obfs_replay = Some(Arc::new(ReplayCache::new(Duration::from_secs(240), 8192)));
+                obfs_replay = Some(Arc::new(ReplayCache::new(Duration::from_secs(240), 65_536)));
             }
         }
 
@@ -500,34 +532,45 @@ impl PreparedStreamListener {
 
     pub async fn accept_and_serve<F, Fut>(&self, stream: TcpStream, handler: F) -> Result<()>
     where
-        F: FnMut(BoxedTransportStream) -> Fut + Clone + Send + 'static,
+        F: FnMut(BoxedTransportStream, Option<[u8; 32]>) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
         match self.config.security {
             FluxSecurityMode::Tls => {
                 if self.config.cert_mode == FluxCertMode::OriginPlain {
-                    vless_transport::serve_server_transport(stream, &self.vless_transport, handler)
-                        .await
+                    let mut inner_handler = handler;
+                    vless_transport::serve_server_transport(
+                        stream,
+                        &self.vless_transport,
+                        move |outer| inner_handler(outer, None),
+                    )
+                    .await
                 } else {
                     let acceptor = self
                         .tls_acceptor
                         .as_ref()
                         .context("missing Flux TLS acceptor")?;
                     let tls_stream = acceptor.accept(stream).await.context("accept Flux TLS")?;
+                    let mut binding = [0u8; 32];
+                    tls_stream
+                        .export_keying_material(&mut binding, b"EXPORTER-Flux-v2", b"")
+                        .context("export Flux server TLS channel binding")?;
+                    let mut inner_handler = handler;
                     vless_transport::serve_server_transport(
                         tls_stream,
                         &self.vless_transport,
-                        handler,
+                        move |outer| inner_handler(outer, Some(binding)),
                     )
                     .await
                 }
             }
             FluxSecurityMode::Obfs => {
-                let obfs_key = self
+                let private_key_str = self
                     .config
-                    .obfs_key
-                    .clone()
-                    .context("missing Flux server obfs_key")?;
+                    .private_key
+                    .as_deref()
+                    .context("missing Flux server private_key")?;
+                let private_key_bytes = parse_flux_x25519_key(private_key_str)?;
                 let replay = self
                     .obfs_replay
                     .clone()
@@ -537,13 +580,12 @@ impl PreparedStreamListener {
                     stream,
                     &self.vless_transport,
                     move |outer| {
-                        let obfs_key = obfs_key.clone();
                         let replay = replay.clone();
                         let mut next = inner_handler.clone();
                         async move {
-                            let decrypted =
-                                server_obfs_handshake(outer, &obfs_key, &replay).await?;
-                            next(decrypted).await
+                            let (decrypted, binding) =
+                                server_obfs_handshake(outer, private_key_bytes, &replay).await?;
+                            next(decrypted, Some(binding)).await
                         }
                     },
                 )
@@ -614,18 +656,21 @@ pub fn build_server_quic_endpoint(
 
     match listener.security {
         FluxSecurityMode::Obfs => {
-            let obfs_key = listener
-                .obfs_key
+            let private_key = listener
+                .private_key
                 .as_deref()
-                .context("missing Flux UDP server obfs_key")?;
+                .context("missing Flux UDP server private_key")?;
+            let private_key_bytes = parse_flux_x25519_key(private_key)?;
+            let public_key_bytes =
+                PublicKey::from(&StaticSecret::from(private_key_bytes)).to_bytes();
             let tls_cfg = generate_ephemeral_quic_server_tls("localhost", default_alpn)?;
             let crypto =
                 QuicServerConfig::try_from(tls_cfg).context("build Flux obfs QUIC server TLS")?;
             let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
             server_cfg.transport_config(transport_cfg);
-            let obfs_sock = FluxObfsUdpSocket::new(udp_std, obfs_key)?;
+            let obfs_sock = FluxObfsUdpSocket::new(udp_std, &public_key_bytes)?;
             let mut ep_cfg = quinn::EndpointConfig::default();
-            let _ = ep_cfg.max_udp_payload_size(1488);
+            let _ = ep_cfg.max_udp_payload_size(1440);
             Endpoint::new_with_abstract_socket(
                 ep_cfg,
                 Some(server_cfg),

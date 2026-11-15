@@ -3,13 +3,17 @@ use crate::tls::ServerTlsMaterial;
 use crate::utls::{UtlsFingerprint, deserialize_optional_fingerprint};
 use crate::vless_transport::VlessTransportConfig;
 use anyhow::{Context, Result, bail, ensure};
+use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 pub const MAX_FLUX_EXPANDED_PORTS: usize = 64;
 pub const DEFAULT_STANDBY_CHANNELS: usize = 2;
+pub const DEFAULT_CHANNEL_MAX_MBPS: u64 = 20;
 pub const DEFAULT_ROTATION_INTERVAL_SEC: u64 = 180;
 pub const DEFAULT_ROTATION_BYTES_MB: u64 = 96;
 
@@ -121,10 +125,20 @@ pub struct FluxOptions {
     pub ip_strategy: FluxIpStrategy,
     #[serde(alias = "standby-channels")]
     pub standby_channels: usize,
+    #[serde(
+        default = "default_channel_max_mbps",
+        alias = "channel-max-mbps",
+        alias = "channelMaxMbps"
+    )]
+    pub channel_max_mbps: u64,
     #[serde(alias = "rotation-interval-sec", alias = "rotation-interval")]
     pub rotation_interval_sec: u64,
     #[serde(alias = "rotation-bytes-mb", alias = "rotation-bytes")]
     pub rotation_bytes_mb: u64,
+}
+
+fn default_channel_max_mbps() -> u64 {
+    DEFAULT_CHANNEL_MAX_MBPS
 }
 
 impl Default for FluxOptions {
@@ -132,6 +146,7 @@ impl Default for FluxOptions {
         Self {
             ip_strategy: FluxIpStrategy::Latency,
             standby_channels: DEFAULT_STANDBY_CHANNELS,
+            channel_max_mbps: DEFAULT_CHANNEL_MAX_MBPS,
             rotation_interval_sec: DEFAULT_ROTATION_INTERVAL_SEC,
             rotation_bytes_mb: DEFAULT_ROTATION_BYTES_MB,
         }
@@ -144,7 +159,15 @@ impl FluxOptions {
             self.standby_channels <= 16,
             "Flux standby_channels must be at most 16"
         );
+        ensure!(
+            self.channel_max_mbps <= 10_000,
+            "Flux channel_max_mbps must be at most 10000"
+        );
         Ok(())
+    }
+
+    pub fn channel_max_bytes_per_sec(&self) -> Option<u64> {
+        (self.channel_max_mbps > 0).then(|| self.channel_max_mbps.saturating_mul(125_000))
     }
 }
 
@@ -225,6 +248,46 @@ pub fn parse_port_spec(spec: &str, max_ports: usize) -> Result<Vec<u16>> {
     Ok(ports)
 }
 
+pub fn parse_flux_x25519_key(raw: &str) -> Result<[u8; 32]> {
+    let trimmed = raw.trim();
+    ensure!(!trimmed.is_empty(), "Flux X25519 key is empty");
+    let bytes = if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        hex::decode(trimmed).context("decode Flux hex X25519 key")?
+    } else {
+        URL_SAFE_NO_PAD
+            .decode(trimmed)
+            .or_else(|_| URL_SAFE.decode(trimmed))
+            .or_else(|_| STANDARD_NO_PAD.decode(trimmed))
+            .or_else(|_| STANDARD.decode(trimmed))
+            .context("decode Flux base64 X25519 key")?
+    };
+    ensure!(bytes.len() == 32, "Flux X25519 key must be 32 bytes");
+    let key: [u8; 32] = bytes.try_into().expect("32-byte key");
+    ensure!(
+        key.iter().any(|&b| b != 0),
+        "Flux X25519 key cannot be all zeros"
+    );
+    Ok(key)
+}
+
+pub fn generate_flux_x25519_keypair() -> Result<(String, String)> {
+    let mut raw = [0u8; 32];
+    getrandom::fill(&mut raw).map_err(|e| anyhow::anyhow!("Flux X25519 keygen: {e}"))?;
+    let secret = StaticSecret::from(raw);
+    let public = PublicKey::from(&secret);
+    Ok((
+        URL_SAFE_NO_PAD.encode(secret.to_bytes()),
+        URL_SAFE_NO_PAD.encode(public.to_bytes()),
+    ))
+}
+
+pub fn derive_flux_x25519_public_key(private_key: &str) -> Result<String> {
+    let raw = parse_flux_x25519_key(private_key)?;
+    let secret = StaticSecret::from(raw);
+    let public = PublicKey::from(&secret);
+    Ok(URL_SAFE_NO_PAD.encode(public.to_bytes()))
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct FluxChannelWireConfig {
@@ -272,8 +335,10 @@ pub struct FluxChannelWireConfig {
         alias = "allow_insecure"
     )]
     pub insecure: Option<bool>,
-    #[serde(alias = "obfs-key", alias = "obfs_password", alias = "obfs-password")]
-    pub obfs_key: Option<String>,
+    #[serde(alias = "public-key", alias = "publicKey")]
+    pub public_key: Option<String>,
+    #[serde(default = "default_true", alias = "tls-binding")]
+    pub tls_binding: bool,
     pub role: FluxChannelRole,
     #[serde(default = "default_weight")]
     pub weight: u8,
@@ -338,7 +403,7 @@ impl FluxChannelWireConfig {
         let http_mode = self.http_mode.or(inferred_http_mode).unwrap_or_default();
         let security = self.security.unwrap_or_else(|| {
             if self
-                .obfs_key
+                .public_key
                 .as_deref()
                 .is_some_and(|v| !v.trim().is_empty())
             {
@@ -357,21 +422,19 @@ impl FluxChannelWireConfig {
             .or_else(|| default_sni.map(str::trim).filter(|v| !v.is_empty()))
             .unwrap_or(&server_host)
             .to_string();
-        let obfs_key = match security {
+        let (public_key, tls_binding) = match security {
             FluxSecurityMode::Obfs => {
                 let key = self
-                    .obfs_key
+                    .public_key
                     .as_deref()
                     .map(str::trim)
                     .filter(|v| !v.is_empty())
-                    .with_context(|| format!("Flux channel {id} requires obfs_key"))?;
-                ensure!(
-                    key.len() >= 4,
-                    "Flux channel {id} obfs_key must be at least 4 bytes"
-                );
-                Some(key.to_string())
+                    .with_context(|| format!("Flux channel {id} obfs requires public_key"))?;
+                let _ = parse_flux_x25519_key(key)
+                    .with_context(|| format!("Flux channel {id} has invalid public_key"))?;
+                (Some(key.to_string()), false)
             }
-            FluxSecurityMode::Tls => None,
+            FluxSecurityMode::Tls => (None, self.tls_binding),
         };
         ensure!(
             (1..=100).contains(&self.weight),
@@ -403,7 +466,8 @@ impl FluxChannelWireConfig {
             ca_cert_paths: Vec::new(),
             ca_certificates: Vec::new(),
             pinned_cert_sha256: Vec::new(),
-            obfs_key,
+            public_key,
+            tls_binding,
             role,
             weight: self.weight,
         }))
@@ -459,7 +523,8 @@ pub struct FluxChannelClientConfig {
     pub ca_cert_paths: Vec<PathBuf>,
     pub ca_certificates: Vec<String>,
     pub pinned_cert_sha256: Vec<String>,
-    pub obfs_key: Option<String>,
+    pub public_key: Option<String>,
+    pub tls_binding: bool,
     pub role: FluxChannelRole,
     pub weight: u8,
 }
@@ -539,14 +604,15 @@ impl FluxClientConfig {
                     );
                 }
                 FluxSecurityMode::Obfs => {
-                    ensure!(
-                        channel
-                            .obfs_key
-                            .as_deref()
-                            .is_some_and(|key| key.len() >= 4),
-                        "Flux channel {} obfs requires obfs_key (>= 4 bytes)",
-                        channel.id
-                    );
+                    let key = channel
+                        .public_key
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .with_context(|| {
+                            format!("Flux channel {} obfs requires public_key", channel.id)
+                        })?;
+                    parse_flux_x25519_key(key)?;
                 }
             }
         }
@@ -600,7 +666,7 @@ pub struct FluxChannelServerConfig {
     pub security: FluxSecurityMode,
     pub cert_mode: FluxCertMode,
     pub tls_material: Option<ServerTlsMaterial>,
-    pub obfs_key: Option<String>,
+    pub private_key: Option<String>,
 }
 
 impl FluxChannelServerConfig {
@@ -690,14 +756,15 @@ impl FluxServerConfig {
                     }
                 },
                 FluxSecurityMode::Obfs => {
-                    ensure!(
-                        listener
-                            .obfs_key
-                            .as_deref()
-                            .is_some_and(|key| key.len() >= 4),
-                        "Flux listener {} obfs requires obfs_key (>= 4 bytes)",
-                        listener.id
-                    );
+                    let key = listener
+                        .private_key
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .with_context(|| {
+                            format!("Flux listener {} obfs requires private_key", listener.id)
+                        })?;
+                    parse_flux_x25519_key(key)?;
                 }
             }
         }

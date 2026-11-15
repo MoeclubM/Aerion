@@ -8,7 +8,7 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -31,7 +31,9 @@ fn make_test_tls_material() -> Result<(ServerTlsMaterial, String)> {
 
 #[test]
 fn flux_mihomo_yaml_parses_default_and_manual_channels() -> Result<()> {
-    let yaml = r#"
+    let (_, pub_tcp) = generate_flux_x25519_keypair()?;
+    let (_, pub_quic) = generate_flux_x25519_keypair()?;
+    let yaml = format!(r#"
 proxies:
   - name: FluxAuto
     type: flux
@@ -50,6 +52,7 @@ proxies:
     password: user-secret-token
     ip-strategy: dual
     standby-channels: 3
+    channel-max-mbps: 35
     rotation-interval-sec: 120
     rotation-bytes-mb: 64
     channels:
@@ -58,7 +61,7 @@ proxies:
         ports: "443"
         ip-version: ipv4
         security: obfs
-        obfs-key: tcp-v4-channel-secret
+        public-key: {pub_tcp}
         role: primary
         weight: 100
       - id: ws-cdn
@@ -75,10 +78,10 @@ proxies:
         ports: "21000-21002"
         transport: udp
         security: obfs
-        obfs-key: obfs-channel-secret
+        public-key: {pub_quic}
         role: backup
         weight: 60
-"#;
+"#);
 
     let cfg: MihomoConfig = serde_yaml::from_str(&yaml)?;
     let listen: SocketAddr = "127.0.0.1:1080".parse()?;
@@ -87,6 +90,7 @@ proxies:
         panic!("expected Flux client config for FluxAuto");
     };
     assert_eq!(auto_cfg.options.ip_strategy, FluxIpStrategy::Latency);
+    assert_eq!(auto_cfg.options.channel_max_mbps, DEFAULT_CHANNEL_MAX_MBPS);
     assert_eq!(auto_cfg.channels.len(), 2);
     assert_eq!(auto_cfg.channels[0].id, "tcp-v4");
     assert_eq!(auto_cfg.channels[0].transport, FluxTransportKind::Tcp);
@@ -111,6 +115,7 @@ proxies:
         panic!("expected Flux client config for FluxManual");
     };
     assert_eq!(manual_cfg.options.standby_channels, 3);
+    assert_eq!(manual_cfg.options.channel_max_mbps, 35);
     assert_eq!(manual_cfg.channels.len(), 3);
     assert_eq!(manual_cfg.channels[0].security, FluxSecurityMode::Obfs);
     assert_eq!(manual_cfg.channels[1].transport, FluxTransportKind::Http);
@@ -146,6 +151,8 @@ proxies:
 #[tokio::test]
 async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> Result<()> {
     let (tls_material, cert_pem) = make_test_tls_material()?;
+    let (ws_priv, ws_pub) = generate_flux_x25519_keypair()?;
+    let (quic_priv, quic_pub) = generate_flux_x25519_keypair()?;
 
     // Target TCP echo server
     let tcp_echo = TcpListener::bind("127.0.0.1:0").await?;
@@ -209,7 +216,7 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
                 security: FluxSecurityMode::Tls,
                 cert_mode: FluxCertMode::Inherit,
                 tls_material: Some(tls_material),
-                obfs_key: None,
+                private_key: None,
             },
             FluxChannelServerConfig {
                 id: "srv-ws-obfs".to_string(),
@@ -223,7 +230,7 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
                 security: FluxSecurityMode::Obfs,
                 cert_mode: FluxCertMode::OriginPlain,
                 tls_material: None,
-                obfs_key: Some("flux-obfs-shared-secret".to_string()),
+                private_key: Some(ws_priv),
             },
             FluxChannelServerConfig {
                 id: "srv-quic-obfs".to_string(),
@@ -237,7 +244,7 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
                 security: FluxSecurityMode::Obfs,
                 cert_mode: FluxCertMode::Inherit,
                 tls_material: None,
-                obfs_key: Some("flux-quic-shared-secret".to_string()),
+                private_key: Some(quic_priv),
             },
         ],
     };
@@ -260,6 +267,7 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
         options: FluxOptions {
             ip_strategy: FluxIpStrategy::Dual,
             standby_channels: 2,
+            channel_max_mbps: DEFAULT_CHANNEL_MAX_MBPS,
             rotation_interval_sec: 180,
             rotation_bytes_mb: 96,
         },
@@ -284,7 +292,8 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
                 ca_cert_paths: Vec::new(),
                 ca_certificates: vec![cert_pem],
                 pinned_cert_sha256: Vec::new(),
-                obfs_key: None,
+                public_key: None,
+                tls_binding: true,
                 role: FluxChannelRole::Primary,
                 weight: 100,
             },
@@ -308,7 +317,8 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
                 ca_cert_paths: Vec::new(),
                 ca_certificates: Vec::new(),
                 pinned_cert_sha256: Vec::new(),
-                obfs_key: Some("flux-obfs-shared-secret".to_string()),
+                public_key: Some(ws_pub),
+                tls_binding: false,
                 role: FluxChannelRole::Primary,
                 weight: 90,
             },
@@ -332,7 +342,8 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
                 ca_cert_paths: Vec::new(),
                 ca_certificates: Vec::new(),
                 pinned_cert_sha256: Vec::new(),
-                obfs_key: Some("flux-quic-shared-secret".to_string()),
+                public_key: Some(quic_pub),
+                tls_binding: false,
                 role: FluxChannelRole::Primary,
                 weight: 95,
             },
@@ -386,6 +397,8 @@ async fn flux_multi_channel_shares_single_core_session_and_relays_tcp_udp() -> R
 
 #[tokio::test]
 async fn flux_hot_stream_migration_survives_mid_transfer_channel_cut() -> Result<()> {
+    let (tcp_priv, tcp_pub) = generate_flux_x25519_keypair()?;
+    let (quic_priv, quic_pub) = generate_flux_x25519_keypair()?;
     // Target TCP echo server that keeps connection open across multiple bursts
     let target_listener = TcpListener::bind("127.0.0.1:0").await?;
     let target_addr = target_listener.local_addr()?;
@@ -431,7 +444,7 @@ async fn flux_hot_stream_migration_survives_mid_transfer_channel_cut() -> Result
                 security: FluxSecurityMode::Obfs,
                 cert_mode: FluxCertMode::Inherit,
                 tls_material: None,
-                obfs_key: Some("primary-tcp-obfs-key".to_string()),
+                private_key: Some(tcp_priv),
             },
             FluxChannelServerConfig {
                 id: "backup-quic".to_string(),
@@ -445,7 +458,7 @@ async fn flux_hot_stream_migration_survives_mid_transfer_channel_cut() -> Result
                 security: FluxSecurityMode::Obfs,
                 cert_mode: FluxCertMode::Inherit,
                 tls_material: None,
-                obfs_key: Some("backup-quic-obfs-key".to_string()),
+                private_key: Some(quic_priv),
             },
         ],
     };
@@ -483,6 +496,7 @@ async fn flux_hot_stream_migration_survives_mid_transfer_channel_cut() -> Result
         options: FluxOptions {
             ip_strategy: FluxIpStrategy::Dual,
             standby_channels: 1,
+            channel_max_mbps: DEFAULT_CHANNEL_MAX_MBPS,
             rotation_interval_sec: 300,
             rotation_bytes_mb: 128,
         },
@@ -507,7 +521,8 @@ async fn flux_hot_stream_migration_survives_mid_transfer_channel_cut() -> Result
                 ca_cert_paths: Vec::new(),
                 ca_certificates: Vec::new(),
                 pinned_cert_sha256: Vec::new(),
-                obfs_key: Some("primary-tcp-obfs-key".to_string()),
+                public_key: Some(tcp_pub),
+                tls_binding: false,
                 role: FluxChannelRole::Primary,
                 weight: 100,
             },
@@ -531,7 +546,8 @@ async fn flux_hot_stream_migration_survives_mid_transfer_channel_cut() -> Result
                 ca_cert_paths: Vec::new(),
                 ca_certificates: Vec::new(),
                 pinned_cert_sha256: Vec::new(),
-                obfs_key: Some("backup-quic-obfs-key".to_string()),
+                public_key: Some(quic_pub),
+                tls_binding: false,
                 role: FluxChannelRole::Backup,
                 weight: 80,
             },
@@ -590,7 +606,10 @@ async fn flux_hot_stream_migration_survives_mid_transfer_channel_cut() -> Result
 
 #[tokio::test]
 async fn flux_latency_strategy_and_udp_relay_role_route_cleanly() -> Result<()> {
-    let yaml = r#"
+    let (tcp_priv, tcp_pub) = generate_flux_x25519_keypair()?;
+    let (udp_priv, udp_pub) = generate_flux_x25519_keypair()?;
+    let (_, udp_eq_pub) = generate_flux_x25519_keypair()?;
+    let yaml = format!(r#"
 proxies:
   - name: FluxPerChannel
     type: flux
@@ -603,7 +622,7 @@ proxies:
       - id: tcp-v4
         transport: tcp
         ip-version: ipv4
-        obfs-key: chan-v4-secret
+        public-key: {tcp_pub}
         role: primary
       - id: tcp-v6
         transport: tcp
@@ -614,14 +633,14 @@ proxies:
       - id: udp-dedicated
         transport: udp
         ports: 21000
-        obfs-key: chan-udp-secret
+        public-key: {udp_pub}
         role: udp_relay
       - id: udp-equal
         transport: udp
         ports: 21001
-        obfs-key: chan-udp-equal
+        public-key: {udp_eq_pub}
         role: equal
-"#;
+"#);
     let cfg: MihomoConfig = serde_yaml::from_str(&yaml)?;
     let listen: SocketAddr = "127.0.0.1:1080".parse()?;
     let MihomoClientConfig::Flux(parsed) = cfg.resolved_proxy_config("FluxPerChannel", listen)?
@@ -655,7 +674,7 @@ proxies:
                     security: FluxSecurityMode::Obfs,
                     cert_mode: FluxCertMode::Inherit,
                     tls_material: None,
-                    obfs_key: Some("tcp-chan-key".to_string()),
+                    private_key: Some(tcp_priv),
                 },
                 FluxChannelServerConfig {
                     id: "udp-relay".to_string(),
@@ -669,7 +688,7 @@ proxies:
                     security: FluxSecurityMode::Obfs,
                     cert_mode: FluxCertMode::Inherit,
                     tls_material: None,
-                    obfs_key: Some("udp-chan-key".to_string()),
+                    private_key: Some(udp_priv),
                 },
             ],
         },
@@ -691,14 +710,14 @@ proxies:
                     "id": "tcp-main",
                     "transport": "tcp",
                     "ports": tcp_port,
-                    "obfs-key": "tcp-chan-key",
+                    "public-key": tcp_pub,
                     "role": "primary"
                 },
                 {
                     "id": "udp-relay",
                     "transport": "udp",
                     "ports": udp_port,
-                    "obfs-key": "udp-chan-key",
+                    "public-key": udp_pub,
                     "role": "udp_relay"
                 }
             ]
@@ -719,5 +738,453 @@ proxies:
     pool.shutdown_all();
     running.stop();
     let _ = running.wait().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn flux_obfs_rejects_wrong_server_key_and_udp_tamper() -> Result<()> {
+    let (srv_priv, srv_pub) = generate_flux_x25519_keypair()?;
+    let (_, wrong_pub) = generate_flux_x25519_keypair()?;
+    let core = ProxyCore::new(vec![CoreUser::password("u1", "secret-user")])?;
+    let srv = start_flux_server_with_core(
+        FluxServerConfig {
+            key: String::new(),
+            users: Vec::new(),
+            udp: true,
+            listeners: vec![
+                FluxChannelServerConfig {
+                    id: "tcp-obfs".into(),
+                    listen_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    ports: vec![0],
+                    transport: FluxTransportKind::Tcp,
+                    http_mode: FluxHttpMode::Ws,
+                    http_host: None,
+                    http_path: "/".into(),
+                    http_headers: BTreeMap::new(),
+                    security: FluxSecurityMode::Obfs,
+                    cert_mode: FluxCertMode::Inherit,
+                    tls_material: None,
+                    private_key: Some(srv_priv.clone()),
+                },
+                FluxChannelServerConfig {
+                    id: "udp-obfs".into(),
+                    listen_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    ports: vec![0],
+                    transport: FluxTransportKind::Udp,
+                    http_mode: FluxHttpMode::Ws,
+                    http_host: None,
+                    http_path: "/".into(),
+                    http_headers: BTreeMap::new(),
+                    security: FluxSecurityMode::Obfs,
+                    cert_mode: FluxCertMode::Inherit,
+                    tls_material: None,
+                    private_key: Some(srv_priv),
+                },
+            ],
+        },
+        core,
+    )?;
+    let tcp_addr = srv.tcp_addrs()[0];
+    let udp_addr = srv.udp_addrs()[0];
+
+    let bad_tcp = transport::connect_client_channel(
+        &FluxChannelClientConfig {
+            id: "tcp-bad".into(),
+            server_host: "127.0.0.1".into(),
+            ports: vec![tcp_addr.port()],
+            ip_version: "ipv4".into(),
+            resolved_v4: Vec::new(),
+            resolved_v6: Vec::new(),
+            transport: FluxTransportKind::Tcp,
+            http_mode: FluxHttpMode::Ws,
+            http_host: None,
+            http_path: "/".into(),
+            http_headers: BTreeMap::new(),
+            security: FluxSecurityMode::Obfs,
+            sni: "localhost".into(),
+            alpn: Vec::new(),
+            fingerprint: None,
+            insecure: false,
+            ca_cert_paths: Vec::new(),
+            ca_certificates: Vec::new(),
+            pinned_cert_sha256: Vec::new(),
+            public_key: Some(wrong_pub.clone()),
+            tls_binding: false,
+            role: FluxChannelRole::Primary,
+            weight: 100,
+        },
+        tcp_addr,
+    )
+    .await;
+    assert!(bad_tcp.is_err(), "wrong X25519 public key must fail TCP obfs handshake");
+
+    // Valid public key on UDP succeeds, wrong key is dropped silently until timeout
+    let good_udp = tokio::time::timeout(
+        Duration::from_secs(3),
+        transport::connect_client_channel(
+            &FluxChannelClientConfig {
+                id: "udp-good".into(),
+                server_host: "127.0.0.1".into(),
+                ports: vec![udp_addr.port()],
+                ip_version: "ipv4".into(),
+                resolved_v4: Vec::new(),
+                resolved_v6: Vec::new(),
+                transport: FluxTransportKind::Udp,
+                http_mode: FluxHttpMode::Ws,
+                http_host: None,
+                http_path: "/".into(),
+                http_headers: BTreeMap::new(),
+                security: FluxSecurityMode::Obfs,
+                sni: "localhost".into(),
+                alpn: Vec::new(),
+                fingerprint: None,
+                insecure: false,
+                ca_cert_paths: Vec::new(),
+                ca_certificates: Vec::new(),
+                pinned_cert_sha256: Vec::new(),
+                public_key: Some(srv_pub),
+                tls_binding: false,
+                role: FluxChannelRole::Primary,
+                weight: 100,
+            },
+            udp_addr,
+        ),
+    )
+    .await?;
+    assert!(good_udp.is_ok());
+
+    let bad_udp = tokio::time::timeout(
+        Duration::from_millis(600),
+        transport::connect_client_channel(
+            &FluxChannelClientConfig {
+                id: "udp-bad".into(),
+                server_host: "127.0.0.1".into(),
+                ports: vec![udp_addr.port()],
+                ip_version: "ipv4".into(),
+                resolved_v4: Vec::new(),
+                resolved_v6: Vec::new(),
+                transport: FluxTransportKind::Udp,
+                http_mode: FluxHttpMode::Ws,
+                http_host: None,
+                http_path: "/".into(),
+                http_headers: BTreeMap::new(),
+                security: FluxSecurityMode::Obfs,
+                sni: "localhost".into(),
+                alpn: Vec::new(),
+                fingerprint: None,
+                insecure: false,
+                ca_cert_paths: Vec::new(),
+                ca_certificates: Vec::new(),
+                pinned_cert_sha256: Vec::new(),
+                public_key: Some(wrong_pub),
+                tls_binding: false,
+                role: FluxChannelRole::Primary,
+                weight: 100,
+            },
+            udp_addr,
+        ),
+    )
+    .await;
+    assert!(bad_udp.is_err(), "wrong X25519 public key must be silently dropped on UDP");
+
+    srv.stop();
+    let _ = srv.wait().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn flux_muxes_under_speed_budget_and_scales_out_parallel_channels_on_overflow() -> Result<()>
+{
+    let (tcp_priv, tcp_pub) = generate_flux_x25519_keypair()?;
+
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let echo_addr = echo_listener.local_addr()?;
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = echo_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 32 * 1024];
+                loop {
+                    let Ok(n) = s.read(&mut buf).await else {
+                        break;
+                    };
+                    if n == 0 {
+                        let _ = s.shutdown().await;
+                        break;
+                    }
+                    if s.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let core = ProxyCore::new(vec![
+        CoreUser::password("u-mux", "mux-secret"),
+        CoreUser::password("u-scale", "scale-secret"),
+    ])?;
+    let srv = start_flux_server_with_core(
+        FluxServerConfig {
+            key: String::new(),
+            users: Vec::new(),
+            udp: false,
+            listeners: vec![FluxChannelServerConfig {
+                id: "tcp-obfs".into(),
+                listen_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                ports: vec![0],
+                transport: FluxTransportKind::Tcp,
+                http_mode: FluxHttpMode::Ws,
+                http_host: None,
+                http_path: "/".into(),
+                http_headers: BTreeMap::new(),
+                security: FluxSecurityMode::Obfs,
+                cert_mode: FluxCertMode::Inherit,
+                tls_material: None,
+                private_key: Some(tcp_priv),
+            }],
+        },
+        core.clone(),
+    )?;
+    let srv_port = srv.tcp_addrs()[0].port();
+
+    let make_channel = || FluxChannelClientConfig {
+        id: "tcp-obfs".into(),
+        server_host: "127.0.0.1".into(),
+        ports: vec![srv_port],
+        ip_version: "ipv4".into(),
+        resolved_v4: Vec::new(),
+        resolved_v6: Vec::new(),
+        transport: FluxTransportKind::Tcp,
+        http_mode: FluxHttpMode::Ws,
+        http_host: None,
+        http_path: "/".into(),
+        http_headers: BTreeMap::new(),
+        security: FluxSecurityMode::Obfs,
+        sni: "localhost".into(),
+        alpn: Vec::new(),
+        fingerprint: None,
+        insecure: false,
+        ca_cert_paths: Vec::new(),
+        ca_certificates: Vec::new(),
+        pinned_cert_sha256: Vec::new(),
+        public_key: Some(tcp_pub.clone()),
+        tls_binding: false,
+        role: FluxChannelRole::Primary,
+        weight: 100,
+    };
+
+    // 1. Under-budget mux packing: 4 concurrent low-speed streams stay muxed on 1 outer channel
+    let mux_socks = TcpListener::bind("127.0.0.1:0").await?;
+    let mux_socks_addr = mux_socks.local_addr()?;
+    let mux_pool = FluxClientPool::new(FluxClientConfig {
+        listen: mux_socks_addr,
+        server_host: "127.0.0.1".into(),
+        server_port: srv_port,
+        key: "mux-secret".into(),
+        udp: false,
+        options: FluxOptions {
+            ip_strategy: FluxIpStrategy::Dual,
+            standby_channels: 2,
+            channel_max_mbps: 50,
+            rotation_interval_sec: 300,
+            rotation_bytes_mb: 128,
+        },
+        channels: vec![make_channel()],
+    })?;
+    let mux_stop = ListenerStopToken::new();
+    let mux_stop_bg = mux_stop.clone();
+    let mux_pool_bg = mux_pool.clone();
+    let mux_task = tokio::spawn(async move {
+        client::run_flux_client_listener_with_pool_until(mux_socks, mux_pool_bg, None, mux_stop_bg)
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(mux_pool.usable_channels().len(), 3);
+
+    let mut open_streams = Vec::new();
+    for idx in 0..4u8 {
+        let mut s = socks::connect_tcp(mux_socks_addr, &ProxyTarget::Ip(echo_addr)).await?;
+        let payload = vec![0x20 + idx; 4096];
+        s.write_all(&payload).await?;
+        let mut echoed = vec![0u8; payload.len()];
+        s.read_exact(&mut echoed).await?;
+        assert_eq!(echoed, payload);
+        open_streams.push(s);
+    }
+
+    let mux_channels = mux_pool.usable_channels();
+    let active_carriers = mux_channels
+        .iter()
+        .filter(|ch| ch.active_stream_count() > 0)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        active_carriers.len(),
+        1,
+        "expected all 4 low-speed streams muxed on 1 outer channel"
+    );
+    assert_eq!(active_carriers[0].active_stream_count(), 4);
+    assert_eq!(
+        mux_channels
+            .iter()
+            .filter(|ch| ch.total_bytes_transferred() > 0)
+            .count(),
+        1
+    );
+
+    for mut s in open_streams {
+        let _ = s.shutdown().await;
+    }
+    mux_stop.stop();
+    let _ = mux_task.await;
+
+    // 2. Overflow & simultaneous burst rebalance: 3 streams exceeding 1 Mbps scale out & split
+    let scale_socks = TcpListener::bind("127.0.0.1:0").await?;
+    let scale_socks_addr = scale_socks.local_addr()?;
+    let scale_pool = FluxClientPool::new(FluxClientConfig {
+        listen: scale_socks_addr,
+        server_host: "127.0.0.1".into(),
+        server_port: srv_port,
+        key: "scale-secret".into(),
+        udp: false,
+        options: FluxOptions {
+            ip_strategy: FluxIpStrategy::Dual,
+            standby_channels: 0,
+            channel_max_mbps: 1,
+            rotation_interval_sec: 300,
+            rotation_bytes_mb: 128,
+        },
+        channels: vec![make_channel()],
+    })?;
+    let scale_stop = ListenerStopToken::new();
+    let scale_stop_bg = scale_stop.clone();
+    let scale_pool_bg = scale_pool.clone();
+    let scale_task = tokio::spawn(async move {
+        client::run_flux_client_listener_with_pool_until(
+            scale_socks,
+            scale_pool_bg,
+            None,
+            scale_stop_bg,
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(scale_pool.usable_channels().len(), 1);
+
+    let mut workers = tokio::task::JoinSet::new();
+    for stream_idx in 0..3u8 {
+        workers.spawn(async move {
+            let mut s = socks::connect_tcp(scale_socks_addr, &ProxyTarget::Ip(echo_addr)).await?;
+            let chunk = vec![0xA0 + stream_idx; 16 * 1024];
+            let mut recv_buf = vec![0u8; chunk.len()];
+            for _ in 0..14 {
+                s.write_all(&chunk).await?;
+                s.read_exact(&mut recv_buf).await?;
+                assert_eq!(recv_buf, chunk);
+                tokio::time::sleep(Duration::from_millis(75)).await;
+            }
+            s.shutdown().await?;
+            Result::<()>::Ok(())
+        });
+    }
+    while let Some(joined) = workers.join_next().await {
+        joined??;
+    }
+
+    let scaled_channels = scale_pool.usable_channels();
+    assert!(
+        scaled_channels.len() >= 2,
+        "expected pool to auto-scale beyond 1 channel under >1 Mbps load, got {}",
+        scaled_channels.len()
+    );
+    let carrying_channels = scaled_channels
+        .iter()
+        .filter(|ch| ch.total_bytes_transferred() > 0)
+        .count();
+    assert!(
+        carrying_channels >= 2,
+        "expected simultaneous streams exceeding 1 Mbps to rebalance across >=2 outer channels, got {carrying_channels}"
+    );
+
+    scale_stop.stop();
+    let _ = scale_task.await;
+    srv.stop();
+    let _ = srv.wait().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn flux_origin_plain_http_works_with_tls_binding_disabled() -> Result<()> {
+    let core = ProxyCore::new(vec![CoreUser::password("u1", "origin-secret")])?;
+    let srv = start_flux_server_with_core(
+        FluxServerConfig {
+            key: String::new(),
+            users: Vec::new(),
+            udp: false,
+            listeners: vec![FluxChannelServerConfig {
+                id: "ws-origin-plain".into(),
+                listen_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                ports: vec![0],
+                transport: FluxTransportKind::Http,
+                http_mode: FluxHttpMode::Ws,
+                http_host: Some("cdn.example.com".into()),
+                http_path: "/ws".into(),
+                http_headers: BTreeMap::new(),
+                security: FluxSecurityMode::Tls,
+                cert_mode: FluxCertMode::OriginPlain,
+                tls_material: None,
+                private_key: None,
+            }],
+        },
+        core,
+    )?;
+    let port = srv.tcp_addrs()[0].port();
+    let target = TcpListener::bind("127.0.0.1:0").await?;
+    let target_addr = target.local_addr()?;
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = target.accept().await {
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        }
+    });
+
+    // Direct HTTP connection against OriginPlain (simulating CDN -> Origin) with tls_binding=false
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
+    let boxed = crate::vless_transport::apply_client_transport(
+        tcp,
+        &crate::vless_transport::VlessTransportConfig::websocket(
+            Some("/ws".into()),
+            Some("cdn.example.com".into()),
+            Vec::new(),
+        ),
+        "127.0.0.1",
+    )
+    .await?;
+    let (mut reader, mut writer, _) = transport::split_boxed_stream_with_binding(boxed, None);
+    let cred_hash = crate::protocol::password_hash("origin-secret");
+    let session_id = [4u8; 16];
+    let ephemeral = [5u8; 32];
+    let blind_key = auth::derive_blind_key(&[0; 32], &session_id, &ephemeral)?;
+    let auth_key = auth::handshake_key(&blind_key, &cred_hash, &[0; 32])?;
+    let mut hello = frame::FluxFrame::SessionHello {
+        session_id,
+        client_ephemeral_pub: ephemeral,
+        timestamp_secs: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        channel_id: "ws-origin-plain".into(),
+        blinded_credential: auth::xor_32(&cred_hash, &blind_key),
+        client_proof: [0; 32],
+    };
+    let proof = auth::client_proof(&auth_key, &hello)?;
+    if let frame::FluxFrame::SessionHello { client_proof, .. } = &mut hello {
+        *client_proof = proof;
+    }
+    writer.write_frame(&hello, true).await?;
+    let ok = reader.read_frame().await?;
+    assert!(matches!(ok, Some(frame::FluxFrame::SessionOk { status: 0, .. })));
+    let _ = target_addr;
+
+    srv.stop();
+    let _ = srv.wait().await;
     Ok(())
 }

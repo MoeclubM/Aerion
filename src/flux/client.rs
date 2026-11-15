@@ -1,7 +1,7 @@
 use super::auth::{self, derive_blind_key, handshake_key, xor_32};
 use super::config::{
     FluxChannelClientConfig, FluxChannelRole, FluxClientConfig, FluxIpStrategy, FluxSecurityMode,
-    FluxTransportKind,
+    FluxTransportKind, parse_flux_x25519_key,
 };
 use super::frame::{
     DEFAULT_STREAM_WINDOW_BYTES, FluxFrame, MAX_FLUX_CHUNK_LEN, RST_CLIENT_ABORT, RST_REMOTE_RESET,
@@ -28,6 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinSet;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 const MAX_UDP_SLICE_BYTES: usize = 1100;
 const CHANNEL_DIAL_TIMEOUT: Duration = Duration::from_secs(8);
@@ -37,6 +38,13 @@ const SILENT_PROBE_US: u64 = 600_000;
 const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(18);
 const WRITER_BATCH_MAX: usize = 64;
 const STREAM_EVENT_BURST_MAX: usize = 32;
+const MAX_AUTO_SCALE_CHANNELS: usize = 16;
+const MAX_UDP_RELAY_CHANNELS: usize = 4;
+const RATE_SAMPLE_MIN_US: u64 = 100_000;
+const RATE_IDLE_RESET_US: u64 = 600_000;
+const SHED_CHANNEL_COOLDOWN_US: u64 = 400_000;
+const STREAM_REBALANCE_COOLDOWN: Duration = Duration::from_secs(3);
+const IDLE_CHANNEL_SCALE_IN_AGE: Duration = Duration::from_secs(15);
 
 pub async fn run_flux_client(config: FluxClientConfig) -> Result<()> {
     let listener = TcpListener::bind(config.listen)
@@ -68,6 +76,15 @@ pub async fn run_flux_client_listener_with_core_until(
 ) -> Result<()> {
     config.validate()?;
     let pool = FluxClientPool::new(config)?;
+    run_flux_client_listener_with_pool_until(listener, pool, core, stop).await
+}
+
+pub(crate) async fn run_flux_client_listener_with_pool_until(
+    listener: TcpListener,
+    pool: Arc<FluxClientPool>,
+    core: Option<ProxyCore>,
+    stop: ListenerStopToken,
+) -> Result<()> {
     let mut handlers = JoinSet::new();
     let bg_stop = pool.stop.clone();
     let bg_pool = pool.clone();
@@ -132,6 +149,7 @@ struct CandidateEndpoint {
 pub struct ClientChannelHandle {
     pub uid: u64,
     pub spec_idx: usize,
+    #[allow(dead_code)]
     pub spec_id: String,
     pub remote_addr: SocketAddr,
     pub transport: FluxTransportKind,
@@ -150,6 +168,12 @@ pub struct ClientChannelHandle {
     smoothed_rtt_ms: AtomicU64,
     degraded_strikes: AtomicUsize,
     bytes_transferred: AtomicU64,
+    last_rate_sample_us: AtomicU64,
+    cached_rate_bps: AtomicU64,
+    rate_state: StdMutex<(u64, u64, u64)>,
+    shed_tokens: AtomicUsize,
+    shed_notify: Notify,
+    last_shed_us: AtomicU64,
     throughput_sample: StdMutex<(Instant, u64, u64)>,
     throughput_degraded: AtomicBool,
     created_at: Instant,
@@ -179,7 +203,88 @@ impl ClientChannelHandle {
     }
 
     pub fn mark_draining(&self) {
-        self.draining.store(true, Ordering::Release);
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    fn try_drain_if_idle(&self) -> bool {
+        self.draining.store(true, Ordering::SeqCst);
+        if self.active_streams.load(Ordering::SeqCst) == 0 {
+            self.mark_dead();
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    pub fn active_stream_count(&self) -> usize {
+        self.active_streams.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn total_bytes_transferred(&self) -> u64 {
+        self.bytes_transferred.load(Ordering::Relaxed)
+    }
+
+    pub fn sample_rate_bps(&self, now_us: u64) -> u64 {
+        let total = self.bytes_transferred.load(Ordering::Relaxed);
+        let mut state = self.rate_state.lock().expect("Flux rate_state poisoned");
+        let elapsed_us = now_us.saturating_sub(state.0);
+        if elapsed_us < RATE_SAMPLE_MIN_US {
+            return state.2;
+        }
+        let delta_bytes = total.saturating_sub(state.1);
+        let inst_bps = delta_bytes.saturating_mul(1_000_000) / elapsed_us.max(1);
+        let prev = state.2;
+        let next = if delta_bytes == 0 && elapsed_us >= RATE_IDLE_RESET_US {
+            0
+        } else if inst_bps >= prev {
+            prev.saturating_add(inst_bps.saturating_mul(3)) / 4
+        } else {
+            let decayed = prev.saturating_mul(2).saturating_add(inst_bps) / 3;
+            if decayed < 16_000 { 0 } else { decayed }
+        };
+        *state = (now_us, total, next);
+        self.cached_rate_bps.store(next, Ordering::Relaxed);
+        self.last_rate_sample_us.store(now_us, Ordering::Relaxed);
+        next
+    }
+
+    pub fn current_rate_bps(&self, now_us: u64) -> u64 {
+        let last_us = self.last_rate_sample_us.load(Ordering::Relaxed);
+        if now_us.saturating_sub(last_us) >= RATE_SAMPLE_MIN_US {
+            self.sample_rate_bps(now_us)
+        } else {
+            self.cached_rate_bps.load(Ordering::Relaxed)
+        }
+    }
+
+    fn request_stream_shed(&self, now_us: u64) {
+        let prev = self.last_shed_us.load(Ordering::Relaxed);
+        if prev > 0 && now_us.saturating_sub(prev) < SHED_CHANNEL_COOLDOWN_US {
+            return;
+        }
+        if self.shed_tokens.load(Ordering::Relaxed) == 0 {
+            self.last_shed_us.store(now_us.max(1), Ordering::Relaxed);
+            self.shed_tokens.store(1, Ordering::Release);
+            self.shed_notify.notify_one();
+        }
+    }
+
+    async fn wait_shed_requested(&self) {
+        loop {
+            let notified = self.shed_notify.notified();
+            if self
+                .shed_tokens
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n > 0).then(|| n - 1)
+                })
+                .is_ok()
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub async fn wait_needs_migration(&self) {
@@ -387,24 +492,54 @@ impl FluxClientPool {
         self.started_at.elapsed().as_micros() as u64
     }
 
+    fn maybe_observe_channel_rate(&self, ch: &ClientChannelHandle, now_us: u64) {
+        if now_us.saturating_sub(ch.last_rate_sample_us.load(Ordering::Relaxed))
+            < RATE_SAMPLE_MIN_US
+        {
+            return;
+        }
+        let prev = ch.cached_rate_bps.load(Ordering::Relaxed);
+        let next = ch.sample_rate_bps(now_us);
+        if let Some(budget_bps) = self.config.options.channel_max_bytes_per_sec() {
+            let prewarm_bps = (budget_bps * 3 / 4).max(1);
+            if prev < prewarm_bps && next >= prewarm_bps {
+                self.warmer_wake.notify_one();
+            }
+        }
+    }
+
     fn target_warm_count(&self) -> usize {
         let base = 1 + self.config.options.standby_channels;
-        if self.config.options.standby_channels == 0 {
-            return 1;
-        }
-        let active_streams: usize = self
+        let Some(budget_bps) = self.config.options.channel_max_bytes_per_sec() else {
+            return base;
+        };
+        let now_us = self.now_micros();
+        let prewarm_bps = (budget_bps * 3 / 4).max(1);
+        let mut total_bps = 0u64;
+        let mut high_water_count = 0usize;
+        let has_non_udp = self.has_non_udp_relay_specs();
+        for ch in self
             .channels
             .lock()
             .expect("Flux client channels poisoned")
             .values()
-            .filter(|ch| ch.is_usable_for_new() && ch.role != FluxChannelRole::UdpRelay)
-            .map(|ch| ch.active_streams.load(Ordering::Relaxed))
-            .sum();
-        if active_streams >= 4 {
-            base.max(4)
-        } else {
-            base
+        {
+            if !ch.is_usable_for_new() || (has_non_udp && ch.role == FluxChannelRole::UdpRelay) {
+                continue;
+            }
+            let rate = ch.current_rate_bps(now_us);
+            total_bps = total_bps.saturating_add(rate);
+            if rate >= prewarm_bps {
+                high_water_count += 1;
+            }
         }
+        if high_water_count == 0 && total_bps < prewarm_bps {
+            return base;
+        }
+        let by_total = (total_bps / budget_bps) as usize + 1;
+        let active_needed = by_total.max(high_water_count + 1);
+        let desired = active_needed + self.config.options.standby_channels.min(2);
+        desired.clamp(base, MAX_AUTO_SCALE_CHANNELS.max(base))
     }
 
     fn has_non_udp_relay_specs(&self) -> bool {
@@ -465,7 +600,7 @@ impl FluxClientPool {
         Ok(out)
     }
 
-    fn usable_channels(&self) -> Vec<Arc<ClientChannelHandle>> {
+    pub(crate) fn usable_channels(&self) -> Vec<Arc<ClientChannelHandle>> {
         self.channels
             .lock()
             .expect("Flux client channels poisoned")
@@ -573,11 +708,25 @@ impl FluxClientPool {
 
     fn score_channel_for_stream(&self, ch: &ClientChannelHandle) -> i64 {
         let rtt = ch.rtt_ms() as i64;
-        let load_step = match self.config.options.ip_strategy {
-            FluxIpStrategy::Latency => 2,
-            _ => 12,
+        let active = ch.active_streams.load(Ordering::Relaxed);
+        let load = if let Some(budget_bps) = self.config.options.channel_max_bytes_per_sec() {
+            let rate = ch.current_rate_bps(self.now_micros());
+            if rate >= budget_bps {
+                let excess_pct =
+                    ((rate - budget_bps).saturating_mul(100) / budget_bps.max(1)) as i64;
+                10_000 + excess_pct.min(50_000) + (active as i64) * 20
+            } else if active > 0 && active < 64 {
+                -20 + (active as i64) / 8
+            } else {
+                (active as i64) / 8
+            }
+        } else {
+            let load_step = match self.config.options.ip_strategy {
+                FluxIpStrategy::Latency => 2,
+                _ => 6,
+            };
+            (active as i64) * load_step
         };
-        let load = (ch.active_streams.load(Ordering::Relaxed) as i64) * load_step;
         let weight_bonus = i64::from(ch.weight) / 10;
         let transport_bonus = match ch.transport {
             FluxTransportKind::Tcp | FluxTransportKind::Udp => 0,
@@ -613,28 +762,23 @@ impl FluxClientPool {
     }
 
     pub(crate) async fn pick_channel_for_new_stream(self: &Arc<Self>) -> Result<StreamSlotGuard> {
-        let candidates = self.new_stream_candidates();
+        let mut candidates = self.new_stream_candidates();
         let needs_stream_warm = candidates.is_empty()
             || (self.has_non_udp_relay_specs()
                 && candidates
                     .iter()
                     .all(|ch| ch.role == FluxChannelRole::UdpRelay));
-        if !needs_stream_warm
-            && let Some(best) = candidates
-                .into_iter()
-                .min_by_key(|ch| self.score_channel_for_stream(ch))
-        {
-            let slot = StreamSlotGuard::acquire(best);
-            self.warmer_wake.notify_one();
-            return Ok(slot);
+        if !needs_stream_warm {
+            candidates.sort_by_key(|ch| self.score_channel_for_stream(ch));
+            if let Some(slot) = candidates.into_iter().find_map(StreamSlotGuard::try_acquire) {
+                self.warmer_wake.notify_one();
+                return Ok(slot);
+            }
         }
         let warm_res = self.ensure_usable_stream_channel(None).await;
-        if let Some(best) = self
-            .new_stream_candidates()
-            .into_iter()
-            .min_by_key(|ch| self.score_channel_for_stream(ch))
-        {
-            let slot = StreamSlotGuard::acquire(best);
+        let mut refreshed = self.new_stream_candidates();
+        refreshed.sort_by_key(|ch| self.score_channel_for_stream(ch));
+        if let Some(slot) = refreshed.into_iter().find_map(StreamSlotGuard::try_acquire) {
             self.warmer_wake.notify_one();
             return Ok(slot);
         }
@@ -642,19 +786,52 @@ impl FluxClientPool {
         bail!("no healthy Flux channel available")
     }
 
+    fn pick_rebalance_channel(
+        &self,
+        current: &ClientChannelHandle,
+    ) -> Option<Arc<ClientChannelHandle>> {
+        let budget_bps = self.config.options.channel_max_bytes_per_sec()?;
+        let receiver_cap_bps = (budget_bps * 3 / 4).max(1);
+        let now_us = self.now_micros();
+        self.new_stream_candidates()
+            .into_iter()
+            .filter(|ch| {
+                ch.uid != current.uid
+                    && ch.role.is_primary_tier()
+                    && ch.current_rate_bps(now_us) < receiver_cap_bps
+            })
+            .min_by_key(|ch| self.score_channel_for_stream(ch))
+    }
+
+    fn udp_relay_needs_warm(&self, usable: &[Arc<ClientChannelHandle>], now_us: u64) -> bool {
+        let relays = usable
+            .iter()
+            .filter(|ch| ch.role == FluxChannelRole::UdpRelay)
+            .collect::<Vec<_>>();
+        if relays.is_empty() {
+            return true;
+        }
+        let Some(budget_bps) = self.config.options.channel_max_bytes_per_sec() else {
+            return false;
+        };
+        let prewarm_bps = (budget_bps * 3 / 4).max(1);
+        relays.len() < MAX_UDP_RELAY_CHANNELS
+            && relays.iter().all(|ch| ch.current_rate_bps(now_us) >= prewarm_bps)
+    }
+
     async fn maybe_warm_udp_relay_channel(self: &Arc<Self>, has_fallback_usable: bool) {
         if !self.has_udp_relay_specs() {
             return;
         }
-        if self
-            .usable_channels()
-            .iter()
-            .any(|ch| ch.role == FluxChannelRole::UdpRelay)
-        {
+        let now_us = self.now_micros();
+        let initial_usable = self.usable_channels();
+        if !self.udp_relay_needs_warm(&initial_usable, now_us) {
             return;
         }
-        let now_us = self.now_micros();
-        if has_fallback_usable {
+        let has_existing_relay = initial_usable
+            .iter()
+            .any(|ch| ch.role == FluxChannelRole::UdpRelay);
+        if has_fallback_usable || has_existing_relay {
             let prev = self.last_udp_relay_dial_micros.load(Ordering::Relaxed);
             if prev > 0 && now_us.saturating_sub(prev) < 2_000_000 {
                 return;
@@ -664,12 +841,8 @@ impl FluxClientPool {
             .store(now_us.max(1), Ordering::Relaxed);
 
         let _guard = self.dial_mutex.lock().await;
-        if self.stop.is_stopped()
-            || self
-                .usable_channels()
-                .iter()
-                .any(|ch| ch.role == FluxChannelRole::UdpRelay)
-        {
+        let active_usable = self.usable_channels();
+        if self.stop.is_stopped() || !self.udp_relay_needs_warm(&active_usable, self.now_micros()) {
             return;
         }
         let Ok(candidates) = self.discover_candidates().await else {
@@ -689,12 +862,16 @@ impl FluxClientPool {
             })
             .min_by_key(|cand| {
                 let spec = &self.config.channels[cand.spec_idx];
+                let existing = active_usable
+                    .iter()
+                    .filter(|ch| ch.spec_idx == cand.spec_idx && ch.remote_addr == cand.addr)
+                    .count() as i64;
                 let ip_pen = match (self.config.options.ip_strategy, cand.addr.is_ipv6()) {
                     (FluxIpStrategy::PreferV4, true) => 15i64,
                     (FluxIpStrategy::PreferV6, false) => 15i64,
                     _ => 0i64,
                 };
-                ip_pen - i64::from(spec.weight) / 10
+                existing * 10 + ip_pen - i64::from(spec.weight) / 10
             });
         if let Some(cand) = best {
             match self.dial_and_register_channel(cand.clone()).await {
@@ -725,12 +902,19 @@ impl FluxClientPool {
 
     pub(crate) async fn pick_channel_for_udp(self: &Arc<Self>) -> Result<Arc<ClientChannelHandle>> {
         let usable = self.usable_channels();
+        let now_us = self.now_micros();
         if let Some(best_relay) = usable
             .iter()
             .filter(|ch| ch.role == FluxChannelRole::UdpRelay)
             .min_by_key(|ch| self.score_channel_for_udp(ch))
             .cloned()
         {
+            if self.udp_relay_needs_warm(&usable, now_us) {
+                let pool = self.clone();
+                tokio::spawn(async move {
+                    pool.maybe_warm_udp_relay_channel(true).await;
+                });
+            }
             return Ok(best_relay);
         }
         self.maybe_warm_udp_relay_channel(!usable.is_empty()).await;
@@ -929,21 +1113,36 @@ impl FluxClientPool {
         }
 
         if !active.is_empty() && active.len() < target {
-            let primary_pool = healthy_candidates
-                .into_iter()
+            let now_scale = Instant::now();
+            let mut scale_pool = healthy_candidates
+                .iter()
                 .filter(|cand| {
                     self.config.channels[cand.spec_idx].role.is_primary_tier()
-                        && !self
+                        && self
                             .failed_endpoints
                             .lock()
                             .expect("Flux failures poisoned")
-                            .contains_key(&(cand.spec_idx, cand.addr))
+                            .get(&(cand.spec_idx, cand.addr))
+                            .is_none_or(|(until, _)| *until <= now_scale)
                 })
+                .cloned()
                 .collect::<Vec<_>>();
-            if !primary_pool.is_empty() {
+            if scale_pool.is_empty() {
+                scale_pool = healthy_candidates
+                    .into_iter()
+                    .filter(|cand| {
+                        self.failed_endpoints
+                            .lock()
+                            .expect("Flux failures poisoned")
+                            .get(&(cand.spec_idx, cand.addr))
+                            .is_none_or(|(until, _)| *until <= now_scale)
+                    })
+                    .collect();
+            }
+            if !scale_pool.is_empty() {
                 let mut in_flight: HashMap<(usize, SocketAddr), usize> = HashMap::new();
                 while active.len() + dial_set.len() < target {
-                    let cand = primary_pool
+                    let cand = scale_pool
                         .iter()
                         .min_by_key(|cand| {
                             let spec = &self.config.channels[cand.spec_idx];
@@ -996,7 +1195,13 @@ impl FluxClientPool {
                 } {
                     if let Ok((cand, res)) = next {
                         match res {
-                            Ok(ch) => active.push(ch),
+                            Ok(ch) => {
+                                self.failed_endpoints
+                                    .lock()
+                                    .expect("Flux failures poisoned")
+                                    .remove(&(cand.spec_idx, cand.addr));
+                                active.push(ch);
+                            }
                             Err(err) => {
                                 let mut failed = self
                                     .failed_endpoints
@@ -1035,17 +1240,29 @@ impl FluxClientPool {
         .await
         .with_context(|| format!("Flux dial timed out for {} ({})", spec.id, cand.addr))??;
 
-        let mut eph_bytes = [0u8; 32];
-        getrandom::fill(&mut eph_bytes).map_err(|e| anyhow::anyhow!("Flux hello random: {e}"))?;
+        let (client_ephemeral_pub, static_ss) = if let Some(pub_str) = spec.public_key.as_deref() {
+            let server_pub = parse_flux_x25519_key(pub_str)?;
+            let mut priv_bytes = [0u8; 32];
+            getrandom::fill(&mut priv_bytes)
+                .map_err(|e| anyhow::anyhow!("Flux hello random: {e}"))?;
+            let eph_secret = StaticSecret::from(priv_bytes);
+            let eph_pub = PublicKey::from(&eph_secret).to_bytes();
+            let ss = eph_secret.diffie_hellman(&PublicKey::from(server_pub));
+            ensure!(
+                ss.was_contributory(),
+                "invalid Flux server X25519 public key"
+            );
+            (eph_pub, Some(*ss.as_bytes()))
+        } else {
+            let mut eph_bytes = [0u8; 32];
+            getrandom::fill(&mut eph_bytes)
+                .map_err(|e| anyhow::anyhow!("Flux hello random: {e}"))?;
+            (eph_bytes, None)
+        };
 
         let client_binding = guard.channel_binding()?;
-        let secret = spec
-            .obfs_key
-            .as_deref()
-            .map(str::as_bytes)
-            .unwrap_or(&client_binding);
-        let blind_key = derive_blind_key(secret, &self.session_id, &eph_bytes)?;
-        let client_ephemeral_pub = eph_bytes;
+        let secret = static_ss.unwrap_or(client_binding);
+        let blind_key = derive_blind_key(&secret, &self.session_id, &client_ephemeral_pub)?;
 
         let blinded_credential = xor_32(&self.cred_hash, &blind_key);
         let auth_key = handshake_key(&blind_key, &self.cred_hash, &client_binding)?;
@@ -1100,6 +1317,7 @@ impl FluxClientPool {
 
         let rotate_after = jitter_duration_secs(self.config.options.rotation_interval_sec, 300);
         let rotate_bytes_limit = jitter_bytes_mb(self.config.options.rotation_bytes_mb, 250);
+        let init_now_us = self.now_micros();
 
         let handle = Arc::new(ClientChannelHandle {
             uid,
@@ -1116,12 +1334,18 @@ impl FluxClientPool {
             draining: AtomicBool::new(false),
             state_notify: Notify::new(),
             active_streams: AtomicUsize::new(0),
-            last_rx_micros: AtomicU64::new(self.now_micros()),
+            last_rx_micros: AtomicU64::new(init_now_us),
             pending_ping: StdMutex::new(None),
             baseline_rtt_ms: AtomicU64::new(init_rtt_ms),
             smoothed_rtt_ms: AtomicU64::new(init_rtt_ms),
             degraded_strikes: AtomicUsize::new(0),
             bytes_transferred: AtomicU64::new(0),
+            last_rate_sample_us: AtomicU64::new(init_now_us),
+            cached_rate_bps: AtomicU64::new(0),
+            rate_state: StdMutex::new((init_now_us, 0, 0)),
+            shed_tokens: AtomicUsize::new(0),
+            shed_notify: Notify::new(),
+            last_shed_us: AtomicU64::new(0),
             throughput_sample: StdMutex::new((Instant::now(), 0, 0)),
             throughput_degraded: AtomicBool::new(false),
             created_at: Instant::now(),
@@ -1187,6 +1411,7 @@ impl FluxClientPool {
                 _ = warming.join_next(), if !warming.is_empty() => continue,
                 _ = self.warmer_wake.notified() => {},
                 _ = tick.tick() => {
+                    self.refresh_rates_and_rebalance();
                     self.expire_unanswered_probes();
                     self.probe_silent_active_channels();
                     if last_probe.elapsed() >= PROBE_INTERVAL {
@@ -1203,6 +1428,49 @@ impl FluxClientPool {
                     let pool = self.clone();
                     warming.spawn(async move { pool.warm_channels_now().await });
                 }
+            }
+        }
+    }
+
+    fn refresh_rates_and_rebalance(&self) {
+        let now_us = self.now_micros();
+        let snapshot = self
+            .channels
+            .lock()
+            .expect("Flux client channels poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for ch in &snapshot {
+            if !ch.is_dead() {
+                ch.sample_rate_bps(now_us);
+            }
+        }
+        let Some(budget_bps) = self.config.options.channel_max_bytes_per_sec() else {
+            return;
+        };
+        let overload_bps = budget_bps.saturating_mul(11) / 10;
+        let receiver_cap_bps = (budget_bps * 3 / 4).max(1);
+        for ch in &snapshot {
+            if !ch.is_usable_for_new() || ch.role == FluxChannelRole::UdpRelay {
+                continue;
+            }
+            if ch.active_streams.load(Ordering::Relaxed) <= 1 {
+                continue;
+            }
+            if ch.current_rate_bps(now_us) <= overload_bps {
+                continue;
+            }
+            let has_underbudget_peer = snapshot.iter().any(|other| {
+                other.uid != ch.uid
+                    && other.is_usable_for_new()
+                    && other.role.is_primary_tier()
+                    && other.current_rate_bps(now_us) < receiver_cap_bps
+            });
+            if has_underbudget_peer {
+                ch.request_stream_shed(now_us);
+            } else {
+                self.warmer_wake.notify_one();
             }
         }
     }
@@ -1313,7 +1581,7 @@ impl FluxClientPool {
                 *sample = (Instant::now(), total, sample.2.max(rate));
             }
             if ch.is_draining() {
-                if ch.active_streams.load(Ordering::Relaxed) == 0 {
+                if ch.active_streams.load(Ordering::SeqCst) == 0 {
                     ch.mark_dead();
                 }
                 continue;
@@ -1347,6 +1615,78 @@ impl FluxClientPool {
             }
             self.send_ping_on_channel(ch, now);
         }
+        self.shrink_idle_excess_channels(&snapshot);
+    }
+
+    fn shrink_idle_excess_channels(&self, snapshot: &[Arc<ClientChannelHandle>]) {
+        let now_us = self.now_micros();
+        let target = self.target_warm_count();
+        let preserve_dual_stack = self.config.options.ip_strategy == FluxIpStrategy::Latency
+            && self.dual_stack_healthy.load(Ordering::Relaxed);
+        let min_stream_keep = if preserve_dual_stack {
+            target.max(2)
+        } else {
+            target
+        };
+        let has_non_udp = self.has_non_udp_relay_specs();
+
+        let mut stream_channels = snapshot
+            .iter()
+            .filter(|ch| {
+                ch.is_usable_for_new() && (!has_non_udp || ch.role != FluxChannelRole::UdpRelay)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if stream_channels.len() > min_stream_keep {
+            stream_channels.sort_by_key(|ch| self.score_channel_for_stream(ch));
+            let mut keep_uids = HashSet::with_capacity(min_stream_keep);
+            if preserve_dual_stack {
+                if let Some(best_v4) = stream_channels.iter().find(|ch| ch.remote_addr.is_ipv4()) {
+                    keep_uids.insert(best_v4.uid);
+                }
+                if let Some(best_v6) = stream_channels.iter().find(|ch| ch.remote_addr.is_ipv6()) {
+                    keep_uids.insert(best_v6.uid);
+                }
+            }
+            for ch in &stream_channels {
+                if keep_uids.len() >= min_stream_keep {
+                    break;
+                }
+                keep_uids.insert(ch.uid);
+            }
+            for ch in stream_channels.into_iter().rev() {
+                if keep_uids.contains(&ch.uid) {
+                    continue;
+                }
+                if ch.active_streams.load(Ordering::SeqCst) == 0
+                    && ch.current_rate_bps(now_us) == 0
+                    && ch.created_at.elapsed() >= IDLE_CHANNEL_SCALE_IN_AGE
+                {
+                    let _ = ch.try_drain_if_idle();
+                }
+            }
+        }
+
+        let mut udp_relays = snapshot
+            .iter()
+            .filter(|ch| ch.is_usable_for_new() && ch.role == FluxChannelRole::UdpRelay)
+            .cloned()
+            .collect::<Vec<_>>();
+        if udp_relays.len() > 1 {
+            udp_relays.sort_by_key(|ch| self.score_channel_for_udp(ch));
+            let best_relay_uid = udp_relays[0].uid;
+            for ch in udp_relays.into_iter().skip(1) {
+                if ch.uid == best_relay_uid {
+                    continue;
+                }
+                if ch.active_streams.load(Ordering::SeqCst) == 0
+                    && ch.current_rate_bps(now_us) == 0
+                    && ch.created_at.elapsed() >= IDLE_CHANNEL_SCALE_IN_AGE
+                {
+                    let _ = ch.try_drain_if_idle();
+                }
+            }
+        }
     }
 }
 
@@ -1364,7 +1704,7 @@ mod maintenance_tests {
             serde_json::json!({
                 "name": "Flux", "server": "127.0.0.1", "port": port,
                 "key": "test-user",
-                "channels": [{"id": "tcp", "transport": "tcp", "security": "obfs", "obfs-key": "test-channel"}],
+                "channels": [{"id": "tcp", "transport": "tcp", "security": "obfs", "public-key": crate::flux::config::generate_flux_x25519_keypair()?.1}],
             }),
         )?;
         let pool = FluxClientPool::new(proxy.to_client_config("127.0.0.1:0".parse()?)?)?;
@@ -1383,6 +1723,93 @@ mod maintenance_tests {
         stop.stop();
         task.await?;
         assert!(polls.load(Ordering::Relaxed) < 64);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idle_excess_channels_scale_in_while_preserving_dual_stack_floor() -> Result<()> {
+        let pub_key = crate::flux::config::generate_flux_x25519_keypair()?.1;
+        let proxy: crate::config_compat::mihomo::MihomoFluxProxy = serde_json::from_value(
+            serde_json::json!({
+                "name": "Flux",
+                "server": "edge.example.com",
+                "port": 443,
+                "key": "test-user",
+                "ip-strategy": "latency",
+                "standby-channels": 0,
+                "channel-max-mbps": 20,
+                "resolved-v4": ["127.0.0.1"],
+                "resolved-v6": ["::1"],
+                "channels": [
+                    {"id": "v4", "transport": "tcp", "ip-version": "ipv4", "security": "obfs", "public-key": pub_key.clone()},
+                    {"id": "v6", "transport": "tcp", "ip-version": "ipv6", "security": "obfs", "public-key": pub_key}
+                ],
+            }),
+        )?;
+        let pool = FluxClientPool::new(proxy.to_client_config("127.0.0.1:0".parse()?)?)?;
+        let old_created = Instant::now() - Duration::from_secs(20);
+
+        let make_handle = |uid: u64, spec_idx: usize, addr: SocketAddr, rtt: u64, created_at: Instant| {
+            let (a, _b) = tokio::io::duplex(64);
+            let (_, _, guard) =
+                super::super::transport::split_boxed_stream_with_binding(Box::new(a), Some([7; 32]));
+            let (prio_tx, _prio_rx) = mpsc::unbounded_channel();
+            let (stream_tx, _stream_rx) = mpsc::channel(16);
+            Arc::new(ClientChannelHandle {
+                uid,
+                spec_idx,
+                spec_id: format!("ch-{uid}"),
+                remote_addr: addr,
+                transport: FluxTransportKind::Tcp,
+                security: FluxSecurityMode::Obfs,
+                role: FluxChannelRole::Primary,
+                weight: 100,
+                prio_tx,
+                stream_tx,
+                dead: AtomicBool::new(false),
+                draining: AtomicBool::new(false),
+                state_notify: Notify::new(),
+                active_streams: AtomicUsize::new(0),
+                last_rx_micros: AtomicU64::new(0),
+                pending_ping: StdMutex::new(None),
+                baseline_rtt_ms: AtomicU64::new(rtt),
+                smoothed_rtt_ms: AtomicU64::new(rtt),
+                degraded_strikes: AtomicUsize::new(0),
+                bytes_transferred: AtomicU64::new(0),
+                last_rate_sample_us: AtomicU64::new(0),
+                cached_rate_bps: AtomicU64::new(0),
+                rate_state: StdMutex::new((0, 0, 0)),
+                shed_tokens: AtomicUsize::new(0),
+                shed_notify: Notify::new(),
+                last_shed_us: AtomicU64::new(0),
+                throughput_sample: StdMutex::new((Instant::now(), 0, 0)),
+                throughput_degraded: AtomicBool::new(false),
+                created_at,
+                rotate_after: None,
+                rotate_bytes_limit: None,
+                guard,
+            })
+        };
+
+        let ch1 = make_handle(1, 0, "127.0.0.1:443".parse()?, 20, old_created);
+        let ch2 = make_handle(2, 0, "127.0.0.1:443".parse()?, 25, old_created);
+        let ch3 = make_handle(3, 0, "127.0.0.1:443".parse()?, 30, Instant::now()); // young (<15s)
+        let ch4 = make_handle(4, 1, "[::1]:443".parse()?, 80, old_created); // sole IPv6 channel
+        {
+            let mut map = pool.channels.lock().unwrap();
+            for ch in [&ch1, &ch2, &ch3, &ch4] {
+                map.insert(ch.uid, ch.clone());
+            }
+        }
+
+        let snap = pool.usable_channels();
+        pool.shrink_idle_excess_channels(&snap);
+
+        // ch2 (excess old IPv4) shrinks; ch4 (sole IPv6 for dual-stack latency) & ch3 (young) & ch1 stay!
+        assert!(!ch1.is_dead());
+        assert!(ch2.is_dead());
+        assert!(!ch3.is_dead());
+        assert!(!ch4.is_dead());
         Ok(())
     }
 }
@@ -1524,8 +1951,8 @@ async fn run_client_reader_loop(
     pool: &Arc<FluxClientPool>,
 ) -> Result<()> {
     while let Some(frame) = reader.read_frame().await? {
-        ch.last_rx_micros
-            .store(pool.now_micros(), Ordering::Relaxed);
+        let rx_now_us = pool.now_micros();
+        ch.last_rx_micros.store(rx_now_us, Ordering::Relaxed);
         match frame {
             FluxFrame::Ping {
                 seq,
@@ -1574,6 +2001,7 @@ async fn run_client_reader_loop(
             } => {
                 ch.bytes_transferred
                     .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                pool.maybe_observe_channel_rate(ch, rx_now_us);
                 let tx = pool
                     .streams
                     .lock()
@@ -1645,6 +2073,7 @@ async fn run_client_reader_loop(
             } => {
                 ch.bytes_transferred
                     .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                pool.maybe_observe_channel_rate(ch, rx_now_us);
                 handle_client_udp_datagram(
                     pool, assoc_id, packet_id, frag_index, frag_total, target, payload,
                 )
@@ -1969,21 +2398,25 @@ pub(crate) struct StreamSlotGuard {
 }
 
 impl StreamSlotGuard {
-    fn acquire(ch: Arc<ClientChannelHandle>) -> Self {
-        ch.active_streams.fetch_add(1, Ordering::Relaxed);
-        Self { ch }
+    fn try_acquire(ch: Arc<ClientChannelHandle>) -> Option<Self> {
+        ch.active_streams.fetch_add(1, Ordering::SeqCst);
+        if !ch.is_usable_for_new() {
+            ch.active_streams.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Self { ch })
     }
 
     fn switch_to(&mut self, next: Arc<ClientChannelHandle>) {
-        self.ch.active_streams.fetch_sub(1, Ordering::Relaxed);
-        next.active_streams.fetch_add(1, Ordering::Relaxed);
+        self.ch.active_streams.fetch_sub(1, Ordering::SeqCst);
+        next.active_streams.fetch_add(1, Ordering::SeqCst);
         self.ch = next;
     }
 }
 
 impl Drop for StreamSlotGuard {
     fn drop(&mut self) {
-        self.ch.active_streams.fetch_sub(1, Ordering::Relaxed);
+        self.ch.active_streams.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -2007,6 +2440,7 @@ async fn run_client_stream(
     let mut downlink_done = false;
     let mut pending_uplink: Option<FluxFrame> = None;
     let mut half_close_deadline: Option<Instant> = None;
+    let mut last_rebalance: Option<Instant> = None;
     let mut read_buf = vec![0u8; MAX_FLUX_CHUNK_LEN];
 
     loop {
@@ -2063,6 +2497,9 @@ async fn run_client_stream(
 
         let local_read_cap = uplink_win.available_window().min(MAX_FLUX_CHUNK_LEN);
         let can_read_local = !uplink_done && pending_uplink.is_none() && local_read_cap > 0;
+        let can_rebalance = !uplink_done
+            && !downlink_done
+            && last_rebalance.is_none_or(|t| t.elapsed() >= STREAM_REBALANCE_COOLDOWN);
 
         let cancel_fut = async {
             if let Some(session) = &core_session {
@@ -2110,6 +2547,41 @@ async fn run_client_stream(
                     uplink_done,
                 )
                 .await?;
+            }
+            _ = ch_watch.wait_shed_requested(), if can_rebalance => {
+                if slot.ch.active_streams.load(Ordering::Relaxed) > 1
+                    && let Some(next_ch) = pool.pick_rebalance_channel(&slot.ch)
+                {
+                    pending_uplink = None;
+                    epoch = epoch.saturating_add(1);
+                    let cur_epoch = epoch;
+                    slot.switch_to(next_ch);
+                    last_rebalance = Some(Instant::now());
+                    if !send_stream_migration_frames(
+                        &slot.ch,
+                        stream_id,
+                        cur_epoch,
+                        &target,
+                        &uplink_win,
+                        &downlink_recv,
+                        uplink_done,
+                    )
+                    .await
+                    {
+                        slot.ch.mark_dead();
+                        migrate_client_stream(
+                            &pool,
+                            &mut slot,
+                            stream_id,
+                            &mut epoch,
+                            &target,
+                            &uplink_win,
+                            &downlink_recv,
+                            uplink_done,
+                        )
+                        .await?;
+                    }
+                }
             }
             permit_res = ch_pending.reserve_stream(), if pending_uplink.is_some() => {
                 match permit_res {
@@ -2256,7 +2728,9 @@ async fn run_client_stream(
                             payload: chunk,
                         };
                         match slot.ch.try_send_stream(data_frame) {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                pool.maybe_observe_channel_rate(&slot.ch, pool.now_micros());
+                            }
                             Err(Some(returned)) => pending_uplink = Some(returned),
                             Err(None) => {
                                 migrate_client_stream(
@@ -2297,6 +2771,52 @@ async fn run_client_stream(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn send_stream_migration_frames(
+    ch: &ClientChannelHandle,
+    stream_id: u32,
+    cur_epoch: u32,
+    target: &ProxyTarget,
+    uplink_win: &SendWindowBuffer,
+    downlink_recv: &RecvOffsetAssembler,
+    uplink_done: bool,
+) -> bool {
+    let mut ok = ch
+        .send_stream(FluxFrame::StreamMigrate {
+            stream_id,
+            epoch: cur_epoch,
+            resume_offset: downlink_recv.next_offset(),
+            target: target.clone(),
+        })
+        .await;
+    if ok {
+        for (offset, chunk) in uplink_win.unacked_from(uplink_win.acked_offset()) {
+            if !ch
+                .send_stream(FluxFrame::StreamData {
+                    stream_id,
+                    epoch: cur_epoch,
+                    offset,
+                    payload: chunk,
+                })
+                .await
+            {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if ok && uplink_done {
+        ok = ch
+            .send_stream(FluxFrame::StreamFin {
+                stream_id,
+                epoch: cur_epoch,
+                final_offset: uplink_win.next_offset(),
+            })
+            .await;
+    }
+    ok
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn migrate_client_stream(
     pool: &Arc<FluxClientPool>,
     slot: &mut StreamSlotGuard,
@@ -2313,44 +2833,17 @@ async fn migrate_client_stream(
         let cur_epoch = *epoch;
         slot.switch_to(next_ch);
 
-        let mut ok = slot
-            .ch
-            .send_stream(FluxFrame::StreamMigrate {
-                stream_id,
-                epoch: cur_epoch,
-                resume_offset: downlink_recv.next_offset(),
-                target: target.clone(),
-            })
-            .await;
-
-        if ok {
-            for (offset, chunk) in uplink_win.unacked_from(uplink_win.acked_offset()) {
-                if !slot
-                    .ch
-                    .send_stream(FluxFrame::StreamData {
-                        stream_id,
-                        epoch: cur_epoch,
-                        offset,
-                        payload: chunk,
-                    })
-                    .await
-                {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok && uplink_done {
-            ok = slot
-                .ch
-                .send_stream(FluxFrame::StreamFin {
-                    stream_id,
-                    epoch: cur_epoch,
-                    final_offset: uplink_win.next_offset(),
-                })
-                .await;
-        }
-        if ok {
+        if send_stream_migration_frames(
+            &slot.ch,
+            stream_id,
+            cur_epoch,
+            target,
+            uplink_win,
+            downlink_recv,
+            uplink_done,
+        )
+        .await
+        {
             return Ok(());
         }
         slot.ch.mark_dead();

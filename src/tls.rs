@@ -97,6 +97,25 @@ impl ServerTlsStream {
             Self::Boring(_) => None,
         }
     }
+
+    pub fn export_keying_material(&self, out: &mut [u8], label: &[u8], context: &[u8]) -> Result<()> {
+        match self {
+            Self::Rustls(stream) => stream
+                .get_ref()
+                .1
+                .export_keying_material(out, label, Some(context))
+                .context("export rustls keying material")
+                .map(|_| ()),
+            #[cfg(feature = "server-ech")]
+            Self::Boring(stream) => {
+                let label_str = std::str::from_utf8(label).context("non-UTF-8 exporter label")?;
+                stream
+                    .ssl()
+                    .export_keying_material(out, label_str, Some(context))
+                    .context("export BoringSSL keying material")
+            }
+        }
+    }
 }
 
 impl tokio::io::AsyncRead for ServerTlsStream {

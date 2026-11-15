@@ -1341,11 +1341,6 @@ pub(super) fn normalize_mihomo_proxy_value(value: &Value) -> Value {
             "client-fingerprint",
             &["client-fingerprint", "client_fingerprint", "fingerprint"],
         );
-        coalesce_alias_keys(
-            &mut out,
-            "obfs-key",
-            &["obfs-key", "obfs_key", "obfs-password", "obfs_password"],
-        );
     } else {
         coalesce_alias_keys(
             &mut out,
@@ -1460,8 +1455,13 @@ pub(super) fn normalize_mihomo_proxy_value(value: &Value) -> Value {
                 );
                 coalesce_alias_keys(
                     ch_map,
-                    "obfs_key",
-                    &["obfs_key", "obfs-key", "obfs_password", "obfs-password"],
+                    "public_key",
+                    &["public_key", "public-key", "publicKey"],
+                );
+                coalesce_alias_keys(
+                    ch_map,
+                    "tls_binding",
+                    &["tls_binding", "tls-binding", "tlsBinding"],
                 );
             }
         }

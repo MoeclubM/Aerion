@@ -1,11 +1,9 @@
-use crate::protocol::constant_time_eq;
 use crate::replay_cache::{ReplayCache, ReplayError};
 use crate::vless_transport::BoxedTransportStream;
 use anyhow::{Context, Result, bail, ensure};
-use blake2::Blake2bVar;
-use blake2::digest::{Update, VariableOutput};
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::{Tag as XChaChaTag, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, Runtime, TokioRuntime, UdpPoller};
 use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
@@ -26,16 +24,21 @@ use tokio::io::{
 use tokio::task::JoinHandle;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-const OBFS_UDP_SALT_LEN: usize = 8;
+const OBFS_UDP_NONCE_LEN: usize = 24;
+const OBFS_UDP_TAG_LEN: usize = 16;
+const OBFS_UDP_OVERHEAD: usize = OBFS_UDP_NONCE_LEN + OBFS_UDP_TAG_LEN;
 const OBFS_PIPE_CAP: usize = 256 * 1024;
 const OBFS_MAX_CHUNK: usize = 32 * 1024;
 const OBFS_TAG_LEN: usize = 16;
-
-type HmacSha256 = Hmac<Sha256>;
+const OBFS_STREAM_HDR_PLAIN_LEN: usize = 4;
+const OBFS_STREAM_HDR_WIRE_LEN: usize = OBFS_STREAM_HDR_PLAIN_LEN + OBFS_TAG_LEN;
+const OBFS_HELLO_HDR_PLAIN_LEN: usize = 16;
+const OBFS_HELLO_HDR_WIRE_LEN: usize = OBFS_HELLO_HDR_PLAIN_LEN + OBFS_TAG_LEN;
+const OBFS_MAX_HELLO_PAD: usize = 128;
 
 pub struct FluxObfsUdpSocket {
     inner: Arc<dyn AsyncUdpSocket>,
-    key: Vec<u8>,
+    cipher: XChaCha20Poly1305,
 }
 
 impl fmt::Debug for FluxObfsUdpSocket {
@@ -45,36 +48,18 @@ impl fmt::Debug for FluxObfsUdpSocket {
 }
 
 impl FluxObfsUdpSocket {
-    pub fn new(socket: std::net::UdpSocket, obfs_key: &str) -> Result<Self> {
-        ensure!(
-            obfs_key.len() >= 4,
-            "Flux UDP obfs_key must be at least 4 bytes"
-        );
+    pub fn new(socket: std::net::UdpSocket, server_public_key: &[u8; 32]) -> Result<Self> {
+        let hkdf = Hkdf::<Sha256>::new(Some(b"flux-obfs-udp-v2"), server_public_key);
+        let mut udp_key = [0u8; 32];
+        hkdf.expand(b"xchacha20poly1305", &mut udp_key)
+            .map_err(|_| anyhow::anyhow!("derive Flux UDP obfs key"))?;
         let inner = TokioRuntime
             .wrap_udp_socket(socket)
             .context("wrap Flux obfs UDP socket")?;
         Ok(Self {
             inner,
-            key: obfs_key.as_bytes().to_vec(),
+            cipher: XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&udp_key)),
         })
-    }
-}
-
-fn obfs_udp_mask(key: &[u8], salt: &[u8; OBFS_UDP_SALT_LEN]) -> [u8; 64] {
-    let mut hasher = Blake2bVar::new(64).expect("64-byte Blake2bVar valid");
-    hasher.update(key);
-    hasher.update(salt);
-    let mut mask = [0u8; 64];
-    hasher
-        .finalize_variable(&mut mask)
-        .expect("64-byte Blake2bVar output valid");
-    mask
-}
-
-fn obfs_udp_xor(key: &[u8], salt: &[u8; OBFS_UDP_SALT_LEN], input: &[u8], output: &mut [u8]) {
-    let mask = obfs_udp_mask(key, salt);
-    for (idx, (dst, src)) in output.iter_mut().zip(input.iter()).enumerate() {
-        *dst = *src ^ mask[idx & 63];
     }
 }
 
@@ -84,17 +69,21 @@ impl AsyncUdpSocket for FluxObfsUdpSocket {
     }
 
     fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
-        let mut salt = [0u8; OBFS_UDP_SALT_LEN];
-        getrandom::fill(&mut salt)
-            .map_err(|e| io::Error::other(format!("Flux obfs salt random: {e}")))?;
-        let mut packet = vec![0u8; OBFS_UDP_SALT_LEN + transmit.contents.len()];
-        packet[..OBFS_UDP_SALT_LEN].copy_from_slice(&salt);
-        obfs_udp_xor(
-            &self.key,
-            &salt,
-            transmit.contents,
-            &mut packet[OBFS_UDP_SALT_LEN..],
-        );
+        let mut nonce_bytes = [0u8; OBFS_UDP_NONCE_LEN];
+        getrandom::fill(&mut nonce_bytes)
+            .map_err(|e| io::Error::other(format!("Flux obfs nonce random: {e}")))?;
+        let mut packet = Vec::with_capacity(OBFS_UDP_OVERHEAD + transmit.contents.len());
+        packet.extend_from_slice(&nonce_bytes);
+        packet.extend_from_slice(transmit.contents);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(
+                XNonce::from_slice(&nonce_bytes),
+                &[],
+                &mut packet[OBFS_UDP_NONCE_LEN..],
+            )
+            .map_err(|_| io::Error::other("Flux UDP obfs encrypt failed"))?;
+        packet.extend_from_slice(&tag);
         let out = Transmit {
             destination: transmit.destination,
             ecn: transmit.ecn,
@@ -116,11 +105,11 @@ impl AsyncUdpSocket for FluxObfsUdpSocket {
             let mut write_idx = 0usize;
             for idx in 0..count {
                 let m = meta[idx];
-                if m.len <= OBFS_UDP_SALT_LEN {
+                if m.len <= OBFS_UDP_OVERHEAD {
                     continue;
                 }
                 let seg_stride = if m.stride == 0 { m.len } else { m.stride };
-                if seg_stride <= OBFS_UDP_SALT_LEN {
+                if seg_stride <= OBFS_UDP_OVERHEAD {
                     continue;
                 }
                 let mut src_off = 0usize;
@@ -131,17 +120,34 @@ impl AsyncUdpSocket for FluxObfsUdpSocket {
                     let slot_buf = &mut bufs[idx][..m.len];
                     while src_off < m.len {
                         let seg_len = (m.len - src_off).min(seg_stride);
-                        if seg_len <= OBFS_UDP_SALT_LEN {
+                        if seg_len <= OBFS_UDP_OVERHEAD {
                             valid = false;
                             break;
                         }
-                        let mut salt = [0u8; OBFS_UDP_SALT_LEN];
-                        salt.copy_from_slice(&slot_buf[src_off..src_off + OBFS_UDP_SALT_LEN]);
-                        let plain_len = seg_len - OBFS_UDP_SALT_LEN;
-                        let mask = obfs_udp_mask(&self.key, &salt);
-                        for j in 0..plain_len {
-                            slot_buf[dst_off + j] =
-                                slot_buf[src_off + OBFS_UDP_SALT_LEN + j] ^ mask[j & 63];
+                        let mut nonce_bytes = [0u8; OBFS_UDP_NONCE_LEN];
+                        nonce_bytes
+                            .copy_from_slice(&slot_buf[src_off..src_off + OBFS_UDP_NONCE_LEN]);
+                        let plain_len = seg_len - OBFS_UDP_OVERHEAD;
+                        let tag_start = src_off + OBFS_UDP_NONCE_LEN + plain_len;
+                        let tag = *XChaChaTag::from_slice(&slot_buf[tag_start..src_off + seg_len]);
+                        if self
+                            .cipher
+                            .decrypt_in_place_detached(
+                                XNonce::from_slice(&nonce_bytes),
+                                &[],
+                                &mut slot_buf[src_off + OBFS_UDP_NONCE_LEN..tag_start],
+                                &tag,
+                            )
+                            .is_err()
+                        {
+                            valid = false;
+                            break;
+                        }
+                        if dst_off != src_off + OBFS_UDP_NONCE_LEN {
+                            slot_buf.copy_within(
+                                src_off + OBFS_UDP_NONCE_LEN..tag_start,
+                                dst_off,
+                            );
                         }
                         src_off += seg_len;
                         dst_off += plain_len;
@@ -161,7 +167,7 @@ impl AsyncUdpSocket for FluxObfsUdpSocket {
                     stride: if segs <= 1 {
                         dst_off
                     } else {
-                        seg_stride - OBFS_UDP_SALT_LEN
+                        seg_stride - OBFS_UDP_OVERHEAD
                     },
                     ecn: m.ecn,
                     dst_ip: m.dst_ip,
@@ -233,49 +239,95 @@ impl AsyncWrite for ObfsStream {
     }
 }
 
-fn hmac_tag(key: &[u8], parts: &[&[u8]]) -> Result<[u8; 32]> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
-        .map_err(|_| anyhow::anyhow!("init Flux obfs HMAC"))?;
-    for part in parts {
-        Mac::update(&mut mac, part);
+#[derive(Clone, Copy)]
+struct DirectionalKeys {
+    hdr_key: [u8; 32],
+    hdr_iv: [u8; 12],
+    data_key: [u8; 32],
+    data_iv: [u8; 12],
+}
+
+fn derive_init_key_nonce(
+    label: &[u8],
+    salt_left: &[u8; 32],
+    salt_right: &[u8; 32],
+    ikm_parts: &[&[u8]],
+) -> Result<([u8; 32], [u8; 12])> {
+    let mut salt = [0u8; 64];
+    salt[..32].copy_from_slice(salt_left);
+    salt[32..].copy_from_slice(salt_right);
+    let mut ikm = Vec::with_capacity(64);
+    for part in ikm_parts {
+        ikm.extend_from_slice(part);
     }
-    Ok(mac.finalize().into_bytes().into())
+    let hkdf = Hkdf::<Sha256>::new(Some(&salt), &ikm);
+    let mut out = [0u8; 44];
+    hkdf.expand(label, &mut out)
+        .map_err(|_| anyhow::anyhow!("derive Flux obfs init key"))?;
+    let mut key = [0u8; 32];
+    let mut nonce = [0u8; 12];
+    key.copy_from_slice(&out[..32]);
+    nonce.copy_from_slice(&out[32..44]);
+    Ok((key, nonce))
 }
 
 fn derive_stream_keys(
-    obfs_key: &[u8],
-    shared_secret: &[u8; 32],
+    static_ss: &[u8; 32],
+    eph_ss: &[u8; 32],
     client_pub: &[u8; 32],
     server_pub: &[u8; 32],
-) -> Result<([u8; 32], [u8; 12], [u8; 32], [u8; 12])> {
-    let hkdf = Hkdf::<Sha256>::new(Some(obfs_key), shared_secret);
-    let mut material = [0u8; 88];
-    let mut info = Vec::with_capacity(80);
-    info.extend_from_slice(b"flux-obfs-stream-v1");
-    info.extend_from_slice(client_pub);
-    info.extend_from_slice(server_pub);
-    hkdf.expand(&info, &mut material)
+) -> Result<(DirectionalKeys, DirectionalKeys, [u8; 32])> {
+    let mut salt = [0u8; 64];
+    salt[..32].copy_from_slice(client_pub);
+    salt[32..].copy_from_slice(server_pub);
+    let mut ikm = [0u8; 64];
+    ikm[..32].copy_from_slice(static_ss);
+    ikm[32..].copy_from_slice(eph_ss);
+    let hkdf = Hkdf::<Sha256>::new(Some(&salt), &ikm);
+    let mut material = [0u8; 208];
+    hkdf.expand(b"flux-obfs-stream-v2", &mut material)
         .map_err(|_| anyhow::anyhow!("derive Flux obfs stream keys"))?;
-    let mut c2s_key = [0u8; 32];
-    let mut c2s_iv = [0u8; 12];
-    let mut s2c_key = [0u8; 32];
-    let mut s2c_iv = [0u8; 12];
-    c2s_key.copy_from_slice(&material[0..32]);
-    c2s_iv.copy_from_slice(&material[32..44]);
-    s2c_key.copy_from_slice(&material[44..76]);
-    s2c_iv.copy_from_slice(&material[76..88]);
-    Ok((c2s_key, c2s_iv, s2c_key, s2c_iv))
+    let take_dir = |offset: usize| -> DirectionalKeys {
+        let mut hdr_key = [0u8; 32];
+        let mut hdr_iv = [0u8; 12];
+        let mut data_key = [0u8; 32];
+        let mut data_iv = [0u8; 12];
+        hdr_key.copy_from_slice(&material[offset..offset + 32]);
+        hdr_iv.copy_from_slice(&material[offset + 32..offset + 44]);
+        data_key.copy_from_slice(&material[offset + 44..offset + 76]);
+        data_iv.copy_from_slice(&material[offset + 76..offset + 88]);
+        DirectionalKeys {
+            hdr_key,
+            hdr_iv,
+            data_key,
+            data_iv,
+        }
+    };
+    let mut binding = [0u8; 32];
+    binding.copy_from_slice(&material[176..208]);
+    Ok((take_dir(0), take_dir(88), binding))
 }
 
 pub async fn client_obfs_handshake(
     mut stream: BoxedTransportStream,
-    obfs_key: &str,
-) -> Result<BoxedTransportStream> {
-    let key_bytes = obfs_key.as_bytes();
+    server_public_key: [u8; 32],
+) -> Result<(BoxedTransportStream, [u8; 32])> {
     let mut secret_bytes = [0u8; 32];
     getrandom::fill(&mut secret_bytes).map_err(|e| anyhow::anyhow!("Flux obfs random: {e}"))?;
     let secret = StaticSecret::from(secret_bytes);
     let client_pub = PublicKey::from(&secret).to_bytes();
+    let static_ss = secret.diffie_hellman(&PublicKey::from(server_public_key));
+    ensure!(
+        static_ss.was_contributory(),
+        "invalid Flux server X25519 public key"
+    );
+    let (c2s_key, c2s_nonce) = derive_init_key_nonce(
+        b"flux-obfs-c2s-init-v2",
+        &client_pub,
+        &server_public_key,
+        &[static_ss.as_bytes()],
+    )?;
+
     let mut pad_seed = [0u8; 1];
     getrandom::fill(&mut pad_seed).map_err(|e| anyhow::anyhow!("Flux obfs pad random: {e}"))?;
     let pad_len = 16usize + usize::from(pad_seed[0] % 49);
@@ -285,17 +337,27 @@ pub async fn client_obfs_handshake(
         .duration_since(UNIX_EPOCH)?
         .as_secs()
         .to_be_bytes();
-    let pad_len_byte = [pad_len as u8];
-    let tag = hmac_tag(
-        key_bytes,
-        &[b"flux-obfs-c2s", &client_pub, &ts, &pad_len_byte, &pad],
-    )?;
-    let mut hello = Vec::with_capacity(32 + 8 + 1 + pad_len + 32);
+    let mut hdr_buf = [0u8; OBFS_HELLO_HDR_WIRE_LEN];
+    getrandom::fill(&mut hdr_buf[9..OBFS_HELLO_HDR_PLAIN_LEN])
+        .map_err(|e| anyhow::anyhow!("Flux obfs header random: {e}"))?;
+    hdr_buf[..8].copy_from_slice(&ts);
+    hdr_buf[8] = pad_len as u8;
+    let c2s_cipher = LessSafeKey::new(
+        UnboundKey::new(&CHACHA20_POLY1305, &c2s_key).expect("32-byte ChaCha20 key"),
+    );
+    let tag = c2s_cipher
+        .seal_in_place_separate_tag(
+            Nonce::assume_unique_for_key(c2s_nonce),
+            Aad::from(&client_pub),
+            &mut hdr_buf[..OBFS_HELLO_HDR_PLAIN_LEN],
+        )
+        .map_err(|_| anyhow::anyhow!("encrypt Flux obfs client hello"))?;
+    hdr_buf[OBFS_HELLO_HDR_PLAIN_LEN..].copy_from_slice(tag.as_ref());
+
+    let mut hello = Vec::with_capacity(32 + OBFS_HELLO_HDR_WIRE_LEN + pad_len);
     hello.extend_from_slice(&client_pub);
-    hello.extend_from_slice(&ts);
-    hello.push(pad_len as u8);
+    hello.extend_from_slice(&hdr_buf);
     hello.extend_from_slice(&pad);
-    hello.extend_from_slice(&tag);
     stream
         .write_all(&hello)
         .await
@@ -305,97 +367,134 @@ pub async fn client_obfs_handshake(
         .await
         .context("flush Flux obfs client hello")?;
 
-    let mut header = [0u8; 33];
+    let mut srv_prefix = [0u8; 32 + OBFS_HELLO_HDR_WIRE_LEN];
     stream
-        .read_exact(&mut header)
+        .read_exact(&mut srv_prefix)
         .await
         .context("read Flux obfs server hello")?;
     let mut server_pub = [0u8; 32];
-    server_pub.copy_from_slice(&header[..32]);
-    let srv_pad_len = usize::from(header[32]);
-    ensure!(srv_pad_len <= 96, "invalid Flux obfs server padding");
-    let mut srv_tail = vec![0u8; srv_pad_len + 32];
-    stream
-        .read_exact(&mut srv_tail)
-        .await
-        .context("read Flux obfs server hello tail")?;
-    let expected_srv_tag = hmac_tag(
-        key_bytes,
-        &[
-            b"flux-obfs-s2c",
-            &client_pub,
-            &server_pub,
-            &[header[32]],
-            &srv_tail[..srv_pad_len],
-        ],
-    )?;
+    server_pub.copy_from_slice(&srv_prefix[..32]);
+    let eph_ss = secret.diffie_hellman(&PublicKey::from(server_pub));
     ensure!(
-        constant_time_eq(&expected_srv_tag, &srv_tail[srv_pad_len..]),
-        "Flux obfs server authentication failed"
-    );
-    let shared = secret.diffie_hellman(&PublicKey::from(server_pub));
-    ensure!(
-        shared.was_contributory(),
+        eph_ss.was_contributory(),
         "invalid Flux obfs server ECDH key"
     );
-    let (c2s_key, c2s_iv, s2c_key, s2c_iv) =
-        derive_stream_keys(key_bytes, shared.as_bytes(), &client_pub, &server_pub)?;
-    Ok(Box::new(spawn_obfs_stream(
-        stream, c2s_key, c2s_iv, s2c_key, s2c_iv,
-    )))
+    let (s2c_key, s2c_nonce) = derive_init_key_nonce(
+        b"flux-obfs-s2c-init-v2",
+        &client_pub,
+        &server_pub,
+        &[static_ss.as_bytes(), eph_ss.as_bytes()],
+    )?;
+    let s2c_cipher = LessSafeKey::new(
+        UnboundKey::new(&CHACHA20_POLY1305, &s2c_key).expect("32-byte ChaCha20 key"),
+    );
+    let mut aad = [0u8; 64];
+    aad[..32].copy_from_slice(&client_pub);
+    aad[32..].copy_from_slice(&server_pub);
+    let plain = s2c_cipher
+        .open_in_place(
+            Nonce::assume_unique_for_key(s2c_nonce),
+            Aad::from(&aad),
+            &mut srv_prefix[32..],
+        )
+        .map_err(|_| anyhow::anyhow!("Flux obfs server authentication failed"))?;
+    let srv_pad_len = usize::from(plain[0]);
+    ensure!(
+        srv_pad_len <= OBFS_MAX_HELLO_PAD,
+        "invalid Flux obfs server padding"
+    );
+    if srv_pad_len > 0 {
+        let mut srv_pad = vec![0u8; srv_pad_len];
+        stream
+            .read_exact(&mut srv_pad)
+            .await
+            .context("read Flux obfs server padding")?;
+    }
+
+    let (c2s_dirs, s2c_dirs, binding) = derive_stream_keys(
+        static_ss.as_bytes(),
+        eph_ss.as_bytes(),
+        &client_pub,
+        &server_pub,
+    )?;
+    Ok((
+        Box::new(spawn_obfs_stream(stream, c2s_dirs, s2c_dirs)),
+        binding,
+    ))
 }
 
-pub async fn server_obfs_handshake(
+pub(crate) async fn server_obfs_handshake(
     mut stream: BoxedTransportStream,
-    obfs_key: &str,
+    server_private_key: [u8; 32],
     replay: &ReplayCache<[u8; 32]>,
-) -> Result<BoxedTransportStream> {
-    let key_bytes = obfs_key.as_bytes();
-    let mut header = [0u8; 41];
+) -> Result<(BoxedTransportStream, [u8; 32])> {
+    let static_secret = StaticSecret::from(server_private_key);
+    let static_public = PublicKey::from(&static_secret).to_bytes();
+
+    let mut prefix = [0u8; 32 + OBFS_HELLO_HDR_WIRE_LEN];
     stream
-        .read_exact(&mut header)
+        .read_exact(&mut prefix)
         .await
         .context("read Flux obfs client hello")?;
     let mut client_pub = [0u8; 32];
-    client_pub.copy_from_slice(&header[..32]);
-    let ts = u64::from_be_bytes(header[32..40].try_into().unwrap());
+    client_pub.copy_from_slice(&prefix[..32]);
+    let static_ss = static_secret.diffie_hellman(&PublicKey::from(client_pub));
+    ensure!(
+        static_ss.was_contributory(),
+        "invalid Flux obfs client ECDH key"
+    );
+    let (c2s_key, c2s_nonce) = derive_init_key_nonce(
+        b"flux-obfs-c2s-init-v2",
+        &client_pub,
+        &static_public,
+        &[static_ss.as_bytes()],
+    )?;
+    let c2s_cipher = LessSafeKey::new(
+        UnboundKey::new(&CHACHA20_POLY1305, &c2s_key).expect("32-byte ChaCha20 key"),
+    );
+    let plain = c2s_cipher
+        .open_in_place(
+            Nonce::assume_unique_for_key(c2s_nonce),
+            Aad::from(&client_pub),
+            &mut prefix[32..],
+        )
+        .map_err(|_| anyhow::anyhow!("Flux obfs client authentication failed"))?;
+
+    let ts = u64::from_be_bytes(plain[..8].try_into().unwrap());
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     ensure!(now.abs_diff(ts) <= 120, "expired Flux obfs handshake");
-    let pad_len = usize::from(header[40]);
-    ensure!(pad_len <= 96, "invalid Flux obfs client padding");
-    let mut tail = vec![0u8; pad_len + 32];
-    stream
-        .read_exact(&mut tail)
-        .await
-        .context("read Flux obfs client hello tail")?;
-    let expected_tag = hmac_tag(
-        key_bytes,
-        &[
-            b"flux-obfs-c2s",
-            &client_pub,
-            &header[32..40],
-            &[header[40]],
-            &tail[..pad_len],
-        ],
-    )?;
-    ensure!(
-        constant_time_eq(&expected_tag, &tail[pad_len..]),
-        "Flux obfs client authentication failed"
-    );
+    let pad_len = usize::from(plain[8]);
+    ensure!(pad_len <= OBFS_MAX_HELLO_PAD, "invalid Flux obfs client padding");
     match replay.check_and_store(client_pub) {
         Ok(()) => {}
         Err(ReplayError::Replayed) => bail!("replayed Flux obfs handshake"),
         Err(ReplayError::Full) => bail!("Flux obfs replay cache full"),
+    }
+    if pad_len > 0 {
+        let mut pad = vec![0u8; pad_len];
+        stream
+            .read_exact(&mut pad)
+            .await
+            .context("read Flux obfs client padding")?;
     }
 
     let mut secret_bytes = [0u8; 32];
     getrandom::fill(&mut secret_bytes).map_err(|e| anyhow::anyhow!("Flux obfs random: {e}"))?;
     let secret = StaticSecret::from(secret_bytes);
     let server_pub = PublicKey::from(&secret).to_bytes();
-    let shared = secret.diffie_hellman(&PublicKey::from(client_pub));
+    let eph_ss = secret.diffie_hellman(&PublicKey::from(client_pub));
     ensure!(
-        shared.was_contributory(),
+        eph_ss.was_contributory(),
         "invalid Flux obfs client ECDH key"
+    );
+    let (s2c_key, s2c_nonce) = derive_init_key_nonce(
+        b"flux-obfs-s2c-init-v2",
+        &client_pub,
+        &server_pub,
+        &[static_ss.as_bytes(), eph_ss.as_bytes()],
+    )?;
+    let s2c_cipher = LessSafeKey::new(
+        UnboundKey::new(&CHACHA20_POLY1305, &s2c_key).expect("32-byte ChaCha20 key"),
     );
 
     let mut pad_seed = [0u8; 1];
@@ -403,21 +502,26 @@ pub async fn server_obfs_handshake(
     let srv_pad_len = 16usize + usize::from(pad_seed[0] % 49);
     let mut srv_pad = vec![0u8; srv_pad_len];
     getrandom::fill(&mut srv_pad).map_err(|e| anyhow::anyhow!("Flux obfs pad fill: {e}"))?;
-    let srv_tag = hmac_tag(
-        key_bytes,
-        &[
-            b"flux-obfs-s2c",
-            &client_pub,
-            &server_pub,
-            &[srv_pad_len as u8],
-            &srv_pad,
-        ],
-    )?;
-    let mut resp = Vec::with_capacity(32 + 1 + srv_pad_len + 32);
+    let mut srv_hdr = [0u8; OBFS_HELLO_HDR_WIRE_LEN];
+    getrandom::fill(&mut srv_hdr[1..OBFS_HELLO_HDR_PLAIN_LEN])
+        .map_err(|e| anyhow::anyhow!("Flux obfs server header random: {e}"))?;
+    srv_hdr[0] = srv_pad_len as u8;
+    let mut aad = [0u8; 64];
+    aad[..32].copy_from_slice(&client_pub);
+    aad[32..].copy_from_slice(&server_pub);
+    let srv_tag = s2c_cipher
+        .seal_in_place_separate_tag(
+            Nonce::assume_unique_for_key(s2c_nonce),
+            Aad::from(&aad),
+            &mut srv_hdr[..OBFS_HELLO_HDR_PLAIN_LEN],
+        )
+        .map_err(|_| anyhow::anyhow!("encrypt Flux obfs server hello"))?;
+    srv_hdr[OBFS_HELLO_HDR_PLAIN_LEN..].copy_from_slice(srv_tag.as_ref());
+
+    let mut resp = Vec::with_capacity(32 + OBFS_HELLO_HDR_WIRE_LEN + srv_pad_len);
     resp.extend_from_slice(&server_pub);
-    resp.push(srv_pad_len as u8);
+    resp.extend_from_slice(&srv_hdr);
     resp.extend_from_slice(&srv_pad);
-    resp.extend_from_slice(&srv_tag);
     stream
         .write_all(&resp)
         .await
@@ -427,43 +531,49 @@ pub async fn server_obfs_handshake(
         .await
         .context("flush Flux obfs server hello")?;
 
-    let (c2s_key, c2s_iv, s2c_key, s2c_iv) =
-        derive_stream_keys(key_bytes, shared.as_bytes(), &client_pub, &server_pub)?;
-    Ok(Box::new(spawn_obfs_stream(
-        stream, s2c_key, s2c_iv, c2s_key, c2s_iv,
-    )))
+    let (c2s_dirs, s2c_dirs, binding) = derive_stream_keys(
+        static_ss.as_bytes(),
+        eph_ss.as_bytes(),
+        &client_pub,
+        &server_pub,
+    )?;
+    Ok((
+        Box::new(spawn_obfs_stream(stream, s2c_dirs, c2s_dirs)),
+        binding,
+    ))
 }
 
-fn step_nonce(iv: &[u8; 12], seq: u64) -> ([u8; 12], u16) {
+fn step_nonce(iv: &[u8; 12], seq: u64) -> [u8; 12] {
     let mut nonce = *iv;
     let seq_bytes = seq.to_be_bytes();
     for (dst, src) in nonce[4..12].iter_mut().zip(seq_bytes.iter()) {
         *dst ^= *src;
     }
-    let len_mask = u16::from_be_bytes([nonce[0] ^ nonce[6], nonce[1] ^ nonce[7]]);
-    (nonce, len_mask)
+    nonce
 }
 
 fn spawn_obfs_stream(
     stream: BoxedTransportStream,
-    write_key: [u8; 32],
-    write_iv: [u8; 12],
-    read_key: [u8; 32],
-    read_iv: [u8; 12],
+    write_dirs: DirectionalKeys,
+    read_dirs: DirectionalKeys,
 ) -> ObfsStream {
     let (mut wire_reader, mut wire_writer) = tokio::io::split(stream);
     let (mut app_sink, reader) = duplex(OBFS_PIPE_CAP);
     let (writer, mut app_source) = duplex(OBFS_PIPE_CAP);
 
     let read_task = tokio::spawn(async move {
-        let cipher = LessSafeKey::new(
-            UnboundKey::new(&CHACHA20_POLY1305, &read_key).expect("32-byte ChaCha20 key"),
+        let hdr_cipher = LessSafeKey::new(
+            UnboundKey::new(&CHACHA20_POLY1305, &read_dirs.hdr_key).expect("32-byte ChaCha20 key"),
+        );
+        let data_cipher = LessSafeKey::new(
+            UnboundKey::new(&CHACHA20_POLY1305, &read_dirs.data_key)
+                .expect("32-byte ChaCha20 key"),
         );
         let mut seq = 0u64;
-        let mut len_buf = [0u8; 2];
-        let mut ct = Vec::with_capacity(OBFS_MAX_CHUNK + OBFS_TAG_LEN);
+        let mut hdr_wire = [0u8; OBFS_STREAM_HDR_WIRE_LEN];
+        let mut body = Vec::with_capacity(OBFS_MAX_CHUNK + OBFS_TAG_LEN + 64);
         loop {
-            match wire_reader.read_exact(&mut len_buf).await {
+            match wire_reader.read_exact(&mut hdr_wire).await {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     let _ = app_sink.shutdown().await;
@@ -471,25 +581,48 @@ fn spawn_obfs_stream(
                 }
                 Err(e) => return Err(e).context("read Flux obfs frame length"),
             }
-            let (nonce, mask) = step_nonce(&read_iv, seq);
+            let hdr_nonce = step_nonce(&read_dirs.hdr_iv, seq);
+            let data_nonce = step_nonce(&read_dirs.data_iv, seq);
             seq = seq.checked_add(1).context("Flux obfs read seq overflow")?;
-            let cipher_len = usize::from(u16::from_be_bytes(len_buf) ^ mask);
+
+            let hdr_aad = hdr_wire;
+            let hdr_plain = hdr_cipher
+                .open_in_place(
+                    Nonce::assume_unique_for_key(hdr_nonce),
+                    Aad::empty(),
+                    &mut hdr_wire,
+                )
+                .map_err(|_| anyhow::anyhow!("decrypt Flux obfs frame header"))?;
+            let payload_len = usize::from(u16::from_be_bytes([hdr_plain[0], hdr_plain[1]]));
+            let pad_len = usize::from(hdr_plain[2]);
             ensure!(
-                (OBFS_TAG_LEN..=OBFS_MAX_CHUNK + OBFS_TAG_LEN).contains(&cipher_len),
-                "invalid Flux obfs record length {cipher_len}"
+                payload_len <= OBFS_MAX_CHUNK,
+                "invalid Flux obfs record length {payload_len}"
             );
-            ct.resize(cipher_len, 0);
-            wire_reader
-                .read_exact(&mut ct)
-                .await
-                .context("read Flux obfs ciphertext")?;
-            let plain = cipher
-                .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut ct)
-                .map_err(|_| anyhow::anyhow!("decrypt Flux obfs record"))?;
-            if plain.is_empty() {
+            if payload_len == 0 {
+                if pad_len > 0 {
+                    body.resize(pad_len, 0);
+                    wire_reader
+                        .read_exact(&mut body)
+                        .await
+                        .context("read Flux obfs EOF padding")?;
+                }
                 let _ = app_sink.shutdown().await;
                 return Ok(());
             }
+            let ct_len = payload_len + OBFS_TAG_LEN;
+            body.resize(ct_len + pad_len, 0);
+            wire_reader
+                .read_exact(&mut body)
+                .await
+                .context("read Flux obfs ciphertext")?;
+            let plain = data_cipher
+                .open_in_place(
+                    Nonce::assume_unique_for_key(data_nonce),
+                    Aad::from(&hdr_aad),
+                    &mut body[..ct_len],
+                )
+                .map_err(|_| anyhow::anyhow!("decrypt Flux obfs record"))?;
             if app_sink.write_all(plain).await.is_err() {
                 return Ok(());
             }
@@ -497,32 +630,66 @@ fn spawn_obfs_stream(
     });
 
     let write_task = tokio::spawn(async move {
-        let cipher = LessSafeKey::new(
-            UnboundKey::new(&CHACHA20_POLY1305, &write_key).expect("32-byte ChaCha20 key"),
+        let hdr_cipher = LessSafeKey::new(
+            UnboundKey::new(&CHACHA20_POLY1305, &write_dirs.hdr_key)
+                .expect("32-byte ChaCha20 key"),
+        );
+        let data_cipher = LessSafeKey::new(
+            UnboundKey::new(&CHACHA20_POLY1305, &write_dirs.data_key)
+                .expect("32-byte ChaCha20 key"),
         );
         let mut seq = 0u64;
         let mut buf = vec![0u8; OBFS_MAX_CHUNK];
-        let mut write_buf = Vec::with_capacity(2 + OBFS_MAX_CHUNK + OBFS_TAG_LEN);
+        let mut write_buf =
+            Vec::with_capacity(OBFS_STREAM_HDR_WIRE_LEN + OBFS_MAX_CHUNK + OBFS_TAG_LEN + 64);
         loop {
             let read = app_source
                 .read(&mut buf)
                 .await
                 .context("read local Flux obfs source")?;
-            let (nonce, mask) = step_nonce(&write_iv, seq);
+            let hdr_nonce = step_nonce(&write_dirs.hdr_iv, seq);
+            let data_nonce = step_nonce(&write_dirs.data_iv, seq);
+            let pad_len = if read > 0 && read < 256 && seq < 16 {
+                let mut r = [0u8; 1];
+                let _ = getrandom::fill(&mut r);
+                usize::from(r[0] & 0x1f)
+            } else {
+                0
+            };
             seq = seq.checked_add(1).context("Flux obfs write seq overflow")?;
-            let ct_len = read + OBFS_TAG_LEN;
-            let masked_len = ((ct_len as u16) ^ mask).to_be_bytes();
+
             write_buf.clear();
-            write_buf.extend_from_slice(&masked_len);
-            write_buf.extend_from_slice(&buf[..read]);
-            let tag = cipher
+            let len_bytes = (read as u16).to_be_bytes();
+            write_buf.extend_from_slice(&[len_bytes[0], len_bytes[1], pad_len as u8, 0]);
+            let hdr_tag = hdr_cipher
                 .seal_in_place_separate_tag(
-                    Nonce::assume_unique_for_key(nonce),
+                    Nonce::assume_unique_for_key(hdr_nonce),
                     Aad::empty(),
-                    &mut write_buf[2..],
+                    &mut write_buf[..OBFS_STREAM_HDR_PLAIN_LEN],
                 )
-                .map_err(|_| anyhow::anyhow!("encrypt Flux obfs record"))?;
-            write_buf.extend_from_slice(tag.as_ref());
+                .map_err(|_| anyhow::anyhow!("encrypt Flux obfs frame header"))?;
+            write_buf.extend_from_slice(hdr_tag.as_ref());
+
+            if read > 0 {
+                let mut hdr_aad = [0u8; OBFS_STREAM_HDR_WIRE_LEN];
+                hdr_aad.copy_from_slice(&write_buf[..OBFS_STREAM_HDR_WIRE_LEN]);
+                write_buf.extend_from_slice(&buf[..read]);
+                let data_tag = data_cipher
+                    .seal_in_place_separate_tag(
+                        Nonce::assume_unique_for_key(data_nonce),
+                        Aad::from(&hdr_aad),
+                        &mut write_buf[OBFS_STREAM_HDR_WIRE_LEN..],
+                    )
+                    .map_err(|_| anyhow::anyhow!("encrypt Flux obfs record"))?;
+                write_buf.extend_from_slice(data_tag.as_ref());
+            }
+            if pad_len > 0 {
+                let pad_start = write_buf.len();
+                write_buf.resize(pad_start + pad_len, 0);
+                getrandom::fill(&mut write_buf[pad_start..])
+                    .map_err(|e| anyhow::anyhow!("Flux obfs frame pad random: {e}"))?;
+            }
+
             wire_writer
                 .write_all(&write_buf)
                 .await

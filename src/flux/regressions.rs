@@ -13,7 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
-fn server_config() -> FluxServerConfig {
+fn server_config(private_key: String) -> FluxServerConfig {
     FluxServerConfig {
         key: "user-token".into(),
         users: vec![],
@@ -30,12 +30,12 @@ fn server_config() -> FluxServerConfig {
             security: FluxSecurityMode::Obfs,
             cert_mode: FluxCertMode::Inherit,
             tls_material: None,
-            obfs_key: Some("channel-shared-key".into()),
+            private_key: Some(private_key),
         }],
     }
 }
 
-fn client_config(ports: Vec<u16>) -> Result<FluxClientConfig> {
+fn client_config(ports: Vec<u16>, public_key: &str) -> Result<FluxClientConfig> {
     let proxy: crate::config_compat::mihomo::MihomoFluxProxy = serde_json::from_value(
         serde_json::json!({
             "name": "Flux", "server": "127.0.0.1", "port": ports[0],
@@ -43,7 +43,7 @@ fn client_config(ports: Vec<u16>) -> Result<FluxClientConfig> {
             "standby-channels": ports.len() - 1, "rotation-interval-sec": 0, "rotation-bytes-mb": 0,
             "channels": ports.into_iter().enumerate().map(|(i, port)| serde_json::json!({
                 "id": format!("channel-{i}"), "ports": port, "transport": "tcp",
-                "security": "obfs", "obfs-key": "channel-shared-key",
+                "security": "obfs", "public-key": public_key,
                 "weight": if i == 0 { 100 } else { 1 }, "role": if i == 0 { "primary" } else { "backup" },
             })).collect::<Vec<_>>()
         }),
@@ -93,7 +93,8 @@ async fn middlebox(
 
 #[tokio::test]
 async fn download_only_blackhole_migrates_and_listener_abort_closes_channels() -> Result<()> {
-    let config = server_config();
+    let (priv_key, pub_key) = generate_flux_x25519_keypair()?;
+    let config = server_config(priv_key);
     let core = ProxyCore::new(vec![CoreUser::password("u", "user-token")])?;
     let server = start_flux_server_with_core(config, core)?;
     let server_addr = server.tcp_addrs()[0];
@@ -120,7 +121,7 @@ async fn download_only_blackhole_migrates_and_listener_abort_closes_channels() -
     });
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let config = client_config(vec![relay_port, server_addr.port()])?;
+    let config = client_config(vec![relay_port, server_addr.port()], &pub_key)?;
     let client_task = tokio::spawn(run_flux_client_listener(listener, config));
     let mut stream = crate::socks::connect_tcp(addr, &ProxyTarget::Ip(target_addr)).await?;
     let mut banner = [0; 5];
@@ -150,10 +151,11 @@ async fn download_only_blackhole_migrates_and_listener_abort_closes_channels() -
 #[tokio::test]
 async fn replacing_listeners_preserves_the_target_connection() -> Result<()> {
     for transport in [FluxTransportKind::Tcp, FluxTransportKind::Udp] {
+        let (priv_key, pub_key) = generate_flux_x25519_keypair()?;
         let core = ProxyCore::new(vec![CoreUser::password("u", "user-token")])?;
         let state = FluxServerState::new(core, true);
         let stop = ListenerStopToken::new();
-        let mut config = server_config();
+        let mut config = server_config(priv_key);
         config.listeners[0].transport = transport;
         let server = start_flux_server_with_state(config.clone(), &state, stop.clone())?;
         let port = if transport == FluxTransportKind::Udp {
@@ -170,7 +172,7 @@ async fn replacing_listeners_preserves_the_target_connection() -> Result<()> {
         });
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        let mut client_config = client_config(vec![port])?;
+        let mut client_config = client_config(vec![port], &pub_key)?;
         client_config.channels[0].transport = transport;
         let client = tokio::spawn(run_flux_client_listener(listener, client_config));
         let mut stream = crate::socks::connect_tcp(addr, &ProxyTarget::Ip(target_addr)).await?;
@@ -234,7 +236,8 @@ fn handshake_proofs_require_secret_and_channel_binding() -> Result<()> {
 
 #[tokio::test]
 async fn target_connect_failures_return_real_socks_reply_codes() -> Result<()> {
-    let config = server_config();
+    let (priv_key, pub_key) = generate_flux_x25519_keypair()?;
+    let config = server_config(priv_key);
     let core = ProxyCore::new(vec![CoreUser::password("u", "user-token")])?;
     let server = start_flux_server_with_core(config, core)?;
     let server_port = server.tcp_addrs()[0].port();
@@ -243,7 +246,7 @@ async fn target_connect_failures_return_real_socks_reply_codes() -> Result<()> {
     let socks_addr = listener.local_addr()?;
     let client_task = tokio::spawn(run_flux_client_listener(
         listener,
-        client_config(vec![server_port])?,
+        client_config(vec![server_port], &pub_key)?,
     ));
 
     let closed_probe = TcpListener::bind("127.0.0.1:0").await?;
@@ -282,7 +285,8 @@ async fn target_connect_failures_return_real_socks_reply_codes() -> Result<()> {
 
 #[tokio::test]
 async fn midstream_target_reset_propagates_rst_while_fin_stays_clean() -> Result<()> {
-    let config = server_config();
+    let (priv_key, pub_key) = generate_flux_x25519_keypair()?;
+    let config = server_config(priv_key);
     let core = ProxyCore::new(vec![CoreUser::password("u", "user-token")])?;
     let server = start_flux_server_with_core(config, core)?;
     let server_port = server.tcp_addrs()[0].port();
@@ -291,7 +295,7 @@ async fn midstream_target_reset_propagates_rst_while_fin_stays_clean() -> Result
     let socks_addr = listener.local_addr()?;
     let client_task = tokio::spawn(run_flux_client_listener(
         listener,
-        client_config(vec![server_port])?,
+        client_config(vec![server_port], &pub_key)?,
     ));
 
     let fin_target = TcpListener::bind("127.0.0.1:0").await?;

@@ -834,7 +834,8 @@ impl MihomoFluxProxy {
                     ca_cert_paths: Vec::new(),
                     ca_certificates: Vec::new(),
                     pinned_cert_sha256: Vec::new(),
-                    obfs_key: None,
+                    public_key: None,
+                    tls_binding: true,
                     role: FluxChannelRole::Primary,
                     weight: 100,
                 });

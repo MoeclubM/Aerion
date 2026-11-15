@@ -137,6 +137,19 @@ pub async fn connect_proxy_target(target: &ProxyTarget) -> Result<TcpStream> {
 }
 
 pub async fn connect_tcp_host_port(host: &str, port: u16) -> Result<TcpStream> {
+    let trimmed_host = host.trim_end_matches('.');
+    if trimmed_host.is_empty()
+        || trimmed_host.eq_ignore_ascii_case("invalid")
+        || trimmed_host
+            .get(trimmed_host.len().saturating_sub(8)..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".invalid"))
+    {
+        let err = std::io::Error::new(
+            std::io::ErrorKind::HostUnreachable,
+            format!("RFC 6761 invalid domain: {host}:{port}"),
+        );
+        return Err(err).with_context(|| format!("resolve TCP peer {host}:{port}"));
+    }
     let addrs = tokio::net::lookup_host((host, port))
         .await
         .map_err(|error| {
