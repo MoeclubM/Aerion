@@ -709,7 +709,7 @@ async fn handle_server_channel(
         session_id,
         client_ephemeral_pub,
         timestamp_secs,
-        channel_id: _,
+        channel_id,
         blinded_credential,
         client_proof,
     } = first_frame.clone()
@@ -765,6 +765,12 @@ async fn handle_server_channel(
             "Flux session active channel limit reached"
         );
     }
+    tracing::info!(
+        channel = %channel_id,
+        transport = ?transport,
+        peer = %peer_addr,
+        "Flux server channel authenticated"
+    );
 
     let udp_enabled = registry.udp_enabled.load(Ordering::Acquire);
     let server_proof = auth::server_proof(&auth_key, &first_frame, udp_enabled)?;

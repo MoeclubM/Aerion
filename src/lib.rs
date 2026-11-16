@@ -121,7 +121,7 @@ pub use shadowsocks::{
 };
 pub use socket_protect::{
     OutboundInterface, clear_outbound_interface, detect_default_outbound_interface,
-    set_outbound_interface,
+    disable_windows_udp_connreset, is_fake_ip, resolve_host_non_fakeip, set_outbound_interface,
 };
 pub use socks::{SocksProxyClientConfig, run_socks_proxy_client, run_socks_proxy_client_listener};
 pub use sudoku::{

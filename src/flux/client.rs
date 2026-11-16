@@ -40,6 +40,8 @@ const WRITER_BATCH_MAX: usize = 64;
 const STREAM_EVENT_BURST_MAX: usize = 32;
 const MAX_AUTO_SCALE_CHANNELS: usize = 16;
 const MAX_UDP_RELAY_CHANNELS: usize = 4;
+const MAX_CLIENT_TOTAL_CHANNELS: usize = 24;
+const DRAINING_FORCE_CLOSE_US: u64 = 60_000_000;
 const RATE_SAMPLE_MIN_US: u64 = 100_000;
 const RATE_IDLE_RESET_US: u64 = 600_000;
 const SHED_CHANNEL_COOLDOWN_US: u64 = 400_000;
@@ -160,6 +162,7 @@ pub struct ClientChannelHandle {
     stream_tx: mpsc::Sender<FluxFrame>,
     dead: AtomicBool,
     draining: AtomicBool,
+    draining_since_us: AtomicU64,
     state_notify: Notify,
     active_streams: AtomicUsize,
     last_rx_micros: AtomicU64,
@@ -204,6 +207,19 @@ impl ClientChannelHandle {
 
     pub fn mark_draining(&self) {
         self.draining.store(true, Ordering::SeqCst);
+        if self.active_streams.load(Ordering::SeqCst) == 0 {
+            self.mark_dead();
+        }
+    }
+
+    fn mark_draining_at(&self, now_us: u64) {
+        let _ = self.draining_since_us.compare_exchange(
+            0,
+            now_us.max(1),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+        self.mark_draining();
     }
 
     fn try_drain_if_idle(&self) -> bool {
@@ -728,9 +744,9 @@ impl FluxClientPool {
             (active as i64) * load_step
         };
         let weight_bonus = i64::from(ch.weight) / 10;
-        let transport_bonus = match ch.transport {
+        let transport_penalty = match ch.transport {
             FluxTransportKind::Tcp | FluxTransportKind::Udp => 0,
-            FluxTransportKind::Http => -2,
+            FluxTransportKind::Http => 12,
         };
         let ip_penalty = match (self.config.options.ip_strategy, ch.remote_addr.is_ipv6()) {
             (FluxIpStrategy::PreferV4, true) => 15,
@@ -749,7 +765,11 @@ impl FluxClientPool {
             } else {
                 0
             };
-        rtt + load - weight_bonus - transport_bonus + ip_penalty + role_penalty + congestion_penalty
+        rtt + load - weight_bonus
+            + transport_penalty
+            + ip_penalty
+            + role_penalty
+            + congestion_penalty
     }
 
     fn score_channel_for_udp(&self, ch: &ClientChannelHandle) -> i64 {
@@ -770,7 +790,10 @@ impl FluxClientPool {
                     .all(|ch| ch.role == FluxChannelRole::UdpRelay));
         if !needs_stream_warm {
             candidates.sort_by_key(|ch| self.score_channel_for_stream(ch));
-            if let Some(slot) = candidates.into_iter().find_map(StreamSlotGuard::try_acquire) {
+            if let Some(slot) = candidates
+                .into_iter()
+                .find_map(StreamSlotGuard::try_acquire)
+            {
                 self.warmer_wake.notify_one();
                 return Ok(slot);
             }
@@ -803,6 +826,31 @@ impl FluxClientPool {
             .min_by_key(|ch| self.score_channel_for_stream(ch))
     }
 
+    fn pick_drain_target_channel(
+        &self,
+        draining_ch: &ClientChannelHandle,
+    ) -> Option<Arc<ClientChannelHandle>> {
+        let now_us = self.now_micros();
+        let candidates = self
+            .new_stream_candidates()
+            .into_iter()
+            .filter(|ch| ch.uid != draining_ch.uid)
+            .collect::<Vec<_>>();
+        if let Some(budget_bps) = self.config.options.channel_max_bytes_per_sec() {
+            if let Some(under_budget) = candidates
+                .iter()
+                .filter(|ch| ch.role.is_primary_tier() && ch.current_rate_bps(now_us) < budget_bps)
+                .min_by_key(|ch| self.score_channel_for_stream(ch))
+                .cloned()
+            {
+                return Some(under_budget);
+            }
+        }
+        candidates
+            .into_iter()
+            .min_by_key(|ch| self.score_channel_for_stream(ch))
+    }
+
     fn udp_relay_needs_warm(&self, usable: &[Arc<ClientChannelHandle>], now_us: u64) -> bool {
         let relays = usable
             .iter()
@@ -816,7 +864,9 @@ impl FluxClientPool {
         };
         let prewarm_bps = (budget_bps * 3 / 4).max(1);
         relays.len() < MAX_UDP_RELAY_CHANNELS
-            && relays.iter().all(|ch| ch.current_rate_bps(now_us) >= prewarm_bps)
+            && relays
+                .iter()
+                .all(|ch| ch.current_rate_bps(now_us) >= prewarm_bps)
     }
 
     async fn maybe_warm_udp_relay_channel(self: &Arc<Self>, has_fallback_usable: bool) {
@@ -882,7 +932,8 @@ impl FluxClientPool {
                         .remove(&(cand.spec_idx, cand.addr));
                 }
                 Err(err) => {
-                    tracing::debug!(
+                    tracing::warn!(
+                        remote = %cand.addr,
                         channel = %self.config.channels[cand.spec_idx].id,
                         "Flux UDP relay channel dial failed: {err:#}"
                     );
@@ -982,6 +1033,16 @@ impl FluxClientPool {
     async fn warm_channels_now(self: &Arc<Self>) -> Result<()> {
         let _guard = self.dial_mutex.lock().await;
         ensure!(!self.stop.is_stopped(), "Flux client stopped");
+        let total_open = self
+            .channels
+            .lock()
+            .expect("Flux client channels poisoned")
+            .values()
+            .filter(|ch| !ch.is_dead())
+            .count();
+        if total_open >= MAX_CLIENT_TOTAL_CHANNELS {
+            return Ok(());
+        }
         let target = self.target_warm_count();
         let has_stream_specs = self.has_non_udp_relay_specs();
         let mut active = self.usable_stream_channels();
@@ -1056,12 +1117,17 @@ impl FluxClientPool {
                             if p_addr.is_ipv6() != cand.addr.is_ipv6() {
                                 score += 100;
                             }
-                            if p_transport != spec.transport {
-                                score += 80;
+                            if p_transport != spec.transport
+                                && spec.transport != FluxTransportKind::Http
+                            {
+                                score += 60;
                             }
                             if p_spec_idx != cand.spec_idx {
                                 score += 30;
                             }
+                        }
+                        if spec.transport == FluxTransportKind::Http {
+                            score -= 15;
                         }
                         score
                     })
@@ -1095,7 +1161,11 @@ impl FluxClientPool {
                     active.push(ch);
                 }
                 Ok((cand, Err(err))) => {
-                    tracing::debug!(channel = %self.config.channels[cand.spec_idx].id, "Flux channel dial failed: {err:#}");
+                    tracing::warn!(
+                        channel = %self.config.channels[cand.spec_idx].id,
+                        remote = %cand.addr,
+                        "Flux channel dial failed: {err:#}"
+                    );
                     planned.retain(|&(idx, addr, _)| !(idx == cand.spec_idx && addr == cand.addr));
                     let mut failed = self
                         .failed_endpoints
@@ -1203,6 +1273,11 @@ impl FluxClientPool {
                                 active.push(ch);
                             }
                             Err(err) => {
+                                tracing::warn!(
+                                    channel = %self.config.channels[cand.spec_idx].id,
+                                    remote = %cand.addr,
+                                    "Flux extra channel dial failed: {err:#}"
+                                );
                                 let mut failed = self
                                     .failed_endpoints
                                     .lock()
@@ -1332,6 +1407,7 @@ impl FluxClientPool {
             stream_tx,
             dead: AtomicBool::new(false),
             draining: AtomicBool::new(false),
+            draining_since_us: AtomicU64::new(0),
             state_notify: Notify::new(),
             active_streams: AtomicUsize::new(0),
             last_rx_micros: AtomicU64::new(init_now_us),
@@ -1378,7 +1454,16 @@ impl FluxClientPool {
         let reader_pool = self.clone();
         let reader_handle = handle.clone();
         tokio::spawn(async move {
-            let _ = run_client_reader_loop(&mut reader, &reader_handle, &reader_pool).await;
+            if let Err(err) =
+                run_client_reader_loop(&mut reader, &reader_handle, &reader_pool).await
+                && !reader_pool.stop.is_stopped()
+            {
+                tracing::warn!(
+                    channel = %reader_handle.spec_id,
+                    remote = %reader_handle.remote_addr,
+                    "Flux client channel ended: {err:#}"
+                );
+            }
             reader_handle.mark_dead();
             writer_task.abort();
             reader_pool
@@ -1389,7 +1474,7 @@ impl FluxClientPool {
             reader_pool.warmer_wake.notify_one();
         });
 
-        tracing::debug!(
+        tracing::info!(
             "Flux client channel {}#{} ({:?}/{:?}) ready to {} (rtt={}ms)",
             spec.id,
             uid,
@@ -1445,6 +1530,18 @@ impl FluxClientPool {
             if !ch.is_dead() {
                 ch.sample_rate_bps(now_us);
             }
+            if ch.is_draining() && !ch.is_dead() {
+                if ch.active_streams.load(Ordering::SeqCst) == 0 {
+                    ch.mark_dead();
+                } else {
+                    let has_replacement = snapshot
+                        .iter()
+                        .any(|other| other.uid != ch.uid && other.is_usable_for_new());
+                    if has_replacement {
+                        ch.request_stream_shed(now_us);
+                    }
+                }
+            }
         }
         let Some(budget_bps) = self.config.options.channel_max_bytes_per_sec() else {
             return;
@@ -1489,6 +1586,11 @@ impl FluxClientPool {
                 if now.saturating_sub(sent) > timeout_us
                     && now.saturating_sub(ch.last_rx_micros.load(Ordering::Relaxed)) > timeout_us
                 {
+                    tracing::warn!(
+                        channel = %ch.spec_id,
+                        remote = %ch.remote_addr,
+                        "Flux channel ping timed out; marking dead"
+                    );
                     ch.mark_dead();
                 }
             }
@@ -1580,13 +1682,44 @@ impl FluxClientPool {
                 );
                 *sample = (Instant::now(), total, sample.2.max(rate));
             }
+            let now = self.now_micros();
             if ch.is_draining() {
                 if ch.active_streams.load(Ordering::SeqCst) == 0 {
                     ch.mark_dead();
+                    continue;
                 }
-                continue;
+                let has_replacement = snapshot.iter().any(|other| {
+                    other.uid != ch.uid
+                        && other.is_usable_for_new()
+                        && (ch.role == FluxChannelRole::UdpRelay
+                            || other.role != FluxChannelRole::UdpRelay)
+                });
+                if has_replacement {
+                    ch.request_stream_shed(now);
+                    let since = ch.draining_since_us.load(Ordering::Relaxed);
+                    if since == 0 {
+                        let _ = ch.draining_since_us.compare_exchange(
+                            0,
+                            now.max(1),
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        );
+                    } else if now.saturating_sub(since) >= DRAINING_FORCE_CLOSE_US {
+                        tracing::warn!(
+                            channel = %ch.spec_id,
+                            remote = %ch.remote_addr,
+                            "Flux draining channel force-closed after timeout"
+                        );
+                        ch.mark_dead();
+                        continue;
+                    }
+                }
             }
-            if ch.should_proactively_rotate() {
+            let live_total = snapshot.iter().filter(|c| !c.is_dead()).count();
+            if !ch.is_draining()
+                && live_total + 2 < MAX_CLIENT_TOTAL_CHANNELS
+                && ch.should_proactively_rotate()
+            {
                 let others_usable = snapshot
                     .iter()
                     .filter(|other| {
@@ -1597,18 +1730,28 @@ impl FluxClientPool {
                     })
                     .count();
                 if others_usable > 0 {
-                    ch.mark_draining();
+                    tracing::info!(
+                        channel = %ch.spec_id,
+                        remote = %ch.remote_addr,
+                        "Flux channel rotating to draining"
+                    );
+                    ch.mark_draining_at(now);
+                    ch.request_stream_shed(now);
                     continue;
                 }
             }
 
-            let now = self.now_micros();
             let pending = *ch.pending_ping.lock().expect("Flux ping poisoned");
             if let Some((_, sent)) = pending {
                 let timeout_us = ch.probe_timeout_us();
                 if now.saturating_sub(sent) > timeout_us
                     && now.saturating_sub(ch.last_rx_micros.load(Ordering::Relaxed)) > timeout_us
                 {
+                    tracing::warn!(
+                        channel = %ch.spec_id,
+                        remote = %ch.remote_addr,
+                        "Flux channel probe timed out; marking dead"
+                    );
                     ch.mark_dead();
                 }
                 continue;
@@ -1749,47 +1892,51 @@ mod maintenance_tests {
         let pool = FluxClientPool::new(proxy.to_client_config("127.0.0.1:0".parse()?)?)?;
         let old_created = Instant::now() - Duration::from_secs(20);
 
-        let make_handle = |uid: u64, spec_idx: usize, addr: SocketAddr, rtt: u64, created_at: Instant| {
-            let (a, _b) = tokio::io::duplex(64);
-            let (_, _, guard) =
-                super::super::transport::split_boxed_stream_with_binding(Box::new(a), Some([7; 32]));
-            let (prio_tx, _prio_rx) = mpsc::unbounded_channel();
-            let (stream_tx, _stream_rx) = mpsc::channel(16);
-            Arc::new(ClientChannelHandle {
-                uid,
-                spec_idx,
-                spec_id: format!("ch-{uid}"),
-                remote_addr: addr,
-                transport: FluxTransportKind::Tcp,
-                security: FluxSecurityMode::Obfs,
-                role: FluxChannelRole::Primary,
-                weight: 100,
-                prio_tx,
-                stream_tx,
-                dead: AtomicBool::new(false),
-                draining: AtomicBool::new(false),
-                state_notify: Notify::new(),
-                active_streams: AtomicUsize::new(0),
-                last_rx_micros: AtomicU64::new(0),
-                pending_ping: StdMutex::new(None),
-                baseline_rtt_ms: AtomicU64::new(rtt),
-                smoothed_rtt_ms: AtomicU64::new(rtt),
-                degraded_strikes: AtomicUsize::new(0),
-                bytes_transferred: AtomicU64::new(0),
-                last_rate_sample_us: AtomicU64::new(0),
-                cached_rate_bps: AtomicU64::new(0),
-                rate_state: StdMutex::new((0, 0, 0)),
-                shed_tokens: AtomicUsize::new(0),
-                shed_notify: Notify::new(),
-                last_shed_us: AtomicU64::new(0),
-                throughput_sample: StdMutex::new((Instant::now(), 0, 0)),
-                throughput_degraded: AtomicBool::new(false),
-                created_at,
-                rotate_after: None,
-                rotate_bytes_limit: None,
-                guard,
-            })
-        };
+        let make_handle =
+            |uid: u64, spec_idx: usize, addr: SocketAddr, rtt: u64, created_at: Instant| {
+                let (a, _b) = tokio::io::duplex(64);
+                let (_, _, guard) = super::super::transport::split_boxed_stream_with_binding(
+                    Box::new(a),
+                    Some([7; 32]),
+                );
+                let (prio_tx, _prio_rx) = mpsc::unbounded_channel();
+                let (stream_tx, _stream_rx) = mpsc::channel(16);
+                Arc::new(ClientChannelHandle {
+                    uid,
+                    spec_idx,
+                    spec_id: format!("ch-{uid}"),
+                    remote_addr: addr,
+                    transport: FluxTransportKind::Tcp,
+                    security: FluxSecurityMode::Obfs,
+                    role: FluxChannelRole::Primary,
+                    weight: 100,
+                    prio_tx,
+                    stream_tx,
+                    dead: AtomicBool::new(false),
+                    draining: AtomicBool::new(false),
+                    draining_since_us: AtomicU64::new(0),
+                    state_notify: Notify::new(),
+                    active_streams: AtomicUsize::new(0),
+                    last_rx_micros: AtomicU64::new(0),
+                    pending_ping: StdMutex::new(None),
+                    baseline_rtt_ms: AtomicU64::new(rtt),
+                    smoothed_rtt_ms: AtomicU64::new(rtt),
+                    degraded_strikes: AtomicUsize::new(0),
+                    bytes_transferred: AtomicU64::new(0),
+                    last_rate_sample_us: AtomicU64::new(0),
+                    cached_rate_bps: AtomicU64::new(0),
+                    rate_state: StdMutex::new((0, 0, 0)),
+                    shed_tokens: AtomicUsize::new(0),
+                    shed_notify: Notify::new(),
+                    last_shed_us: AtomicU64::new(0),
+                    throughput_sample: StdMutex::new((Instant::now(), 0, 0)),
+                    throughput_degraded: AtomicBool::new(false),
+                    created_at,
+                    rotate_after: None,
+                    rotate_bytes_limit: None,
+                    guard,
+                })
+            };
 
         let ch1 = make_handle(1, 0, "127.0.0.1:443".parse()?, 20, old_created);
         let ch2 = make_handle(2, 0, "127.0.0.1:443".parse()?, 25, old_created);
@@ -1810,6 +1957,91 @@ mod maintenance_tests {
         assert!(ch2.is_dead());
         assert!(!ch3.is_dead());
         assert!(!ch4.is_dead());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn draining_channel_sheds_single_stream_and_closes_when_empty() -> Result<()> {
+        let pub_key = crate::flux::config::generate_flux_x25519_keypair()?.1;
+        let proxy: crate::config_compat::mihomo::MihomoFluxProxy =
+            serde_json::from_value(serde_json::json!({
+                "name": "Flux",
+                "server": "127.0.0.1",
+                "port": 443,
+                "key": "test-user",
+                "channel-max-mbps": 0,
+                "channels": [
+                    {"id": "v4", "transport": "tcp", "security": "obfs", "public-key": pub_key}
+                ],
+            }))?;
+        let pool = FluxClientPool::new(proxy.to_client_config("127.0.0.1:0".parse()?)?)?;
+        let make = |uid: u64| {
+            let (a, _b) = tokio::io::duplex(64);
+            let (_, _, guard) = super::super::transport::split_boxed_stream_with_binding(
+                Box::new(a),
+                Some([9; 32]),
+            );
+            let (prio_tx, _prio_rx) = mpsc::unbounded_channel();
+            let (stream_tx, _stream_rx) = mpsc::channel(16);
+            Arc::new(ClientChannelHandle {
+                uid,
+                spec_idx: 0,
+                spec_id: format!("ch-{uid}"),
+                remote_addr: "127.0.0.1:443".parse().unwrap(),
+                transport: FluxTransportKind::Tcp,
+                security: FluxSecurityMode::Obfs,
+                role: FluxChannelRole::Primary,
+                weight: 100,
+                prio_tx,
+                stream_tx,
+                dead: AtomicBool::new(false),
+                draining: AtomicBool::new(false),
+                draining_since_us: AtomicU64::new(0),
+                state_notify: Notify::new(),
+                active_streams: AtomicUsize::new(0),
+                last_rx_micros: AtomicU64::new(0),
+                pending_ping: StdMutex::new(None),
+                baseline_rtt_ms: AtomicU64::new(20),
+                smoothed_rtt_ms: AtomicU64::new(20),
+                degraded_strikes: AtomicUsize::new(0),
+                bytes_transferred: AtomicU64::new(0),
+                last_rate_sample_us: AtomicU64::new(0),
+                cached_rate_bps: AtomicU64::new(0),
+                rate_state: StdMutex::new((0, 0, 0)),
+                shed_tokens: AtomicUsize::new(0),
+                shed_notify: Notify::new(),
+                last_shed_us: AtomicU64::new(0),
+                throughput_sample: StdMutex::new((Instant::now(), 0, 0)),
+                throughput_degraded: AtomicBool::new(false),
+                created_at: Instant::now(),
+                rotate_after: None,
+                rotate_bytes_limit: None,
+                guard,
+            })
+        };
+        let old_ch = make(1);
+        let new_ch = make(2);
+        {
+            let mut map = pool.channels.lock().unwrap();
+            map.insert(old_ch.uid, old_ch.clone());
+            map.insert(new_ch.uid, new_ch.clone());
+        }
+        let mut slot = StreamSlotGuard::try_acquire(old_ch.clone()).expect("acquire old_ch");
+        old_ch.mark_draining_at(pool.now_micros());
+        assert!(!old_ch.is_dead(), "still has 1 active stream");
+
+        pool.refresh_rates_and_rebalance();
+        tokio::time::timeout(Duration::from_millis(200), old_ch.wait_shed_requested()).await?;
+        let target = pool
+            .pick_drain_target_channel(&old_ch)
+            .expect("drain target available even with channel-max-mbps=0");
+        assert_eq!(target.uid, new_ch.uid);
+        slot.switch_to(target);
+        assert!(
+            old_ch.is_dead(),
+            "draining channel closes immediately when last stream leaves"
+        );
+        assert_eq!(new_ch.active_stream_count(), 1);
         Ok(())
     }
 }
@@ -1899,7 +2131,7 @@ async fn resolve_channel_ips(
     }
 
     let lookup_port = spec.ports.first().copied().unwrap_or(443);
-    if let Ok(addrs) = tokio::net::lookup_host((host_clean, lookup_port)).await {
+    if let Ok(addrs) = socket_protect::resolve_host_non_fakeip(host_clean, lookup_port).await {
         for sock_addr in addrs {
             let ip = sock_addr.ip();
             if ((ip.is_ipv4() && allow_v4) || (ip.is_ipv6() && allow_v6)) && seen.insert(ip) {
@@ -1989,7 +2221,8 @@ async fn run_client_reader_loop(
                         .iter()
                         .any(|other| other.uid != ch.uid && other.rtt_ms() * 2 < ch.rtt_ms());
                     if healthier_exists {
-                        ch.mark_draining();
+                        ch.mark_draining_at(now);
+                        ch.request_stream_shed(now);
                     }
                 }
             }
@@ -2408,7 +2641,10 @@ impl StreamSlotGuard {
     }
 
     fn switch_to(&mut self, next: Arc<ClientChannelHandle>) {
-        self.ch.active_streams.fetch_sub(1, Ordering::SeqCst);
+        let prev = self.ch.active_streams.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 && self.ch.is_draining() {
+            self.ch.mark_dead();
+        }
         next.active_streams.fetch_add(1, Ordering::SeqCst);
         self.ch = next;
     }
@@ -2416,7 +2652,10 @@ impl StreamSlotGuard {
 
 impl Drop for StreamSlotGuard {
     fn drop(&mut self) {
-        self.ch.active_streams.fetch_sub(1, Ordering::SeqCst);
+        let prev = self.ch.active_streams.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 && self.ch.is_draining() {
+            self.ch.mark_dead();
+        }
     }
 }
 
@@ -2549,8 +2788,14 @@ async fn run_client_stream(
                 .await?;
             }
             _ = ch_watch.wait_shed_requested(), if can_rebalance => {
-                if slot.ch.active_streams.load(Ordering::Relaxed) > 1
-                    && let Some(next_ch) = pool.pick_rebalance_channel(&slot.ch)
+                let target_ch = if slot.ch.is_draining() {
+                    pool.pick_drain_target_channel(&slot.ch)
+                } else if slot.ch.active_streams.load(Ordering::Relaxed) > 1 {
+                    pool.pick_rebalance_channel(&slot.ch)
+                } else {
+                    None
+                };
+                if let Some(next_ch) = target_ch
                 {
                     pending_uplink = None;
                     epoch = epoch.saturating_add(1);

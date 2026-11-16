@@ -408,6 +408,11 @@ pub async fn write_reply(stream: &mut TcpStream, code: u8) -> Result<()> {
 }
 
 pub async fn connect_tcp(upstream: SocketAddr, target: &ProxyTarget) -> Result<TcpStream> {
+    if upstream.ip().is_loopback() {
+        let mut stream = connect_loopback_pipelined(upstream, 0x01, target).await?;
+        read_proxy_reply(&mut stream, upstream).await?;
+        return Ok(stream);
+    }
     let mut stream = connect_no_auth(upstream).await?;
     write_proxy_request(&mut stream, 0x01, target).await?;
     read_proxy_reply(&mut stream, upstream).await?;
@@ -428,8 +433,6 @@ async fn connect_proxy_tcp(
 }
 
 pub async fn udp_associate(upstream: SocketAddr) -> Result<SocksUdpAssociation> {
-    let mut control = connect_no_auth(upstream).await?;
-    let local_ip = control.local_addr()?.ip();
     let bind_request = if upstream.is_ipv4() {
         ProxyTarget::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
     } else {
@@ -438,11 +441,19 @@ pub async fn udp_associate(upstream: SocketAddr) -> Result<SocksUdpAssociation> 
             0,
         ))
     };
-    write_proxy_request(&mut control, 0x03, &bind_request).await?;
+    let mut control = if upstream.ip().is_loopback() {
+        connect_loopback_pipelined(upstream, 0x03, &bind_request).await?
+    } else {
+        let mut s = connect_no_auth(upstream).await?;
+        write_proxy_request(&mut s, 0x03, &bind_request).await?;
+        s
+    };
+    let local_ip = control.local_addr()?.ip();
     let bind = normalize_udp_bind(read_proxy_reply(&mut control, upstream).await?, upstream);
     let udp = UdpSocket::bind(SocketAddr::new(local_ip, 0))
         .await
         .with_context(|| format!("bind SOCKS UDP client socket for {upstream}"))?;
+    let _ = socket_protect::disable_windows_udp_connreset(&udp);
     Ok(SocksUdpAssociation { control, udp, bind })
 }
 
@@ -567,13 +578,15 @@ async fn handle_socks_proxy_udp_associate(
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         ip => ip,
     };
-    let client_udp = Arc::new(
-        UdpSocket::bind(SocketAddr::new(bind_ip, 0))
+    let client_udp = Arc::new({
+        let u = UdpSocket::bind(SocketAddr::new(bind_ip, 0))
             .await
             .with_context(|| {
                 format!("bind local SOCKS proxy UDP associate socket on {bind_ip}:0")
-            })?,
-    );
+            })?;
+        let _ = socket_protect::disable_windows_udp_connreset(&u);
+        u
+    });
     write_reply_with_bind(&mut control, 0x00, client_udp.local_addr()?).await?;
     tracing::info!(
         "SOCKS proxy UDP associate listening on {}",
@@ -617,6 +630,7 @@ async fn connect_no_auth(upstream: SocketAddr) -> Result<TcpStream> {
     let mut stream = TcpStream::connect(upstream)
         .await
         .with_context(|| format!("connect SOCKS upstream {upstream}"))?;
+    socket_protect::configure_tcp_socket(&stream);
     stream
         .write_all(&[0x05, 0x01, 0x00])
         .await
@@ -633,12 +647,40 @@ async fn connect_no_auth(upstream: SocketAddr) -> Result<TcpStream> {
     Ok(stream)
 }
 
-async fn write_proxy_request(
-    stream: &mut TcpStream,
+async fn connect_loopback_pipelined(
+    upstream: SocketAddr,
+    command: u8,
+    target: &ProxyTarget,
+) -> Result<TcpStream> {
+    let mut stream = TcpStream::connect(upstream)
+        .await
+        .with_context(|| format!("connect SOCKS upstream {upstream}"))?;
+    socket_protect::configure_tcp_socket(&stream);
+    let mut payload = Vec::with_capacity(32);
+    payload.extend_from_slice(&[0x05, 0x01, 0x00]);
+    encode_proxy_request_into(&mut payload, command, target)?;
+    stream
+        .write_all(&payload)
+        .await
+        .context("write pipelined SOCKS greeting + request")?;
+    let mut method = [0u8; 2];
+    stream
+        .read_exact(&mut method)
+        .await
+        .context("read SOCKS method response")?;
+    ensure!(
+        method == [0x05, 0x00],
+        "SOCKS upstream {upstream} rejected no-auth method"
+    );
+    Ok(stream)
+}
+
+fn encode_proxy_request_into(
+    request: &mut Vec<u8>,
     command: u8,
     target: &ProxyTarget,
 ) -> Result<()> {
-    let mut request = vec![0x05, command, 0x00];
+    request.extend_from_slice(&[0x05, command, 0x00]);
     match target {
         ProxyTarget::Ip(addr) => match addr.ip() {
             IpAddr::V4(ip) => {
@@ -661,6 +703,16 @@ async fn write_proxy_request(
         }
     }
     request.extend_from_slice(&target_port(target).to_be_bytes());
+    Ok(())
+}
+
+async fn write_proxy_request(
+    stream: &mut TcpStream,
+    command: u8,
+    target: &ProxyTarget,
+) -> Result<()> {
+    let mut request = Vec::with_capacity(32);
+    encode_proxy_request_into(&mut request, command, target)?;
     stream
         .write_all(&request)
         .await

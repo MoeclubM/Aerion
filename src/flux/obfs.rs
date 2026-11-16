@@ -1,6 +1,7 @@
 use crate::replay_cache::{ReplayCache, ReplayError};
 use crate::vless_transport::BoxedTransportStream;
 use anyhow::{Context, Result, bail, ensure};
+use bytes::BytesMut;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Tag as XChaChaTag, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
@@ -16,18 +17,17 @@ use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context as TaskContext, Poll, ready};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{
-    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex,
-};
-use tokio::task::JoinHandle;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const OBFS_UDP_NONCE_LEN: usize = 24;
 const OBFS_UDP_TAG_LEN: usize = 16;
 const OBFS_UDP_OVERHEAD: usize = OBFS_UDP_NONCE_LEN + OBFS_UDP_TAG_LEN;
-const OBFS_PIPE_CAP: usize = 256 * 1024;
+const OBFS_UDP_STACK_BUF_CAP: usize = 2048;
+const OBFS_READ_BUF_CAP: usize = 64 * 1024;
 const OBFS_MAX_CHUNK: usize = 32 * 1024;
 const OBFS_TAG_LEN: usize = 16;
 const OBFS_STREAM_HDR_PLAIN_LEN: usize = 4;
@@ -36,9 +36,52 @@ const OBFS_HELLO_HDR_PLAIN_LEN: usize = 16;
 const OBFS_HELLO_HDR_WIRE_LEN: usize = OBFS_HELLO_HDR_PLAIN_LEN + OBFS_TAG_LEN;
 const OBFS_MAX_HELLO_PAD: usize = 128;
 
+#[inline]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+struct FastPadRng(u64);
+
+impl FastPadRng {
+    fn from_os_seed() -> Self {
+        let mut seed = [0u8; 8];
+        let _ = getrandom::fill(&mut seed);
+        let s = u64::from_le_bytes(seed);
+        Self(if s == 0 { 0x9e37_79b9_7f4a_7c15 } else { s })
+    }
+
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn fill_bytes(&mut self, mut dst: &mut [u8]) {
+        while dst.len() >= 8 {
+            let chunk = self.next_u64().to_le_bytes();
+            dst[..8].copy_from_slice(&chunk);
+            dst = &mut dst[8..];
+        }
+        if !dst.is_empty() {
+            let chunk = self.next_u64().to_le_bytes();
+            dst.copy_from_slice(&chunk[..dst.len()]);
+        }
+    }
+}
+
 pub struct FluxObfsUdpSocket {
     inner: Arc<dyn AsyncUdpSocket>,
     cipher: XChaCha20Poly1305,
+    nonce_seed: [u64; 3],
+    nonce_seq: AtomicU64,
 }
 
 impl fmt::Debug for FluxObfsUdpSocket {
@@ -53,13 +96,35 @@ impl FluxObfsUdpSocket {
         let mut udp_key = [0u8; 32];
         hkdf.expand(b"xchacha20poly1305", &mut udp_key)
             .map_err(|_| anyhow::anyhow!("derive Flux UDP obfs key"))?;
+        let mut raw_seed = [0u8; 24];
+        getrandom::fill(&mut raw_seed)
+            .map_err(|e| anyhow::anyhow!("seed Flux UDP obfs nonce generator: {e}"))?;
         let inner = TokioRuntime
             .wrap_udp_socket(socket)
             .context("wrap Flux obfs UDP socket")?;
         Ok(Self {
             inner,
             cipher: XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&udp_key)),
+            nonce_seed: [
+                u64::from_le_bytes(raw_seed[0..8].try_into().unwrap()),
+                u64::from_le_bytes(raw_seed[8..16].try_into().unwrap()),
+                u64::from_le_bytes(raw_seed[16..24].try_into().unwrap()),
+            ],
+            nonce_seq: AtomicU64::new(1),
         })
+    }
+
+    #[inline]
+    fn next_nonce(&self) -> [u8; OBFS_UDP_NONCE_LEN] {
+        let seq = self.nonce_seq.fetch_add(1, Ordering::Relaxed);
+        let w0 = splitmix64(self.nonce_seed[0] ^ seq);
+        let w1 = splitmix64(self.nonce_seed[1] ^ seq.rotate_left(21) ^ w0);
+        let w2 = splitmix64(self.nonce_seed[2] ^ seq.rotate_left(43) ^ w1);
+        let mut out = [0u8; OBFS_UDP_NONCE_LEN];
+        out[0..8].copy_from_slice(&w0.to_le_bytes());
+        out[8..16].copy_from_slice(&w1.to_le_bytes());
+        out[16..24].copy_from_slice(&w2.to_le_bytes());
+        out
     }
 }
 
@@ -69,10 +134,32 @@ impl AsyncUdpSocket for FluxObfsUdpSocket {
     }
 
     fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
-        let mut nonce_bytes = [0u8; OBFS_UDP_NONCE_LEN];
-        getrandom::fill(&mut nonce_bytes)
-            .map_err(|e| io::Error::other(format!("Flux obfs nonce random: {e}")))?;
-        let mut packet = Vec::with_capacity(OBFS_UDP_OVERHEAD + transmit.contents.len());
+        let nonce_bytes = self.next_nonce();
+        let total_len = OBFS_UDP_OVERHEAD + transmit.contents.len();
+        if total_len <= OBFS_UDP_STACK_BUF_CAP {
+            let mut stack_buf = [0u8; OBFS_UDP_STACK_BUF_CAP];
+            stack_buf[..OBFS_UDP_NONCE_LEN].copy_from_slice(&nonce_bytes);
+            let ct_end = OBFS_UDP_NONCE_LEN + transmit.contents.len();
+            stack_buf[OBFS_UDP_NONCE_LEN..ct_end].copy_from_slice(transmit.contents);
+            let tag = self
+                .cipher
+                .encrypt_in_place_detached(
+                    XNonce::from_slice(&nonce_bytes),
+                    &[],
+                    &mut stack_buf[OBFS_UDP_NONCE_LEN..ct_end],
+                )
+                .map_err(|_| io::Error::other("Flux UDP obfs encrypt failed"))?;
+            stack_buf[ct_end..total_len].copy_from_slice(&tag);
+            let out = Transmit {
+                destination: transmit.destination,
+                ecn: transmit.ecn,
+                contents: &stack_buf[..total_len],
+                segment_size: None,
+                src_ip: transmit.src_ip,
+            };
+            return self.inner.try_send(&out);
+        }
+        let mut packet = Vec::with_capacity(total_len);
         packet.extend_from_slice(&nonce_bytes);
         packet.extend_from_slice(transmit.contents);
         let tag = self
@@ -144,10 +231,7 @@ impl AsyncUdpSocket for FluxObfsUdpSocket {
                             break;
                         }
                         if dst_off != src_off + OBFS_UDP_NONCE_LEN {
-                            slot_buf.copy_within(
-                                src_off + OBFS_UDP_NONCE_LEN..tag_start,
-                                dst_off,
-                            );
+                            slot_buf.copy_within(src_off + OBFS_UDP_NONCE_LEN..tag_start, dst_off);
                         }
                         src_off += seg_len;
                         dst_off += plain_len;
@@ -197,17 +281,193 @@ impl AsyncUdpSocket for FluxObfsUdpSocket {
     }
 }
 
-pub struct ObfsStream {
-    reader: DuplexStream,
-    writer: DuplexStream,
-    read_task: JoinHandle<Result<()>>,
-    write_task: JoinHandle<Result<()>>,
+#[derive(Clone, Copy)]
+struct PendingReadRecord {
+    payload_len: usize,
+    pad_len: usize,
+    hdr_aad: [u8; OBFS_STREAM_HDR_WIRE_LEN],
+    data_nonce: [u8; 12],
 }
 
-impl Drop for ObfsStream {
-    fn drop(&mut self) {
-        self.read_task.abort();
-        self.write_task.abort();
+pub struct ObfsStream {
+    inner: BoxedTransportStream,
+    read_hdr_cipher: LessSafeKey,
+    read_data_cipher: LessSafeKey,
+    read_hdr_iv: [u8; 12],
+    read_data_iv: [u8; 12],
+    read_seq: u64,
+    wire_read_buf: BytesMut,
+    plain_read_buf: BytesMut,
+    pending_record: Option<PendingReadRecord>,
+    read_eof: bool,
+    write_hdr_cipher: LessSafeKey,
+    write_data_cipher: LessSafeKey,
+    write_hdr_iv: [u8; 12],
+    write_data_iv: [u8; 12],
+    write_seq: u64,
+    write_buf: Vec<u8>,
+    write_pos: usize,
+    write_eof_queued: bool,
+    pad_rng: FastPadRng,
+}
+
+impl ObfsStream {
+    fn flush_pending_write_buf(&mut self, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        while self.write_pos < self.write_buf.len() {
+            let n = ready!(
+                Pin::new(&mut self.inner).poll_write(cx, &self.write_buf[self.write_pos..])
+            )?;
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "write zero to Flux obfs stream",
+                )));
+            }
+            self.write_pos += n;
+        }
+        self.write_buf.clear();
+        self.write_pos = 0;
+        Poll::Ready(Ok(()))
+    }
+
+    fn encode_record(&mut self, plain: &[u8]) -> io::Result<()> {
+        let read = plain.len();
+        let hdr_nonce = step_nonce(&self.write_hdr_iv, self.write_seq);
+        let data_nonce = step_nonce(&self.write_data_iv, self.write_seq);
+        let pad_len = if read > 0 && read < 256 && self.write_seq < 16 {
+            (self.pad_rng.next_u64() as usize) & 0x1f
+        } else {
+            0
+        };
+        self.write_seq = self
+            .write_seq
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("Flux obfs write seq overflow"))?;
+
+        let base = self.write_buf.len();
+        self.write_buf.reserve(
+            OBFS_STREAM_HDR_WIRE_LEN + if read > 0 { read + OBFS_TAG_LEN } else { 0 } + pad_len,
+        );
+        let len_bytes = (read as u16).to_be_bytes();
+        self.write_buf
+            .extend_from_slice(&[len_bytes[0], len_bytes[1], pad_len as u8, 0]);
+        let hdr_tag = self
+            .write_hdr_cipher
+            .seal_in_place_separate_tag(
+                Nonce::assume_unique_for_key(hdr_nonce),
+                Aad::empty(),
+                &mut self.write_buf[base..base + OBFS_STREAM_HDR_PLAIN_LEN],
+            )
+            .map_err(|_| io::Error::other("encrypt Flux obfs frame header"))?;
+        self.write_buf.extend_from_slice(hdr_tag.as_ref());
+
+        if read > 0 {
+            let mut hdr_aad = [0u8; OBFS_STREAM_HDR_WIRE_LEN];
+            hdr_aad.copy_from_slice(&self.write_buf[base..base + OBFS_STREAM_HDR_WIRE_LEN]);
+            let data_start = self.write_buf.len();
+            self.write_buf.extend_from_slice(plain);
+            let data_tag = self
+                .write_data_cipher
+                .seal_in_place_separate_tag(
+                    Nonce::assume_unique_for_key(data_nonce),
+                    Aad::from(&hdr_aad),
+                    &mut self.write_buf[data_start..],
+                )
+                .map_err(|_| io::Error::other("encrypt Flux obfs record"))?;
+            self.write_buf.extend_from_slice(data_tag.as_ref());
+        }
+        if pad_len > 0 {
+            let pad_start = self.write_buf.len();
+            self.write_buf.resize(pad_start + pad_len, 0);
+            self.pad_rng.fill_bytes(&mut self.write_buf[pad_start..]);
+        }
+        Ok(())
+    }
+
+    fn decode_buffered_records(&mut self, dst: &mut ReadBuf<'_>) -> io::Result<()> {
+        while !self.read_eof {
+            if self.pending_record.is_none() {
+                if self.wire_read_buf.len() < OBFS_STREAM_HDR_WIRE_LEN {
+                    break;
+                }
+                let mut hdr_wire = [0u8; OBFS_STREAM_HDR_WIRE_LEN];
+                hdr_wire.copy_from_slice(&self.wire_read_buf[..OBFS_STREAM_HDR_WIRE_LEN]);
+                let _ = self.wire_read_buf.split_to(OBFS_STREAM_HDR_WIRE_LEN);
+                let hdr_aad = hdr_wire;
+                let hdr_nonce = step_nonce(&self.read_hdr_iv, self.read_seq);
+                let data_nonce = step_nonce(&self.read_data_iv, self.read_seq);
+                self.read_seq = self.read_seq.checked_add(1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Flux obfs read seq overflow")
+                })?;
+                let hdr_plain = self
+                    .read_hdr_cipher
+                    .open_in_place(
+                        Nonce::assume_unique_for_key(hdr_nonce),
+                        Aad::empty(),
+                        &mut hdr_wire,
+                    )
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "decrypt Flux obfs frame header")
+                    })?;
+                let payload_len = usize::from(u16::from_be_bytes([hdr_plain[0], hdr_plain[1]]));
+                let pad_len = usize::from(hdr_plain[2]);
+                if payload_len > OBFS_MAX_CHUNK {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid Flux obfs record length {payload_len}"),
+                    ));
+                }
+                self.pending_record = Some(PendingReadRecord {
+                    payload_len,
+                    pad_len,
+                    hdr_aad,
+                    data_nonce,
+                });
+            }
+
+            let rec = self.pending_record.unwrap();
+            if rec.payload_len == 0 {
+                if self.wire_read_buf.len() < rec.pad_len {
+                    break;
+                }
+                if rec.pad_len > 0 {
+                    let _ = self.wire_read_buf.split_to(rec.pad_len);
+                }
+                self.pending_record = None;
+                self.read_eof = true;
+                break;
+            }
+
+            let ct_len = rec.payload_len + OBFS_TAG_LEN;
+            let total_body = ct_len + rec.pad_len;
+            if self.wire_read_buf.len() < total_body {
+                break;
+            }
+            self.pending_record = None;
+            let mut body = self.wire_read_buf.split_to(total_body);
+            let plain = self
+                .read_data_cipher
+                .open_in_place(
+                    Nonce::assume_unique_for_key(rec.data_nonce),
+                    Aad::from(&rec.hdr_aad),
+                    &mut body[..ct_len],
+                )
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "decrypt Flux obfs record")
+                })?;
+            if self.plain_read_buf.is_empty() && plain.len() <= dst.remaining() {
+                dst.put_slice(plain);
+            } else {
+                let direct = dst.remaining().min(plain.len());
+                if self.plain_read_buf.is_empty() && direct > 0 {
+                    dst.put_slice(&plain[..direct]);
+                    self.plain_read_buf.extend_from_slice(&plain[direct..]);
+                } else {
+                    self.plain_read_buf.extend_from_slice(plain);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -217,7 +477,60 @@ impl AsyncRead for ObfsStream {
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.reader).poll_read(cx, buf)
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let this = &mut *self;
+        if !this.plain_read_buf.is_empty() {
+            let n = buf.remaining().min(this.plain_read_buf.len());
+            let chunk = this.plain_read_buf.split_to(n);
+            buf.put_slice(&chunk);
+            if buf.remaining() == 0 || this.wire_read_buf.is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+        }
+
+        let initial_filled = buf.filled().len();
+        loop {
+            this.decode_buffered_records(buf)?;
+            if buf.filled().len() > initial_filled {
+                return Poll::Ready(Ok(()));
+            }
+            if !this.plain_read_buf.is_empty() {
+                let n = buf.remaining().min(this.plain_read_buf.len());
+                let chunk = this.plain_read_buf.split_to(n);
+                buf.put_slice(&chunk);
+                return Poll::Ready(Ok(()));
+            }
+            if this.read_eof {
+                return Poll::Ready(Ok(()));
+            }
+
+            if this.wire_read_buf.capacity() - this.wire_read_buf.len() < OBFS_MAX_CHUNK + 128 {
+                this.wire_read_buf.reserve(OBFS_READ_BUF_CAP);
+            }
+            let read_n = {
+                let spare = this.wire_read_buf.spare_capacity_mut();
+                let mut rbuf = ReadBuf::uninit(spare);
+                ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rbuf))?;
+                rbuf.filled().len()
+            };
+            if read_n == 0 {
+                if this.pending_record.is_none() && this.wire_read_buf.is_empty() {
+                    this.read_eof = true;
+                    return Poll::Ready(Ok(()));
+                }
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated Flux obfs frame",
+                )));
+            }
+            // SAFETY: `poll_read` initialized `read_n` bytes at the start of `spare_capacity_mut()`.
+            unsafe {
+                let new_len = this.wire_read_buf.len() + read_n;
+                this.wire_read_buf.set_len(new_len);
+            }
+        }
     }
 }
 
@@ -227,15 +540,35 @@ impl AsyncWrite for ObfsStream {
         cx: &mut TaskContext<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.writer).poll_write(cx, buf)
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let this = &mut *self;
+        ready!(this.flush_pending_write_buf(cx))?;
+        let chunk = buf.len().min(OBFS_MAX_CHUNK);
+        this.encode_record(&buf[..chunk])?;
+        if let Poll::Ready(Err(err)) = this.flush_pending_write_buf(cx) {
+            return Poll::Ready(Err(err));
+        }
+        Poll::Ready(Ok(chunk))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.writer).poll_flush(cx)
+        let this = &mut *self;
+        ready!(this.flush_pending_write_buf(cx))?;
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.writer).poll_shutdown(cx)
+        let this = &mut *self;
+        ready!(this.flush_pending_write_buf(cx))?;
+        if !this.write_eof_queued {
+            this.encode_record(&[])?;
+            this.write_eof_queued = true;
+        }
+        ready!(this.flush_pending_write_buf(cx))?;
+        ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 
@@ -464,7 +797,10 @@ pub(crate) async fn server_obfs_handshake(
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     ensure!(now.abs_diff(ts) <= 120, "expired Flux obfs handshake");
     let pad_len = usize::from(plain[8]);
-    ensure!(pad_len <= OBFS_MAX_HELLO_PAD, "invalid Flux obfs client padding");
+    ensure!(
+        pad_len <= OBFS_MAX_HELLO_PAD,
+        "invalid Flux obfs client padding"
+    );
     match replay.check_and_store(client_pub) {
         Ok(()) => {}
         Err(ReplayError::Replayed) => bail!("replayed Flux obfs handshake"),
@@ -557,159 +893,37 @@ fn spawn_obfs_stream(
     write_dirs: DirectionalKeys,
     read_dirs: DirectionalKeys,
 ) -> ObfsStream {
-    let (mut wire_reader, mut wire_writer) = tokio::io::split(stream);
-    let (mut app_sink, reader) = duplex(OBFS_PIPE_CAP);
-    let (writer, mut app_source) = duplex(OBFS_PIPE_CAP);
-
-    let read_task = tokio::spawn(async move {
-        let hdr_cipher = LessSafeKey::new(
+    ObfsStream {
+        inner: stream,
+        read_hdr_cipher: LessSafeKey::new(
             UnboundKey::new(&CHACHA20_POLY1305, &read_dirs.hdr_key).expect("32-byte ChaCha20 key"),
-        );
-        let data_cipher = LessSafeKey::new(
-            UnboundKey::new(&CHACHA20_POLY1305, &read_dirs.data_key)
-                .expect("32-byte ChaCha20 key"),
-        );
-        let mut seq = 0u64;
-        let mut hdr_wire = [0u8; OBFS_STREAM_HDR_WIRE_LEN];
-        let mut body = Vec::with_capacity(OBFS_MAX_CHUNK + OBFS_TAG_LEN + 64);
-        loop {
-            match wire_reader.read_exact(&mut hdr_wire).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    let _ = app_sink.shutdown().await;
-                    return Ok(());
-                }
-                Err(e) => return Err(e).context("read Flux obfs frame length"),
-            }
-            let hdr_nonce = step_nonce(&read_dirs.hdr_iv, seq);
-            let data_nonce = step_nonce(&read_dirs.data_iv, seq);
-            seq = seq.checked_add(1).context("Flux obfs read seq overflow")?;
-
-            let hdr_aad = hdr_wire;
-            let hdr_plain = hdr_cipher
-                .open_in_place(
-                    Nonce::assume_unique_for_key(hdr_nonce),
-                    Aad::empty(),
-                    &mut hdr_wire,
-                )
-                .map_err(|_| anyhow::anyhow!("decrypt Flux obfs frame header"))?;
-            let payload_len = usize::from(u16::from_be_bytes([hdr_plain[0], hdr_plain[1]]));
-            let pad_len = usize::from(hdr_plain[2]);
-            ensure!(
-                payload_len <= OBFS_MAX_CHUNK,
-                "invalid Flux obfs record length {payload_len}"
-            );
-            if payload_len == 0 {
-                if pad_len > 0 {
-                    body.resize(pad_len, 0);
-                    wire_reader
-                        .read_exact(&mut body)
-                        .await
-                        .context("read Flux obfs EOF padding")?;
-                }
-                let _ = app_sink.shutdown().await;
-                return Ok(());
-            }
-            let ct_len = payload_len + OBFS_TAG_LEN;
-            body.resize(ct_len + pad_len, 0);
-            wire_reader
-                .read_exact(&mut body)
-                .await
-                .context("read Flux obfs ciphertext")?;
-            let plain = data_cipher
-                .open_in_place(
-                    Nonce::assume_unique_for_key(data_nonce),
-                    Aad::from(&hdr_aad),
-                    &mut body[..ct_len],
-                )
-                .map_err(|_| anyhow::anyhow!("decrypt Flux obfs record"))?;
-            if app_sink.write_all(plain).await.is_err() {
-                return Ok(());
-            }
-        }
-    });
-
-    let write_task = tokio::spawn(async move {
-        let hdr_cipher = LessSafeKey::new(
-            UnboundKey::new(&CHACHA20_POLY1305, &write_dirs.hdr_key)
-                .expect("32-byte ChaCha20 key"),
-        );
-        let data_cipher = LessSafeKey::new(
+        ),
+        read_data_cipher: LessSafeKey::new(
+            UnboundKey::new(&CHACHA20_POLY1305, &read_dirs.data_key).expect("32-byte ChaCha20 key"),
+        ),
+        read_hdr_iv: read_dirs.hdr_iv,
+        read_data_iv: read_dirs.data_iv,
+        read_seq: 0,
+        wire_read_buf: BytesMut::with_capacity(OBFS_READ_BUF_CAP),
+        plain_read_buf: BytesMut::with_capacity(16 * 1024),
+        pending_record: None,
+        read_eof: false,
+        write_hdr_cipher: LessSafeKey::new(
+            UnboundKey::new(&CHACHA20_POLY1305, &write_dirs.hdr_key).expect("32-byte ChaCha20 key"),
+        ),
+        write_data_cipher: LessSafeKey::new(
             UnboundKey::new(&CHACHA20_POLY1305, &write_dirs.data_key)
                 .expect("32-byte ChaCha20 key"),
-        );
-        let mut seq = 0u64;
-        let mut buf = vec![0u8; OBFS_MAX_CHUNK];
-        let mut write_buf =
-            Vec::with_capacity(OBFS_STREAM_HDR_WIRE_LEN + OBFS_MAX_CHUNK + OBFS_TAG_LEN + 64);
-        loop {
-            let read = app_source
-                .read(&mut buf)
-                .await
-                .context("read local Flux obfs source")?;
-            let hdr_nonce = step_nonce(&write_dirs.hdr_iv, seq);
-            let data_nonce = step_nonce(&write_dirs.data_iv, seq);
-            let pad_len = if read > 0 && read < 256 && seq < 16 {
-                let mut r = [0u8; 1];
-                let _ = getrandom::fill(&mut r);
-                usize::from(r[0] & 0x1f)
-            } else {
-                0
-            };
-            seq = seq.checked_add(1).context("Flux obfs write seq overflow")?;
-
-            write_buf.clear();
-            let len_bytes = (read as u16).to_be_bytes();
-            write_buf.extend_from_slice(&[len_bytes[0], len_bytes[1], pad_len as u8, 0]);
-            let hdr_tag = hdr_cipher
-                .seal_in_place_separate_tag(
-                    Nonce::assume_unique_for_key(hdr_nonce),
-                    Aad::empty(),
-                    &mut write_buf[..OBFS_STREAM_HDR_PLAIN_LEN],
-                )
-                .map_err(|_| anyhow::anyhow!("encrypt Flux obfs frame header"))?;
-            write_buf.extend_from_slice(hdr_tag.as_ref());
-
-            if read > 0 {
-                let mut hdr_aad = [0u8; OBFS_STREAM_HDR_WIRE_LEN];
-                hdr_aad.copy_from_slice(&write_buf[..OBFS_STREAM_HDR_WIRE_LEN]);
-                write_buf.extend_from_slice(&buf[..read]);
-                let data_tag = data_cipher
-                    .seal_in_place_separate_tag(
-                        Nonce::assume_unique_for_key(data_nonce),
-                        Aad::from(&hdr_aad),
-                        &mut write_buf[OBFS_STREAM_HDR_WIRE_LEN..],
-                    )
-                    .map_err(|_| anyhow::anyhow!("encrypt Flux obfs record"))?;
-                write_buf.extend_from_slice(data_tag.as_ref());
-            }
-            if pad_len > 0 {
-                let pad_start = write_buf.len();
-                write_buf.resize(pad_start + pad_len, 0);
-                getrandom::fill(&mut write_buf[pad_start..])
-                    .map_err(|e| anyhow::anyhow!("Flux obfs frame pad random: {e}"))?;
-            }
-
-            wire_writer
-                .write_all(&write_buf)
-                .await
-                .context("write Flux obfs frame")?;
-            wire_writer
-                .flush()
-                .await
-                .context("flush Flux obfs stream")?;
-            if read == 0 {
-                let _ = wire_writer.shutdown().await;
-                return Ok(());
-            }
-        }
-    });
-
-    ObfsStream {
-        reader,
-        writer,
-        read_task,
-        write_task,
+        ),
+        write_hdr_iv: write_dirs.hdr_iv,
+        write_data_iv: write_dirs.data_iv,
+        write_seq: 0,
+        write_buf: Vec::with_capacity(
+            OBFS_STREAM_HDR_WIRE_LEN + OBFS_MAX_CHUNK + OBFS_TAG_LEN + 64,
+        ),
+        write_pos: 0,
+        write_eof_queued: false,
+        pad_rng: FastPadRng::from_os_seed(),
     }
 }
 

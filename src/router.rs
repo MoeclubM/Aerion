@@ -9,9 +9,12 @@ use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
+
+const ROUTE_UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 pub struct RouteProxyConfig {
@@ -279,17 +282,18 @@ async fn handle_udp_associate(mut control: TcpStream, state: RouteProxyState) ->
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         ip => ip,
     };
-    let udp = Arc::new(
-        UdpSocket::bind(SocketAddr::new(bind_ip, 0))
-            .await
-            .with_context(|| format!("bind route UDP associate socket on {bind_ip}:0"))?,
-    );
+    let raw_udp = UdpSocket::bind(SocketAddr::new(bind_ip, 0))
+        .await
+        .with_context(|| format!("bind route UDP associate socket on {bind_ip}:0"))?;
+    let _ = socket_protect::disable_windows_udp_connreset(&raw_udp);
+    let udp = Arc::new(raw_udp);
     socks::write_reply_with_bind(&mut control, 0x00, udp.local_addr()?).await?;
     tracing::info!("route UDP associate listening on {}", udp.local_addr()?);
 
     let mut sessions = BTreeMap::<String, mpsc::Sender<UdpCommand>>::new();
     let mut packet = vec![0u8; u16::MAX as usize + 512];
     let mut control_probe = [0u8; 1];
+    let mut sweep_counter = 0u32;
 
     let peer = control.peer_addr()?;
     let session = if let Some(core) = state.core() {
@@ -302,18 +306,37 @@ async fn handle_udp_associate(mut control: TcpStream, state: RouteProxyState) ->
         tokio::select! {
             received = udp.recv_from(&mut packet) => {
                 let (read, peer) = received.context("receive route UDP packet")?;
+                sweep_counter = sweep_counter.wrapping_add(1);
+                if sweep_counter & 0x3f == 0 {
+                    sessions.retain(|_, tx| !tx.is_closed());
+                }
                 let (target, payload) = uot::parse_socks_udp_packet(&packet[..read])?;
                 match state.try_decide(&target, RouteNetwork::Udp)? {
                     RouteDecision::Direct => {
                         let key = format!("direct:{}", target_name(&target));
-                        let tx = sessions.entry(key).or_insert_with(|| {
-                            spawn_direct_udp_session(target.clone(), udp.clone(), session.clone())
-                        }).clone();
-                        tx.send(UdpCommand {
-                            target,
+                        let cmd = UdpCommand {
+                            target: target.clone(),
                             payload: payload.to_vec(),
                             peer,
-                        }).await.context("send direct UDP route command")?;
+                        };
+                        let mut tx = match sessions.get(&key) {
+                            Some(existing) if !existing.is_closed() => existing.clone(),
+                            _ => {
+                                let fresh = spawn_direct_udp_session(
+                                    target.clone(),
+                                    udp.clone(),
+                                    session.clone(),
+                                );
+                                sessions.insert(key.clone(), fresh.clone());
+                                fresh
+                            }
+                        };
+                        if let Err(err) = tx.send(cmd).await {
+                            let fresh = spawn_direct_udp_session(target, udp.clone(), session.clone());
+                            sessions.insert(key, fresh.clone());
+                            tx = fresh;
+                            let _ = tx.send(err.0).await;
+                        }
                     }
                     RouteDecision::Block => {
                         tracing::info!("blocking UDP {}", target_name(&target));
@@ -322,17 +345,32 @@ async fn handle_udp_associate(mut control: TcpStream, state: RouteProxyState) ->
                         let upstream = state
                             .upstream(&tag)
                             .with_context(|| format!("route UDP outbound {tag} was not started"))?;
-                        let tx = sessions
-                            .entry(format!("proxy:{tag}@{upstream}"))
-                            .or_insert_with(|| {
-                                spawn_proxy_udp_session(tag.clone(), upstream, udp.clone(), session.clone())
-                            })
-                            .clone();
-                        tx.send(UdpCommand {
+                        let key = format!("proxy:{tag}@{upstream}");
+                        let cmd = UdpCommand {
                             target,
                             payload: payload.to_vec(),
                             peer,
-                        }).await.with_context(|| format!("send UDP route command to {tag}"))?;
+                        };
+                        let mut tx = match sessions.get(&key) {
+                            Some(existing) if !existing.is_closed() => existing.clone(),
+                            _ => {
+                                let fresh = spawn_proxy_udp_session(
+                                    tag.clone(),
+                                    upstream,
+                                    udp.clone(),
+                                    session.clone(),
+                                );
+                                sessions.insert(key.clone(), fresh.clone());
+                                fresh
+                            }
+                        };
+                        if let Err(err) = tx.send(cmd).await {
+                            let fresh =
+                                spawn_proxy_udp_session(tag, upstream, udp.clone(), session.clone());
+                            sessions.insert(key, fresh.clone());
+                            tx = fresh;
+                            let _ = tx.send(err.0).await;
+                        }
                     }
                 }
             }
@@ -381,6 +419,9 @@ async fn run_direct_udp_session(
     session: Option<crate::core::CoreSession>,
 ) -> Result<()> {
     let remote = resolve_udp_target(&target).await?;
+    if socket_protect::is_fake_ip(remote.ip()) {
+        bail!("refusing direct UDP route to synthetic FakeIP {remote}");
+    }
     let bind = if remote.is_ipv4() {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
     } else {
@@ -389,12 +430,18 @@ async fn run_direct_udp_session(
     let socket = socket_protect::bind_udp(bind).await?;
     let mut peer = None;
     let mut buffer = vec![0u8; u16::MAX as usize];
+    let idle_sleep = tokio::time::sleep(ROUTE_UDP_SESSION_IDLE_TIMEOUT);
+    tokio::pin!(idle_sleep);
     loop {
         tokio::select! {
+            _ = &mut idle_sleep => {
+                return Ok(());
+            }
             command = rx.recv() => {
                 let Some(command) = command else {
                     return Ok(());
                 };
+                idle_sleep.as_mut().reset(tokio::time::Instant::now() + ROUTE_UDP_SESSION_IDLE_TIMEOUT);
                 peer = Some(command.peer);
                 if let Some(session) = &session {
                     session.record_upload(command.payload.len()).await?;
@@ -405,6 +452,7 @@ async fn run_direct_udp_session(
             }
             received = socket.recv_from(&mut buffer) => {
                 let (read, source) = received.context("receive direct UDP response")?;
+                idle_sleep.as_mut().reset(tokio::time::Instant::now() + ROUTE_UDP_SESSION_IDLE_TIMEOUT);
                 if let Some(session) = &session {
                     session.record_download(read).await?;
                 }
@@ -434,12 +482,18 @@ async fn run_proxy_udp_session(
     let bind = association.bind;
     let mut peer = None;
     let mut buffer = vec![0u8; u16::MAX as usize + 512];
+    let idle_sleep = tokio::time::sleep(ROUTE_UDP_SESSION_IDLE_TIMEOUT);
+    tokio::pin!(idle_sleep);
     loop {
         tokio::select! {
+            _ = &mut idle_sleep => {
+                return Ok(());
+            }
             command = rx.recv() => {
                 let Some(command) = command else {
                     return Ok(());
                 };
+                idle_sleep.as_mut().reset(tokio::time::Instant::now() + ROUTE_UDP_SESSION_IDLE_TIMEOUT);
                 peer = Some(command.peer);
                 if let Some(session) = &session {
                     session.record_upload(command.payload.len()).await?;
@@ -451,6 +505,7 @@ async fn run_proxy_udp_session(
             }
             received = socket.recv_from(&mut buffer) => {
                 let (read, _) = received.with_context(|| format!("receive UDP route via {tag}"))?;
+                idle_sleep.as_mut().reset(tokio::time::Instant::now() + ROUTE_UDP_SESSION_IDLE_TIMEOUT);
                 if let Some(session) = &session {
                     session.record_download(read).await?;
                 }
@@ -467,12 +522,23 @@ async fn run_proxy_udp_session(
 
 async fn resolve_udp_target(target: &ProxyTarget) -> Result<SocketAddr> {
     match target {
-        ProxyTarget::Ip(addr) => Ok(*addr),
-        ProxyTarget::Domain(host, port) => tokio::net::lookup_host((host.as_str(), *port))
-            .await
-            .with_context(|| format!("resolve UDP target {host}:{port}"))?
-            .next()
-            .with_context(|| format!("UDP target resolved to no addresses: {host}:{port}")),
+        ProxyTarget::Ip(addr) => {
+            if socket_protect::is_fake_ip(addr.ip()) {
+                bail!("refusing UDP resolution to synthetic FakeIP {addr}");
+            }
+            Ok(*addr)
+        }
+        ProxyTarget::Domain(host, port) => {
+            let addrs = socket_protect::resolve_host_non_fakeip(host, *port)
+                .await
+                .with_context(|| format!("resolve UDP target {host}:{port}"))?;
+            addrs
+                .iter()
+                .copied()
+                .find(SocketAddr::is_ipv4)
+                .or_else(|| addrs.first().copied())
+                .with_context(|| format!("UDP target resolved to no addresses: {host}:{port}"))
+        }
     }
 }
 

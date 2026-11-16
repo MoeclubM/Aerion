@@ -1,7 +1,7 @@
 use crate::protocol::{ProxyTarget, target_name};
 use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
@@ -12,6 +12,63 @@ use std::os::fd::{AsFd, AsRawFd};
 
 const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(15);
 const UDP_BUF_SIZES: [usize; 3] = [8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024];
+const FALLBACK_DNS_SERVERS: [SocketAddr; 2] = [
+    SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(223, 5, 5, 5), 53)),
+    SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 53)),
+];
+
+/// Returns true when `ip` belongs to the RFC 2544 benchmark range (`198.18.0.0/15`)
+/// commonly used as synthetic FakeIP space by TUN VirtualDNS implementations.
+pub fn is_fake_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let oct = v4.octets();
+            oct[0] == 198 && (oct[1] == 18 || oct[1] == 19)
+        }
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .is_some_and(|v4| is_fake_ip(IpAddr::V4(v4))),
+    }
+}
+
+pub(crate) fn is_tunnel_or_vpn_adapter(if_type: u32, name: &str, description: &str) -> bool {
+    // 24 = IF_TYPE_SOFTWARE_LOOPBACK, 53 = IF_TYPE_PROP_VIRTUAL (Wintun/Tailscale/WireGuard),
+    // 131 = IF_TYPE_TUNNEL.
+    if matches!(if_type, 24 | 53 | 131) {
+        return true;
+    }
+    let name_lower = name.to_ascii_lowercase();
+    let desc_lower = description.to_ascii_lowercase();
+    const KEYWORDS: [&str; 15] = [
+        "wintun",
+        "wireguard",
+        "tailscale",
+        "zerotier",
+        "tap-windows",
+        "tap adapter",
+        "openvpn",
+        "sing-tun",
+        "clash",
+        "mihomo",
+        "neto",
+        "secovpn",
+        "xbclient",
+        "utun",
+        "npcap",
+    ];
+    KEYWORDS
+        .iter()
+        .any(|kw| name_lower.contains(kw) || desc_lower.contains(kw))
+}
+
+pub(crate) fn is_hypervisor_bridge_adapter(name: &str, description: &str) -> bool {
+    let name_lower = name.to_ascii_lowercase();
+    let desc_lower = description.to_ascii_lowercase();
+    const BRIDGE_KEYWORDS: [&str; 5] = ["vethernet", "wsl", "vmware", "virtualbox", "docker"];
+    BRIDGE_KEYWORDS
+        .iter()
+        .any(|kw| name_lower.contains(kw) || desc_lower.contains(kw))
+}
 
 type SocketProtector = Arc<dyn Fn(i32) -> Result<()> + Send + Sync + 'static>;
 
@@ -41,9 +98,19 @@ pub fn clear_socket_protector() {
 }
 
 pub fn set_outbound_interface(interface: OutboundInterface) {
-    *OUTBOUND_INTERFACE
+    let mut guard = OUTBOUND_INTERFACE
         .write()
-        .expect("outbound interface lock poisoned") = Some(interface);
+        .expect("outbound interface lock poisoned");
+    let changed = guard.as_ref() != Some(&interface);
+    if changed {
+        tracing::info!(
+            name = ?interface.name,
+            ipv4_index = ?interface.ipv4_index,
+            ipv6_index = ?interface.ipv6_index,
+            "Aerion outbound interface updated"
+        );
+    }
+    *guard = Some(interface);
 }
 
 pub fn clear_outbound_interface() {
@@ -72,6 +139,12 @@ pub fn detect_default_outbound_interface() -> Option<OutboundInterface> {
                 && !iface.starts_with("tun")
                 && !iface.starts_with("utun")
                 && !iface.starts_with("wg")
+                && !iface.starts_with("tailscale")
+                && !iface.starts_with("zt")
+                && !iface.starts_with("clash")
+                && !iface.starts_with("sing")
+                && !iface.starts_with("Meta")
+                && !iface.starts_with("neto")
             {
                 return Some(OutboundInterface {
                     name: Some(iface.to_string()),
@@ -136,8 +209,8 @@ pub async fn connect_proxy_target(target: &ProxyTarget) -> Result<TcpStream> {
     }
 }
 
-pub async fn connect_tcp_host_port(host: &str, port: u16) -> Result<TcpStream> {
-    let trimmed_host = host.trim_end_matches('.');
+pub async fn resolve_host_non_fakeip(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    let trimmed_host = host.trim().trim_matches(['[', ']']).trim_end_matches('.');
     if trimmed_host.is_empty()
         || trimmed_host.eq_ignore_ascii_case("invalid")
         || trimmed_host
@@ -148,25 +221,198 @@ pub async fn connect_tcp_host_port(host: &str, port: u16) -> Result<TcpStream> {
             std::io::ErrorKind::HostUnreachable,
             format!("RFC 6761 invalid domain: {host}:{port}"),
         );
-        return Err(err).with_context(|| format!("resolve TCP peer {host}:{port}"));
+        return Err(err).with_context(|| format!("resolve peer {host}:{port}"));
     }
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|error| {
-            std::io::Error::new(
+    if let Ok(ip) = trimmed_host.parse::<IpAddr>() {
+        if is_fake_ip(ip) {
+            let err = std::io::Error::new(
+                std::io::ErrorKind::HostUnreachable,
+                format!("refusing direct resolution of synthetic FakeIP {ip}:{port}"),
+            );
+            return Err(err).with_context(|| format!("resolve peer {host}:{port}"));
+        }
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let mut saw_fake_ip = false;
+    let mut addrs = Vec::new();
+    match tokio::net::lookup_host((trimmed_host, port)).await {
+        Ok(iter) => {
+            for addr in iter {
+                if is_fake_ip(addr.ip()) {
+                    saw_fake_ip = true;
+                } else if !addrs.contains(&addr) {
+                    addrs.push(addr);
+                }
+            }
+        }
+        Err(error) => {
+            let err = std::io::Error::new(
                 std::io::ErrorKind::HostUnreachable,
                 format!("{host}:{port}: {error}"),
-            )
-        })
-        .with_context(|| format!("resolve TCP peer {host}:{port}"))?
-        .collect::<Vec<_>>();
+            );
+            return Err(err).with_context(|| format!("resolve peer {host}:{port}"));
+        }
+    }
+
+    if addrs.is_empty() && saw_fake_ip {
+        tracing::warn!(
+            host = %trimmed_host,
+            "OS DNS returned synthetic FakeIP; falling back to protected UDP DNS"
+        );
+        addrs = resolve_via_protected_udp_dns(trimmed_host, port).await?;
+    }
     if addrs.is_empty() {
         let err = std::io::Error::new(
             std::io::ErrorKind::HostUnreachable,
-            format!("TCP peer resolved to no addresses: {host}:{port}"),
+            format!("peer resolved to no routable addresses: {host}:{port}"),
         );
         return Err(err.into());
     }
+    Ok(addrs)
+}
+
+async fn resolve_via_protected_udp_dns(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    let q_a = build_dns_query(host, 1, 0x4101)?;
+    let q_aaaa = build_dns_query(host, 28, 0x4102)?;
+    let sock = bind_udp(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await?;
+    for server in FALLBACK_DNS_SERVERS {
+        let _ = sock.send_to(&q_a, server).await;
+        let _ = sock.send_to(&q_aaaa, server).await;
+    }
+    let mut out = Vec::new();
+    let mut buf = [0u8; 1500];
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+    let mut got_a = false;
+    let mut got_aaaa = false;
+    while (!got_a || !got_aaaa) && tokio::time::Instant::now() < deadline {
+        let recv_timeout = if out.is_empty() {
+            deadline
+        } else {
+            (tokio::time::Instant::now() + Duration::from_millis(80)).min(deadline)
+        };
+        match tokio::time::timeout_at(recv_timeout, sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) if n >= 12 => {
+                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                if id == 0x4101 {
+                    got_a = true;
+                } else if id == 0x4102 {
+                    got_aaaa = true;
+                } else {
+                    continue;
+                }
+                for ip in parse_dns_answers(&buf[..n]) {
+                    if !is_fake_ip(ip) {
+                        let sa = SocketAddr::new(ip, port);
+                        if !out.contains(&sa) {
+                            out.push(sa);
+                        }
+                    }
+                }
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    Ok(out)
+}
+
+fn build_dns_query(host: &str, qtype: u16, tx_id: u16) -> Result<Vec<u8>> {
+    let mut pkt = Vec::with_capacity(64 + host.len());
+    pkt.extend_from_slice(&tx_id.to_be_bytes());
+    pkt.extend_from_slice(&0x0100u16.to_be_bytes()); // RD=1
+    pkt.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+    pkt.extend_from_slice(&[0; 6]); // AN/NS/AR = 0
+    for label in host.trim_end_matches('.').split('.') {
+        anyhow::ensure!(
+            !label.is_empty() && label.len() <= 63,
+            "invalid DNS label in {host}"
+        );
+        pkt.push(label.len() as u8);
+        pkt.extend_from_slice(label.as_bytes());
+    }
+    pkt.push(0);
+    pkt.extend_from_slice(&qtype.to_be_bytes());
+    pkt.extend_from_slice(&1u16.to_be_bytes()); // IN
+    Ok(pkt)
+}
+
+fn skip_dns_name(pkt: &[u8], mut pos: usize) -> Option<usize> {
+    let mut jumps = 0usize;
+    loop {
+        let len = *pkt.get(pos)?;
+        if len == 0 {
+            return Some(pos + 1);
+        }
+        if (len & 0xC0) == 0xC0 {
+            let _ = pkt.get(pos + 1)?;
+            return Some(pos + 2);
+        }
+        if (len & 0xC0) != 0 {
+            return None;
+        }
+        pos = pos.checked_add(1 + usize::from(len))?;
+        jumps += 1;
+        if jumps > 128 || pos > pkt.len() {
+            return None;
+        }
+    }
+}
+
+fn parse_dns_answers(pkt: &[u8]) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    if pkt.len() < 12 || (pkt[2] & 0x80) == 0 || (pkt[3] & 0x0F) != 0 {
+        return out;
+    }
+    let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
+    let ancount = u16::from_be_bytes([pkt[6], pkt[7]]) as usize;
+    let mut pos = 12usize;
+    for _ in 0..qdcount {
+        let Some(next) = skip_dns_name(pkt, pos) else {
+            return out;
+        };
+        if next + 4 > pkt.len() {
+            return out;
+        }
+        pos = next + 4;
+    }
+    for _ in 0..ancount {
+        let Some(next) = skip_dns_name(pkt, pos) else {
+            break;
+        };
+        if next + 10 > pkt.len() {
+            break;
+        }
+        let rtype = u16::from_be_bytes([pkt[next], pkt[next + 1]]);
+        let rclass = u16::from_be_bytes([pkt[next + 2], pkt[next + 3]]);
+        let rdlen = u16::from_be_bytes([pkt[next + 8], pkt[next + 9]]) as usize;
+        let rdata = next + 10;
+        if rdata + rdlen > pkt.len() {
+            break;
+        }
+        if rclass == 1 {
+            if rtype == 1 && rdlen == 4 {
+                out.push(IpAddr::V4(Ipv4Addr::new(
+                    pkt[rdata],
+                    pkt[rdata + 1],
+                    pkt[rdata + 2],
+                    pkt[rdata + 3],
+                )));
+            } else if rtype == 28 && rdlen == 16 {
+                let mut oct = [0u8; 16];
+                oct.copy_from_slice(&pkt[rdata..rdata + 16]);
+                out.push(IpAddr::V6(Ipv6Addr::from(oct)));
+            }
+        }
+        pos = rdata + rdlen;
+    }
+    out
+}
+
+pub async fn connect_tcp_host_port(host: &str, port: u16) -> Result<TcpStream> {
+    let addrs = resolve_host_non_fakeip(host, port)
+        .await
+        .with_context(|| format!("resolve TCP peer {host}:{port}"))?;
     if addrs.len() == 1 {
         return connect_tcp_addr(addrs[0])
             .await
@@ -270,6 +516,17 @@ pub fn enable_tcp_keepalive(stream: &TcpStream) {
 }
 
 async fn connect_tcp_addr_inner(addr: SocketAddr) -> Result<TcpStream> {
+    if is_fake_ip(addr.ip()) {
+        tracing::warn!(
+            target = %addr,
+            "refusing direct TCP dial to synthetic FakeIP"
+        );
+        let err = std::io::Error::new(
+            std::io::ErrorKind::HostUnreachable,
+            format!("refusing direct TCP dial to synthetic FakeIP {addr}"),
+        );
+        return Err(err).with_context(|| format!("connect TCP peer {addr}"));
+    }
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4().context("create outbound IPv4 TCP socket")?
     } else {
@@ -402,6 +659,15 @@ fn apply_windows_outbound_interface<S: std::os::windows::io::AsRawSocket>(
 mod windows_udp {
     use super::*;
     use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GAA_FLAG_INCLUDE_GATEWAYS, GetAdaptersAddresses, GetBestInterfaceEx,
+        IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET as WS_AF_INET, AF_INET6 as WS_AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+    };
 
     const AF_INET: u16 = 2;
     const AF_INET6: u16 = 23;
@@ -451,9 +717,107 @@ mod windows_udp {
         ) -> i32;
     }
 
-    #[link(name = "iphlpapi")]
-    unsafe extern "system" {
-        fn GetBestInterfaceEx(dest_addr: *const core::ffi::c_void, best_if_index: *mut u32) -> u32;
+    unsafe fn pwstr_to_string(ptr: *const u16) -> String {
+        if ptr.is_null() {
+            return String::new();
+        }
+        let mut len = 0usize;
+        while unsafe { *ptr.add(len) } != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    struct PhysicalCandidate {
+        name: String,
+        if_index_v4: u32,
+        if_index_v6: u32,
+        metric_v4: u32,
+        metric_v6: u32,
+        has_v4_gw: bool,
+        has_v6_gw: bool,
+        is_bridge: bool,
+    }
+
+    fn enumerate_physical_candidates() -> Vec<PhysicalCandidate> {
+        let mut size: u32 = 32 * 1024;
+        let mut buf: Vec<u8> = vec![0u8; size as usize];
+        for _ in 0..3 {
+            let rc = unsafe {
+                GetAdaptersAddresses(
+                    AF_UNSPEC as u32,
+                    GAA_FLAG_INCLUDE_GATEWAYS,
+                    std::ptr::null(),
+                    buf.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>(),
+                    &mut size,
+                )
+            };
+            if rc == NO_ERROR {
+                break;
+            }
+            if rc == ERROR_BUFFER_OVERFLOW {
+                buf.resize(size as usize, 0);
+                continue;
+            }
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        let mut cur = buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+        while !cur.is_null() {
+            let adapter = unsafe { &*cur };
+            cur = adapter.Next;
+            if adapter.OperStatus != IfOperStatusUp {
+                continue;
+            }
+            let name = unsafe { pwstr_to_string(adapter.FriendlyName) };
+            let desc = unsafe { pwstr_to_string(adapter.Description) };
+            if is_tunnel_or_vpn_adapter(adapter.IfType, &name, &desc) {
+                continue;
+            }
+
+            let mut has_v4_gw = false;
+            let mut has_v6_gw = false;
+            let mut gw = adapter.FirstGatewayAddress;
+            while !gw.is_null() {
+                let gw_ref = unsafe { &*gw };
+                let sa = gw_ref.Address.lpSockaddr;
+                if !sa.is_null() {
+                    let fam = unsafe { (*sa).sa_family };
+                    if fam == WS_AF_INET {
+                        let sin = unsafe { &*(sa.cast::<SOCKADDR_IN>()) };
+                        let ip = Ipv4Addr::from(unsafe { sin.sin_addr.S_un.S_addr }.to_ne_bytes());
+                        if !ip.is_unspecified() && !ip.is_loopback() && !is_fake_ip(IpAddr::V4(ip))
+                        {
+                            has_v4_gw = true;
+                        }
+                    } else if fam == WS_AF_INET6 {
+                        let sin6 = unsafe { &*(sa.cast::<SOCKADDR_IN6>()) };
+                        let ip = Ipv6Addr::from(unsafe { sin6.sin6_addr.u.Byte });
+                        if !ip.is_unspecified() && !ip.is_loopback() {
+                            has_v6_gw = true;
+                        }
+                    }
+                }
+                gw = gw_ref.Next;
+            }
+
+            if !has_v4_gw && !has_v6_gw {
+                continue;
+            }
+            let if_index_v4 = unsafe { adapter.Anonymous1.Anonymous.IfIndex };
+            out.push(PhysicalCandidate {
+                is_bridge: is_hypervisor_bridge_adapter(&name, &desc),
+                name,
+                if_index_v4,
+                if_index_v6: adapter.Ipv6IfIndex,
+                metric_v4: adapter.Ipv4Metric,
+                metric_v6: adapter.Ipv6Metric,
+                has_v4_gw,
+                has_v6_gw,
+            });
+        }
+        out
     }
 
     pub(super) fn detect_default_interface() -> Option<OutboundInterface> {
@@ -464,7 +828,7 @@ mod windows_udp {
             sin_zero: [0; 8],
         };
         let mut idx_v4 = 0u32;
-        let ipv4_index =
+        let best_v4 =
             (unsafe { GetBestInterfaceEx((&probe_v4 as *const SockAddrIn).cast(), &mut idx_v4) }
                 == 0
                 && idx_v4 != 0)
@@ -480,20 +844,62 @@ mod windows_udp {
             sin6_scope_id: 0,
         };
         let mut idx_v6 = 0u32;
-        let ipv6_index =
+        let best_v6 =
             (unsafe { GetBestInterfaceEx((&probe_v6 as *const SockAddrIn6).cast(), &mut idx_v6) }
                 == 0
                 && idx_v6 != 0)
                 .then_some(idx_v6);
 
-        if ipv4_index.is_none() && ipv6_index.is_none() {
-            return None;
+        let candidates = enumerate_physical_candidates();
+        if !candidates.is_empty() {
+            let chosen_v4 = best_v4
+                .and_then(|idx| {
+                    candidates
+                        .iter()
+                        .find(|c| c.has_v4_gw && c.if_index_v4 == idx && !c.is_bridge)
+                })
+                .or_else(|| {
+                    candidates
+                        .iter()
+                        .filter(|c| c.has_v4_gw && c.if_index_v4 != 0)
+                        .min_by_key(|c| (c.is_bridge, c.metric_v4, c.if_index_v4))
+                });
+
+            let chosen_v6 = best_v6
+                .and_then(|idx| {
+                    candidates
+                        .iter()
+                        .find(|c| c.has_v6_gw && c.if_index_v6 == idx && !c.is_bridge)
+                })
+                .or_else(|| {
+                    candidates
+                        .iter()
+                        .filter(|c| c.has_v6_gw && c.if_index_v6 != 0)
+                        .min_by_key(|c| (c.is_bridge, c.metric_v6, c.if_index_v6))
+                })
+                .or_else(|| chosen_v4.filter(|c| c.if_index_v6 != 0));
+
+            let ipv4_index = chosen_v4.map(|c| c.if_index_v4);
+            let ipv6_index = chosen_v6.map(|c| c.if_index_v6);
+            let name = chosen_v4
+                .or(chosen_v6)
+                .map(|c| c.name.clone())
+                .filter(|s| !s.is_empty());
+            if ipv4_index.is_some() || ipv6_index.is_some() {
+                return Some(OutboundInterface {
+                    name,
+                    ipv4_index,
+                    ipv6_index,
+                });
+            }
         }
-        Some(OutboundInterface {
-            name: None,
-            ipv4_index,
-            ipv6_index,
-        })
+
+        tracing::warn!(
+            best_v4 = ?best_v4,
+            best_v6 = ?best_v6,
+            "no physical outbound adapter with gateway found on Windows"
+        );
+        None
     }
 
     pub(super) fn bind_unicast_if<S: AsRawSocket>(
@@ -557,13 +963,91 @@ mod windows_udp {
 }
 
 #[cfg(windows)]
-pub(crate) fn disable_windows_udp_connreset<S: std::os::windows::io::AsRawSocket>(
+pub fn disable_windows_udp_connreset<S: std::os::windows::io::AsRawSocket>(
     socket: &S,
 ) -> Result<()> {
     windows_udp::disable_connreset(socket)
 }
 
 #[cfg(not(windows))]
-pub(crate) fn disable_windows_udp_connreset<T>(_: &T) -> Result<()> {
+pub fn disable_windows_udp_connreset<T>(_: &T) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filters_tunnel_and_fake_ip_ranges() {
+        assert!(is_fake_ip("198.18.0.1".parse().unwrap()));
+        assert!(is_fake_ip("198.19.255.254".parse().unwrap()));
+        assert!(!is_fake_ip("198.20.0.1".parse().unwrap()));
+        assert!(!is_fake_ip("8.8.8.8".parse().unwrap()));
+
+        assert!(is_tunnel_or_vpn_adapter(53, "wintun", "wintun Tunnel"));
+        assert!(is_tunnel_or_vpn_adapter(
+            53,
+            "Tailscale",
+            "Tailscale Tunnel"
+        ));
+        assert!(is_tunnel_or_vpn_adapter(
+            6,
+            "以太网 5",
+            "TAP-Windows Adapter V9 #2"
+        ));
+        assert!(!is_tunnel_or_vpn_adapter(
+            71,
+            "WLAN 2",
+            "Intel(R) Wi-Fi 6E AX211 160MHz #2"
+        ));
+        assert!(is_hypervisor_bridge_adapter(
+            "vEthernet (WSL)",
+            "Hyper-V Virtual Ethernet Adapter"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_direct_dial_to_fake_ip() {
+        let err = connect_tcp_addr("198.18.0.214:443".parse().unwrap())
+            .await
+            .unwrap_err();
+        let has_unreachable = err.chain().any(|c| {
+            c.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::HostUnreachable)
+        });
+        assert!(has_unreachable, "unexpected error: {err:#}");
+    }
+
+    #[test]
+    fn dns_wire_codec_round_trips_answers() {
+        let q = build_dns_query("example.com", 1, 0x4101).unwrap();
+        let mut resp = q.clone();
+        resp[2] = 0x81;
+        resp[3] = 0x80;
+        resp[6] = 0x00;
+        resp[7] = 0x01; // 1 answer
+        resp.extend_from_slice(&[0xC0, 0x0C]); // pointer to example.com
+        resp.extend_from_slice(&1u16.to_be_bytes()); // A
+        resp.extend_from_slice(&1u16.to_be_bytes()); // IN
+        resp.extend_from_slice(&60u32.to_be_bytes()); // TTL
+        resp.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+        resp.extend_from_slice(&[93, 184, 216, 34]);
+        assert_eq!(
+            parse_dns_answers(&resp),
+            vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]
+        );
+    }
+
+    #[test]
+    fn default_outbound_interface_never_selects_tunnel_adapter() {
+        if let Some(iface) = detect_default_outbound_interface()
+            && let Some(name) = iface.name.as_deref()
+        {
+            assert!(
+                !is_tunnel_or_vpn_adapter(0, name, ""),
+                "selected tunnel interface: {iface:?}"
+            );
+        }
+    }
 }

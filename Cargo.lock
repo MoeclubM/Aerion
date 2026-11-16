@@ -72,6 +72,7 @@ dependencies = [
  "tracing-subscriber",
  "tun2proxy",
  "webpki-roots",
+ "windows-sys 0.61.2",
  "x25519-dalek",
 ]
 
