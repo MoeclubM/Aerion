@@ -485,21 +485,13 @@ impl AsyncRead for ObfsStream {
             let n = buf.remaining().min(this.plain_read_buf.len());
             let chunk = this.plain_read_buf.split_to(n);
             buf.put_slice(&chunk);
-            if buf.remaining() == 0 || this.wire_read_buf.is_empty() {
-                return Poll::Ready(Ok(()));
-            }
+            return Poll::Ready(Ok(()));
         }
 
         let initial_filled = buf.filled().len();
         loop {
             this.decode_buffered_records(buf)?;
             if buf.filled().len() > initial_filled {
-                return Poll::Ready(Ok(()));
-            }
-            if !this.plain_read_buf.is_empty() {
-                let n = buf.remaining().min(this.plain_read_buf.len());
-                let chunk = this.plain_read_buf.split_to(n);
-                buf.put_slice(&chunk);
                 return Poll::Ready(Ok(()));
             }
             if this.read_eof {
@@ -1007,5 +999,78 @@ impl ServerCertVerifier for ObfsQuicCertVerifier {
         self.provider
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn obfs_stream_read_buf_preserves_buffered_plaintext_when_next_record_is_partial()
+    -> Result<()> {
+        let (client_raw, mut wire_tx) = tokio::io::duplex(4096);
+        let (mut wire_rx, server_raw) = tokio::io::duplex(4096);
+        let mut client = spawn_obfs_stream(
+            Box::new(client_raw),
+            DirectionalKeys {
+                hdr_key: [5u8; 32],
+                hdr_iv: [6u8; 12],
+                data_key: [7u8; 32],
+                data_iv: [8u8; 12],
+            },
+            DirectionalKeys {
+                hdr_key: [1u8; 32],
+                hdr_iv: [2u8; 12],
+                data_key: [3u8; 32],
+                data_iv: [4u8; 12],
+            },
+        );
+        let mut server = spawn_obfs_stream(
+            Box::new(server_raw),
+            DirectionalKeys {
+                hdr_key: [1u8; 32],
+                hdr_iv: [2u8; 12],
+                data_key: [3u8; 32],
+                data_iv: [4u8; 12],
+            },
+            DirectionalKeys {
+                hdr_key: [5u8; 32],
+                hdr_iv: [6u8; 12],
+                data_key: [7u8; 32],
+                data_iv: [8u8; 12],
+            },
+        );
+
+        let first = vec![0x5au8; 100];
+        let second = vec![0x42u8; 120];
+        server.write_all(&first).await?;
+        server.flush().await?;
+        let mut first_wire = vec![0u8; 256];
+        let first_len = wire_rx.read(&mut first_wire).await?;
+        wire_tx.write_all(&first_wire[..first_len]).await?;
+
+        server.write_all(&second).await?;
+        server.flush().await?;
+        let mut second_wire = vec![0u8; 256];
+        let second_len = wire_rx.read(&mut second_wire).await?;
+        wire_tx.write_all(&second_wire[..10]).await?;
+        wire_tx.flush().await?;
+
+        let mut head = [0u8; 40];
+        client.read_exact(&mut head).await?;
+        assert!(head.iter().all(|b| *b == 0x5a));
+
+        let mut out = BytesMut::with_capacity(256);
+        let read = client.read_buf(&mut out).await?;
+        assert_eq!(read, 60);
+        assert!(out.iter().all(|b| *b == 0x5a));
+
+        wire_tx.write_all(&second_wire[10..second_len]).await?;
+        wire_tx.flush().await?;
+        let mut tail = vec![0u8; 120];
+        client.read_exact(&mut tail).await?;
+        assert_eq!(tail, second);
+        Ok(())
     }
 }

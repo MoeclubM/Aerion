@@ -76,6 +76,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Prepare Windows target examples directory
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path target/debug/examples | Out-Null
+
       - name: Check
         run: cargo check --locked
 
