@@ -657,7 +657,7 @@ async fn connect_tcp_addr_inner(addr: SocketAddr) -> Result<TcpStream> {
     }
     #[cfg(windows)]
     {
-        apply_windows_outbound_interface(&socket, addr.is_ipv6(), false, is_loopback);
+        apply_windows_outbound_interface(&socket, addr.is_ipv6(), false, false, is_loopback);
     }
     socket
         .connect(addr)
@@ -698,7 +698,7 @@ async fn bind_dual_stack_udp_inner(large_buffers: bool) -> Result<UdpSocket> {
         .context("bind dual-stack UDP socket")?;
     disable_windows_udp_connreset(&socket)?;
     #[cfg(windows)]
-    apply_windows_outbound_interface(&socket, true, true, false);
+    apply_windows_outbound_interface(&socket, true, true, true, false);
     #[cfg(unix)]
     {
         protect_socket_fd(socket.as_raw_fd())?;
@@ -749,7 +749,7 @@ fn bind_udp_std_inner(addr: SocketAddr, large_buffers: bool) -> Result<std::net:
     disable_windows_udp_connreset(&socket)?;
     let is_loopback = addr.ip().is_loopback();
     #[cfg(windows)]
-    apply_windows_outbound_interface(&socket, addr.is_ipv6(), false, is_loopback);
+    apply_windows_outbound_interface(&socket, addr.is_ipv6(), false, true, is_loopback);
     #[cfg(unix)]
     {
         protect_socket_fd(socket.as_raw_fd())?;
@@ -783,6 +783,7 @@ fn apply_windows_outbound_interface<S: std::os::windows::io::AsRawSocket>(
     socket: &S,
     ipv6: bool,
     dual_stack: bool,
+    udp: bool,
     is_loopback: bool,
 ) {
     if is_loopback {
@@ -793,7 +794,7 @@ fn apply_windows_outbound_interface<S: std::os::windows::io::AsRawSocket>(
         .expect("outbound interface lock poisoned")
         .clone();
     if let Some(iface) = iface {
-        windows_udp::bind_unicast_if(socket, &iface, ipv6, dual_stack);
+        windows_udp::bind_outbound_if(socket, &iface, ipv6, dual_stack, udp);
     }
 }
 
@@ -818,6 +819,8 @@ mod windows_udp {
     const IPPROTO_IPV6: i32 = 41;
     const IP_UNICAST_IF: i32 = 31;
     const IPV6_UNICAST_IF: i32 = 31;
+    const IP_MULTICAST_IF: i32 = 9;
+    const IPV6_MULTICAST_IF: i32 = 9;
     const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
 
     #[repr(C)]
@@ -1103,11 +1106,12 @@ mod windows_udp {
         None
     }
 
-    pub(super) fn bind_unicast_if<S: AsRawSocket>(
+    pub(super) fn bind_outbound_if<S: AsRawSocket>(
         socket: &S,
         iface: &OutboundInterface,
         ipv6: bool,
         dual_stack: bool,
+        udp: bool,
     ) {
         let raw = socket.as_raw_socket() as usize;
         if (!ipv6 || dual_stack)
@@ -1123,6 +1127,26 @@ mod windows_udp {
                     4,
                 )
             };
+            // IP_UNICAST_IF does not select the multicast egress adapter.
+            // On Windows, 0.x.x.x encodes an interface index for IP_MULTICAST_IF.
+            if udp {
+                let result = unsafe {
+                    setsockopt(
+                        raw,
+                        IPPROTO_IP,
+                        IP_MULTICAST_IF,
+                        (&net_idx as *const u32).cast(),
+                        4,
+                    )
+                };
+                if result != 0 {
+                    tracing::warn!(
+                        interface_index = idx4,
+                        error = %std::io::Error::last_os_error(),
+                        "bind IPv4 multicast outbound interface failed"
+                    );
+                }
+            }
         }
         if ipv6 && let Some(idx6) = iface.ipv6_index {
             let _ = unsafe {
@@ -1134,6 +1158,24 @@ mod windows_udp {
                     4,
                 )
             };
+            if udp {
+                let result = unsafe {
+                    setsockopt(
+                        raw,
+                        IPPROTO_IPV6,
+                        IPV6_MULTICAST_IF,
+                        (&idx6 as *const u32).cast(),
+                        4,
+                    )
+                };
+                if result != 0 {
+                    tracing::warn!(
+                        interface_index = idx6,
+                        error = %std::io::Error::last_os_error(),
+                        "bind IPv6 multicast outbound interface failed"
+                    );
+                }
+            }
         }
     }
 
