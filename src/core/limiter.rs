@@ -37,12 +37,18 @@ impl ByteRateLimiter {
         let wait_until = {
             let mut next = self.next.lock().expect("core limiter lock poisoned");
             let now = Instant::now();
-            if *next < now {
-                *next = now;
+            // Allow up to 50ms of accumulated credit so timer oversleep is compensated;
+            // otherwise a single session settles well below the configured rate.
+            let floor = now.checked_sub(Duration::from_millis(50)).unwrap_or(now);
+            if *next < floor {
+                *next = floor;
             }
             *next += Duration::from_secs_f64(bytes as f64 / rate as f64);
             *next
         };
+        if wait_until <= Instant::now() {
+            return Ok(());
+        }
         tokio::select! {
             _ = control.cancelled() => bail!("core session cancelled"),
             _ = tokio::time::sleep_until(wait_until) => Ok(()),
