@@ -12,12 +12,11 @@ pub use client::{
 };
 pub use config::{
     DEFAULT_CHANNEL_MAX_MBPS, DEFAULT_ROTATION_BYTES_MB, DEFAULT_ROTATION_INTERVAL_SEC,
-    DEFAULT_STANDBY_CHANNELS,
-    FluxCertMode, FluxChannelClientConfig, FluxChannelRole, FluxChannelServerConfig,
-    FluxChannelWireConfig, FluxClientConfig, FluxHttpMode, FluxIpStrategy, FluxOptions,
-    FluxSecurityMode, FluxServerConfig, FluxTransportKind, MAX_FLUX_EXPANDED_PORTS, PortSpecInput,
-    derive_flux_x25519_public_key, generate_flux_x25519_keypair, normalize_ip_version,
-    parse_flux_x25519_key, parse_port_spec, parse_transport_and_mode,
+    DEFAULT_STANDBY_CHANNELS, FluxCertMode, FluxChannelClientConfig, FluxChannelRole,
+    FluxChannelServerConfig, FluxChannelWireConfig, FluxClientConfig, FluxHttpMode, FluxIpStrategy,
+    FluxOptions, FluxSecurityMode, FluxServerConfig, FluxTransportKind, MAX_FLUX_EXPANDED_PORTS,
+    PortSpecInput, derive_flux_x25519_public_key, generate_flux_x25519_keypair,
+    normalize_ip_version, parse_flux_x25519_key, parse_port_spec, parse_transport_and_mode,
 };
 pub use server::{
     FluxServerState, RunningFluxServer, run_flux_server, run_flux_server_with_core,

@@ -588,7 +588,10 @@ impl FluxServerRegistry {
         Self {
             core,
             udp_enabled: AtomicBool::new(udp_enabled),
-            hello_replay: ReplayCache::new(Duration::from_secs(auth::HELLO_REPLAY_TTL_SECS), 65_536),
+            hello_replay: ReplayCache::new(
+                Duration::from_secs(auth::HELLO_REPLAY_TTL_SECS),
+                65_536,
+            ),
             hello_rate: StdMutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             next_channel_uid: AtomicU64::new(1),
@@ -731,8 +734,12 @@ async fn handle_server_channel(
         ensure!(binding != [0; 32], "missing Flux TLS channel binding");
     }
     let secret = if let Some(priv_bytes) = private_key {
-        let ss = StaticSecret::from(priv_bytes).diffie_hellman(&PublicKey::from(client_ephemeral_pub));
-        ensure!(ss.was_contributory(), "invalid Flux SessionHello X25519 key");
+        let ss =
+            StaticSecret::from(priv_bytes).diffie_hellman(&PublicKey::from(client_ephemeral_pub));
+        ensure!(
+            ss.was_contributory(),
+            "invalid Flux SessionHello X25519 key"
+        );
         *ss.as_bytes()
     } else {
         binding
@@ -759,7 +766,10 @@ async fn handle_server_channel(
         .get_or_open_session(session_id, cred_hash, peer_addr)
         .await?;
     {
-        let channels = session.channels.lock().expect("Flux server channels poisoned");
+        let channels = session
+            .channels
+            .lock()
+            .expect("Flux server channels poisoned");
         ensure!(
             channels.len() < MAX_CHANNELS_PER_SESSION,
             "Flux session active channel limit reached"
@@ -1629,8 +1639,10 @@ mod authentication_tests {
             [(1, "wrong", false), (2, "wrong", false), (3, "valid", true)]
         {
             let (client, server) = tokio::io::duplex(4096);
-            let (mut reader, mut writer, _) = split_boxed_stream_with_binding(Box::new(client), None);
-            let (server_reader, server_writer, guard) = split_boxed_stream_with_binding(Box::new(server), None);
+            let (mut reader, mut writer, _) =
+                split_boxed_stream_with_binding(Box::new(client), None);
+            let (server_reader, server_writer, guard) =
+                split_boxed_stream_with_binding(Box::new(server), None);
             let registry = registry.clone();
             let server_task = tokio::spawn(async move {
                 handle_server_channel(

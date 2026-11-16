@@ -33,7 +33,8 @@ fn make_test_tls_material() -> Result<(ServerTlsMaterial, String)> {
 fn flux_mihomo_yaml_parses_default_and_manual_channels() -> Result<()> {
     let (_, pub_tcp) = generate_flux_x25519_keypair()?;
     let (_, pub_quic) = generate_flux_x25519_keypair()?;
-    let yaml = format!(r#"
+    let yaml = format!(
+        r#"
 proxies:
   - name: FluxAuto
     type: flux
@@ -81,7 +82,8 @@ proxies:
         public-key: {pub_quic}
         role: backup
         weight: 60
-"#);
+"#
+    );
 
     let cfg: MihomoConfig = serde_yaml::from_str(&yaml)?;
     let listen: SocketAddr = "127.0.0.1:1080".parse()?;
@@ -609,7 +611,8 @@ async fn flux_latency_strategy_and_udp_relay_role_route_cleanly() -> Result<()> 
     let (tcp_priv, tcp_pub) = generate_flux_x25519_keypair()?;
     let (udp_priv, udp_pub) = generate_flux_x25519_keypair()?;
     let (_, udp_eq_pub) = generate_flux_x25519_keypair()?;
-    let yaml = format!(r#"
+    let yaml = format!(
+        r#"
 proxies:
   - name: FluxPerChannel
     type: flux
@@ -640,7 +643,8 @@ proxies:
         ports: 21001
         public-key: {udp_eq_pub}
         role: equal
-"#);
+"#
+    );
     let cfg: MihomoConfig = serde_yaml::from_str(&yaml)?;
     let listen: SocketAddr = "127.0.0.1:1080".parse()?;
     let MihomoClientConfig::Flux(parsed) = cfg.resolved_proxy_config("FluxPerChannel", listen)?
@@ -816,7 +820,10 @@ async fn flux_obfs_rejects_wrong_server_key_and_udp_tamper() -> Result<()> {
         tcp_addr,
     )
     .await;
-    assert!(bad_tcp.is_err(), "wrong X25519 public key must fail TCP obfs handshake");
+    assert!(
+        bad_tcp.is_err(),
+        "wrong X25519 public key must fail TCP obfs handshake"
+    );
 
     // Valid public key on UDP succeeds, wrong key is dropped silently until timeout
     let good_udp = tokio::time::timeout(
@@ -885,7 +892,10 @@ async fn flux_obfs_rejects_wrong_server_key_and_udp_tamper() -> Result<()> {
         ),
     )
     .await;
-    assert!(bad_udp.is_err(), "wrong X25519 public key must be silently dropped on UDP");
+    assert!(
+        bad_udp.is_err(),
+        "wrong X25519 public key must be silently dropped on UDP"
+    );
 
     srv.stop();
     let _ = srv.wait().await;
@@ -1181,7 +1191,10 @@ async fn flux_origin_plain_http_works_with_tls_binding_disabled() -> Result<()> 
     }
     writer.write_frame(&hello, true).await?;
     let ok = reader.read_frame().await?;
-    assert!(matches!(ok, Some(frame::FluxFrame::SessionOk { status: 0, .. })));
+    assert!(matches!(
+        ok,
+        Some(frame::FluxFrame::SessionOk { status: 0, .. })
+    ));
     let _ = target_addr;
 
     srv.stop();

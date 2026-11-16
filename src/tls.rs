@@ -98,7 +98,12 @@ impl ServerTlsStream {
         }
     }
 
-    pub fn export_keying_material(&self, out: &mut [u8], label: &[u8], context: &[u8]) -> Result<()> {
+    pub fn export_keying_material(
+        &self,
+        out: &mut [u8],
+        label: &[u8],
+        context: &[u8],
+    ) -> Result<()> {
         match self {
             Self::Rustls(stream) => stream
                 .get_ref()
