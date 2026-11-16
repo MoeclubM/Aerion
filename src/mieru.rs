@@ -434,12 +434,12 @@ impl SharedMieruClientSession {
         }
     }
 
-    async fn get_or_connect(&self) -> Result<ClientUnderlay> {
+    async fn get_or_connect(&self) -> Result<(ClientUnderlay, bool)> {
         {
             let guard = self.underlay.lock().await;
             if let Some(underlay) = guard.as_ref() {
                 if underlay.is_alive().await {
-                    return Ok(underlay.clone());
+                    return Ok((underlay.clone(), true));
                 }
             }
         }
@@ -447,14 +447,25 @@ impl SharedMieruClientSession {
         let mut guard = self.underlay.lock().await;
         if let Some(underlay) = guard.as_ref() {
             if underlay.is_alive().await {
-                return Ok(underlay.clone());
+                return Ok((underlay.clone(), true));
             }
             guard.take();
         }
 
         let underlay = connect_mieru_underlay(&self.config).await?;
         guard.replace(underlay.clone());
-        Ok(underlay)
+        Ok((underlay, false))
+    }
+
+    async fn invalidate(&self, stale: &ClientUnderlay) {
+        let mut guard = self.underlay.lock().await;
+        if guard
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.abort, &stale.abort))
+        {
+            guard.take();
+        }
+        stale.abort.trigger();
     }
 }
 
@@ -838,7 +849,7 @@ pub async fn run_mieru_server(config: MieruServerConfig) -> Result<()> {
 
 pub async fn run_mieru_server_with_core(config: MieruServerConfig, core: ProxyCore) -> Result<()> {
     if config.transport == MieruTransport::Udp {
-        let socket = socket_protect::bind_udp(config.listen)
+        let socket = socket_protect::bind_tunnel_udp(config.listen)
             .await
             .with_context(|| format!("bind Mieru UDP server on {}", config.listen))?;
         return run_mieru_packet_server_socket_with_core(socket, config, core).await;
@@ -944,11 +955,28 @@ async fn handle_mieru_socks_client(
     let request = read_socks_request_raw(&mut local).await?;
     let command = request[1];
     let (mut session, response) = match async {
-        let underlay = shared.get_or_connect().await?;
-        let mut session = underlay.open_session(shared.config.mtu()).await?;
-        session.write_all(&request).await?;
-        let response = read_socks_response_raw(&mut session).await?;
-        Ok::<_, anyhow::Error>((session, response))
+        let mut attempt = 0u8;
+        loop {
+            let (underlay, reused) = shared.get_or_connect().await?;
+            let result = async {
+                let mut session = underlay.open_session(shared.config.mtu()).await?;
+                session.write_all(&request).await?;
+                let response = read_socks_response_raw(&mut session).await?;
+                Ok::<_, anyhow::Error>((session, response))
+            }
+            .await;
+            match result {
+                Ok(pair) => break Ok::<_, anyhow::Error>(pair),
+                Err(error) if reused && attempt == 0 => {
+                    attempt += 1;
+                    shared.invalidate(&underlay).await;
+                    tracing::debug!(
+                        "retrying Mieru SOCKS request after stale underlay failure: {error:#}"
+                    );
+                }
+                Err(error) => break Err(error),
+            }
+        }
     }
     .await
     {
@@ -1092,6 +1120,7 @@ async fn connect_mieru_underlay(config: &MieruClientConfig) -> Result<ClientUnde
     tokio::spawn(run_mieru_underlay_cleaner(
         sessions.clone(),
         Some(writer.clone()),
+        Some(closed.clone()),
         abort.clone(),
         had_session.clone(),
     ));
@@ -1123,10 +1152,11 @@ async fn connect_mieru_packet_underlay(config: &MieruClientConfig) -> Result<Cli
         config.server_port
     );
     let socket = if candidates.iter().any(SocketAddr::is_ipv6) {
-        Arc::new(socket_protect::bind_dual_stack_udp().await?)
+        Arc::new(socket_protect::bind_dual_stack_tunnel_udp().await?)
     } else {
         Arc::new(
-            socket_protect::bind_udp(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await?,
+            socket_protect::bind_tunnel_udp(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+                .await?,
         )
     };
     configure_mieru_packet_socket(&socket)?;
@@ -1168,6 +1198,7 @@ async fn connect_mieru_packet_underlay(config: &MieruClientConfig) -> Result<Cli
     tokio::spawn(run_mieru_underlay_cleaner(
         sessions.clone(),
         Some(writer.clone()),
+        Some(closed.clone()),
         abort.clone(),
         had_session.clone(),
     ));
@@ -1183,10 +1214,13 @@ async fn connect_mieru_packet_underlay(config: &MieruClientConfig) -> Result<Cli
 
 impl ClientUnderlay {
     async fn is_alive(&self) -> bool {
-        self.closed.lock().await.is_none()
+        !self.abort.is_triggered() && self.closed.lock().await.is_none()
     }
 
     async fn open_session(&self, mtu: usize) -> Result<MieruSession> {
+        if self.abort.is_triggered() {
+            bail!("Mieru underlay is closed");
+        }
         if let Some(error) = self.closed.lock().await.clone() {
             bail!("Mieru underlay is closed: {error}");
         }
@@ -1248,6 +1282,7 @@ async fn handle_mieru_underlay_server(
     let cleaner = tokio::spawn(run_mieru_underlay_cleaner(
         sessions.clone(),
         Some(writer.clone()),
+        None,
         abort.clone(),
         had_session.clone(),
     ));
@@ -2133,6 +2168,7 @@ async fn write_output_segment(
 async fn run_mieru_underlay_cleaner(
     sessions: MieruSessionMap,
     writer: Option<Arc<Mutex<MieruAnyWriter>>>,
+    closed: Option<Arc<Mutex<Option<String>>>>,
     abort: Arc<TaskAbort>,
     had_session: Arc<AtomicBool>,
 ) {
@@ -2150,6 +2186,12 @@ async fn run_mieru_underlay_cleaner(
             sessions.retain(|_, entry| !entry.outbound.is_closed());
             if writer.is_none() || !had_session.load(Ordering::Relaxed) || !sessions.is_empty() {
                 continue;
+            }
+        }
+        if let Some(closed) = closed.as_ref() {
+            let mut guard = closed.lock().await;
+            if guard.is_none() {
+                *guard = Some("Mieru underlay closed on idle".to_string());
             }
         }
         abort.trigger();

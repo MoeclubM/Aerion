@@ -1000,7 +1000,7 @@ fn build_naive_quic_endpoint(
     let bind_addr = if bind_ipv6 { "[::]:0" } else { "0.0.0.0:0" }
         .parse()
         .context("build Naive QUIC bind address")?;
-    let socket = socket_protect::bind_udp_std(bind_addr)?;
+    let socket = socket_protect::bind_tunnel_udp_std(bind_addr)?;
     let mut endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         None,
@@ -1037,7 +1037,7 @@ fn build_naive_server_endpoint(config: &NaiveServerConfig) -> Result<quinn::Endp
     server_config.transport_config(Arc::new(naive_quic_transport_config(
         &config.quic_congestion_control,
     )?));
-    let socket = socket_protect::bind_udp_std(config.listen)?;
+    let socket = socket_protect::bind_tunnel_udp_std(config.listen)?;
     quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(server_config),

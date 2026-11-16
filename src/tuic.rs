@@ -1558,7 +1558,7 @@ fn build_client_endpoint(config: &TuicClientConfig, bind_ipv6: bool) -> Result<E
     } else {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
     };
-    let socket = socket_protect::bind_udp_std(bind_addr)?;
+    let socket = socket_protect::bind_tunnel_udp_std(bind_addr)?;
     let mut endpoint = Endpoint::new(
         quinn::EndpointConfig::default(),
         None,
@@ -1593,7 +1593,7 @@ fn build_server_endpoint(config: &TuicServerConfig) -> Result<Endpoint> {
         QuicServerConfig::try_from(tls_config).context("build TUIC QUIC TLS server config")?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     server_config.transport_config(Arc::new(tuic_transport_config(&config.congestion_control)?));
-    let socket = socket_protect::bind_udp_std(config.listen)?;
+    let socket = socket_protect::bind_tunnel_udp_std(config.listen)?;
     Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(server_config),

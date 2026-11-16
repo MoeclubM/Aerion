@@ -1471,13 +1471,16 @@ fn hy2_transport_config(congestion_control: &str) -> Result<quinn::TransportConf
 
 fn bind_client_udp_socket(bind_ipv6: bool) -> Result<std::net::UdpSocket> {
     if bind_ipv6 {
-        socket_protect::bind_udp_std(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
+        socket_protect::bind_tunnel_udp_std(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
             .or_else(|_| {
-                socket_protect::bind_udp_std(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0))
+                socket_protect::bind_tunnel_udp_std(SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::LOCALHOST),
+                    0,
+                ))
             })
             .context("bind Hysteria2 UDP socket")
     } else {
-        socket_protect::bind_udp_std(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        socket_protect::bind_tunnel_udp_std(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
             .context("bind Hysteria2 UDP socket")
     }
 }

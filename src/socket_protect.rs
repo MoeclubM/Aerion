@@ -12,22 +12,56 @@ use std::os::fd::{AsFd, AsRawFd};
 
 const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(15);
 const UDP_BUF_SIZES: [usize; 3] = [8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024];
-const FALLBACK_DNS_SERVERS: [SocketAddr; 2] = [
+const FALLBACK_DNS_SERVERS: [SocketAddr; 6] = [
+    SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(114, 114, 114, 114), 53)),
     SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(223, 5, 5, 5), 53)),
+    SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(119, 29, 29, 29), 53)),
     SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 53)),
+    SocketAddr::V6(std::net::SocketAddrV6::new(
+        Ipv6Addr::new(0x2400, 0x3200, 0, 0, 0, 0, 0, 1),
+        53,
+        0,
+        0,
+    )),
+    SocketAddr::V6(std::net::SocketAddrV6::new(
+        Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
+        53,
+        0,
+        0,
+    )),
 ];
 
 /// Returns true when `ip` belongs to the RFC 2544 benchmark range (`198.18.0.0/15`)
-/// commonly used as synthetic FakeIP space by TUN VirtualDNS implementations.
+/// or tun2proxy's IPv6 VirtualDNS range (`fdfe:dcba:9877::/64`).
 pub fn is_fake_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let oct = v4.octets();
             oct[0] == 198 && (oct[1] == 18 || oct[1] == 19)
         }
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .is_some_and(|v4| is_fake_ip(IpAddr::V4(v4))),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_fake_ip(IpAddr::V4(v4));
+            }
+            let segs = v6.segments();
+            segs[0] == 0xfdfe && segs[1] == 0xdcba && segs[2] == 0x9877 && segs[3] == 0
+        }
+    }
+}
+
+fn is_usable_dns_ip(ip: IpAddr) -> bool {
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || is_fake_ip(ip) {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => !v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_usable_dns_ip(IpAddr::V4(v4));
+            }
+            let seg0 = v6.segments()[0];
+            !v6.is_unicast_link_local() && (seg0 & 0xffc0) != 0xfec0
+        }
     }
 }
 
@@ -234,7 +268,16 @@ pub async fn resolve_host_non_fakeip(host: &str, port: u16) -> Result<Vec<Socket
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
+    let has_tunnel_protection = SOCKET_PROTECTOR
+        .read()
+        .expect("socket protector lock poisoned")
+        .is_some()
+        || OUTBOUND_INTERFACE
+            .read()
+            .expect("outbound interface lock poisoned")
+            .is_some();
     let mut saw_fake_ip = false;
+    let mut lookup_err = None;
     let mut addrs = Vec::new();
     match tokio::net::lookup_host((trimmed_host, port)).await {
         Ok(iter) => {
@@ -247,20 +290,37 @@ pub async fn resolve_host_non_fakeip(host: &str, port: u16) -> Result<Vec<Socket
             }
         }
         Err(error) => {
-            let err = std::io::Error::new(
-                std::io::ErrorKind::HostUnreachable,
-                format!("{host}:{port}: {error}"),
-            );
-            return Err(err).with_context(|| format!("resolve peer {host}:{port}"));
+            lookup_err = Some(error);
         }
     }
 
-    if addrs.is_empty() && saw_fake_ip {
+    if addrs.is_empty() && (saw_fake_ip || has_tunnel_protection) {
         tracing::warn!(
             host = %trimmed_host,
-            "OS DNS returned synthetic FakeIP; falling back to protected UDP DNS"
+            saw_fake_ip,
+            has_lookup_error = lookup_err.is_some(),
+            "OS DNS produced no routable addresses; falling back to protected UDP DNS"
         );
-        addrs = resolve_via_protected_udp_dns(trimmed_host, port).await?;
+        match resolve_via_protected_udp_dns(trimmed_host, port).await {
+            Ok(resolved) if !resolved.is_empty() => addrs = resolved,
+            Ok(_) => {}
+            Err(udp_err) => {
+                if let Some(error) = lookup_err {
+                    let err = std::io::Error::new(
+                        std::io::ErrorKind::HostUnreachable,
+                        format!("{host}:{port}: {error}; protected UDP DNS failed: {udp_err:#}"),
+                    );
+                    return Err(err).with_context(|| format!("resolve peer {host}:{port}"));
+                }
+                return Err(udp_err);
+            }
+        }
+    } else if let Some(error) = lookup_err {
+        let err = std::io::Error::new(
+            std::io::ErrorKind::HostUnreachable,
+            format!("{host}:{port}: {error}"),
+        );
+        return Err(err).with_context(|| format!("resolve peer {host}:{port}"));
     }
     if addrs.is_empty() {
         let err = std::io::Error::new(
@@ -272,13 +332,58 @@ pub async fn resolve_host_non_fakeip(host: &str, port: u16) -> Result<Vec<Socket
     Ok(addrs)
 }
 
+fn collect_protected_dns_servers() -> Vec<SocketAddr> {
+    let mut servers = Vec::new();
+    #[cfg(windows)]
+    {
+        for addr in windows_udp::detect_physical_dns_servers() {
+            if !servers.contains(&addr) {
+                servers.push(addr);
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(resolv) = std::fs::read_to_string("/etc/resolv.conf") {
+        for line in resolv.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if let Some(rest) = line.strip_prefix("nameserver")
+                && let Ok(ip) = rest.trim().parse::<IpAddr>()
+                && is_usable_dns_ip(ip)
+            {
+                let sa = SocketAddr::new(ip, 53);
+                if !servers.contains(&sa) {
+                    servers.push(sa);
+                }
+            }
+        }
+    }
+    for server in FALLBACK_DNS_SERVERS {
+        if !servers.contains(&server) {
+            servers.push(server);
+        }
+    }
+    servers.truncate(8);
+    servers
+}
+
 async fn resolve_via_protected_udp_dns(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     let q_a = build_dns_query(host, 1, 0x4101)?;
     let q_aaaa = build_dns_query(host, 28, 0x4102)?;
-    let sock = bind_udp(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await?;
-    for server in FALLBACK_DNS_SERVERS {
-        let _ = sock.send_to(&q_a, server).await;
-        let _ = sock.send_to(&q_aaaa, server).await;
+    let (sock, dual_stack) = match bind_dual_stack_udp().await {
+        Ok(sock) => (sock, true),
+        Err(_) => (
+            bind_udp(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await?,
+            false,
+        ),
+    };
+    for server in collect_protected_dns_servers() {
+        if dual_stack {
+            let _ = send_to_dual_stack(&sock, &q_a, server).await;
+            let _ = send_to_dual_stack(&sock, &q_aaaa, server).await;
+        } else if server.is_ipv4() {
+            let _ = sock.send_to(&q_a, server).await;
+            let _ = sock.send_to(&q_aaaa, server).await;
+        }
     }
     let mut out = Vec::new();
     let mut buf = [0u8; 1500];
@@ -294,19 +399,24 @@ async fn resolve_via_protected_udp_dns(host: &str, port: u16) -> Result<Vec<Sock
         match tokio::time::timeout_at(recv_timeout, sock.recv_from(&mut buf)).await {
             Ok(Ok((n, _))) if n >= 12 => {
                 let id = u16::from_be_bytes([buf[0], buf[1]]);
-                if id == 0x4101 {
-                    got_a = true;
-                } else if id == 0x4102 {
-                    got_aaaa = true;
-                } else {
+                if id != 0x4101 && id != 0x4102 {
                     continue;
                 }
+                let mut parsed_any = false;
                 for ip in parse_dns_answers(&buf[..n]) {
                     if !is_fake_ip(ip) {
+                        parsed_any = true;
                         let sa = SocketAddr::new(ip, port);
                         if !out.contains(&sa) {
                             out.push(sa);
                         }
+                    }
+                }
+                if parsed_any {
+                    if id == 0x4101 {
+                        got_a = true;
+                    } else {
+                        got_aaaa = true;
                     }
                 }
             }
@@ -549,18 +659,33 @@ async fn connect_tcp_addr_inner(addr: SocketAddr) -> Result<TcpStream> {
 }
 
 pub async fn bind_udp(addr: SocketAddr) -> Result<UdpSocket> {
-    let socket = bind_udp_std(addr)?;
+    let socket = bind_udp_std_inner(addr, false)?;
+    UdpSocket::from_std(socket).context("create tokio UDP socket from protected socket")
+}
+
+pub async fn bind_tunnel_udp(addr: SocketAddr) -> Result<UdpSocket> {
+    let socket = bind_udp_std_inner(addr, true)?;
     UdpSocket::from_std(socket).context("create tokio UDP socket from protected socket")
 }
 
 pub async fn bind_dual_stack_udp() -> Result<UdpSocket> {
+    bind_dual_stack_udp_inner(false).await
+}
+
+pub async fn bind_dual_stack_tunnel_udp() -> Result<UdpSocket> {
+    bind_dual_stack_udp_inner(true).await
+}
+
+async fn bind_dual_stack_udp_inner(large_buffers: bool) -> Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))
         .context("create dual-stack UDP socket")?;
     socket.set_only_v6(false).context("enable dual-stack UDP")?;
     socket
         .set_nonblocking(true)
         .context("set dual-stack UDP socket nonblocking")?;
-    configure_udp_socket_buffers(&socket);
+    if large_buffers {
+        configure_udp_socket_buffers(&socket);
+    }
     socket
         .bind(&std::net::SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())
         .context("bind dual-stack UDP socket")?;
@@ -601,9 +726,19 @@ pub async fn connect_dual_stack(socket: &UdpSocket, dest: SocketAddr) -> std::io
 }
 
 pub fn bind_udp_std(addr: SocketAddr) -> Result<std::net::UdpSocket> {
+    bind_udp_std_inner(addr, false)
+}
+
+pub fn bind_tunnel_udp_std(addr: SocketAddr) -> Result<std::net::UdpSocket> {
+    bind_udp_std_inner(addr, true)
+}
+
+fn bind_udp_std_inner(addr: SocketAddr, large_buffers: bool) -> Result<std::net::UdpSocket> {
     let socket = std::net::UdpSocket::bind(addr)
         .with_context(|| format!("bind protected UDP socket on {addr}"))?;
-    configure_udp_socket_buffers(&socket2::SockRef::from(&socket));
+    if large_buffers {
+        configure_udp_socket_buffers(&socket2::SockRef::from(&socket));
+    }
     disable_windows_udp_connreset(&socket)?;
     let is_loopback = addr.ip().is_loopback();
     #[cfg(windows)]
@@ -666,7 +801,8 @@ mod windows_udp {
     };
     use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
     use windows_sys::Win32::Networking::WinSock::{
-        AF_INET as WS_AF_INET, AF_INET6 as WS_AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+        AF_INET as WS_AF_INET, AF_INET6 as WS_AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_IN,
+        SOCKADDR_IN6,
     };
 
     const AF_INET: u16 = 2;
@@ -728,6 +864,24 @@ mod windows_udp {
         String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
     }
 
+    unsafe fn sockaddr_to_ip(sa: *const SOCKADDR) -> Option<IpAddr> {
+        if sa.is_null() {
+            return None;
+        }
+        let fam = unsafe { (*sa).sa_family };
+        if fam == WS_AF_INET {
+            let sin = unsafe { &*(sa.cast::<SOCKADDR_IN>()) };
+            let ip = Ipv4Addr::from(unsafe { sin.sin_addr.S_un.S_addr }.to_ne_bytes());
+            Some(IpAddr::V4(ip))
+        } else if fam == WS_AF_INET6 {
+            let sin6 = unsafe { &*(sa.cast::<SOCKADDR_IN6>()) };
+            let ip = Ipv6Addr::from(unsafe { sin6.sin6_addr.u.Byte });
+            Some(IpAddr::V6(ip))
+        } else {
+            None
+        }
+    }
+
     struct PhysicalCandidate {
         name: String,
         if_index_v4: u32,
@@ -737,6 +891,7 @@ mod windows_udp {
         has_v4_gw: bool,
         has_v6_gw: bool,
         is_bridge: bool,
+        dns_servers: Vec<IpAddr>,
     }
 
     fn enumerate_physical_candidates() -> Vec<PhysicalCandidate> {
@@ -781,22 +936,23 @@ mod windows_udp {
             let mut gw = adapter.FirstGatewayAddress;
             while !gw.is_null() {
                 let gw_ref = unsafe { &*gw };
-                let sa = gw_ref.Address.lpSockaddr;
-                if !sa.is_null() {
-                    let fam = unsafe { (*sa).sa_family };
-                    if fam == WS_AF_INET {
-                        let sin = unsafe { &*(sa.cast::<SOCKADDR_IN>()) };
-                        let ip = Ipv4Addr::from(unsafe { sin.sin_addr.S_un.S_addr }.to_ne_bytes());
-                        if !ip.is_unspecified() && !ip.is_loopback() && !is_fake_ip(IpAddr::V4(ip))
+                if let Some(ip) = unsafe { sockaddr_to_ip(gw_ref.Address.lpSockaddr) } {
+                    match ip {
+                        IpAddr::V4(ip)
+                            if !ip.is_unspecified()
+                                && !ip.is_loopback()
+                                && !is_fake_ip(IpAddr::V4(ip)) =>
                         {
                             has_v4_gw = true;
                         }
-                    } else if fam == WS_AF_INET6 {
-                        let sin6 = unsafe { &*(sa.cast::<SOCKADDR_IN6>()) };
-                        let ip = Ipv6Addr::from(unsafe { sin6.sin6_addr.u.Byte });
-                        if !ip.is_unspecified() && !ip.is_loopback() {
+                        IpAddr::V6(ip)
+                            if !ip.is_unspecified()
+                                && !ip.is_loopback()
+                                && !is_fake_ip(IpAddr::V6(ip)) =>
+                        {
                             has_v6_gw = true;
                         }
+                        _ => {}
                     }
                 }
                 gw = gw_ref.Next;
@@ -804,6 +960,18 @@ mod windows_udp {
 
             if !has_v4_gw && !has_v6_gw {
                 continue;
+            }
+            let mut dns_servers = Vec::new();
+            let mut dns = adapter.FirstDnsServerAddress;
+            while !dns.is_null() {
+                let dns_ref = unsafe { &*dns };
+                if let Some(ip) = unsafe { sockaddr_to_ip(dns_ref.Address.lpSockaddr) }
+                    && is_usable_dns_ip(ip)
+                    && !dns_servers.contains(&ip)
+                {
+                    dns_servers.push(ip);
+                }
+                dns = dns_ref.Next;
             }
             let if_index_v4 = unsafe { adapter.Anonymous1.Anonymous.IfIndex };
             out.push(PhysicalCandidate {
@@ -815,7 +983,37 @@ mod windows_udp {
                 metric_v6: adapter.Ipv6Metric,
                 has_v4_gw,
                 has_v6_gw,
+                dns_servers,
             });
+        }
+        out
+    }
+
+    pub(super) fn detect_physical_dns_servers() -> Vec<SocketAddr> {
+        let outbound = OUTBOUND_INTERFACE
+            .read()
+            .expect("outbound interface lock poisoned")
+            .clone();
+        let mut candidates = enumerate_physical_candidates();
+        candidates.sort_by_key(|c| {
+            let matches_outbound = outbound.as_ref().is_some_and(|iface| {
+                (iface.ipv4_index.is_some() && iface.ipv4_index == Some(c.if_index_v4))
+                    || (iface.ipv6_index.is_some() && iface.ipv6_index == Some(c.if_index_v6))
+            });
+            (
+                !matches_outbound,
+                c.is_bridge,
+                c.metric_v4.min(c.metric_v6),
+            )
+        });
+        let mut out = Vec::new();
+        for c in candidates {
+            for ip in c.dns_servers {
+                let sa = SocketAddr::new(ip, 53);
+                if !out.contains(&sa) {
+                    out.push(sa);
+                }
+            }
         }
         out
     }
@@ -984,6 +1182,9 @@ mod tests {
         assert!(is_fake_ip("198.19.255.254".parse().unwrap()));
         assert!(!is_fake_ip("198.20.0.1".parse().unwrap()));
         assert!(!is_fake_ip("8.8.8.8".parse().unwrap()));
+        assert!(is_fake_ip("fdfe:dcba:9877::1".parse().unwrap()));
+        assert!(!is_fake_ip("fdfe:dcba:9878::1".parse().unwrap()));
+        assert!(!is_fake_ip("2001:4860:4860::8888".parse().unwrap()));
 
         assert!(is_tunnel_or_vpn_adapter(53, "wintun", "wintun Tunnel"));
         assert!(is_tunnel_or_vpn_adapter(

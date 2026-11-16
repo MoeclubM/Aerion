@@ -331,7 +331,7 @@ async fn connect_client_quic_channel(
     } else {
         "0.0.0.0:0".parse().unwrap()
     };
-    let udp_std = socket_protect::bind_udp_std(bind_addr)?;
+    let udp_std = socket_protect::bind_tunnel_udp_std(bind_addr)?;
     let transport_cfg = Arc::new(build_quic_transport_config(
         true,
         channel.security == FluxSecurityMode::Obfs,
