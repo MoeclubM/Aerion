@@ -13,9 +13,15 @@ use std::os::fd::{AsFd, AsRawFd};
 const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(15);
 const UDP_BUF_SIZES: [usize; 3] = [8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024];
 const FALLBACK_DNS_SERVERS: [SocketAddr; 6] = [
-    SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(114, 114, 114, 114), 53)),
+    SocketAddr::V4(std::net::SocketAddrV4::new(
+        Ipv4Addr::new(114, 114, 114, 114),
+        53,
+    )),
     SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(223, 5, 5, 5), 53)),
-    SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(119, 29, 29, 29), 53)),
+    SocketAddr::V4(std::net::SocketAddrV4::new(
+        Ipv4Addr::new(119, 29, 29, 29),
+        53,
+    )),
     SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 53)),
     SocketAddr::V6(std::net::SocketAddrV6::new(
         Ipv6Addr::new(0x2400, 0x3200, 0, 0, 0, 0, 0, 1),
@@ -49,6 +55,7 @@ pub fn is_fake_ip(ip: IpAddr) -> bool {
     }
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 fn is_usable_dns_ip(ip: IpAddr) -> bool {
     if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || is_fake_ip(ip) {
         return false;
@@ -1000,11 +1007,7 @@ mod windows_udp {
                 (iface.ipv4_index.is_some() && iface.ipv4_index == Some(c.if_index_v4))
                     || (iface.ipv6_index.is_some() && iface.ipv6_index == Some(c.if_index_v6))
             });
-            (
-                !matches_outbound,
-                c.is_bridge,
-                c.metric_v4.min(c.metric_v6),
-            )
+            (!matches_outbound, c.is_bridge, c.metric_v4.min(c.metric_v6))
         });
         let mut out = Vec::new();
         for c in candidates {

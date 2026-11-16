@@ -1566,6 +1566,7 @@ async fn run_mieru_packet_server(
     tokio::spawn(run_mieru_underlay_cleaner(
         sessions.clone(),
         None,
+        None,
         abort,
         Arc::new(AtomicBool::new(false)),
     ));
